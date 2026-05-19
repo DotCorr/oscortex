@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "kernel",
+    "tools/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Dotcorr <dev@dotcorr.com>"]
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+# Kernel-space (no_std)
+spin = { version = "0.9", features = ["mutex", "rwlock"] }
+bitflags = "2"
+log = { version = "0.4", default-features = false }
+# Bootloader protocol
+limine = "0.2"
+# WASM runtime for hot-loadable drivers (future)
+# wasm3 = { version = "0.4", default-features = false }
+# Cross-arch
+cfg-if = "1"
+

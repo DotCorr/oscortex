@@ -1,0 +1,23 @@
+# build-std is passed explicitly via xtask (cargo +nightly ... -Z build-std=...)
+# Do NOT enable it globally here — it would break host crates (xtask)
+
+# Default build target for kernel package (used when --target not specified)
+# Override per-package via xtask or explicit --target flag.
+
+[alias]
+xtask = "run --package xtask --"
+kbuild = "run --package xtask -- build"
+krun   = "run --package xtask -- run"
+kiso   = "run --package xtask -- iso"
+
+# Force static (non-PIE) ELF for all bare-metal kernel targets.
+# Limine panics on ET_DYN with empty PT_DYNAMIC.
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.aarch64-unknown-none]
+rustflags = ["-C", "relocation-model=static"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = ["-C", "relocation-model=static"]
+

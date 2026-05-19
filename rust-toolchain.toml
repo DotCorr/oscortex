@@ -1,0 +1,9 @@
+# rust-toolchain.toml — OSCortex requires nightly for kernel dev features
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy", "llvm-tools"]
+targets = [
+    "x86_64-unknown-none",
+    "aarch64-unknown-none",
+    "riscv64gc-unknown-none-elf",
+]

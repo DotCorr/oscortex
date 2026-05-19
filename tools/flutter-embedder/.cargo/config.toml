@@ -1,0 +1,15 @@
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Force static relocation model. The default x86_64-unknown-none target spec
+# sets position-independent-executables=true which makes LLVM emit
+# `call memset@GOTPCREL(%rip)` style indirect calls. Our kernel loader maps the
+# ELF at its link-time VA but does not populate the GOT, so those slots stay
+# zero and any GOT-indirect call (notably memset/memcpy for large stack
+# zero-fills) dereferences address 0 and faults.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=small",
+]
+

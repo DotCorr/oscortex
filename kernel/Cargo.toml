@@ -1,0 +1,43 @@
+[package]
+name = "oscortex-kernel"
+version.workspace = true
+edition.workspace = true
+description = "OSCortex AI-first kernel core"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+spin = { version = "0.9", features = ["mutex", "rwlock", "once"] }
+bitflags = "2"
+log = { version = "0.4", default-features = false }
+limine = "0.6"
+cfg-if = "1"
+linked_list_allocator = { version = "0.10", default-features = false, features = ["use_spin"] }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "alloc",
+    "proto-ipv4",
+    "proto-dhcpv4",
+    "socket-udp",
+    "socket-tcp",
+    "socket-icmp",
+    "socket-dhcpv4",
+    "medium-ethernet",
+    "log",
+    "iface-max-route-count-4",
+    "iface-neighbor-cache-count-16",
+    "iface-max-addr-count-4",
+    "iface-max-multicast-group-count-4",
+    "assembler-max-segment-count-4",
+] }
+
+[features]
+default = ["arch-x86_64"]
+arch-x86_64 = []
+arch-aarch64 = []
+arch-riscv64 = []
+ai-cortex = []
+driver-wasm = []
+self-healing = []
