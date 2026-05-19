@@ -56,6 +56,33 @@ static mut SYSCALL_USER_RIP: u64 = 0;
 /// overwrites r9 with the linux a4, so we stash it here first.
 static mut SYSCALL_USER_R9: u64 = 0;
 
+// ── Full user GPR snapshot captured at SYSCALL entry ──────────────────────────
+//
+// SysV ABI requires callee-saved regs (rbx, rbp, r12, r13, r14, r15) to be
+// preserved across a function call. The trampoline that invokes SYSCALL is
+// such a call from the C++ caller's perspective, so the kernel MUST hand
+// these registers back unchanged on SYSRET — and, critically, must do so
+// even after a voluntary yield (e.g. futex_wait) that re-enters user mode
+// through `enter_user_by_pid_noreturn`. Argument registers (rdi/rsi/rdx/r10/
+// r8/r9) are caller-saved by ABI but a parked thread that resumes from a
+// yield still expects them to hold the values they had at the SYSCALL
+// instant (the syscall's post-return state is `rax=retval`, all other regs
+// unchanged from the SYSCALL point).
+//
+// We stash all of them at SYSCALL entry so a yield handler can snapshot the
+// full user GPR set into the process's `UserRegs` before context-switching.
+static mut SYSCALL_USER_RBX: u64 = 0;
+static mut SYSCALL_USER_RBP: u64 = 0;
+static mut SYSCALL_USER_R12: u64 = 0;
+static mut SYSCALL_USER_R13: u64 = 0;
+static mut SYSCALL_USER_R14: u64 = 0;
+static mut SYSCALL_USER_R15: u64 = 0;
+static mut SYSCALL_USER_RDI: u64 = 0;
+static mut SYSCALL_USER_RSI: u64 = 0;
+static mut SYSCALL_USER_RDX: u64 = 0;
+static mut SYSCALL_USER_R10: u64 = 0;
+static mut SYSCALL_USER_R8:  u64 = 0;
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 pub fn init() {
@@ -109,6 +136,35 @@ pub fn user_r9() -> u64 {
     unsafe { SYSCALL_USER_R9 }
 }
 
+/// Snapshot of all general-purpose user registers captured at SYSCALL entry.
+#[derive(Clone, Copy, Default)]
+pub struct UserGprSnapshot {
+    pub rdi: u64, pub rsi: u64, pub rdx: u64,
+    pub r10: u64, pub r8:  u64, pub r9:  u64,
+    pub rbx: u64, pub rbp: u64,
+    pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+}
+
+/// Read the full user GPR snapshot stashed by `syscall_entry`.
+pub fn user_gprs() -> UserGprSnapshot {
+    unsafe {
+        UserGprSnapshot {
+            rdi: SYSCALL_USER_RDI,
+            rsi: SYSCALL_USER_RSI,
+            rdx: SYSCALL_USER_RDX,
+            r10: SYSCALL_USER_R10,
+            r8:  SYSCALL_USER_R8,
+            r9:  SYSCALL_USER_R9,
+            rbx: SYSCALL_USER_RBX,
+            rbp: SYSCALL_USER_RBP,
+            r12: SYSCALL_USER_R12,
+            r13: SYSCALL_USER_R13,
+            r14: SYSCALL_USER_R14,
+            r15: SYSCALL_USER_R15,
+        }
+    }
+}
+
 /// Fast syscall entry point (SYSCALL instruction from ring 3).
 ///
 /// On entry (hardware convention):
@@ -133,6 +189,21 @@ unsafe extern "C" fn syscall_entry() {
         "mov [{user_rsp}], rsp",          // save user RSP
         "mov [{user_rip}], rcx",          // save user RIP (RCX = return addr from SYSCALL)
         "mov [{user_r9}], r9",            // save user R9 (often 3rd vararg)
+        // Snapshot the rest of the user GPR set so yield handlers can
+        // capture the complete register state. rcx/r11/rax are NOT saved
+        // here: rcx is the saved user RIP, r11 the saved user RFLAGS, and
+        // rax the syscall number (the syscall return value goes in rax).
+        "mov [{user_rdi}], rdi",
+        "mov [{user_rsi}], rsi",
+        "mov [{user_rdx}], rdx",
+        "mov [{user_r10}], r10",
+        "mov [{user_r8}],  r8",
+        "mov [{user_rbx}], rbx",
+        "mov [{user_rbp}], rbp",
+        "mov [{user_r12}], r12",
+        "mov [{user_r13}], r13",
+        "mov [{user_r14}], r14",
+        "mov [{user_r15}], r15",
         "mov rsp, [{kstack_top}]",        // load kernel syscall stack top
 
         // ── 2. Save user RIP, RFLAGS, and all caller-saved arg regs ───────
@@ -179,6 +250,17 @@ unsafe extern "C" fn syscall_entry() {
         user_rsp   = sym SYSCALL_USER_RSP,
         user_rip   = sym SYSCALL_USER_RIP,
         user_r9    = sym SYSCALL_USER_R9,
+        user_rdi   = sym SYSCALL_USER_RDI,
+        user_rsi   = sym SYSCALL_USER_RSI,
+        user_rdx   = sym SYSCALL_USER_RDX,
+        user_r10   = sym SYSCALL_USER_R10,
+        user_r8    = sym SYSCALL_USER_R8,
+        user_rbx   = sym SYSCALL_USER_RBX,
+        user_rbp   = sym SYSCALL_USER_RBP,
+        user_r12   = sym SYSCALL_USER_R12,
+        user_r13   = sym SYSCALL_USER_R13,
+        user_r14   = sym SYSCALL_USER_R14,
+        user_r15   = sym SYSCALL_USER_R15,
         kstack_top = sym ACTIVE_SYSCALL_STACK_TOP,
     )
 }

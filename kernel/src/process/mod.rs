@@ -691,12 +691,17 @@ pub fn schedule_user_launch(pid: u32) {
 }
 
 pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
-    let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx, syscall_stack_top, fs_base) = {
+    let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
+         rbx, rbp, r8, r9, r10, r12, r13, r14, r15,
+         syscall_stack_top, fs_base) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
         (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
-         p.regs.rdi, p.regs.rsi, p.regs.rdx, p.syscall_stack_top, p.fs_base)
+         p.regs.rdi, p.regs.rsi, p.regs.rdx,
+         p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,
+         p.regs.r12, p.regs.r13, p.regs.r14, p.regs.r15,
+         p.syscall_stack_top, p.fs_base)
     };
 
     log::warn!(
@@ -726,32 +731,60 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     }
 
     // Use SYSRET to enter user mode. This is the native x86_64 user-entry path
-    // and mirrors how SYSCALL returns to user code. RDI/RSI/RDX are restored
-    // so pthread-created threads receive their start-routine argument(s)
-    // correctly (SysV AMD64: first three int args go in RDI, RSI, RDX).
+    // and mirrors how SYSCALL returns to user code. The full user GPR set is
+    // restored so a thread that yielded via a syscall (e.g. futex_wait) sees
+    // exactly the register state it had at the SYSCALL instant, with only
+    // RAX changed to the syscall return value. This is required because the
+    // SysV ABI mandates that callee-saved regs (rbx, rbp, r12–r15) survive
+    // a function call, and the userspace SYSCALL trampoline is such a call.
     //
     // Stage values in a fixed-layout stack array and load them inside the asm
-    // block via a single pointer. This sidesteps any compiler register
-    // allocation that could otherwise alias two `in()` operands and have one
-    // `mov` clobber another input before it is read. The kernel-stack page is
-    // mapped in the high-half region of every user PML4, so the loads remain
-    // valid after the CR3 switch above.
-    let frame: [u64; 7] = [rip, rflags, rsp, rdi, rsi, rdx, rax];
+    // block via a single pointer. RSP and the syscall-consumed regs (RCX,
+    // R11) are loaded last so all intermediate reads complete first.
+    let frame: [u64; 16] = [
+        /* 0x00 */ rip,
+        /* 0x08 */ rflags,
+        /* 0x10 */ rsp,
+        /* 0x18 */ rdi,
+        /* 0x20 */ rsi,
+        /* 0x28 */ rdx,
+        /* 0x30 */ rax,
+        /* 0x38 */ rbx,
+        /* 0x40 */ rbp,
+        /* 0x48 */ r8,
+        /* 0x50 */ r9,
+        /* 0x58 */ r10,
+        /* 0x60 */ r12,
+        /* 0x68 */ r13,
+        /* 0x70 */ r14,
+        /* 0x78 */ r15,
+    ];
     unsafe {
         core::arch::asm!(
-            // Use R8 as the base pointer (explicitly pinned via `in("r8")`)
-            // so the compiler cannot allocate it to any destination register
-            // and corrupt the base mid-sequence. RSP is loaded last because
-            // it switches stacks; all memory reads complete before that.
-            "mov rcx, [r8 + 0x00]",   // user RIP   → RCX (consumed by sysretq)
-            "mov r11, [r8 + 0x08]",   // user RFL   → R11 (consumed by sysretq)
-            "mov rdi, [r8 + 0x18]",
-            "mov rsi, [r8 + 0x20]",
-            "mov rdx, [r8 + 0x28]",
-            "mov rax, [r8 + 0x30]",
-            "mov rsp, [r8 + 0x10]",   // switch to user stack last
+            // Pin the frame base in r11. r11 is consumed by SYSRET (as user
+            // RFLAGS) and is the LAST register we load — every other load
+            // can therefore use [r11 + disp] safely. If we let the compiler
+            // pick the base register, it can alias the base with the first
+            // destination (e.g. rax) and have the very first `mov` clobber
+            // the pointer before any further reads happen.
+            "mov rax, [r11 + 0x30]",
+            "mov rdi, [r11 + 0x18]",
+            "mov rsi, [r11 + 0x20]",
+            "mov rdx, [r11 + 0x28]",
+            "mov rbx, [r11 + 0x38]",
+            "mov rbp, [r11 + 0x40]",
+            "mov r8,  [r11 + 0x48]",
+            "mov r9,  [r11 + 0x50]",
+            "mov r10, [r11 + 0x58]",
+            "mov r12, [r11 + 0x60]",
+            "mov r13, [r11 + 0x68]",
+            "mov r14, [r11 + 0x70]",
+            "mov r15, [r11 + 0x78]",
+            "mov rcx, [r11 + 0x00]",   // user RIP   → RCX (consumed by sysretq)
+            "mov rsp, [r11 + 0x10]",   // switch to user stack (mapped in user PML4)
+            "mov r11, [r11 + 0x08]",   // user RFL  → R11 (consumed by sysretq) — load LAST
             "sysretq",
-            in("r8") frame.as_ptr(),
+            in("r11") frame.as_ptr(),
             options(noreturn),
         )
     }
@@ -794,6 +827,31 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
     }
 }
 
+/// Snapshot the full user GPR set (as captured at SYSCALL entry) into the
+/// process's register file. Must be called from inside a syscall handler
+/// before yielding the CPU to another process via
+/// `enter_user_by_pid_noreturn`, otherwise the yielding thread will resume
+/// with stale rbx/rbp/r12–r15/rdi/rsi/etc. and corrupt its C++ caller's
+/// `this` pointer and locals.
+pub fn save_full_user_gprs(pid: u32) {
+    let snap = crate::arch::syscall::user_gprs();
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid != pid { return; }
+    p.regs.rdi = snap.rdi;
+    p.regs.rsi = snap.rsi;
+    p.regs.rdx = snap.rdx;
+    p.regs.r10 = snap.r10;
+    p.regs.r8  = snap.r8;
+    p.regs.r9  = snap.r9;
+    p.regs.rbx = snap.rbx;
+    p.regs.rbp = snap.rbp;
+    p.regs.r12 = snap.r12;
+    p.regs.r13 = snap.r13;
+    p.regs.r14 = snap.r14;
+    p.regs.r15 = snap.r15;
+}
+
 /// Set the `rax` return value that will be delivered when this process is
 /// next entered via `enter_user_by_pid_noreturn`.
 pub fn set_rax(pid: u32, val: u64) {
@@ -807,6 +865,17 @@ pub fn set_state(pid: u32, state: ProcState) {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid { p.state = state; }
+}
+
+/// True if `pid` is currently `Blocked` (i.e. genuinely waiting in
+/// waitpid / exec_wait / cond_wait / similar).  Used by `sys_exit` to
+/// decide whether the parent should be woken with the child's exit
+/// code — clobbering a running parent's RAX would corrupt unrelated
+/// in-flight syscalls (e.g. pthread_cond_wait expecting 0 on signal).
+pub fn is_blocked(pid: u32) -> bool {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    p.pid == pid && p.state == ProcState::Blocked
 }
 
 /// Record which process is waiting for `child_pid` to exit.

@@ -1,0 +1,362 @@
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+limine: Loading executable `boot():/boot/kernel`...
+limine: Physical base:   0x106ca000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff8008a9f0
+limine: Base revision:   6
+limine: Requests count:  7
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/libflutter_engine.so`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+acpi: Found RSDP at 0xf52e0
+acpi: Found RSDP at 0xf52e0
+acpi: Found "FACP" at 0x1ffe222f
+acpi: Found SMBIOS 32-bit entry point at 0xf5300
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: Found "APIC" at 0x1ffe22a3
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+smp: [xAPIC] Found candidate AP for bring-up. LAPIC ID: 1
+smp: Successfully brought up AP
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+acpi: Found RSDP at 0xf52e0
+acpi: Found "APIC" at 0x1ffe22a3
+
+[OSCORTEX] kernel_main reached
+[OSCORTEX] HHDM offset: 0xffff800000000000
+[ARCH] assert_required_features
+[ARCH] gdt::init
+[ARCH] idt::init
+[ARCH] disable_pic
+[ARCH] apic::init_bsp
+[APIC] x2APIC online — timer armed (vec 0x30)
+[ARCH] cpu::enable_fpu_simd
+[ARCH] syscall::init
+[ARCH] early_init complete
+[OSCORTEX] arch::early_init done
+[MM::Paging] Virtual memory manager online (CR3=0x000000001ff85000)
+[MM::Heap] init base=0xffff800000100000 phys=0x0000000000100000
+[INFO] kernel: Framebuffer: 1280x800 bpp=32 pitch=5120 addr=0xffff8000fd000000
+[INFO] kernel: OSCortex kernel 0.1.0 booting...
+[INFO] kernel: AI Cortex: ENABLED
+[INFO] kernel: [BOOT] Limine module: libflutter_engine.so (95866952 bytes)
+[INFO] kernel::drivers::registry: [Drivers] Driver registry initialised
+[INFO] kernel::drivers::ps2: [PS/2] controller ready — devices: kbd=true mouse=true
+[INFO] kernel: [Input] PS/2 enabled (QEMU/KVM path)
+[INFO] kernel::drivers::usb: [USB] No XHCI controllers found — PS/2 input only
+[INFO] kernel::compositor: [Compositor] M13 scaffold online (max_surfaces=32)
+[INFO] kernel::sched: [Sched] Scheduler initialised (max_tasks=64, stack=32KiB, slice=5 ticks)
+[INFO] kernel::security: [Security] Capability-based security model active
+[INFO] kernel::ipc: [IPC] Message-passing subsystem online (cap=16 msgs/proc)
+[INFO] kernel::wm: [WM] Event queue online (cap=256)
+[INFO] kernel::fs: [VFS] Mounted 'initramfs' at '/'
+[INFO] kernel::fs: [VFS] Virtual filesystem initialised
+[INFO] kernel::drivers::uart: [UART] COM1 initialised at 115200 8-N-1
+[INFO] kernel::drivers::virtio_net: [virtio-net] no device found on PCI bus 0
+[INFO] kernel::drivers::nvme: [NVMe] no controller found
+[INFO] kernel::net: [net] UDP stack online (virtio-net backend)
+[INFO] kernel::net::tcp: [smoltcp] virtio-net not ready — TCP stack not started
+[INFO] kernel::cortex: [Cortex] Initialising AI runtime...
+[INFO] kernel::cortex: [Cortex] Starting inference engine...
+[INFO] kernel::cortex::inference: [Cortex::Inference] Model capsule loaded (version=1 kind=0x01 inputs=4 hidden=8 outputs=1)
+[INFO] kernel::cortex::inference: [Cortex::Inference] Built-in model capsule loaded — NN inference ACTIVE (4→8→1 i8-quantised)
+[INFO] kernel::cortex: [Cortex] Inference OK
+[INFO] kernel::cortex: [Cortex] Starting context graph...
+[INFO] kernel::cortex::context: [Cortex::Context] Graph initialised (capacity: 4096 nodes, 16384 edges)
+[INFO] kernel::cortex: [Cortex] Context OK
+[INFO] kernel::cortex: [Cortex] Starting healing...
+[INFO] kernel::cortex::healing: [Cortex::Healing] Self-healing watchdog armed
+[INFO] kernel::cortex: [Cortex] Healing OK
+[INFO] kernel::cortex: [Cortex] Starting driver generation...
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] CDP driver registry ready (capacity: 256)
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] Driver 'null-driver' loaded via WASM sandbox (id=0)
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] Built-in null driver loaded (id=0) — WASM sandbox OK
+[INFO] kernel::cortex: [Cortex] Driver gen OK
+[INFO] kernel::cortex: [Cortex] Starting PID-0 channel...
+[INFO] kernel::cortex::pid0: [Cortex::PID0] PID-0 Cortex API registered on syscall 0x1000-0x100F
+[INFO] kernel::cortex: [Cortex] PID-0 OK
+[INFO] kernel::cortex: [Cortex] AI runtime online — self-healing ACTIVE, driver-gen ACTIVE
+[INFO] kernel::arch::x86_64::smp: [SMP] 2 total CPU(s) — waking 1 AP(s)
+[INFO] kernel::arch::x86_64::syscall: [Syscall] SYSCALL/SYSRET initialised (STAR base=0x18)
+[INFO] kernel::arch::x86_64::smp: [SMP] AP cpu=1 lapic_id=1 online
+[INFO] kernel::sched: [Sched] AP cpu=1 ready, parked (BSP-only scheduler)
+[INFO] kernel::arch::x86_64::smp: [SMP] 2/2 CPU(s) online
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=95612 filesz=95612 ro exec
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x417580 memsz=22735 filesz=22735 ro 
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x41d000 memsz=32 filesz=0 rw 
+[INFO] kernel::process::elf: [ELF] Loaded: entry=0x400000
+[INFO] kernel::process: [Process] Spawned 'init' pid=1 entry=0x400000
+[INFO] kernel::sched: [Sched] spawned 'user-init' pid=0 stack=0xffff800000121df0
+[INFO] kernel::process: [Process] user-init kernel task registered for pid=1
+[INFO] kernel: [INIT] Spawned /init as PID 1
+[INFO] kernel: OSCortex kernel init complete — entering Cortex-managed loop
+[INFO] kernel::sched: [Sched] registered 'cortex-idle' as task-1 (pid=1)
+[INFO] kernel::sched: [Sched] spawned 'cortex-bg' pid=2 stack=0xffff800000129df0
+[INFO] kernel::cortex: [Cortex::BG] background worker started — scheduler ALIVE
+[INFO] kernel::process: [Process] launching userspace pid=1 via SYSRET
+[WARN] kernel::process: [trace] enter_user pid=1 rip=0x400000 rsp=0x7ffffffefff8 rax=0x0 fs=0x0 cr3=0x1102000
+[WARN] kernel::syscall: [syscall] bootstrapped FS base pid=1 fs=0x7ffffffefdf0 rsp=0x7ffffffefff0
+![embedder] starting
+[embedder] host_register ok
+[embedder] ENGINE_CANARY_MODE=2 (full engine)
+[embedder] calling dlopen...
+[INFO] kernel::syscall: [dlopen] Serving libflutter_engine.so from Limine module (95866952 bytes)
+[INFO] kernel::process::dl: [DL] pid=1 dlopen base=0x1000000 handle=1 exports=98
+[embedder] dlopen OK
+[embedder] running C++ ctors
+[embedder] calling DT_INIT
+[embedder] calling DT_INIT_ARRAY
+[embedder] ctors done
+[embedder] resolving symbols...
+[embedder] dlsym done
+[embedder] using GetProcAddresses path
+[embedder] proctable ready
+[embedder] proctable registered
+[embedder] creating surface...
+[embedder] surface capped to 640x360 for bootstrap
+[embedder/aot] syscall rc=0x0000000000000000
+[embedder/aot] syscall va=0x000000029b000000
+[embedder/aot] syscall sz=0x00000000003443b0
+[embedder] AOT snapshot loaded from /system/flutter/app.aot
+[embedder] calling FlutterEngineRun...
+[WARN] kernel::syscall: [stat-trace] nr=0x45d path='/system/flutter/flutter_assets/kernel_blob.bin'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/kernel_blob.bin' → fd=3 (41584416 bytes)
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee130
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee130 size=0x200000
+[INFO] kernel::process: [Process] Thread tid=2 spawned in pid=1 entry=0x29c23e0 tls=0x2bc000000
+[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2b8000010 attr=0x7ffffffee130 entry=0x29c23e0 arg=0x2ba000010 stk=0x200000 -> 0
+[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee130
+[WARN] kernel::syscall: [futex] yield pid=1 -> pid=2 uaddr=0x7ffffffee1a0 val=0 rip=0x7fffe39a
+[WARN] kernel::process: [trace] enter_user pid=2 rip=0x29c23e0 rsp=0x2bb1ffff8 rax=0x0 fs=0x2bc000000 cr3=0x1102000
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x1000010 name_ptr=0x2bb1fff69
+[WARN] kernel::syscall: [trace] sys_thread_exit pid=2 code=0x0 rip=0x7ffff4ca rsp=0x2bb200000
+[ERROR] kernel::syscall: [syscall-trace] last 64 syscall(s):
+[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x35b a0=0x0 a1=0x30 a2=0x0 rip=0x7ffff4ca
+[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x3a1 a0=0x2ba000010 a1=0x30 a2=0x0 rip=0x7fffe01a
+[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x3a1 a0=0x2b9000010 a1=0x70 a2=0x0 rip=0x7fffe01a
+[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x3d4 a0=0x6000010 a1=0x2bb1fff50 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3d3 a0=0x6000010 a1=0x0 a2=0x0 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x3d4 a0=0x6000010 a1=0x0 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x3d3 a0=0x6000010 a1=0x6000010 a2=0x0 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x405 a0=0x1 a1=0x2bb1fff08 a2=0x1 rip=0x7fffe63a
+[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x47b a0=0x5 a1=0x2bb1fff98 a2=0x1 rip=0x7fffeeba
+[ERROR] kernel::syscall: [syscall-trace] #11 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x3d4 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x39d a0=0x7ffffffee1a0 a1=0x81 a2=0x1 rip=0x7fffe3aa
+[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x3de a0=0x7ffffffee1a0 a1=0x4000010 a2=0x5 rip=0x7fffe3aa
+[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x3d3 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x3fd a0=0x36f1c88 a1=0x2bb1ffe78 a2=0x5 rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x3a0 a0=0x18 a1=0x1 a2=0x5 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x47a a0=0x5 a1=0x1 a2=0x5 rip=0x7fffeeaa
+[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x47f a0=0x1 a1=0x80800 a2=0x0 rip=0x7fffeefa
+[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x478 a0=0x1 a1=0x0 a2=0x0 rip=0x7fffee8a
+[ERROR] kernel::syscall: [syscall-trace] #21 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x3d4 a0=0x6000010 a1=0x0 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3d3 a0=0x6000010 a1=0x0 a2=0x5000010 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x3d4 a0=0x6000010 a1=0xb000010 a2=0x3000010 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3a0 a0=0x30 a1=0x0 a2=0x3000010 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x3a0 a0=0x80 a1=0x0 a2=0x3000010 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x3a0 a0=0x50 a1=0x2000018 a2=0x3000010 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3d3 a0=0x6000010 a1=0x2000018 a2=0x3000010 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x3d4 a0=0x372c708 a1=0x2000018 a2=0x3000010 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #32 nr=0x3d3 a0=0x372c708 a1=0x2000018 a2=0x3000010 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #33 nr=0x3a0 a0=0x4 a1=0x2000018 a2=0x3000010 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #34 nr=0x3a0 a0=0x18 a1=0x2000018 a2=0x36f3e00 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #35 nr=0x3fd a0=0x36f1c88 a1=0x2000018 a2=0x36f3e00 rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #36 nr=0x3fd a0=0x36f1c88 a1=0x372c740 a2=0x0 rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #37 nr=0x3a0 a0=0x50 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #38 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #39 nr=0x3d4 a0=0x372c708 a1=0x372c740 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #40 nr=0xba a0=0x372c740 a1=0x0 a2=0x7fffe2fa rip=0x7fffe71a
+[ERROR] kernel::syscall: [syscall-trace] #41 nr=0x411 a0=0xba a1=0x372c740 a2=0x0 rip=0x7fffe71a
+[ERROR] kernel::syscall: [syscall-trace] #42 nr=0x3d3 a0=0x372c708 a1=0x372c740 a2=0x0 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #43 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #44 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #45 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #46 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a
+[ERROR] kernel::syscall: [syscall-trace] #47 nr=0x3fd a0=0x36f1c88 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #48 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #49 nr=0x3d4 a0=0x372c708 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #50 nr=0x3d3 a0=0x372c708 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #51 nr=0x41d a0=0x35d71e0 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe8ba
+[ERROR] kernel::syscall: [syscall-trace] #52 nr=0x3d8 a0=0x372c740 a1=0x35d7240 a2=0x36f3e00 rip=0x7fffe34a
+[ERROR] kernel::syscall: [syscall-trace] #53 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #54 nr=0x3d4 a0=0x372c708 a1=0x2000008 a2=0x36f3e00 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #55 nr=0xba a0=0x2000008 a1=0x36f3e00 a2=0x7fffe2fa rip=0x7fffe71a
+[ERROR] kernel::syscall: [syscall-trace] #56 nr=0x411 a0=0xba a1=0x2000008 a2=0x36f3e00 rip=0x7fffe71a
+[ERROR] kernel::syscall: [syscall-trace] #57 nr=0x3d3 a0=0x372c708 a1=0x2000008 a2=0x36f3e00 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #58 nr=0x3fd a0=0x36f1c88 a1=0x2bb1fff69 a2=0xd rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #59 nr=0x3f4 a0=0x1000010 a1=0x2bb1fff69 a2=0xd rip=0x7fffe50a
+[ERROR] kernel::syscall: [syscall-trace] #60 nr=0x3b3 a0=0x2bb1fff69 a1=0x2b9000061 a2=0xd rip=0x7fffe0ca
+[ERROR] kernel::syscall: [syscall-trace] #61 nr=0x3d1 a0=0x2b9000060 a1=0x2b9000060 a2=0x0 rip=0x7fffe2da
+[ERROR] kernel::syscall: [syscall-trace] #62 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe39a
+[ERROR] kernel::syscall: [syscall-trace] #63 nr=0x3dd a0=0x7ffffffee1a0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe39a
+[INFO] kernel::process: [Process] pid=2 exited with code 0
+[WARN] kernel::syscall: [trace] sys_exit: pid=2 parent ppid=1 not blocked — leaving as zombie, dispatching scheduler
+[WARN] kernel::syscall: [trace] sys_exit: pid=2 no parent — falling through to scheduler
+[WARN] kernel::process: [trace] enter_user pid=1 rip=0x7fffe39a rsp=0x7ffffffee148 rax=0x0 fs=0x7ffffffefdf0 cr3=0x1102000
+[WARN] kernel::syscall: [postexit-sc] #000 pid=1 nr=0x3d4 a0=0x7ffffffee1d0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe30a rsp=0x7ffffffee158 stk=[0x29bfaf6,0x0,0x7ffffffee1d0,+0x40=0xc000010,+0x48=0x1]
+[WARN] kernel::syscall: [postexit-sc] #001 pid=1 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x7ffffffee158 stk=[0x29bfaf6,0x0,0x7ffffffee1d0,+0x40=0xc000010,+0x48=0x1]
+[WARN] kernel::syscall: [postexit-sc] #002 pid=1 nr=0x3e0 a0=0x7ffffffee1a0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe3ca rsp=0x7ffffffee188 stk=[0x29c22d5,0x0,0xc000010,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #003 pid=1 nr=0x3a0 a0=0x18 a1=0x7ffffffee1d0 a2=0x4 rip=0x7fffe00a rsp=0x7ffffffee318 stk=[0x366a308,0x7ffffffee398,0x31c5f56,+0x40=0x29c6bdd,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #004 pid=1 nr=0x3a0 a0=0x8 a1=0x7ffffffee210 a2=0x7ffffffee400 rip=0x7fffe00a rsp=0x7ffffffee178 stk=[0x366a308,0x2bd000010,0x29c2037,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #005 pid=1 nr=0x3a0 a0=0x70 a1=0x7ffffffee270 a2=0x7ffffffee400 rip=0x7fffe00a rsp=0x7ffffffee178 stk=[0x366a308,0x2bd000010,0x29c20e2,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #006 pid=1 nr=0x3e7 a0=0x7ffffffee130 a1=0x7ffffffee2c0 a2=0x7ffffffee400 rip=0x7fffe43a rsp=0x7ffffffee008 stk=[0x29c1d63,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee130
+[WARN] kernel::syscall: [postexit-sc] #007 pid=1 nr=0x3e9 a0=0x7ffffffee130 a1=0x200000 a2=0x7ffffffee400 rip=0x7fffe45a rsp=0x7ffffffee008 stk=[0x29c1d70,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee130 size=0x200000
+[WARN] kernel::syscall: [postexit-sc] #008 pid=1 nr=0x3a0 a0=0x30 a1=0x200000 a2=0x7ffffffee400 rip=0x7fffe00a rsp=0x7ffffffedff8 stk=[0x366a308,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #009 pid=1 nr=0x35a a0=0x2be000010 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe29a rsp=0x7ffffffee008 stk=[0x29c1dfc,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[INFO] kernel::process: [Process] Thread tid=3 spawned in pid=1 entry=0x29c23e0 tls=0x2c2000000
+[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2be000010 attr=0x7ffffffee130 entry=0x29c23e0 arg=0x2c0000010 stk=0x200000 -> 0
+[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
+[WARN] kernel::syscall: [postexit-sc] #010 pid=1 nr=0x3e8 a0=0x7ffffffee130 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe44a rsp=0x7ffffffee008 stk=[0x29c1e38,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee130
+[WARN] kernel::syscall: [postexit-sc] #011 pid=1 nr=0x3d3 a0=0x7ffffffee1d0 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe2fa rsp=0x7ffffffee148 stk=[0x29afbb6,0x20,0x29bfabd,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #012 pid=1 nr=0x3dd a0=0x7ffffffee1a0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe39a rsp=0x7ffffffee148 stk=[0x29878cf,0x20,0x29bfadb,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #013 pid=1 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe39a rsp=0x7ffffffee148 stk=[0x29878cf,0x20,0x29bfadb,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [futex] yield pid=1 -> pid=3 uaddr=0x7ffffffee1a0 val=0 rip=0x7fffe39a
+[WARN] kernel::process: [trace] enter_user pid=3 rip=0x29c23e0 rsp=0x2c11ffff8 rax=0x0 fs=0x2c2000000 cr3=0x1102000
+[WARN] kernel::syscall: [postexit-sc] #014 pid=3 nr=0x3d1 a0=0x2bf000060 a1=0x2bf000060 a2=0x0 rip=0x7fffe2da rsp=0x2c11fff58 stk=[0x29c1ec5,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #015 pid=3 nr=0x3b3 a0=0x2c11fff69 a1=0x2bf000061 a2=0xf rip=0x7fffe0ca rsp=0x2c11fff58 stk=[0x29c1f00,0x0,0x1e,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #016 pid=3 nr=0x3f4 a0=0x1000010 a1=0x2c11fff69 a2=0xf rip=0x7fffe50a rsp=0x2c11fff58 stk=[0x29c1f11,0x0,0x74756c662e6f691e,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x1000010 name_ptr=0x2c11fff69
+[WARN] kernel::syscall: [postexit-sc] #017 pid=3 nr=0x3fd a0=0x36f1c88 a1=0x2c11fff69 a2=0xf rip=0x7fffe59a rsp=0x2c11fffa8 stk=[0x29bbd51,0x2bf000010,0x0,+0x40=0x29c23f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #018 pid=3 nr=0x3fd a0=0x36f1c88 a1=0x2000008 a2=0x36f3e00 rip=0x7fffe59a rsp=0x2c11fff78 stk=[0x35d70f7,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #019 pid=3 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a rsp=0x2c11fff78 stk=[0x35d7118,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #020 pid=3 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a rsp=0x2c11fff78 stk=[0x35d7138,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #021 pid=3 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a rsp=0x2c11fff98 stk=[0x366a308,0x2000000,0x29bbd92,+0x40=0x2c0000010,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #022 pid=3 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a rsp=0x2c11ffe38 stk=[0x366a308,0x4000010,0x29bc0e1,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #023 pid=3 nr=0x3d3 a0=0x6000010 a1=0x372c740 a2=0x0 rip=0x7fffe2fa rsp=0x2c11ffca8 stk=[0x29afbb6,0x6000010,0x29bc663,+0x40=0x2000008,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #024 pid=3 nr=0x3a0 a0=0x50 a1=0x372c740 a2=0x0 rip=0x7fffe00a rsp=0x2c11ffca8 stk=[0x366a308,0x6000010,0x29bc679,+0x40=0x2000008,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #025 pid=3 nr=0x3a0 a0=0x80 a1=0x0 a2=0x0 rip=0x7fffe00a rsp=0x2c11ffc68 stk=[0x366a308,0x6000010,0x29bc5a8,+0x40=0x1,+0x48=0x6000010]
+[WARN] kernel::syscall: [postexit-sc] #026 pid=3 nr=0x3a0 a0=0x30 a1=0x1 a2=0x0 rip=0x7fffe00a rsp=0x2c11ffca8 stk=[0x366a308,0x6000010,0x29bc6d6,+0x40=0x2000008,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #027 pid=3 nr=0x3d4 a0=0x6000010 a1=0x8000010 a2=0x0 rip=0x7fffe30a rsp=0x2c11ffcb8 stk=[0x29bc77b,0x6000010,0x5000010,+0x40=0x29bc127,+0x48=0x5000010]
+[WARN] kernel::syscall: [postexit-sc] #028 pid=3 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x2c11ffcb8 stk=[0x29bc77b,0x6000010,0x5000010,+0x40=0x29bc127,+0x48=0x5000010]
+[WARN] kernel::syscall: [postexit-sc] #029 pid=3 nr=0x3d3 a0=0x6000010 a1=0x1 a2=0x5000010 rip=0x7fffe2fa rsp=0x2c11ffba8 stk=[0x29afbb6,0x1,0x29bd80c,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #030 pid=3 nr=0x3d4 a0=0x6000010 a1=0x1 a2=0x1 rip=0x7fffe30a rsp=0x2c11ffbb8 stk=[0x29bd8d7,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #031 pid=3 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x2c11ffbb8 stk=[0x29bd8d7,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #032 pid=3 nr=0x478 a0=0x1 a1=0x1 a2=0x1 rip=0x7fffee8a rsp=0x2c11ffd08 stk=[0x29c3b9a,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #033 pid=3 nr=0x47f a0=0x1 a1=0x80800 a2=0x1 rip=0x7fffeefa rsp=0x2c11ffd08 stk=[0x29c3bbd,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #034 pid=3 nr=0x47a a0=0x5 a1=0x1 a2=0x5 rip=0x7fffeeaa rsp=0x2c11ffd08 stk=[0x29c3bf7,0x500000001,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #035 pid=3 nr=0x3a0 a0=0x18 a1=0x1 a2=0x5 rip=0x7fffe00a rsp=0x2c11ffe58 stk=[0x366a308,0x4000010,0x29bbeac,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #036 pid=3 nr=0x3fd a0=0x36f1c88 a1=0x2c11ffe78 a2=0x5 rip=0x7fffe59a rsp=0x2c11ffe88 stk=[0x29bbcb6,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #037 pid=3 nr=0x3d3 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe2fa rsp=0x2c11fff98 stk=[0x29afbb6,0x7ffffffee198,0x29bfa83,+0x40=0x2c0000010,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #038 pid=3 nr=0x3de a0=0x7ffffffee1a0 a1=0x4000010 a2=0x5 rip=0x7fffe3aa rsp=0x2c11fffa8 stk=[0x29bfa8f,0x7ffffffee198,0x2bf000010,+0x40=0x29c23f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #039 pid=3 nr=0x39d a0=0x7ffffffee1a0 a1=0x81 a2=0x1 rip=0x7fffe3aa rsp=0x2c11fffa8 stk=[0x29bfa8f,0x7ffffffee198,0x2bf000010,+0x40=0x29c23f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #040 pid=3 nr=0x3d4 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe30a rsp=0x2c11fffc8 stk=[0x29c2729,0x0,0x2c0000010,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #041 pid=3 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x2c11fffc8 stk=[0x29c2729,0x0,0x2c0000010,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #042 pid=3 nr=0x47b a0=0x5 a1=0x2c11fff98 a2=0x1 rip=0x7fffeeba rsp=0x2c11fff88 stk=[0x29c3dd5,0x0,0x0,+0x40=0x29c2731,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #043 pid=3 nr=0x405 a0=0x1 a1=0x2c11fff08 a2=0x1 rip=0x7fffe63a rsp=0x2c11ffef8 stk=[0x2987873,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #044 pid=3 nr=0x3d3 a0=0x6000010 a1=0x6000010 a2=0x1 rip=0x7fffe2fa rsp=0x2c11ffec8 stk=[0x29afbb6,0x17979d003ccb5fa2,0x29bcdbf,+0x40=0x17979d003ccb5fa2,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #045 pid=3 nr=0x3d4 a0=0x6000010 a1=0x1 a2=0x0 rip=0x7fffe30a rsp=0x2c11ffed8 stk=[0x29bcf2f,0x17979d003ccb5fa2,0x1,+0x40=0x29bc2f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #046 pid=3 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x2c11ffed8 stk=[0x29bcf2f,0x17979d003ccb5fa2,0x1,+0x40=0x29bc2f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #047 pid=3 nr=0x3d3 a0=0x6000010 a1=0x1 a2=0x0 rip=0x7fffe2fa rsp=0x2c11fff98 stk=[0x29afbb6,0x0,0x29bc990,+0x40=0x2c0000010,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #048 pid=3 nr=0x433 a0=0x0 a1=0x11adfce a2=0x2c11ffec0 rip=0x7fffea2a rsp=0x2c11ffeb8 stk=[0x29b5368,0x3000000008,0x2c11fffa0,+0x40=0x1,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #049 pid=3 nr=0x1 a0=0x1 a1=0xffff800004372408 a2=0x56 rip=0x7fffea2a rsp=0x2c11ffeb8 stk=[0x29b5368,0x3000000008,0x2c11fffa0,+0x40=0x1,+0x48=0x0]
+out_of_range was thrown in -fno-exceptions mode with message "map::at:  key not found"[WARN] kernel::syscall: [postexit-sc] #050 pid=3 nr=0x400 a0=0x0 a1=0x11adfce a2=0x2c11ffec0 rip=0x7fffe5aa rsp=0x2c11ffeb8 stk=[0x29b536d,0x3000000008,0x2c11fffa0,+0x40=0x1,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [sys_abort] pid=3 aborting — dumping recent syscalls:
+[ERROR] kernel::syscall: [syscall-trace] last 32 syscall(s):
+[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x400 a0=0x0 a1=0x11adfce a2=0x2c11ffec0 rip=0x7fffe5aa
+[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x1 a0=0x1 a1=0xffff800004372408 a2=0x56 rip=0x7fffea2a
+[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x433 a0=0x0 a1=0x11adfce a2=0x2c11ffec0 rip=0x7fffea2a
+[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x3d3 a0=0x6000010 a1=0x1 a2=0x0 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3d4 a0=0x6000010 a1=0x1 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x3d3 a0=0x6000010 a1=0x6000010 a2=0x1 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x405 a0=0x1 a1=0x2c11fff08 a2=0x1 rip=0x7fffe63a
+[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x47b a0=0x5 a1=0x2c11fff98 a2=0x1 rip=0x7fffeeba
+[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x3d4 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #11 nr=0x39d a0=0x7ffffffee1a0 a1=0x81 a2=0x1 rip=0x7fffe3aa
+[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x3de a0=0x7ffffffee1a0 a1=0x4000010 a2=0x5 rip=0x7fffe3aa
+[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x3d3 a0=0x7ffffffee1d0 a1=0x4000010 a2=0x5 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x3fd a0=0x36f1c88 a1=0x2c11ffe78 a2=0x5 rip=0x7fffe59a
+[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x3a0 a0=0x18 a1=0x1 a2=0x5 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x47a a0=0x5 a1=0x1 a2=0x5 rip=0x7fffeeaa
+[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x47f a0=0x1 a1=0x80800 a2=0x1 rip=0x7fffeefa
+[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x478 a0=0x1 a1=0x1 a2=0x1 rip=0x7fffee8a
+[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x3d4 a0=0x6000010 a1=0x1 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #21 nr=0x3d3 a0=0x6000010 a1=0x1 a2=0x5000010 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x39d a0=0x6000010 a1=0x81 a2=0x1 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3d4 a0=0x6000010 a1=0x8000010 a2=0x0 rip=0x7fffe30a
+[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x3a0 a0=0x30 a1=0x1 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x3a0 a0=0x80 a1=0x0 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3a0 a0=0x50 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x3d3 a0=0x6000010 a1=0x372c740 a2=0x0 rip=0x7fffe2fa
+[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a
+[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a
+[INFO] kernel::process: [Process] pid=3 exited with code -6
+[WARN] kernel::syscall: [trace] sys_exit: pid=3 parent ppid=1 not blocked — leaving as zombie, dispatching scheduler
+[WARN] kernel::syscall: [trace] sys_exit: pid=3 no parent — falling through to scheduler
+[WARN] kernel::process: [trace] enter_user pid=1 rip=0x7fffe39a rsp=0x7ffffffee148 rax=0x0 fs=0x7ffffffefdf0 cr3=0x1102000
+[WARN] kernel::syscall: [postexit-sc] #051 pid=1 nr=0x3d4 a0=0x7ffffffee1d0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe30a rsp=0x7ffffffee158 stk=[0x29bfaf6,0x0,0x7ffffffee1d0,+0x40=0x9000010,+0x48=0x1]
+[WARN] kernel::syscall: [postexit-sc] #052 pid=1 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe30a rsp=0x7ffffffee158 stk=[0x29bfaf6,0x0,0x7ffffffee1d0,+0x40=0x9000010,+0x48=0x1]
+[WARN] kernel::syscall: [postexit-sc] #053 pid=1 nr=0x3e0 a0=0x7ffffffee1a0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe3ca rsp=0x7ffffffee188 stk=[0x29c22d5,0x0,0x9000010,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #054 pid=1 nr=0x3a0 a0=0x18 a1=0x7ffffffee1d0 a2=0x8 rip=0x7fffe00a rsp=0x7ffffffee318 stk=[0x366a308,0x7ffffffee398,0x31c5f56,+0x40=0x29c6bdd,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #055 pid=1 nr=0x3a0 a0=0x8 a1=0x7ffffffee210 a2=0x7ffffffee3d0 rip=0x7fffe00a rsp=0x7ffffffee178 stk=[0x366a308,0x2c3000010,0x29c2037,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #056 pid=1 nr=0x3a0 a0=0x70 a1=0x7ffffffee270 a2=0x7ffffffee3d0 rip=0x7fffe00a rsp=0x7ffffffee178 stk=[0x366a308,0x2c3000010,0x29c20e2,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #057 pid=1 nr=0x3e7 a0=0x7ffffffee130 a1=0x7ffffffee2c0 a2=0x7ffffffee3d0 rip=0x7fffe43a rsp=0x7ffffffee008 stk=[0x29c1d63,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee130
+[WARN] kernel::syscall: [postexit-sc] #058 pid=1 nr=0x3e9 a0=0x7ffffffee130 a1=0x200000 a2=0x7ffffffee3d0 rip=0x7fffe45a rsp=0x7ffffffee008 stk=[0x29c1d70,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee130 size=0x200000
+[WARN] kernel::syscall: [postexit-sc] #059 pid=1 nr=0x3a0 a0=0x30 a1=0x200000 a2=0x7ffffffee3d0 rip=0x7fffe00a rsp=0x7ffffffedff8 stk=[0x366a308,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #060 pid=1 nr=0x35a a0=0x2c4000010 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe29a rsp=0x7ffffffee008 stk=[0x29c1dfc,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[INFO] kernel::process: [Process] Thread tid=4 spawned in pid=1 entry=0x29c23e0 tls=0x2c8000000
+[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2c4000010 attr=0x7ffffffee130 entry=0x29c23e0 arg=0x2c6000010 stk=0x200000 -> 0
+[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
+[WARN] kernel::syscall: [postexit-sc] #061 pid=1 nr=0x3e8 a0=0x7ffffffee130 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe44a rsp=0x7ffffffee008 stk=[0x29c1e38,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee130
+[WARN] kernel::syscall: [postexit-sc] #062 pid=1 nr=0x3d3 a0=0x7ffffffee1d0 a1=0x7ffffffee130 a2=0x29c23e0 rip=0x7fffe2fa rsp=0x7ffffffee148 stk=[0x29afbb6,0x20,0x29bfabd,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #063 pid=1 nr=0x3dd a0=0x7ffffffee1a0 a1=0x7ffffffee1d0 a2=0x29c23e0 rip=0x7fffe39a rsp=0x7ffffffee148 stk=[0x29878cf,0x20,0x29bfadb,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #064 pid=1 nr=0x39d a0=0x7ffffffee1d0 a1=0x81 a2=0x1 rip=0x7fffe39a rsp=0x7ffffffee148 stk=[0x29878cf,0x20,0x29bfadb,+0x40=0x29c227f,+0x48=0x0]
+[WARN] kernel::syscall: [futex] yield pid=1 -> pid=4 uaddr=0x7ffffffee1a0 val=0 rip=0x7fffe39a
+[WARN] kernel::process: [trace] enter_user pid=4 rip=0x29c23e0 rsp=0x2c71ffff8 rax=0x0 fs=0x2c8000000 cr3=0x1102000
+[WARN] kernel::syscall: [postexit-sc] #065 pid=4 nr=0x3d1 a0=0x2c5000060 a1=0x2c5000060 a2=0x0 rip=0x7fffe2da rsp=0x2c71fff58 stk=[0x29c1ec5,0x0,0x0,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #066 pid=4 nr=0x3b3 a0=0x2c71fff69 a1=0x2c5000061 a2=0xd rip=0x7fffe0ca rsp=0x2c71fff58 stk=[0x29c1f00,0x0,0x1a,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #067 pid=4 nr=0x3f4 a0=0x1000010 a1=0x2c71fff69 a2=0xd rip=0x7fffe50a rsp=0x2c71fff58 stk=[0x29c1f11,0x0,0x74756c662e6f691a,+0x40=0x0,+0x48=0x0]
+[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x1000010 name_ptr=0x2c71fff69
+[WARN] kernel::syscall: [postexit-sc] #068 pid=4 nr=0x3fd a0=0x36f1c88 a1=0x2c71fff69 a2=0xd rip=0x7fffe59a rsp=0x2c71fffa8 stk=[0x29bbd51,0x2c5000010,0x0,+0x40=0x29c23f3,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #069 pid=4 nr=0x3fd a0=0x36f1c88 a1=0x2000008 a2=0x36f3e00 rip=0x7fffe59a rsp=0x2c71fff78 stk=[0x35d70f7,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #070 pid=4 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a rsp=0x2c71fff78 stk=[0x35d7118,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #071 pid=4 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a rsp=0x2c71fff78 stk=[0x35d7138,0x2000000,0x2000000,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #072 pid=4 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a rsp=0x2c71fff98 stk=[0x366a308,0x2000000,0x29bbd92,+0x40=0x2c6000010,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #073 pid=4 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a rsp=0x2c71ffe38 stk=[0x366a308,0x4000010,0x29bc0e1,+0x40=0x0,+0x48=0x0]
+[WARN] kernel::syscall: [postexit-sc] #074 pid=4 nr=0x3d3 a0=0x6000010 a1=0x372c740 a2=0x0 rip=0x7fffe2fa rsp=0x2c71ffca8 stk=[0x29afbb6,0x6000010,0x29bc663,+0x40=0x2000008,+0x48=0x0]

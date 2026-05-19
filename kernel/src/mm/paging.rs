@@ -61,9 +61,24 @@ mod x86_64_impl {
         unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
     }
 
-    #[inline]
+    #[inline(never)]
     fn phys_to_virt(phys: u64) -> u64 {
-        phys + frame_allocator::hhdm_offset()
+        // QEMU runs with at most a few GB of RAM. Any "physical" address
+        // beyond ~16 GiB is almost certainly garbage from a corrupted PTE.
+        // Adding the HHDM base to such a value would yield a non-canonical
+        // virtual address, which then page-faults as a #GP when dereferenced.
+        if phys >= 0x0000_0004_0000_0000 {
+            panic!(
+                "phys_to_virt: corrupt PTE phys={:#x} — a page table was overwritten",
+                phys
+            );
+        }
+        // The HHDM base lives in the high-half (e.g. 0xffff_8000_0000_0000),
+        // so any non-trivial `phys` makes the sum > u64::MAX under signed
+        // arithmetic — Rust's debug-build overflow checks then panic on a
+        // perfectly valid wrap. Use wrapping_add: the result is the correct
+        // 64-bit virtual address either way.
+        phys.wrapping_add(frame_allocator::hhdm_offset())
     }
 
     fn alloc_page_table() -> Option<u64> {
@@ -399,3 +414,4 @@ pub fn free_user_pml4(pml4_phys: u64) {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = pml4_phys;
 }
+

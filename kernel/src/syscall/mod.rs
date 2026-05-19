@@ -114,6 +114,210 @@ static SYSCALL_TRACE_BUF: spin::Mutex<[SyscallTraceEntry; SYSCALL_TRACE_DEPTH]> 
 static SYSCALL_TRACE_HEAD: AtomicU32 = AtomicU32::new(0);
 static FUTEX_WAITERS: spin::Mutex<BTreeMap<u64, Vec<u32>>> = spin::Mutex::new(BTreeMap::new());
 
+// ── Post-exit syscall trace window ────────────────────────────────────────────
+// When pid=2 exits, activate a one-shot bounded trace that logs the next
+// POSTEXIT_TRACE_LIMIT syscalls (any pid) so we can see what pid=1 does after
+// it resumes from pthread_cond_wait.
+const POSTEXIT_TRACE_LIMIT: u32 = 300;
+static POSTEXIT_TRACE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static POSTEXIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+// ── Synthetic FD allocator ────────────────────────────────────────────────────
+// epoll_create / inotify_init1 / timerfd_create return integer fds that
+// user space then stores in std::map<fd, T> keyed event loops. Returning the
+// same constant for two different objects causes map::at() to fail
+// ("key not found") when one overwrites the other. Hand out unique numbers
+// from a private high range that won't collide with real sys_open fds.
+static SYNTH_FD_NEXT: AtomicU32 = AtomicU32::new(64);
+#[inline]
+fn alloc_synth_fd() -> i64 {
+    SYNTH_FD_NEXT.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+// ── Real-ish timerfd + epoll support ──────────────────────────────────────────
+// User-space event loops (Flutter, Dart isolates) rely on:
+//   timerfd_create() → fd
+//   timerfd_settime(fd, flags, &itimerspec{it_interval, it_value}, NULL)
+//   epoll_ctl(epfd, ADD, fd, &event)
+//   epoll_wait(epfd, events, maxevents, timeout_ms)  → expects EPOLLIN when
+//   the timerfd's deadline has passed.
+// Stubbing epoll_wait to return 0 immediately starves the event loop and the
+// downstream Dart code aborts. We track timerfd deadlines and per-epfd
+// interest sets so epoll_wait can return real events.
+
+#[derive(Clone, Copy)]
+struct TimerState {
+    deadline_ns: u64, // absolute monotonic ns; 0 = disarmed
+    period_ns: u64,
+}
+
+#[derive(Clone, Copy)]
+struct EpollEntry {
+    fd: u32,
+    events: u32,
+    data: u64,
+}
+
+static TIMERFD_TABLE: spin::Mutex<BTreeMap<u32, TimerState>> = spin::Mutex::new(BTreeMap::new());
+static EPOLL_TABLE: spin::Mutex<BTreeMap<u32, Vec<EpollEntry>>> = spin::Mutex::new(BTreeMap::new());
+
+#[inline]
+fn monotonic_ns() -> u64 {
+    // Match sys_clock_gettime's "TSC/3 ≈ ns" assumption.
+    let lo: u32;
+    let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    (((hi as u64) << 32) | lo as u64) / 3
+}
+
+fn sys_timerfd_create_real() -> i64 {
+    let fd = alloc_synth_fd();
+    TIMERFD_TABLE.lock().insert(fd as u32, TimerState { deadline_ns: 0, period_ns: 0 });
+    log::warn!("[timerfd] create fd={}", fd);
+    fd
+}
+
+/// flags bit 0 = TFD_TIMER_ABSTIME. new_value points to itimerspec:
+///   it_interval { tv_sec:i64, tv_nsec:i64 }
+///   it_value    { tv_sec:i64, tv_nsec:i64 }
+fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64) -> i64 {
+    if new_value == 0 { return -22; }
+    let (int_s, int_ns, val_s, val_ns) = unsafe {
+        (
+            core::ptr::read_unaligned(new_value as *const i64),
+            core::ptr::read_unaligned((new_value + 8) as *const i64),
+            core::ptr::read_unaligned((new_value + 16) as *const i64),
+            core::ptr::read_unaligned((new_value + 24) as *const i64),
+        )
+    };
+    let period_ns = (int_s.max(0) as u64).saturating_mul(1_000_000_000)
+        .saturating_add(int_ns.max(0) as u64);
+    let value_ns = (val_s.max(0) as u64).saturating_mul(1_000_000_000)
+        .saturating_add(val_ns.max(0) as u64);
+    let now = monotonic_ns();
+    let deadline = if value_ns == 0 {
+        0 // disarm
+    } else if flags & 1 != 0 {
+        value_ns // ABSTIME (caller already used clock_gettime base)
+    } else {
+        now.saturating_add(value_ns)
+    };
+    let mut tbl = TIMERFD_TABLE.lock();
+    // Auto-register if user-space called settime on an fd we didn't see
+    // through timerfd_create (shouldn't happen, but be lenient).
+    tbl.entry(fd as u32)
+        .and_modify(|t| { t.deadline_ns = deadline; t.period_ns = period_ns; })
+        .or_insert(TimerState { deadline_ns: deadline, period_ns });
+    log::warn!("[timerfd] settime fd={} flags={:#x} value_ns={} period_ns={} deadline={}",
+        fd, flags, value_ns, period_ns, deadline);
+    0
+}
+
+fn sys_epoll_create_real() -> i64 {
+    let fd = alloc_synth_fd();
+    EPOLL_TABLE.lock().insert(fd as u32, Vec::new());
+    fd
+}
+
+/// epoll_ctl(epfd, op, fd, event*). op: 1=ADD, 2=DEL, 3=MOD.
+/// event layout (packed): u32 events; u64 data.
+fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> i64 {
+    let mut tbl = EPOLL_TABLE.lock();
+    let list = tbl.entry(epfd as u32).or_insert_with(Vec::new);
+    let fd32 = fd as u32;
+    match op {
+        2 => { // DEL
+            list.retain(|e| e.fd != fd32);
+            0
+        }
+        1 | 3 => { // ADD or MOD
+            if event_ptr == 0 { return -22; }
+            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
+                e.events = events;
+                e.data = data;
+            } else {
+                list.push(EpollEntry { fd: fd32, events, data });
+            }
+            0
+        }
+        _ => -22,
+    }
+}
+
+/// Returns ready events. event slot layout (packed): u32 events; u64 data.
+fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
+    if events_out == 0 || maxevents <= 0 { return 0; }
+    let now = monotonic_ns();
+    let mut count: i32 = 0;
+    let tbl = EPOLL_TABLE.lock();
+    let Some(list) = tbl.get(&epfd) else { return 0; };
+    let mut tfd_tbl = TIMERFD_TABLE.lock();
+    for entry in list.iter() {
+        if count >= maxevents { break; }
+        if let Some(t) = tfd_tbl.get_mut(&entry.fd) {
+            if t.deadline_ns != 0 && now >= t.deadline_ns {
+                // Fire EPOLLIN.
+                let slot = events_out + (count as u64) * 12;
+                unsafe {
+                    core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
+                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                }
+                // Re-arm if periodic, else disarm.
+                if t.period_ns != 0 {
+                    t.deadline_ns = now.saturating_add(t.period_ns);
+                } else {
+                    t.deadline_ns = 0;
+                }
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// epoll_wait(epfd, events, maxevents, timeout_ms).
+fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, timeout_ms: u64) -> i64 {
+    let max = maxevents as i32;
+    let timeout_signed = timeout_ms as i64;
+
+    // Fast path: any events already ready?
+    let ready = epoll_collect_ready(epfd as u32, events_out, max);
+    if ready > 0 { return ready as i64; }
+    if timeout_signed == 0 { return 0; }
+
+    // Cooperative yield: if a sibling thread is runnable, hand it the CPU.
+    // We save user context with RAX=0 so when the scheduler returns here
+    // the user sees "0 events" and re-polls in its own loop.
+    let cur = crate::process::current_pid();
+    if cur != 0 {
+        if let Some(next) = crate::process::next_runnable_pid(cur) {
+            if next != cur {
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip, ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0);
+                crate::process::save_xstate(cur);
+                // Keep cur Running so it gets re-scheduled soon — don't
+                // mark Blocked here because no one will wake us.
+                crate::process::enter_user_by_pid_noreturn(next);
+            }
+        }
+    }
+
+    // No sibling — small bounded spin then return 0.
+    let start = monotonic_ns();
+    let spin_until = start.saturating_add(1_000_000); // 1ms cap
+    loop {
+        let ready = epoll_collect_ready(epfd as u32, events_out, max);
+        if ready > 0 { return ready as i64; }
+        if monotonic_ns() >= spin_until { return 0; }
+        for _ in 0..10_000 { core::hint::spin_loop(); }
+    }
+}
+
 #[inline]
 fn record_syscall_trace(nr: u64, a0: u64, a1: u64, a2: u64, rip: u64) {
     let idx = (SYSCALL_TRACE_HEAD.fetch_add(1, Ordering::Relaxed) as usize) % SYSCALL_TRACE_DEPTH;
@@ -376,13 +580,18 @@ fn sys_exit(code: u64) -> i64 {
         crate::process::exit(pid, code as i32);
 
         if let Some(ppid) = parent_pid {
-            // Parent was blocking in sys_exec_wait — wake it with exit code.
-            crate::process::reap_zombie(pid);
-            crate::process::set_rax(ppid, code);
-            crate::process::set_state(ppid, crate::process::ProcState::Running);
-            crate::process::set_current_pid(ppid);
-            log::warn!("[trace] sys_exit: pid={} → wake parent ppid={} code={:#x}", pid, ppid, code);
-            crate::process::enter_user_by_pid_noreturn(ppid);
+            // We do NOT wake the parent here. Even if the parent is in the
+            // `Blocked` state, that block could be for ANY reason —
+            // futex_wait, pthread_cond_wait, etc — not just waitpid().
+            // Clobbering the parent's RAX with our exit code makes
+            // pthread_cond_wait return -6, which Flutter's libc++ wraps
+            // and re-throws as "condition_variable wait failed" → abort.
+            // The legitimate wake paths (cond_signal, futex_wake, real
+            // waitpid polling) will reap the zombie themselves.
+            log::warn!(
+                "[trace] sys_exit: pid={} → parent ppid={} left untouched (zombie pending)",
+                pid, ppid
+            );
         }
         log::warn!("[trace] sys_exit: pid={} no parent — falling through to scheduler", pid);
 
@@ -495,6 +704,7 @@ fn sys_exec_wait(path_ptr: u64, path_len: u64) -> i64 {
     let parent_rip = crate::arch::syscall::user_rip();
     let parent_rsp = crate::arch::syscall::user_rsp();
     crate::process::save_return_context(parent_pid, parent_rip, parent_rsp);
+    crate::process::save_full_user_gprs(parent_pid);
 
     // Block the parent — it will be unblocked by the child's sys_exit.
     crate::process::set_state(parent_pid, crate::process::ProcState::Blocked);
@@ -2026,6 +2236,7 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
                         pid, next, uaddr, val, urip
                     );
                     crate::process::save_return_context(pid, urip, ursp);
+                    crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, 0);
                     crate::process::save_xstate(pid);
                     crate::process::set_state(pid, crate::process::ProcState::Blocked);
@@ -2154,6 +2365,14 @@ fn sys_thread_exit(code: u64) -> i64 {
     let user_rsp = crate::arch::syscall::user_rsp();
     log::warn!("[trace] sys_thread_exit pid={} code={:#x} rip={:#x} rsp={:#x}",
         pid, code, user_rip, user_rsp);
+    // Dump full syscall ring buffer so we can see EVERY syscall this thread
+    // made before exiting — critical for diagnosing the Flutter fml::Thread
+    // start_routine bail-out (only pthread_setname_np visible otherwise).
+    dump_recent_syscalls(SYSCALL_TRACE_DEPTH);
+    // Activate post-exit syscall trace window so we can see what pid=1 does
+    // after it resumes from pthread_cond_wait.
+    POSTEXIT_TRACE_COUNT.store(0, Ordering::Relaxed);
+    POSTEXIT_TRACE_ACTIVE.store(true, Ordering::Relaxed);
     sys_exit(code)
 }
 
@@ -3371,13 +3590,134 @@ mod posix {
         0
     }
 
-    pub fn sys_fprintf(fp: u64, fmt_ptr: u64, fmt_len: u64) -> i64 {
-        // Simplified: write format string as-is (no argument expansion).
+    pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
+        // Simplified vfprintf with minimal %i / %s / %d / %x expansion so
+        // diagnostic messages (errno, strerror) are actually readable.
+        //
+        // C semantics for both fprintf(stream, fmt, ...) and vfprintf(stream,
+        // fmt, va_list ap): the format string is NUL-terminated and the third
+        // ABI slot is a va_list pointer — never a byte count. Earlier code
+        // (mis-)used arg2 as a length, which made vfprintf hand its caller's
+        // stack pointer to sys_write as the buffer length, then EFAULT, then
+        // abort.
+        //
+        // SysV x86_64 va_list layout (struct __va_list_tag):
+        //   off 0:   u32 gp_offset      (next int-reg byte offset 0..48)
+        //   off 4:   u32 fp_offset
+        //   off 8:   *mut u8 overflow_arg_area
+        //   off 16:  *mut u8 reg_save_area
+        if fmt_ptr == 0 { return 0; }
         let fd: u64 = if fp == 0 || fp == 1 { 1 }
                       else if fp == 2 { 2 }
                       else { unsafe { *(fp as *const i64) as u64 } };
-        let len = if fmt_len > 0 { fmt_len } else { sys_strlen(fmt_ptr) as u64 };
-        crate::syscall::dispatch_fast(1, fd, fmt_ptr, len, 0, 0)
+
+        // Read va_list state if pointer is plausibly a user-mode pointer.
+        let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
+        let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) =
+            if plausible_user(ap) {
+                unsafe {
+                    let g = core::ptr::read_unaligned((ap as *const u32));
+                    let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
+                    let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
+                    (g, r, o)
+                }
+            } else { (48, 0, 0) };
+
+        // Pull next u64-sized int arg from the va_list. Integers consume
+        // 8 bytes of gp regs first, then overflow.
+        let mut next_int = || -> u64 {
+            if gp_off < 48 && plausible_user(reg_save) {
+                let v = unsafe { core::ptr::read_unaligned((reg_save + gp_off as u64) as *const u64) };
+                gp_off += 8;
+                v
+            } else if plausible_user(ovf) {
+                let v = unsafe { core::ptr::read_unaligned(ovf as *const u64) };
+                ovf += 8;
+                v
+            } else { 0 }
+        };
+
+        // Format into a stack buffer (cap 512 bytes) then sys_write.
+        let mut out = [0u8; 512];
+        let mut olen: usize = 0;
+        let mut push = |s: &[u8], olen: &mut usize, out: &mut [u8; 512]| {
+            let n = s.len().min(out.len() - *olen);
+            out[*olen..*olen + n].copy_from_slice(&s[..n]);
+            *olen += n;
+        };
+
+        let fmt_len = sys_strlen(fmt_ptr) as usize;
+        let fmt = unsafe { core::slice::from_raw_parts(fmt_ptr as *const u8, fmt_len) };
+        let mut i = 0;
+        while i < fmt.len() && olen < out.len() {
+            let c = fmt[i];
+            if c != b'%' || i + 1 >= fmt.len() {
+                push(&[c], &mut olen, &mut out);
+                i += 1;
+                continue;
+            }
+            // Skip flags/width — minimal: read a single conversion char,
+            // ignoring length modifiers ('l','ll','h','z').
+            let mut j = i + 1;
+            while j < fmt.len() && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#') {
+                j += 1;
+            }
+            if j >= fmt.len() { break; }
+            let conv = fmt[j];
+            let mut tmp = [0u8; 32];
+            match conv {
+                b'd' | b'i' => {
+                    let v = next_int() as i64;
+                    let mut n = 0usize;
+                    let (neg, mut u) = if v < 0 { (true, (v.wrapping_neg()) as u64) } else { (false, v as u64) };
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                    if neg { tmp[n] = b'-'; n += 1; }
+                    tmp[..n].reverse();
+                    push(&tmp[..n], &mut olen, &mut out);
+                }
+                b'u' => {
+                    let mut u = next_int();
+                    let mut n = 0usize;
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                    tmp[..n].reverse();
+                    push(&tmp[..n], &mut olen, &mut out);
+                }
+                b'x' | b'X' | b'p' => {
+                    let mut u = next_int();
+                    if conv == b'p' { push(b"0x", &mut olen, &mut out); }
+                    let hexd = if conv == b'X' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+                    let mut n = 0usize;
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = hexd[(u & 0xF) as usize]; n += 1; u >>= 4; }
+                    tmp[..n].reverse();
+                    push(&tmp[..n], &mut olen, &mut out);
+                }
+                b's' => {
+                    let p = next_int();
+                    if plausible_user(p) {
+                        let sl = sys_strlen(p) as usize;
+                        let s = unsafe { core::slice::from_raw_parts(p as *const u8, sl) };
+                        push(s, &mut olen, &mut out);
+                    } else {
+                        push(b"(null)", &mut olen, &mut out);
+                    }
+                }
+                b'c' => {
+                    let v = next_int() as u8;
+                    push(&[v], &mut olen, &mut out);
+                }
+                b'%' => { push(b"%", &mut olen, &mut out); }
+                _ => {
+                    // Unknown — emit literally.
+                    push(&fmt[i..=j], &mut olen, &mut out);
+                }
+            }
+            i = j + 1;
+        }
+        if olen == 0 { return 0; }
+        crate::syscall::dispatch_fast(1, fd, out.as_ptr() as u64, olen as u64, 0, 0)
     }
 
     // ── Signals ───────────────────────────────────────────────────────────────
@@ -3488,6 +3828,49 @@ mod posix {
 pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
+
+    // Post-pid2-exit trace window: log every syscall (any pid) for the first
+    // POSTEXIT_TRACE_LIMIT calls after PID-2's exit, so we can see exactly
+    // what pid=1 does once it resumes from pthread_cond_wait.
+    if POSTEXIT_TRACE_ACTIVE.load(Ordering::Relaxed) {
+        let n = POSTEXIT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < POSTEXIT_TRACE_LIMIT {
+            // The user caller's return address is on the user stack at [rsp]
+            // (the trampoline did a `ret` after syscall, so on syscall entry
+            // the trampoline hasn't returned yet — but actually syscall is
+            // *before* ret, so [rsp] holds the libflutter return address that
+            // *called* the trampoline). Read it carefully.
+            let user_rsp = crate::arch::syscall::user_rsp();
+            // Read only offsets that stay within the same 4 KiB page as
+            // user_rsp — otherwise a thread whose rsp sits within the
+            // last few bytes of its stack page would page-fault the kernel
+            // when we touch [rsp + 0x48] etc. (Threads created via
+            // pthread_create have a hard stack-top boundary; the next page
+            // is unmapped.)
+            let same_page = |off: u64| -> bool {
+                (user_rsp & !0xfff) == ((user_rsp + off) & !0xfff)
+            };
+            let safe_read = |off: u64| -> u64 {
+                if same_page(off) {
+                    unsafe { core::ptr::read_volatile((user_rsp + off) as *const u64) }
+                } else {
+                    0
+                }
+            };
+            let (c0, c1, c2, c3, c4): (u64, u64, u64, u64, u64) = if user_rsp != 0 && user_rsp >= 0x1000 && user_rsp < 0x0000_8000_0000_0000 {
+                (safe_read(0), safe_read(8), safe_read(16), safe_read(0x40), safe_read(0x48))
+            } else {
+                (0, 0, 0, 0, 0)
+            };
+            log::warn!(
+                "[postexit-sc] #{:03} pid={} nr={:#x} a0={:#x} a1={:#x} a2={:#x} rip={:#x} rsp={:#x} stk=[{:#x},{:#x},{:#x},+0x40={:#x},+0x48={:#x}]",
+                n, crate::process::current_pid(), number, arg0, arg1, arg2, user_rip, user_rsp, c0, c1, c2, c3, c4
+            );
+        } else if n == POSTEXIT_TRACE_LIMIT {
+            log::warn!("[postexit-sc] limit reached ({} syscalls logged)", POSTEXIT_TRACE_LIMIT);
+            POSTEXIT_TRACE_ACTIVE.store(false, Ordering::Relaxed);
+        }
+    }
 
     // ── Stability: persist user return context into the PCB immediately on
     // every SYSCALL entry. Several syscall handlers may invoke
@@ -3921,15 +4304,17 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x45D => posix::sys_stat(arg1, 0, arg2), // __xstat64(ver, path, stat_ptr)
         // Network — all return -ENOSYS (no network stack from POSIX syscalls)
         0x460..=0x477 => -38,
-        // Epoll/inotify — return fake fd 5 for epoll_create, -1 for others
-        0x478 | 0x479 => 5, // epoll_create/create1 → fake fd 5
-        0x47A => 0,         // epoll_ctl → success
-        0x47B => 0,         // epoll_wait → 0 events (timeout)
-        0x47C => 5,         // inotify_init1 → fake fd
-        0x47D => 1,         // inotify_add_watch → watch descriptor 1
-        0x47E => 0,         // inotify_rm_watch
-        0x47F => 5,         // timerfd_create → fake fd
-        0x480 => 0,         // timerfd_settime → success
+        // Epoll/inotify — return unique synthetic fds so user-space event
+        // loops that key std::map<fd, T> don't collide and trigger
+        // out_of_range("map::at: key not found").
+        0x478 | 0x479 => sys_epoll_create_real(),         // epoll_create / epoll_create1
+        0x47A => sys_epoll_ctl_real(arg0, arg1, arg2, arg3),
+        0x47B => sys_epoll_wait_real(arg0, arg1, arg2, arg3),
+        0x47C => alloc_synth_fd(),          // inotify_init1
+        0x47D => 1,                         // inotify_add_watch → wd 1
+        0x47E => 0,                         // inotify_rm_watch
+        0x47F => sys_timerfd_create_real(),
+        0x480 => sys_timerfd_settime_real(arg0, arg1, arg2, arg3),
         0x481 => 0,         // poll → 0 events
         0x482 => 0,         // ioctl → success
         0x483 => 0, // sigemptyset: zero the set (ptr in arg0)

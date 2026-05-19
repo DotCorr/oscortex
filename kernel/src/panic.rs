@@ -37,8 +37,28 @@ fn panic(info: &PanicInfo) -> ! {
     crate::logger::early_print("\r\n");
     if let Some(loc) = info.location() {
         crate::logger::early_print(loc.file());
-        crate::logger::early_print("\r\n");
+        let mut linebuf = PanicBuf::new();
+        let _ = write!(linebuf, ":{}:{}\r\n", loc.line(), loc.column());
+        crate::logger::early_print(linebuf.as_str());
+    }
+    // Best-effort backtrace: walk the saved RBP chain a few frames and print
+    // each return address. Stops on a bogus pointer.
+    unsafe {
+        let mut rbp: u64;
+        core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack));
+        crate::logger::early_print("backtrace:\r\n");
+        for _ in 0..16 {
+            if rbp < 0xffff_8000_0000_0000 || (rbp & 7) != 0 { break; }
+            let saved_rbp = (rbp as *const u64).read_volatile();
+            let ret_addr  = ((rbp + 8) as *const u64).read_volatile();
+            let mut fbuf = PanicBuf::new();
+            let _ = write!(fbuf, "  rip={:#x}\r\n", ret_addr);
+            crate::logger::early_print(fbuf.as_str());
+            if saved_rbp <= rbp { break; }
+            rbp = saved_rbp;
+        }
     }
     log::error!("KERNEL PANIC at {}: {}", info.location().map_or("?", |l| l.file()), info.message());
     crate::arch::halt_forever()
 }
+

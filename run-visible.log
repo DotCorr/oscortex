@@ -1,0 +1,124 @@
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+limine: Loading executable `boot():/boot/kernel`...
+limine: Physical base:   0x10614000
+limine: Virtual base:    0xffffffff80000000
+limine: Slide:           0x0
+limine: ELF entry point: 0xffffffff80098080
+limine: Base revision:   6
+limine: Requests count:  7
+limine: Top of HHDM:     0x40000000
+acpi: Found RSDP at 0xf52e0
+limine: Loading module `boot():/boot/libflutter_engine.so`...
+vbe: Initialising...
+vbe: Version: 3.0
+vbe: OEM: SeaBIOS VBE(C) 2011
+vbe: Graphics vendor: SeaBIOS Developers
+vbe: Product name: SeaBIOS VBE Adapter
+vbe: Product revision: Rev. 1
+edid: Success.
+vbe: EDID detected screen resolution of 1280x800
+vbe: Found matching mode 0x17a, attempting to set...
+vbe: Mode was already set, perfect!
+vbe: Framebuffer address: 0xfd000000
+edid: Success.
+acpi: Found RSDP at 0xf52e0
+acpi: Found RSDP at 0xf52e0
+acpi: Found "FACP" at 0x1ffe222f
+acpi: Found SMBIOS 32-bit entry point at 0xf5300
+paging: 1GiB pages are not supported!
+acpi: Found RSDP at 0xf52e0
+acpi: Found "APIC" at 0x1ffe22a3
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+smp: [xAPIC] Found candidate AP for bring-up. LAPIC ID: 1
+smp: Successfully brought up AP
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "DMAR" not found
+acpi: Found RSDP at 0xf52e0
+acpi: "IVRS" not found
+acpi: Found RSDP at 0xf52e0
+acpi: Found "APIC" at 0x1ffe22a3
+
+[OSCORTEX] kernel_main reached
+[OSCORTEX] HHDM offset: 0xffff800000000000
+[ARCH] assert_required_features
+[ARCH] gdt::init
+[ARCH] idt::init
+[ARCH] disable_pic
+[ARCH] apic::init_bsp
+[APIC] x2APIC online — timer armed (vec 0x30)
+[ARCH] cpu::enable_fpu_simd
+[ARCH] syscall::init
+[ARCH] early_init complete
+[OSCORTEX] arch::early_init done
+[MM::Paging] Virtual memory manager online (CR3=0x000000001ff95000)
+[MM::Heap] init base=0xffff800000100000 phys=0x0000000000100000
+[INFO] kernel: Framebuffer: 1280x800 bpp=32 pitch=5120 addr=0xffff8000fd000000
+[INFO] kernel: OSCortex kernel 0.1.0 booting...
+[INFO] kernel: AI Cortex: ENABLED
+[INFO] kernel: [BOOT] Limine module: libflutter_engine.so (95866952 bytes)
+[INFO] kernel::drivers::registry: [Drivers] Driver registry initialised
+[INFO] kernel::drivers::ps2: [PS/2] controller ready — devices: kbd=true mouse=true
+[INFO] kernel: [Input] PS/2 enabled (QEMU/KVM path)
+[INFO] kernel::drivers::usb: [USB] No XHCI controllers found — PS/2 input only
+[INFO] kernel::compositor: [Compositor] M13 scaffold online (max_surfaces=32)
+[INFO] kernel::sched: [Sched] Scheduler initialised (max_tasks=64, stack=32KiB, slice=5 ticks)
+[INFO] kernel::security: [Security] Capability-based security model active
+[INFO] kernel::ipc: [IPC] Message-passing subsystem online (cap=16 msgs/proc)
+[INFO] kernel::wm: [WM] Event queue online (cap=256)
+[INFO] kernel::fs: [VFS] Mounted 'initramfs' at '/'
+[INFO] kernel::fs: [VFS] Virtual filesystem initialised
+[INFO] kernel::drivers::uart: [UART] COM1 initialised at 115200 8-N-1
+[INFO] kernel::drivers::virtio_net: [virtio-net] no device found on PCI bus 0
+[INFO] kernel::drivers::nvme: [NVMe] no controller found
+[INFO] kernel::net: [net] UDP stack online (virtio-net backend)
+[INFO] kernel::net::tcp: [smoltcp] virtio-net not ready — TCP stack not started
+[INFO] kernel::cortex: [Cortex] Initialising AI runtime...
+[INFO] kernel::cortex: [Cortex] Starting inference engine...
+[INFO] kernel::cortex::inference: [Cortex::Inference] Model capsule loaded (version=1 kind=0x01 inputs=4 hidden=8 outputs=1)
+[INFO] kernel::cortex::inference: [Cortex::Inference] Built-in model capsule loaded — NN inference ACTIVE (4→8→1 i8-quantised)
+[INFO] kernel::cortex: [Cortex] Inference OK
+[INFO] kernel::cortex: [Cortex] Starting context graph...
+[INFO] kernel::cortex::context: [Cortex::Context] Graph initialised (capacity: 4096 nodes, 16384 edges)
+[INFO] kernel::cortex: [Cortex] Context OK
+[INFO] kernel::cortex: [Cortex] Starting healing...
+[INFO] kernel::cortex::healing: [Cortex::Healing] Self-healing watchdog armed
+[INFO] kernel::cortex: [Cortex] Healing OK
+[INFO] kernel::cortex: [Cortex] Starting driver generation...
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] CDP driver registry ready (capacity: 256)
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] Driver 'null-driver' loaded via WASM sandbox (id=0)
+[INFO] kernel::cortex::driver_gen: [Cortex::DriverGen] Built-in null driver loaded (id=0) — WASM sandbox OK
+[INFO] kernel::cortex: [Cortex] Driver gen OK
+[INFO] kernel::cortex: [Cortex] Starting PID-0 channel...
+[INFO] kernel::cortex::pid0: [Cortex::PID0] PID-0 Cortex API registered on syscall 0x1000-0x100F
+[INFO] kernel::cortex: [Cortex] PID-0 OK
+[INFO] kernel::cortex: [Cortex] AI runtime online — self-healing ACTIVE, driver-gen ACTIVE
+[INFO] kernel::arch::x86_64::smp: [SMP] 2 total CPU(s) — waking 1 AP(s)
+[INFO] kernel::arch::x86_64::syscall: [Syscall] SYSCALL/SYSRET initialised (STAR base=0x18)
+[INFO] kernel::arch::x86_64::smp: [SMP] AP cpu=1 lapic_id=1 online
+[INFO] kernel::sched: [Sched] AP cpu=1 ready, parked (BSP-only scheduler)
+[INFO] kernel::arch::x86_64::smp: [SMP] 2/2 CPU(s) online
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=95612 filesz=95612 ro exec
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x417580 memsz=22735 filesz=22735 ro 
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x41d000 memsz=32 filesz=0 rw 
+[INFO] kernel::process::elf: [ELF] Loaded: entry=0x400000
+[INFO] kernel::process: [Process] Spawned 'init' pid=1 entry=0x400000
+[INFO] kernel::sched: [Sched] spawned 'user-init' pid=0 stack=0xffff800000121df0
+[INFO] kernel::process: [Process] user-init kernel task registered for pid=1
+[INFO] kernel: [INIT] Spawned /init as PID 1
+[INFO] kernel: OSCortex kernel init complete — entering Cortex-managed loop
+[INFO] kernel::sched: [Sched] registered 'cortex-idle' as task-1 (pid=1)
+[INFO] kernel::sched: [Sched] spawned 'cortex-bg' pid=2 stack=0xffff800000129df0
+[INFO] kernel::cortex: [Co
