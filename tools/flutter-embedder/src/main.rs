@@ -570,17 +570,12 @@ extern "C" fn main_embedder() {
     );
 
     let aot_snapshot = aot_loader::load_dart_snapshot(b"/system/flutter/app.aot\0");
-    if let Some(snapshot) = aot_snapshot {
-        write(b"[embedder] AOT snapshot loaded from /system/flutter/app.aot\n");
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, snapshot.vm_data);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, snapshot.vm_data_size);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS, snapshot.vm_instr);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, snapshot.vm_instr_size);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, snapshot.iso_data);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, snapshot.iso_data_size);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS, snapshot.iso_instr);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE, snapshot.iso_instr_size);
-        write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_AOT_DATA, 0);
+    // NOTE: our shipped libflutter_engine.so is the linux-x64 (debug/JIT) build.
+    // Feeding it AOT snapshot pointers triggers kInvalidArguments ("JIT runtime
+    // cannot run a precompiled snapshot"). Force JIT mode regardless.
+    let _ = aot_snapshot;
+    if false {
+        // (legacy AOT branch kept disabled; re-enable if/when we ship the AOT engine)
     } else {
         // JIT fallback: our libflutter_engine.so is the linux-x64 (debug/JIT)
         // build that Flutter publishes as `linux-x64-embedder.zip`. With all

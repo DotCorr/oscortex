@@ -243,7 +243,8 @@ const STUBS: &[(&str, StubKind)] = &[
     /* 139 */ ("__cxa_atexit",        StubKind::Syscall(0x41D)),
     // ── IO ─────────────────────────────────────────────────────────────────
     /* 140 */ ("open64",              StubKind::Syscall(0x420)),
-    /* 141 */ ("openat64",            StubKind::Syscall(0x420)), // alias
+    /* 141 */ ("openat64",            StubKind::Syscall(257)), // Linux openat(dirfd, path, flags, mode)
+    /* 141a*/ ("openat",              StubKind::Syscall(257)),
     /* 142 */ ("lseek64",             StubKind::Syscall(0x421)),
     /* 143 */ ("fopen64",             StubKind::Syscall(0x422)),
     /* 144 */ ("fclose",              StubKind::Syscall(0x423)),

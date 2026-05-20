@@ -106,6 +106,17 @@ pub fn stat(path: &str) -> Option<u64> {
     lookup(path).map(|d| d.len() as u64)
 }
 
+/// True if `path` is a directory in any mounted filesystem.
+pub fn is_dir(path: &str) -> bool {
+    // Strip a mount prefix if present and probe each mount.
+    let mounts = MOUNTS.lock();
+    for entry in mounts.iter().flatten() {
+        let rel = path.strip_prefix(entry.prefix).unwrap_or(path);
+        if initramfs::is_dir_in_embedded(rel) { return true; }
+    }
+    initramfs::is_dir_in_embedded(path)
+}
+
 // ── Phase 40: sysfs ──────────────────────────────────────────────────────────
 //
 // Each virtual path is backed by a static buffer that is filled on first access.

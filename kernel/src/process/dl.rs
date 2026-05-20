@@ -193,31 +193,49 @@ struct LoadedLib {
 
 // ── Global library table ───────────────────────────────────────────────────────
 
+/// Maximum number of distinct address spaces we track bump cursors for.
+const MAX_AS_SLOTS: usize = 64;
+
 struct LibTable {
     entries:     Vec<LoadedLib>,
     next_handle: u32,
-    /// Per-process bump VA for the next dynamic mapping (libraries + mmap).
-    /// Indexed by `pid as usize % MAX_PROCS`.  Lazily initialised on first use.
-    next_va:     Vec<u64>,
+    /// Per-address-space bump VA for the next dynamic mapping (libraries + mmap).
+    /// Keyed by `pml4_phys` so that threads sharing an address space also share
+    /// the cursor — otherwise each thread would re-bump from `LIB_VA_BASE` and
+    /// silently overwrite its siblings' heap mappings in the shared PML4.
+    /// Fixed-size linear table: (pml4_phys, next_va). `pml4_phys == 0` ⇒ free.
+    as_slots:    [(u64, u64); MAX_AS_SLOTS],
 }
 
 impl LibTable {
     const fn new() -> Self {
-        Self { entries: Vec::new(), next_handle: 1, next_va: Vec::new() }
-    }
-
-    fn ensure_init(&mut self) {
-        if self.next_va.is_empty() {
-            self.next_va.resize(super::MAX_PROCS, LIB_VA_BASE);
+        Self {
+            entries:     Vec::new(),
+            next_handle: 1,
+            as_slots:    [(0, 0); MAX_AS_SLOTS],
         }
     }
 
-    fn bump_va(&mut self, pid: u32, size: u64) -> u64 {
-        self.ensure_init();
-        let idx  = pid as usize % super::MAX_PROCS;
-        let base = self.next_va[idx];
+    fn bump_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
         let aligned = (size + LIB_VA_STRIDE - 1) / LIB_VA_STRIDE * LIB_VA_STRIDE;
-        self.next_va[idx] = base + aligned;
+        // Find existing slot for this address space.
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == pml4_phys {
+                let base = slot.1;
+                slot.1 = base + aligned;
+                return base;
+            }
+        }
+        // Allocate a new slot.
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == 0 {
+                *slot = (pml4_phys, LIB_VA_BASE + aligned);
+                return LIB_VA_BASE;
+            }
+        }
+        // Fallback: should not happen with MAX_AS_SLOTS=64. Reuse slot 0.
+        let base = self.as_slots[0].1;
+        self.as_slots[0].1 = base + aligned;
         base
     }
 }
@@ -421,8 +439,12 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
     if hdr.e_machine != EM_X86_64       { return Err("not x86_64"); }
 
     // ── Allocate load base ────────────────────────────────────────────────
+    // Key the bump cursor on pml4_phys, not pid, so threads sharing an
+    // address space also share the cursor (otherwise they would re-bump
+    // from LIB_VA_BASE and silently overwrite each other's mappings).
+    let _ = pid;
     let span      = pt_load_span(elf_bytes, &hdr);
-    let load_base = LIBS.lock().bump_va(pid, span);
+    let load_base = LIBS.lock().bump_va(pml4_phys, span);
 
     // ── Map PT_LOAD segments ──────────────────────────────────────────────
     let ph_off  = hdr.e_phoff as usize;
@@ -621,10 +643,11 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
     let writable = (prot & 0x2) != 0 || prot == 0; // PROT_WRITE or PROT_NONE → writable for now
     let exec     = (prot & 0x4) != 0;              // PROT_EXEC
 
+    let _ = pid;
     let base_va = if hint_va != 0 {
         hint_va & !0xFFF // align down
     } else {
-        LIBS.lock().bump_va(pid, (pages * 4096) as u64)
+        LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
     };
 
     for p in 0..pages {

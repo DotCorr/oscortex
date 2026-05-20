@@ -127,11 +127,42 @@ pub fn list_in_tar(data: &'static [u8], prefix: &str, out: *mut u8, cap: usize) 
     written
 }
 
-
-
 /// Convenience wrapper: list files in the embedded initramfs tar.
 pub fn list_in_embedded(prefix: &str, out: *mut u8, cap: usize) -> usize {
     list_in_tar(INITRAMFS_DATA, prefix, out, cap)
+}
+
+/// Returns true if `path` names a directory present in the embedded tar.
+/// A directory is recognised either by an explicit tar dir entry (typeflag '5')
+/// or implicitly by being a path prefix of at least one regular file.
+pub fn is_dir_in_embedded(path: &str) -> bool {
+    let want = path.trim_start_matches('/').trim_end_matches('/');
+    if want.is_empty() { return true; } // root
+    let data = INITRAMFS_DATA;
+    let mut pos = 0usize;
+    while pos + BLOCK <= data.len() {
+        let header = &data[pos..pos + BLOCK];
+        if header[0] == 0 { break; }
+        let name_bytes = &header[0..100];
+        let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(100);
+        let name = core::str::from_utf8(&name_bytes[..name_len]).unwrap_or("");
+        let cmp = name.trim_start_matches("./").trim_end_matches('/');
+        let typeflag = header[156];
+        // Explicit directory entry.
+        if typeflag == b'5' && cmp == want { return true; }
+        // Implicit: regular file whose path begins with want + '/'.
+        let is_file = typeflag == b'0' || typeflag == 0;
+        if is_file && cmp.len() > want.len()
+            && cmp.as_bytes().get(want.len()) == Some(&b'/')
+            && &cmp[..want.len()] == want
+        {
+            return true;
+        }
+        let size = parse_octal(&header[124..135]) as usize;
+        let blocks_used = size.div_ceil(BLOCK);
+        pos += BLOCK + blocks_used * BLOCK;
+    }
+    false
 }
 
 struct EmbeddedRamFs;
@@ -149,3 +180,4 @@ static EMBEDDED_RAMFS: EmbeddedRamFs = EmbeddedRamFs;
 pub fn mount_embedded() {
     crate::fs::mount("/", &EMBEDDED_RAMFS);
 }
+

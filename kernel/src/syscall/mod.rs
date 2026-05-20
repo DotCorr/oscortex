@@ -173,7 +173,6 @@ fn monotonic_ns() -> u64 {
 fn sys_timerfd_create_real() -> i64 {
     let fd = alloc_synth_fd();
     TIMERFD_TABLE.lock().insert(fd as u32, TimerState { deadline_ns: 0, period_ns: 0 });
-    log::warn!("[timerfd] create fd={}", fd);
     fd
 }
 
@@ -208,8 +207,6 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
     tbl.entry(fd as u32)
         .and_modify(|t| { t.deadline_ns = deadline; t.period_ns = period_ns; })
         .or_insert(TimerState { deadline_ns: deadline, period_ns });
-    log::warn!("[timerfd] settime fd={} flags={:#x} value_ns={} period_ns={} deadline={}",
-        fd, flags, value_ns, period_ns, deadline);
     0
 }
 
@@ -352,6 +349,82 @@ pub fn dump_recent_syscalls(limit: usize) {
 
 pub fn init() {}
 
+/// Dump current timerfd and epoll-interest state (for post-mortem diagnosis).
+pub fn dump_event_state() {
+    let now = monotonic_ns();
+    let t = TIMERFD_TABLE.lock();
+    log::error!("[event-state] timerfd_table: {} entries (now={}ns)", t.len(), now);
+    for (fd, st) in t.iter() {
+        let rel = if st.deadline_ns == 0 {
+            0i64
+        } else {
+            st.deadline_ns as i64 - now as i64
+        };
+        log::error!(
+            "[event-state]   tfd={} deadline={}ns ({:+}ns from now) period={}ns",
+            fd, st.deadline_ns, rel, st.period_ns
+        );
+    }
+    drop(t);
+    let e = EPOLL_TABLE.lock();
+    log::error!("[event-state] epoll_table: {} epfd(s)", e.len());
+    for (epfd, list) in e.iter() {
+        log::error!("[event-state]   epfd={} watching {} fd(s):", epfd, list.len());
+        for ent in list.iter() {
+            log::error!(
+                "[event-state]     fd={} events={:#x} data={:#x}",
+                ent.fd, ent.events, ent.data
+            );
+        }
+    }
+}
+
+/// Scan the user's stack (from RSP upward) and print any qword that looks
+/// like a return address into libflutter_engine.so (loaded at 0x1000000).
+/// libflutter has no frame pointers (RBP is used as a GPR), so an RBP walk
+/// is impossible — a stack scan is the most we can do without DWARF unwind.
+pub fn dump_user_backtrace(depth: usize) {
+    let urip = crate::arch::syscall::user_rip();
+    let ursp = crate::arch::syscall::user_rsp();
+    let urbp = crate::arch::syscall::user_rbp();
+    const FLUTTER_BASE: u64 = 0x1000000;
+    // .so is ~92MiB; .text typically fits well inside 64MiB. Use a generous
+    // window so we don't miss late-loaded sections.
+    const FLUTTER_END: u64 = FLUTTER_BASE + 0x0800_0000; // +128MiB
+    log::error!(
+        "[backtrace] user_rip={:#x} (flutter+{:#x}) user_rsp={:#x} user_rbp={:#x}",
+        urip,
+        urip.wrapping_sub(FLUTTER_BASE),
+        ursp,
+        urbp,
+    );
+    // Sanity: rsp must be a plausible user address.
+    if ursp == 0 || ursp & 0x7 != 0 || ursp >= 0x0000_8000_0000_0000 {
+        log::error!("[backtrace] bad rsp — aborting scan");
+        return;
+    }
+    let mut printed = 0usize;
+    // Scan up to 4 KiB of stack (512 qwords).
+    let max_words = 512usize;
+    for i in 0..max_words {
+        let addr = ursp + (i as u64) * 8;
+        // Avoid stepping into a guard page near the top.
+        if addr >= 0x0000_8000_0000_0000 { break; }
+        let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
+        if val >= FLUTTER_BASE && val < FLUTTER_END {
+            log::error!(
+                "[backtrace]   stk+{:#06x} = {:#x} (flutter+{:#x})",
+                i * 8, val, val - FLUTTER_BASE,
+            );
+            printed += 1;
+            if printed >= depth { break; }
+        }
+    }
+    if printed == 0 {
+        log::error!("[backtrace] no libflutter return addresses found in scanned stack");
+    }
+}
+
 // ── Open-file table ───────────────────────────────────────────────────────────
 //
 // Simple global open-file table (max 64 entries).  No per-process isolation —
@@ -362,11 +435,12 @@ struct OpenFile {
     data:   &'static [u8],
     offset: u64,
     used:   bool,
+    is_dir: bool,
 }
 
 const MAX_OPEN_FILES: usize = 64;
 static OPEN_FILES: spin::Mutex<[OpenFile; MAX_OPEN_FILES]> = spin::Mutex::new(
-    [const { OpenFile { data: &[], offset: 0, used: false } }; MAX_OPEN_FILES]
+    [const { OpenFile { data: &[], offset: 0, used: false, is_dir: false } }; MAX_OPEN_FILES]
 );
 
 /// Allocate an fd (≥3) backed by `data` from the VFS.
@@ -374,7 +448,19 @@ fn fd_alloc(data: &'static [u8]) -> Option<u64> {
     let mut tbl = OPEN_FILES.lock();
     for (i, slot) in tbl.iter_mut().enumerate().skip(3) {
         if !slot.used {
-            *slot = OpenFile { data, offset: 0, used: true };
+            *slot = OpenFile { data, offset: 0, used: true, is_dir: false };
+            return Some(i as u64);
+        }
+    }
+    None
+}
+
+/// Allocate an fd that represents an open directory (no data, no read).
+fn fd_alloc_dir() -> Option<u64> {
+    let mut tbl = OPEN_FILES.lock();
+    for (i, slot) in tbl.iter_mut().enumerate().skip(3) {
+        if !slot.used {
+            *slot = OpenFile { data: &[], offset: 0, used: true, is_dir: true };
             return Some(i as u64);
         }
     }
@@ -465,6 +551,16 @@ fn sys_open(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
             }
         }
         None => {
+            // File not found — maybe it's a directory.
+            if crate::fs::is_dir(path) {
+                match fd_alloc_dir() {
+                    Some(fd) => {
+                        log::debug!("[sys_open] '{}' → fd={} (dir)", path, fd);
+                        return fd as i64;
+                    }
+                    None => return -23,
+                }
+            }
             log::debug!("[sys_open] '{}' → ENOENT", path);
             -2 // ENOENT
         }
@@ -503,12 +599,12 @@ fn sys_lseek(fd: u64, offset: i64, whence: u64) -> i64 {
 fn sys_fstat(fd: u64, stat_ptr: u64) -> i64 {
     // Minimal stat: only st_size matters for the Flutter engine.
     let idx = fd as usize;
-    let size: u64 = if idx < 3 {
-        0
+    let (size, is_dir): (u64, bool) = if idx < 3 {
+        (0, false)
     } else {
         let tbl = OPEN_FILES.lock();
         if !tbl[idx].used { return -9; }
-        tbl[idx].data.len() as u64
+        (tbl[idx].data.len() as u64, tbl[idx].is_dir)
     };
     if stat_ptr != 0 {
         // Write a minimal stat64 struct — st_size is at offset 48 in Linux stat64.
@@ -522,8 +618,9 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> i64 {
             (p.add(56) as *mut u64).write_unaligned(4096);
             // st_blocks at offset 64 = (size+511)/512
             (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);
-            // st_mode at offset 24 = 0100644 (regular file)
-            (p.add(24) as *mut u32).write_unaligned(0o100644);
+            // st_mode at offset 24: S_IFDIR|0755 for dirs, S_IFREG|0644 for files
+            let mode: u32 = if is_dir { 0o040755 } else { 0o100644 };
+            (p.add(24) as *mut u32).write_unaligned(mode);
         }
     }
     0
@@ -3153,9 +3250,13 @@ mod posix {
         // runnable process (or halts if none), and is `-> i64` only because
         // it threads through the normal dispatch table; in practice it never
         // returns.
-        log::error!("[sys_abort] pid={} aborting — dumping recent syscalls:",
-            crate::process::current_pid());
+        let pid = crate::process::current_pid();
+        log::error!("[sys_abort] pid={} aborting — dumping recent syscalls:", pid);
         super::dump_recent_syscalls(32);
+        // Dump timerfd + epoll state to help diagnose event-loop starvation.
+        super::dump_event_state();
+        // Walk user-mode RBP frames to identify the abort call site.
+        super::dump_user_backtrace(16);
         super::sys_exit((-6i64) as u64);
         loop {
             unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
@@ -3556,7 +3657,38 @@ mod posix {
                 }
             }
             let w_s = core::str::from_utf8(&wbuf[..wn]).unwrap_or("");
-            log::warn!("[snprintf] fmt='{}' arg1='{}' (raw={:#x}) arg2={} (={:#x}) arg3='{}' (raw={:#x})", fmt_s, v_s, first_vararg, second_vararg as i64, second_vararg, w_s, third_vararg);
+            // Read varargs 4 and 5 from the user stack (SysV: stack[0..] after r9).
+            let user_rsp = crate::arch::syscall::user_rsp();
+            let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
+            let safe_qword = |off: u64| -> u64 {
+                let addr = user_rsp.wrapping_add(off);
+                let page = addr & !0xfff;
+                if crate::mm::paging::translate_user_page(cur_cr3, page).is_some() {
+                    unsafe { core::ptr::read_volatile(addr as *const u64) }
+                } else { 0 }
+            };
+            // Skip the return address at stk[0]; varargs begin at stk[1].
+            let fourth_vararg = safe_qword(8);
+            let fifth_vararg  = safe_qword(16);
+            let read_cstr = |p: u64, buf: &mut [u8]| -> usize {
+                if p < 0x1000 { return 0; }
+                let page = p & !0xfff;
+                if crate::mm::paging::translate_user_page(cur_cr3, page).is_none() { return 0; }
+                let mut n = 0usize;
+                unsafe {
+                    let pp = p as *const u8;
+                    while n < buf.len() && *pp.add(n) != 0 { buf[n] = *pp.add(n); n += 1; }
+                }
+                n
+            };
+            let mut xbuf = [0u8; 32];
+            let xn = read_cstr(fourth_vararg, &mut xbuf);
+            let x_s = core::str::from_utf8(&xbuf[..xn]).unwrap_or("");
+            let mut ybuf = [0u8; 192];
+            let yn = read_cstr(fifth_vararg, &mut ybuf);
+            let y_s = core::str::from_utf8(&ybuf[..yn]).unwrap_or("");
+            log::warn!("[snprintf] fmt='{}' arg1='{}' (raw={:#x}) arg2={} (={:#x}) arg3='{}' (raw={:#x}) arg4='{}' (raw={:#x}) arg5='{}' (raw={:#x})",
+                fmt_s, v_s, first_vararg, second_vararg as i64, second_vararg, w_s, third_vararg, x_s, fourth_vararg, y_s, fifth_vararg);
         }
         // Copy format string to buf (no actual formatting).
         let len = sys_strlen(fmt_ptr) as u64;
@@ -3841,18 +3973,16 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             // *before* ret, so [rsp] holds the libflutter return address that
             // *called* the trampoline). Read it carefully.
             let user_rsp = crate::arch::syscall::user_rsp();
-            // Read only offsets that stay within the same 4 KiB page as
-            // user_rsp — otherwise a thread whose rsp sits within the
-            // last few bytes of its stack page would page-fault the kernel
-            // when we touch [rsp + 0x48] etc. (Threads created via
-            // pthread_create have a hard stack-top boundary; the next page
-            // is unmapped.)
-            let same_page = |off: u64| -> bool {
-                (user_rsp & !0xfff) == ((user_rsp + off) & !0xfff)
-            };
+            // Read only offsets whose target VA is actually mapped in the
+            // current address space. A thread's stack may be only a few
+            // pages, and any off that crosses into an unmapped guard page
+            // would page-fault the kernel.
+            let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
             let safe_read = |off: u64| -> u64 {
-                if same_page(off) {
-                    unsafe { core::ptr::read_volatile((user_rsp + off) as *const u64) }
+                let addr = user_rsp.wrapping_add(off);
+                let page = addr & !0xfff;
+                if crate::mm::paging::translate_user_page(cur_cr3, page).is_some() {
+                    unsafe { core::ptr::read_volatile(addr as *const u64) }
                 } else {
                     0
                 }
@@ -3918,7 +4048,9 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     }
 
     // Trace stat-family calls so we can verify Flutter's IsFile() reaches us.
-    if matches!(number, 4 | 6 | 21 | 257 | 262 | 269 | 0x441 | 0x45A | 0x45B | 0x45C | 0x45D | 0x458) {
+    // NOTE: 0x45A (__fxstat64) and 0x458 (__fxstat) take (ver, fd, stat_ptr) —
+    // arg1 is an fd, NOT a path pointer; exclude them from the path trace.
+    if matches!(number, 4 | 6 | 21 | 257 | 262 | 269 | 0x441 | 0x45B | 0x45C | 0x45D) {
         let path_arg = match number {
             4 | 6 | 21 | 0x441 => arg0,
             _ => arg1,

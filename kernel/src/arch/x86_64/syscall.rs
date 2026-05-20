@@ -136,6 +136,11 @@ pub fn user_r9() -> u64 {
     unsafe { SYSCALL_USER_R9 }
 }
 
+/// Return user RBP captured at SYSCALL entry.
+pub fn user_rbp() -> u64 {
+    unsafe { SYSCALL_USER_RBP }
+}
+
 /// Snapshot of all general-purpose user registers captured at SYSCALL entry.
 #[derive(Clone, Copy, Default)]
 pub struct UserGprSnapshot {
