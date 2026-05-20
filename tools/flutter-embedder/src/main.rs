@@ -147,6 +147,12 @@ const OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGC: usize = 232;
 const OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGV: usize = 240;
 const OFF_PROJECT_ARGS_LOG_MESSAGE_CALLBACK: usize = 248;
 
+// Engine command-line switches (offset relative to FlutterProjectArgs).
+// From flutter_embedder.h: assets_path(8) + main_path(8) + packages_path(8)
+// + icu_data_path(8) starting at offset 8 → ends at 40. Then int + pad + ptr.
+const OFF_PROJECT_ARGS_COMMAND_LINE_ARGC: usize = 40;
+const OFF_PROJECT_ARGS_COMMAND_LINE_ARGV: usize = 48;
+
 // Legacy Dart AOT snapshot pointer offsets (FlutterProjectArgs).
 // Verified against tools/flutter-engine/flutter_embedder.h (Flutter 3.29).
 const OFF_PA_VM_SNAPSHOT_DATA:               usize =  64;
@@ -547,10 +553,30 @@ extern "C" fn main_embedder() {
 
     let assets_path  = b"/system/flutter/flutter_assets\0";
     let icu_path     = b"/system/flutter/icudtl.dat\0";
+
+    // Engine command-line switches. The first argv item is the executable
+    // name (engine skips it). We disable Impeller because the Impeller
+    // backend requires GPU contexts we don't provide and otherwise destroys
+    // an unfulfilled `std::promise<RuntimeStageBackend>`, throwing
+    // `std::future_error` which abort()s under our no-libunwind runtime.
+    static ARG0: &[u8] = b"oscortex-flutter\0";
+    static ARG1: &[u8] = b"--enable-impeller=false\0";
+    static ARG2: &[u8] = b"--enable-software-rendering=true\0";
+    #[repr(transparent)]
+    struct ArgvPtrs([*const u8; 3]);
+    unsafe impl Sync for ArgvPtrs {}
+    static ENGINE_ARGV: ArgvPtrs = ArgvPtrs([
+        ARG0.as_ptr(),
+        ARG1.as_ptr(),
+        ARG2.as_ptr(),
+    ]);
+
     let mut project_args = FlutterProjectArgsRaw { bytes: [0; FLUTTER_PROJECT_ARGS_SIZE] };
     write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_STRUCT_SIZE, FLUTTER_PROJECT_ARGS_SIZE as u64);
     write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ASSETS_PATH, assets_path.as_ptr() as u64);
     write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ICU_DATA_PATH, icu_path.as_ptr() as u64);
+    write_i32_at(&mut project_args.bytes, OFF_PROJECT_ARGS_COMMAND_LINE_ARGC, ENGINE_ARGV.0.len() as i32);
+    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_COMMAND_LINE_ARGV, ENGINE_ARGV.0.as_ptr() as u64);
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_PLATFORM_MESSAGE_CALLBACK,
@@ -577,12 +603,46 @@ extern "C" fn main_embedder() {
     if false {
         // (legacy AOT branch kept disabled; re-enable if/when we ship the AOT engine)
     } else {
-        // JIT fallback: our libflutter_engine.so is the linux-x64 (debug/JIT)
-        // build that Flutter publishes as `linux-x64-embedder.zip`. With all
-        // snapshot pointer fields left NULL and `aot_data` left NULL, the
-        // engine auto-loads `kernel_blob.bin` plus the VM/isolate snapshots
-        // from `assets_path` via its own file callbacks.
-        write(b"[embedder] JIT mode: engine will load kernel_blob.bin from assets_path\n");
+        // JIT mode: our libflutter_engine.so is the linux-x64 (debug/JIT)
+        // build that Flutter publishes as `linux-x64-embedder.zip`. The engine
+        // does *not* auto-load `vm_snapshot_data` / `isolate_snapshot_data`
+        // from `assets_path` — those files contain the VM/isolate snapshots
+        // and MUST be provided via the legacy `vm_snapshot_*` /
+        // `isolate_snapshot_*` pointer fields in `FlutterProjectArgs`. (The
+        // engine *will* still load `kernel_blob.bin` from `assets_path`.)
+        //
+        // CRITICAL: In this libflutter_engine.so build, the
+        // `FlutterProjectArgs.{vm,isolate}_snapshot_data` fields are
+        // interpreted as NULL-TERMINATED FILE PATH STRINGS, NOT as binary
+        // buffers. The engine's PopulateJITSnapshotMappingCallbacks wraps
+        // each pointer in a lambda that calls
+        // `fml::FileMapping::CreateReadOnly(std::string{ptr})`.
+        //
+        // Disassembly evidence (libflutter_engine.so):
+        //   0x196c0dd  callq strlen(0x8(this))                # treat as cstr
+        //   0x196c1ee  callq fml::FileMapping::CreateReadOnly # open+mmap
+        //
+        // So we pass the asset PATHS here and let the engine open() and
+        // mmap() them via our file-backed mmap path (already proven to
+        // work for kernel_blob.bin + icudtl.dat).
+        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
+
+        // Static, NUL-terminated path strings — must outlive FlutterEngineRun.
+        static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
+        static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
+
+        let vm_ptr  = VM_PATH.as_ptr()  as u64;
+        let iso_ptr = ISO_PATH.as_ptr() as u64;
+
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,       vm_ptr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE,  (VM_PATH.len()  - 1) as u64);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA,      iso_ptr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
+        // JIT instructions are NULL — the kernel_blob carries the executable
+        // bytecode, not native machine code.
+
+        let _ = aot_snapshot;
+        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
     }
 
     // 8. Start the Flutter engine if the stub resolved a real `run` pointer.

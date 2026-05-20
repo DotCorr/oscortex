@@ -68,7 +68,7 @@ pub fn init() {
         IDT.entries[7].set(device_not_avail_handler as *const () as u64, 0, 0);
         IDT.entries[8].set(double_fault_handler as *const () as u64, DOUBLE_FAULT_IST, 0);
         IDT.entries[13].set(general_protection_handler as *const () as u64, 0, 0);
-        IDT.entries[14].set(page_fault_handler as *const () as u64, 0, 0);
+        IDT.entries[14].set(page_fault_entry as *const () as u64, 0, 0);
         IDT.entries[16].set(x87_fp_handler as *const () as u64, 0, 0);
         IDT.entries[17].set(alignment_check_handler as *const () as u64, 0, 0);
         IDT.entries[18].set(machine_check_handler as *const () as u64, 0, 0);
@@ -154,27 +154,131 @@ extern "x86-interrupt" fn general_protection_handler(frame: InterruptFrame, err:
     panic!("GPF! ip={:#x} err={:#x}", frame.ip, err);
 }
 extern "x86-interrupt" fn page_fault_handler(frame: InterruptFrame, err: u64) {
+    // Kept for any vestigial callers; primary handler is page_fault_entry below.
+    let _ = (frame, err);
+}
+
+#[repr(C)]
+struct PageFaultFrame {
+    // Pushed by our naked entry (in reverse pop order).
+    r15: u64, r14: u64, r13: u64, r12: u64,
+    r11: u64, r10: u64, r9: u64,  r8: u64,
+    rdi: u64, rsi: u64, rbp: u64, rbx: u64,
+    rdx: u64, rcx: u64, rax: u64,
+    // Pushed by the CPU.
+    err: u64,
+    rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64,
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn page_fault_entry() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        // Handler diverges for user faults; for resolved kernel faults it
+        // returns and we pop+iretq.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "add rsp, 8",   // discard error code
+        "iretq",
+        handler = sym page_fault_full_handler,
+    );
+}
+
+extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
+    let frame = unsafe { &*frame_ptr };
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2) };
-    crate::cortex::interrupt_hook(14, &frame, Some(err));
-    
-    // Try to resolve the page fault (demand paging, cow, etc.)
-    if !crate::cortex::handle_page_fault(cr2, err) {
-        // If it's a user-mode fault (err & 0x4), gracefully kill the process instead of panicking.
-        let user_mode = (err & 0x4) != 0;
+
+    // Build a CPU-pushed-style frame for legacy hooks.
+    let legacy = InterruptFrame {
+        ip:    frame.rip,
+        cs:    frame.cs,
+        flags: frame.rflags,
+        sp:    frame.rsp,
+        ss:    frame.ss,
+    };
+    crate::cortex::interrupt_hook(14, &legacy, Some(frame.err));
+
+    if !crate::cortex::handle_page_fault(cr2, frame.err) {
+        let user_mode = (frame.err & 0x4) != 0;
         if user_mode {
             let pid = crate::process::current_pid();
             log::error!(
                 "[PageFault] SIGSEGV: addr={:#x} err={:#x} ip={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x}",
-                cr2,
-                err,
-                frame.ip,
-                pid,
-                frame.cs,
-                frame.sp,
-                frame.ss,
-                frame.flags
+                cr2, frame.err, frame.rip, pid, frame.cs, frame.rsp, frame.ss, frame.rflags
             );
+            log::error!(
+                "[PageFault] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
+                frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp
+            );
+            log::error!(
+                "[PageFault] regs:  r8={:#x}  r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15
+            );
+            if frame.rsp != 0 {
+                let mut slots = [0u64; 8];
+                unsafe {
+                    for i in 0..8 {
+                        let p = (frame.rsp as *const u64).add(i);
+                        slots[i] = core::ptr::read_volatile(p);
+                    }
+                }
+                log::error!(
+                    "[PageFault] user stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x}",
+                    slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]
+                );
+            }
+            // For ip=0 (NULL call), try to disassemble the bytes just before
+            // the return-address pushed on the stack — that's the indirect
+            // call instruction. Print the 12 bytes preceding [rsp] so we can
+            // decode `call *...` and identify the source operand.
+            if frame.rip == 0 && frame.rsp != 0 {
+                unsafe {
+                    let ret_addr = core::ptr::read_volatile(frame.rsp as *const u64);
+                    if ret_addr > 0x10 {
+                        let start = ret_addr - 12;
+                        let mut bytes = [0u8; 12];
+                        for i in 0..12 {
+                            bytes[i] = core::ptr::read_volatile((start + i as u64) as *const u8);
+                        }
+                        log::error!(
+                            "[PageFault] callsite @ {:#x}-12 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            ret_addr,
+                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                            bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]
+                        );
+                    }
+                }
+            }
             crate::syscall::dump_recent_syscalls(24);
             if pid != 0 {
                 crate::process::kill(pid).ok();
@@ -182,8 +286,7 @@ extern "x86-interrupt" fn page_fault_handler(frame: InterruptFrame, err: u64) {
             crate::process::set_current_pid(0);
             crate::arch::halt_forever();
         }
-        // Kernel-mode page fault is always fatal.
-        panic!("Unresolvable kernel page fault: addr={:#x} err={:#x} ip={:#x}", cr2, err, frame.ip);
+        panic!("Unresolvable kernel page fault: addr={:#x} err={:#x} ip={:#x}", cr2, frame.err, frame.rip);
     }
 }
 extern "x86-interrupt" fn x87_fp_handler(_frame: InterruptFrame) {}

@@ -118,7 +118,7 @@ static FUTEX_WAITERS: spin::Mutex<BTreeMap<u64, Vec<u32>>> = spin::Mutex::new(BT
 // When pid=2 exits, activate a one-shot bounded trace that logs the next
 // POSTEXIT_TRACE_LIMIT syscalls (any pid) so we can see what pid=1 does after
 // it resumes from pthread_cond_wait.
-const POSTEXIT_TRACE_LIMIT: u32 = 300;
+const POSTEXIT_TRACE_LIMIT: u32 = 5000;
 static POSTEXIT_TRACE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static POSTEXIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -436,11 +436,37 @@ struct OpenFile {
     offset: u64,
     used:   bool,
     is_dir: bool,
+    /// For directory fds: the absolute path of the directory (NUL-padded).
+    dir_path: [u8; 192],
+    dir_path_len: usize,
+    /// For pipe FDs: index into PIPES table (-1 if not a pipe).
+    pipe_id: i16,
+    pipe_is_write: bool,
 }
 
 const MAX_OPEN_FILES: usize = 64;
 static OPEN_FILES: spin::Mutex<[OpenFile; MAX_OPEN_FILES]> = spin::Mutex::new(
-    [const { OpenFile { data: &[], offset: 0, used: false, is_dir: false } }; MAX_OPEN_FILES]
+    [const { OpenFile { data: &[], offset: 0, used: false, is_dir: false, dir_path: [0; 192], dir_path_len: 0, pipe_id: -1, pipe_is_write: false } }; MAX_OPEN_FILES]
+);
+
+// ── Pipe buffers ──────────────────────────────────────────────────────────────
+// Fixed-size ring buffers shared between paired pipe FDs.  Engine uses pipes
+// for thread wakeup / eventfd-like signaling — small buffers are sufficient.
+
+const PIPE_BUF_SIZE: usize = 4096;
+const MAX_PIPES: usize = 32;
+
+struct PipeBuf {
+    buf: [u8; PIPE_BUF_SIZE],
+    head: usize,   // read offset
+    tail: usize,   // write offset
+    len:  usize,   // bytes currently buffered
+    r_refs: u8,    // open read ends
+    w_refs: u8,    // open write ends
+}
+
+static PIPES: spin::Mutex<[PipeBuf; MAX_PIPES]> = spin::Mutex::new(
+    [const { PipeBuf { buf: [0; PIPE_BUF_SIZE], head: 0, tail: 0, len: 0, r_refs: 0, w_refs: 0 } }; MAX_PIPES]
 );
 
 /// Allocate an fd (≥3) backed by `data` from the VFS.
@@ -448,7 +474,7 @@ fn fd_alloc(data: &'static [u8]) -> Option<u64> {
     let mut tbl = OPEN_FILES.lock();
     for (i, slot) in tbl.iter_mut().enumerate().skip(3) {
         if !slot.used {
-            *slot = OpenFile { data, offset: 0, used: true, is_dir: false };
+            *slot = OpenFile { data, offset: 0, used: true, is_dir: false, dir_path: [0; 192], dir_path_len: 0, pipe_id: -1, pipe_is_write: false };
             return Some(i as u64);
         }
     }
@@ -456,15 +482,86 @@ fn fd_alloc(data: &'static [u8]) -> Option<u64> {
 }
 
 /// Allocate an fd that represents an open directory (no data, no read).
-fn fd_alloc_dir() -> Option<u64> {
+/// `path` is the absolute path of the directory, stored for openat() resolution.
+fn fd_alloc_dir(path: &str) -> Option<u64> {
     let mut tbl = OPEN_FILES.lock();
     for (i, slot) in tbl.iter_mut().enumerate().skip(3) {
         if !slot.used {
-            *slot = OpenFile { data: &[], offset: 0, used: true, is_dir: true };
+            let bytes = path.as_bytes();
+            let n = bytes.len().min(192);
+            let mut buf = [0u8; 192];
+            buf[..n].copy_from_slice(&bytes[..n]);
+            *slot = OpenFile { data: &[], offset: 0, used: true, is_dir: true, dir_path: buf, dir_path_len: n, pipe_id: -1, pipe_is_write: false };
             return Some(i as u64);
         }
     }
     None
+}
+
+/// Allocate a pipe pair.  On success writes `[read_fd, write_fd]` (i32) to
+/// `pipefd_ptr` and returns 0.  `_flags` accepts O_CLOEXEC / O_NONBLOCK
+/// (ignored — pipes are non-blocking).
+fn sys_pipe2(pipefd_ptr: u64, _flags: u64) -> i64 {
+    if pipefd_ptr == 0 { return -14; } // EFAULT
+    // Reserve a pipe buffer slot.
+    let pid = {
+        let mut pipes = PIPES.lock();
+        let mut found = usize::MAX;
+        for (i, p) in pipes.iter_mut().enumerate() {
+            if p.r_refs == 0 && p.w_refs == 0 {
+                p.head = 0; p.tail = 0; p.len = 0;
+                p.r_refs = 1; p.w_refs = 1;
+                found = i;
+                break;
+            }
+        }
+        if found == usize::MAX { return -23; } // ENFILE
+        found
+    };
+    // Allocate two FDs in the open-file table.
+    let (read_fd, write_fd) = {
+        let mut tbl = OPEN_FILES.lock();
+        let mut rfd: i32 = -1;
+        let mut wfd: i32 = -1;
+        for (i, slot) in tbl.iter_mut().enumerate().skip(3) {
+            if !slot.used {
+                if rfd < 0 {
+                    *slot = OpenFile { data: &[], offset: 0, used: true, is_dir: false, dir_path: [0; 192], dir_path_len: 0, pipe_id: pid as i16, pipe_is_write: false };
+                    rfd = i as i32;
+                } else {
+                    *slot = OpenFile { data: &[], offset: 0, used: true, is_dir: false, dir_path: [0; 192], dir_path_len: 0, pipe_id: pid as i16, pipe_is_write: true };
+                    wfd = i as i32;
+                    break;
+                }
+            }
+        }
+        if rfd < 0 || wfd < 0 {
+            // Roll back.
+            if rfd >= 0 { tbl[rfd as usize].used = false; tbl[rfd as usize].pipe_id = -1; }
+            let mut pipes = PIPES.lock();
+            pipes[pid].r_refs = 0; pipes[pid].w_refs = 0;
+            return -23;
+        }
+        (rfd, wfd)
+    };
+    unsafe {
+        let arr = pipefd_ptr as *mut i32;
+        core::ptr::write_unaligned(arr,           read_fd);
+        core::ptr::write_unaligned(arr.add(1),    write_fd);
+    }
+    log::debug!("[pipe2] read_fd={} write_fd={} pipe_id={} flags={:#x}", read_fd, write_fd, pid, _flags);
+    0
+}
+
+/// If `fd` is an open directory fd, return its stored path.
+fn fd_dir_path(fd: u64) -> Option<alloc::string::String> {
+    let idx = fd as usize;
+    if idx >= MAX_OPEN_FILES { return None; }
+    let tbl = OPEN_FILES.lock();
+    if !tbl[idx].used || !tbl[idx].is_dir { return None; }
+    let n = tbl[idx].dir_path_len;
+    let s = core::str::from_utf8(&tbl[idx].dir_path[..n]).ok()?;
+    Some(alloc::string::String::from(s))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -490,6 +587,31 @@ unsafe fn write_user_bytes(ptr: u64, src: &[u8]) -> bool {
 // ── Syscall implementations ───────────────────────────────────────────────────
 
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
+    // Pipe write fast-path.
+    let idx = fd as usize;
+    if idx >= 3 && idx < MAX_OPEN_FILES {
+        let tbl = OPEN_FILES.lock();
+        if tbl[idx].used && tbl[idx].pipe_id >= 0 {
+            if !tbl[idx].pipe_is_write { return -9; } // EBADF (read end)
+            let pid = tbl[idx].pipe_id as usize;
+            drop(tbl);
+            let src = match unsafe { read_user_bytes(buf_ptr, len as usize) } {
+                Some(b) => b,
+                None => return -14,
+            };
+            let mut pipes = PIPES.lock();
+            let p = &mut pipes[pid];
+            if p.r_refs == 0 { return -32; } // EPIPE
+            let free = PIPE_BUF_SIZE - p.len;
+            let n = src.len().min(free);
+            for i in 0..n {
+                p.buf[p.tail] = src[i];
+                p.tail = (p.tail + 1) % PIPE_BUF_SIZE;
+            }
+            p.len += n;
+            return if n == 0 { -11 } else { n as i64 }; // EAGAIN if full
+        }
+    }
     if fd != 1 && fd != 2 { return -9; } // EBADF
     let bytes = match unsafe { read_user_bytes(buf_ptr, len as usize) } {
         Some(b) => b,
@@ -512,6 +634,26 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     let idx = fd as usize;
     if idx >= MAX_OPEN_FILES || !tbl[idx].used {
         return -9; // EBADF
+    }
+    // Pipe read fast-path.
+    if tbl[idx].pipe_id >= 0 {
+        if tbl[idx].pipe_is_write { return -9; } // EBADF (write end)
+        let pid = tbl[idx].pipe_id as usize;
+        drop(tbl);
+        let mut pipes = PIPES.lock();
+        let p = &mut pipes[pid];
+        if p.len == 0 {
+            // No data.  If all writers closed → EOF; otherwise EAGAIN.
+            return if p.w_refs == 0 { 0 } else { -11 };
+        }
+        let n = to_read.min(p.len);
+        let dst = buf_ptr as *mut u8;
+        for i in 0..n {
+            unsafe { *dst.add(i) = p.buf[p.head]; }
+            p.head = (p.head + 1) % PIPE_BUF_SIZE;
+        }
+        p.len -= n;
+        return n as i64;
     }
     let offset = tbl[idx].offset as usize;
     let data   = tbl[idx].data;
@@ -553,7 +695,7 @@ fn sys_open(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
         None => {
             // File not found — maybe it's a directory.
             if crate::fs::is_dir(path) {
-                match fd_alloc_dir() {
+                match fd_alloc_dir(path) {
                     Some(fd) => {
                         log::debug!("[sys_open] '{}' → fd={} (dir)", path, fd);
                         return fd as i64;
@@ -572,6 +714,23 @@ fn sys_close(fd: u64) -> i64 {
     if idx < 3 || idx >= MAX_OPEN_FILES { return 0; }
     let mut tbl = OPEN_FILES.lock();
     if tbl[idx].used {
+        // If this is a pipe end, decrement the pipe's refcount.
+        if tbl[idx].pipe_id >= 0 {
+            let pid = tbl[idx].pipe_id as usize;
+            let is_write = tbl[idx].pipe_is_write;
+            tbl[idx].pipe_id = -1;
+            drop(tbl);
+            let mut pipes = PIPES.lock();
+            if is_write && pipes[pid].w_refs > 0 { pipes[pid].w_refs -= 1; }
+            if !is_write && pipes[pid].r_refs > 0 { pipes[pid].r_refs -= 1; }
+            // Re-acquire to clear the file slot.
+            drop(pipes);
+            let mut tbl = OPEN_FILES.lock();
+            tbl[idx].used = false;
+            tbl[idx].data = &[];
+            tbl[idx].offset = 0;
+            return 0;
+        }
         tbl[idx].used = false;
         tbl[idx].data = &[];
         tbl[idx].offset = 0;
@@ -1269,9 +1428,20 @@ fn sys_dlopen(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
 }
 
 fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> i64 {
-    let name = match unsafe { read_user_bytes(name_ptr, name_len as usize) } {
+    if name_ptr == 0 { return 0; } // POSIX: NULL on bad args
+    // The libc-ABI `dlsym(handle, name)` trampoline only passes 2 args, so
+    // `name_len` here is garbage from the caller's rdx. If it's zero or
+    // unreasonable, fall back to strlen on the C-string. dlsym MUST return
+    // NULL (0) on any failure — never a kernel errno like -14, which the
+    // engine would mistake for a valid pointer.
+    let effective_len = if name_len == 0 || name_len > 0x1000 {
+        posix::sys_strlen(name_ptr) as usize
+    } else {
+        name_len as usize
+    };
+    let name = match unsafe { read_user_bytes(name_ptr, effective_len) } {
         Some(b) => b,
-        None => return -14, // EFAULT
+        None => return 0, // not found
     };
     match crate::process::dl::dlsym(handle as u32, name) {
         Some(addr) => addr as i64,
@@ -1545,9 +1715,14 @@ fn sys_aot_snapshot_load(
         Some(d) => d,
         None => return -2, // ENOENT
     };
-    // Validate: accept ELF magic or raw Dart snapshot magic (0xDC DC DC DC).
-    let valid = (data.len() >= 4 && &data[..4] == b"\x7fELF")
-        || (data.len() >= 4 && data[..4] == [0xDC, 0xDC, 0xDC, 0xDC]);
+    // Validate: accept ELF magic (AOT shared objects) or raw Dart snapshot
+    // magic. Flutter JIT VM/isolate snapshots start with F5 F5 DC DC (the
+    // little-endian Snapshot::kMagicValue = 0xDCDCF5F5); some older variants
+    // use DC DC DC DC. Accept either to keep this loader format-agnostic.
+    let valid = data.len() >= 4
+        && (&data[..4] == b"\x7fELF"
+            || data[..4] == [0xF5, 0xF5, 0xDC, 0xDC]
+            || data[..4] == [0xDC, 0xDC, 0xDC, 0xDC]);
     if !valid {
         return -22; // EINVAL — not a recognised snapshot format
     }
@@ -2469,7 +2644,8 @@ fn sys_thread_exit(code: u64) -> i64 {
     // Activate post-exit syscall trace window so we can see what pid=1 does
     // after it resumes from pthread_cond_wait.
     POSTEXIT_TRACE_COUNT.store(0, Ordering::Relaxed);
-    POSTEXIT_TRACE_ACTIVE.store(true, Ordering::Relaxed);
+    // Disabled: engine is healthy past pid-2 exit; trace just spams logs.
+    // POSTEXIT_TRACE_ACTIVE.store(true, Ordering::Relaxed);
     sys_exit(code)
 }
 
@@ -2537,6 +2713,17 @@ mod posix {
     // We store (pid → tls_base) here; the area is allocated on first use.
 
     static TLS_TABLE: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+
+    // Per-thread emulated-TLS storage: (pid, obj_va) -> storage_va.
+    //
+    // CRITICAL: The "ptr" cell inside the __emutls_object (at obj+16) is shared
+    // across all threads because the object lives in libflutter_engine.so's
+    // .data. Caching the allocation there means thread A's storage becomes
+    // visible to thread B, which is the OPPOSITE of what TLS means. Threads
+    // then read each other's uninitialized slots (frequently NULL function
+    // pointers) and crash via call-thru-NULL. We must keep a per-thread cache
+    // here and NEVER write back into obj+16.
+    static EMUTLS_TABLE: Mutex<BTreeMap<(u32, u64), u64>> = Mutex::new(BTreeMap::new());
 
     fn get_or_alloc_tls(pid: u32, pml4_phys: u64) -> u64 {
         let mut table = TLS_TABLE.lock();
@@ -3205,10 +3392,19 @@ mod posix {
 
     pub fn sys_emutls_get_address(obj: u64) -> i64 {
         if obj == 0 { return 0; }
-        // Fetch current ptr (offset +16).
-        let cur_ptr = unsafe { *((obj + 16) as *const u64) };
-        if cur_ptr != 0 { return cur_ptr as i64; }
-        // Allocate storage for this TLS variable.
+        let (pid, _pml4) = pid_and_pml4();
+
+        // Per-thread cache lookup. DO NOT consult obj+16 — that cell is in the
+        // engine's .data and shared across all threads, which would alias TLS
+        // between threads and cause call-thru-NULL crashes.
+        {
+            let table = EMUTLS_TABLE.lock();
+            if let Some(&va) = table.get(&(pid, obj)) {
+                return va as i64;
+            }
+        }
+
+        // Allocate storage for this thread's copy of the TLS variable.
         let size = unsafe { *(obj as *const u64) };
         let sz = size.max(8);
         let ptr_va = sys_malloc(sz) as u64;
@@ -3226,8 +3422,8 @@ mod posix {
         } else {
             unsafe { core::ptr::write_bytes(ptr_va as *mut u8, 0, sz as usize); }
         }
-        // Persist ptr back into the object so future calls are O(1).
-        unsafe { *((obj + 16) as *mut u64) = ptr_va; }
+        // Insert into per-thread cache. Intentionally DO NOT write obj+16.
+        EMUTLS_TABLE.lock().insert((pid, obj), ptr_va);
         ptr_va as i64
     }
 
@@ -3236,7 +3432,7 @@ mod posix {
         unsafe {
             *(obj as *mut u64)          = size;
             *((obj + 8)  as *mut u64)   = align;
-            *((obj + 16) as *mut u64)   = 0;    // clear cached ptr
+            *((obj + 16) as *mut u64)   = 0;    // legacy: clear cached ptr (unused now)
             *((obj + 24) as *mut u64)   = templ;
         }
         0
@@ -4076,7 +4272,51 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         5   => sys_fstat(arg0, arg1),         // Linux fstat
         6   => sys_stat_path(arg0, arg1),    // Linux lstat (no symlinks)
         8   => sys_lseek(arg0, arg1 as i64, arg2), // Linux lseek
-        9   => sys_mmap(arg0, arg1, arg2),   // Linux mmap (anonymous; MAP_ANON)
+        9   => {
+            // Linux mmap(addr, len, prot, flags, fd, offset).
+            let flags = arg3;
+            let fd    = arg4;
+            let off   = crate::arch::syscall::user_r9();
+            let is_anon = (flags & 0x20) != 0;
+            let is_fixed = (flags & 0x10) != 0; // MAP_FIXED
+            let fd_signed = fd as i64;
+            let file_backed = !is_anon && fd_signed >= 3 && (fd_signed as usize) < MAX_OPEN_FILES;
+            // For file-backed mmap we must copy data into the pages, so
+            // they need to be writable temporarily.  Our mprotect is a stub
+            // so this is effectively final perms; that's acceptable for now.
+            let effective_prot = if file_backed { arg2 | 0x2 } else { arg2 };
+            // Without MAP_FIXED, `addr` is only a hint; the kernel is free
+            // to choose any address. Our sys_mmap treats any non-zero hint
+            // as MAP_FIXED, which clobbers libflutter pages when Dart's heap
+            // allocator passes hints that overlap. Force hint=0 unless the
+            // caller explicitly asked for MAP_FIXED.
+            let hint = if is_fixed { arg0 } else { 0 };
+            let va = sys_mmap(hint, arg1, effective_prot);
+            if va < 0 { return va; }
+            if file_backed {
+                let idx = fd_signed as usize;
+                let tbl = OPEN_FILES.lock();
+                if tbl[idx].used && !tbl[idx].is_dir {
+                    let data = tbl[idx].data;
+                    let start = off as usize;
+                    if start < data.len() {
+                        let n = (data.len() - start).min(arg1 as usize);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                data.as_ptr().add(start),
+                                va as *mut u8,
+                                n,
+                            );
+                        }
+                        log::debug!(
+                            "[mmap] file-backed fd={} off={:#x} len={:#x} → va={:#x} ({} copied)",
+                            fd, off, arg1, va, n
+                        );
+                    }
+                }
+            }
+            va
+        }
         10  => sys_mprotect(arg0, arg1, arg2),
         11  => sys_munmap(arg0, arg1),
         12  => 0,                            // brk stub — return 0 (= current break)
@@ -4099,6 +4339,27 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
                 if path_ptr != 0 {
                     let p = path_ptr as *const u8;
                     while len < 4096 && *p.add(len) != 0 { len += 1; }
+                }
+            }
+            // Absolute path or AT_FDCWD → use as-is.
+            let is_abs = unsafe { path_ptr != 0 && *(path_ptr as *const u8) == b'/' };
+            let dirfd_i = arg0 as i64;
+            let at_fdcwd = (arg0 as u32) == 0xFFFFFF9C; // AT_FDCWD = -100
+            if is_abs || at_fdcwd {
+                return sys_open(path_ptr, len as u64, arg2);
+            }
+            // Relative path against a directory fd: join "<dir_path>/<rel>".
+            if dirfd_i >= 0 {
+                if let Some(dir_path) = fd_dir_path(arg0) {
+                    let rel = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
+                    let rel_str = core::str::from_utf8(rel).unwrap_or("");
+                    let mut joined = dir_path;
+                    if !joined.ends_with('/') { joined.push('/'); }
+                    joined.push_str(rel_str);
+                    log::debug!("[openat] dirfd={} rel='{}' → '{}'", dirfd_i, rel_str, joined);
+                    let cstr_ptr = joined.as_ptr() as u64;
+                    let cstr_len = joined.len() as u64;
+                    return sys_open(cstr_ptr, cstr_len, arg2);
                 }
             }
             sys_open(path_ptr, len as u64, arg2)
@@ -4429,6 +4690,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x440 => posix::sys_clearerr(arg0),
         0x441 => posix::sys_stat(arg0, arg1, arg2),
         0x442..=0x44F => 0, // fdopen/opendir/closedir etc stubs
+        0x457 => sys_pipe2(arg0, arg1),
         0x44A..=0x459 => 0, // filesystem stubs all return 0
         0x45A => sys_fstat(arg1, arg2),         // __fxstat64(ver, fd, stat_ptr)
         0x45B => 0,                             // __fxstatat64 stub
@@ -4465,6 +4727,37 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x49A => -1, // execvp → ENOEXEC
         0x49B => 0, // syslog noop
         0x49C..=0x4A2 => 0, // ilogbf/modff/nextafterf/scalbnf/llround/llroundf/remainder stubs
+        0x4A3 => 0, // fcntl/fcntl64 stub: F_GETFL/F_SETFL/F_GETFD/F_SETFD all succeed with 0
+
+        // Linux getrandom(2) (nr=318 = 0x13E): Dart VM uses this for entropy.
+        // Fill the buffer with bytes from a simple TSC-mixed PRNG.
+        // Returns number of bytes written (matches Linux ABI).
+        0x13E => {
+            let buf = arg0;
+            let len = arg1 as usize;
+            if buf == 0 || len == 0 { return 0; }
+            // Best-effort: cap at 256 MiB to avoid runaway.
+            let n = len.min(256 * 1024 * 1024);
+            let mut s: u64 = unsafe { core::arch::x86_64::_rdtsc() } ^ 0xA5A5_F00D_DEAD_BEEFu64;
+            unsafe {
+                let p = buf as *mut u8;
+                let mut i = 0usize;
+                while i < n {
+                    // xorshift64*
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    let mut v = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
+                    let chunk = (n - i).min(8);
+                    for _ in 0..chunk {
+                        core::ptr::write_volatile(p.add(i), (v & 0xFF) as u8);
+                        v >>= 8;
+                        i += 1;
+                    }
+                }
+            }
+            n as i64
+        }
 
     // GNU emulated TLS
     0x4B0 => posix::sys_emutls_get_address(arg0),

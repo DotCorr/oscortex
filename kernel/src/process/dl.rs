@@ -336,28 +336,40 @@ fn apply_rela_table(
     let ent_sz = core::mem::size_of::<Elf64Rela>();
     let count  = table_sz / ent_sz;
 
+    let mut n_rel = 0usize;
+    let mut n_64 = 0usize;
+    let mut n_glob = 0usize;
+    let mut n_jmp = 0usize;
+    let mut n_other = 0usize;
+    let mut n_oob = 0usize;
+
     for i in 0..count {
         let rela: Elf64Rela = match read_pod(bytes, rela_file + i * ent_sz) {
             Some(r) => r,
-            None    => break,
+            None    => { n_oob += 1; break; },
         };
         let rtype   = (rela.r_info & 0xFFFF_FFFF) as u32;
         let sym_idx = (rela.r_info >> 32) as usize;
         let target  = load_base.wrapping_add(rela.r_offset);
 
         let value = match rtype {
-            R_X86_64_RELATIVE  => load_base.wrapping_add(rela.r_addend as u64),
-            R_X86_64_64        => sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64),
-            R_X86_64_GLOB_DAT  => sym_vaddr(sym_idx),
-            R_X86_64_JUMP_SLOT => sym_vaddr(sym_idx),
-            0                  => continue, // R_X86_64_NONE
-            _                  => continue, // unsupported — leave as zero
+            R_X86_64_RELATIVE  => { n_rel += 1; load_base.wrapping_add(rela.r_addend as u64) },
+            R_X86_64_64        => { n_64 += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
+            R_X86_64_GLOB_DAT  => { n_glob += 1; sym_vaddr(sym_idx) },
+            R_X86_64_JUMP_SLOT => { n_jmp += 1; sym_vaddr(sym_idx) },
+            0                  => continue,
+            _                  => { n_other += 1; continue; },
         };
 
         // Write through the live user page table.
         // Safe: CR3 = user PML4 during SYSCALL; SMAP not set in this build.
         unsafe { write_user_u64(target, value); }
     }
+
+    log::info!(
+        "[dl] rela table sz={} count={} applied: REL={} _64={} GLOB={} JMP={} other={} oob={}",
+        table_sz, count, n_rel, n_64, n_glob, n_jmp, n_other, n_oob
+    );
 }
 
 // ── Symbol export harvesting ───────────────────────────────────────────────────
@@ -645,7 +657,28 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
 
     let _ = pid;
     let base_va = if hint_va != 0 {
-        hint_va & !0xFFF // align down
+        let aligned = hint_va & !0xFFF;
+        // Check that NONE of the target pages are already mapped. If any
+        // page in the requested range is occupied (e.g., libflutter's
+        // .data.rel.ro), fall back to the bump allocator so we don't
+        // silently clobber existing mappings.
+        let mut clear = true;
+        for p in 0..pages {
+            let v = aligned + (p * 4096) as u64;
+            if paging::translate_user_page(pml4_phys, v).is_some() {
+                clear = false;
+                break;
+            }
+        }
+        if clear {
+            aligned
+        } else {
+            log::warn!(
+                "[mmap_anon] hint {:#x} pages={} overlaps existing mapping; reallocating",
+                hint_va, pages
+            );
+            LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
+        }
     } else {
         LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
     };
