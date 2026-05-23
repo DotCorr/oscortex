@@ -161,6 +161,8 @@ pub fn kbd_irq() {
     let byte = unsafe { in8(PS2_DATA) };
     let status = unsafe { in8(PS2_STATUS) };
 
+    log::trace!("[PS2 KBD] byte=0x{:02X} status=0x{:02X}", byte, status);
+
     // If the byte is actually from the mouse (auxiliary) port, re-route.
     if status & STATUS_MOUSE != 0 {
         handle_mouse_byte(byte);
@@ -182,6 +184,12 @@ pub fn kbd_irq() {
         sc
     };
 
+    // Rate-limited log for debugging keypresses
+    static KBD_SAMPLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if KBD_SAMPLE.fetch_add(1, Ordering::Relaxed) < 32 {
+        log::warn!("[PS2 KBD Dispatch] scancode={:#x} ({}) pressed={}", scancode, scancode, pressed);
+    }
+
     crate::wm::push_key(scancode, pressed);
     unsafe { pic_eoi_master(); }
 }
@@ -190,6 +198,7 @@ pub fn kbd_irq() {
 /// Accumulates 3-byte packets and pushes pointer events.
 pub fn mouse_irq() {
     let byte = unsafe { in8(PS2_DATA) };
+    log::trace!("[PS2 MOUSE] byte=0x{:02X}", byte);
     handle_mouse_byte(byte);
     unsafe { pic_eoi_slave(); }
 }
@@ -229,13 +238,19 @@ fn handle_mouse_byte(byte: u8) {
         .map(|(w, h)| (w as i32, h as i32))
         .unwrap_or((640, 480));
 
-    let x = CURSOR_X.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
-        Some((v + dx).clamp(0, (max_w - 1).max(0)))
-    }).unwrap_or(0);
+    let mut x = 32;
+    let _ = CURSOR_X.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+        let nv = (v + dx).clamp(0, (max_w - 1).max(0));
+        x = nv;
+        Some(nv)
+    });
     // PS/2 Y is positive = move up; screen Y is positive = move down → negate dy.
-    let y = CURSOR_Y.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
-        Some((v - dy).clamp(0, (max_h - 1).max(0)))
-    }).unwrap_or(0);
+    let mut y = 32;
+    let _ = CURSOR_Y.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |v| {
+        let nv = (v - dy).clamp(0, (max_h - 1).max(0));
+        y = nv;
+        Some(nv)
+    });
 
     let buttons = (p0 & 0x07) as u32;
     crate::wm::push_pointer(x, y, buttons);
@@ -277,8 +292,8 @@ pub fn init() {
         let cmd_byte = if wait_read() { in8(PS2_DATA) } else { 0x47 };
 
         // Patch: enable port-1 IRQ (bit 0), enable port-2 IRQ (bit 1),
-        // disable scan-code translation (clear bit 6).
-        let cmd_byte = (cmd_byte | 0x03) & !0x40;
+        // enable scan-code translation (set bit 6).
+        let cmd_byte = cmd_byte | 0x43;
 
         // Write patched command byte back.
         wait_write(); out8(PS2_STATUS, 0x60);
@@ -344,3 +359,4 @@ pub fn device_info_packed(n: u32) -> u32 {
     }
     0
 }
+

@@ -917,6 +917,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         /* 0x70 */ r14,
         /* 0x78 */ r15,
     ];
+    log::info!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
     unsafe {
         core::arch::asm!(
             // Pin the frame base in r11. r11 is consumed by SYSRET (as user

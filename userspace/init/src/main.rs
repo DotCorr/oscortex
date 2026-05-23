@@ -37,7 +37,7 @@ const SYS_NET_SEND:           u64 = 0x37E;
 const SYS_NET_RECV:           u64 = 0x37F;
 const SYS_FB_RELEASE:         u64 = 0x380;
 const SYS_SURFACE_FULLSCREEN: u64 = 0x381;
-const SYS_EXEC_WAIT:          u64 = 0x382;
+const SYS_EXEC_WAIT:          u64 = 0x39E;
 const SYS_SERIAL_READ:        u64 = 0x383;
 const SYS_SERIAL_WRITE:       u64 = 0x384;
 const SYS_BLK_INFO:           u64 = 0x385;
@@ -809,3 +809,4 @@ pub extern "C" fn init_main() -> ! {
 fn panic(_: &core::panic::PanicInfo) -> ! {
     loop { unsafe { asm!("hlt", options(nostack)); } }
 }
+

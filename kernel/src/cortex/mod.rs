@@ -129,7 +129,10 @@ pub fn run() -> ! {
     crate::arch::enable_interrupts();
     loop {
         // Cooperative yield: hand CPU to the next ready task from the idle loop.
+        // Disable interrupts during the context switch to prevent preemption races.
+        crate::arch::disable_interrupts();
         crate::sched::schedule();
+        crate::arch::enable_interrupts();
         // Run a bounded Cortex maintenance tick (context graph, anomaly scan).
         tick();
         // Pause until the next interrupt.

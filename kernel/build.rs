@@ -426,7 +426,7 @@ fn generate_liboscortex_shim() -> Vec<u8> {
         ("oscortex_fb_release",              0x380),
         ("oscortex_surface_fullscreen",      0x381),
         // Phase 47: ELF exec round-trip
-        ("oscortex_exec_wait",               0x382),
+        ("oscortex_exec_wait",               0x39E),
         // Phase 48: UART serial console
         ("oscortex_serial_read",             0x383),
         ("oscortex_serial_write",            0x384),

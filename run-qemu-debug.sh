@@ -28,13 +28,17 @@ echo ""
 # Real graphical window (Cocoa on macOS); readonly avoids lock conflicts.
 qemu-system-x86_64 \
     -M q35 \
+    -cpu qemu64,+x2apic \
     -smp cpus=2 \
     -m 2G \
     -cdrom "$ISO" \
     -boot d \
     -serial file:"$SERIAL_LOG" \
     -display cocoa \
-    -vga std &
+    -vga std \
+    -d int,cpu_reset \
+    -D "$SCRIPT_DIR/qemu-debug.log" \
+    -no-reboot &
 
 QEMU_PID=$!
 

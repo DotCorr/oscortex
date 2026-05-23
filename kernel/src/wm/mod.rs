@@ -193,11 +193,18 @@ pub fn tick() {
     let mut s = SYNTH.lock();
     s.tick = s.tick.wrapping_add(1);
 
-    let real_input = poll_ps2_input(&mut s, w as i32, h as i32);
+    let is_ps2_ready = crate::drivers::ps2::PS2_READY.load(core::sync::atomic::Ordering::Relaxed);
+    let real_input = if is_ps2_ready {
+        false
+    } else {
+        poll_ps2_input(&mut s, w as i32, h as i32)
+    };
 
     // If no real hardware events arrived, keep synthetic producers alive as a
     // stable fallback for bring-up and CI validation.
-    if real_input {
+    // However, if the PS/2 controller is ready, do not generate synthetic inputs,
+    // as they would conflict with real mouse/keyboard inputs.
+    if real_input || is_ps2_ready {
         return;
     }
 

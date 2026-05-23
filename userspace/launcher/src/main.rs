@@ -46,7 +46,7 @@ const SYS_EXEC:               u64 = 59;
 const SYS_FB_MAP:             u64 = 0x377;
 const SYS_WM_NEXT_EVENT:      u64 = 0x378;
 const SYS_SCHED_YIELD:        u64 = 0x390;
-const SYS_EXEC_WAIT:          u64 = 0x382;
+const SYS_EXEC_WAIT:          u64 = 0x39E;
 const SYS_SERIAL_WRITE:       u64 = 0x384;
 
 // ── WM event kinds ────────────────────────────────────────────────────────────
@@ -118,6 +118,13 @@ unsafe fn syscall0(nr: u64) -> i64 {
          out("rcx") _, out("r11") _, lateout("rax") r,
          options(nostack));
     r
+}
+
+#[inline(always)]
+fn serial_write(msg: &[u8]) {
+    unsafe {
+        let _ = syscall2(SYS_SERIAL_WRITE, msg.as_ptr() as u64, msg.len() as u64);
+    }
 }
 
 // ── Framebuffer helpers ───────────────────────────────────────────────────────
@@ -257,8 +264,8 @@ const APPS: &[App] = &[
     App { name: b"Files",     path: b"/bin/files\0",    color: C_CYAN,   icon: 1 },
     App { name: b"Settings",  path: b"/bin/settings\0", color: C_GREY,   icon: 2 },
     App { name: b"Editor",    path: b"/bin/editor\0",   color: C_ORANGE, icon: 3 },
-    App { name: b"Flutter",   path: b"/bin/flutter-embedder\0",  color: C_ACCENT, icon: 4 },
-    App { name: b"About",     path: b"/bin/hello\0",    color: C_PURPLE, icon: 5 },
+    App { name: b"Hello",     path: b"/bin/hello\0",    color: C_ACCENT, icon: 4 },
+    App { name: b"Shell",     path: b"/bin/init\0",     color: C_PURPLE, icon: 5 },
 ];
 
 // ── Tile geometry ─────────────────────────────────────────────────────────────
@@ -275,6 +282,7 @@ struct LauncherState {
     fb:        Fb,
     mouse_x:   i32,
     mouse_y:   i32,
+    last_buttons: u32,
     hovered:   i32,  // -1 = none
     clicked:   i32,  // -1 = none (transient flash frame)
     grid_x0:   i32,
@@ -421,15 +429,42 @@ impl LauncherState {
         self.draw_taskbar();
         self.draw_dock();
         self.draw_grid();
+        self.draw_cursor();
         self.needs_redraw = false;
+    }
+
+    fn draw_cursor(&self) {
+        let fb = &self.fb;
+        let mx = self.mouse_x;
+        let my = self.mouse_y;
+
+        for dy in 0..12 {
+            for dx in 0..dy + 1 {
+                if dx < 12 {
+                    let px = mx + dx;
+                    let py = my + dy;
+                    if px >= 0 && py >= 0 && px < fb.width as i32 && py < fb.height as i32 {
+                        let is_border = dx == 0 || dx == dy || dy == 11;
+                        let color = if is_border { 0x000000 } else { 0xFFFFFF };
+                        fb.set(px as u32, py as u32, color);
+                    }
+                }
+            }
+        }
     }
 
     fn launch(&self, idx: usize) {
         if idx >= APPS.len() { return; }
         let app = &APPS[idx];
+        serial_write(b"[launcher] launch start\n");
         // SYS_EXEC_WAIT: kernel spawns child and blocks us until it exits.
-        unsafe {
-            syscall2(SYS_EXEC_WAIT, app.path.as_ptr() as u64, (app.path.len() - 1) as u64);
+        let rc = unsafe {
+            syscall2(SYS_EXEC_WAIT, app.path.as_ptr() as u64, (app.path.len() - 1) as u64)
+        };
+        if rc < 0 {
+            serial_write(b"[launcher] launch failed\n");
+        } else {
+            serial_write(b"[launcher] app exited\n");
         }
         // When the child exits we get control back and redraw.
     }
@@ -464,6 +499,7 @@ pub extern "C" fn launcher_main() -> ! {
         fb,
         mouse_x: 0,
         mouse_y: 0,
+        last_buttons: 0,
         hovered: -1,
         clicked: -1,
         grid_x0,
@@ -508,8 +544,12 @@ pub extern "C" fn launcher_main() -> ! {
                 let px = (ev.a >> 32) as i32;
                 let py = (ev.a & 0xFFFF_FFFF) as i32;
                 let buttons = ev.flags;
-                state.mouse_x = px;
-                state.mouse_y = py;
+
+                if px != state.mouse_x || py != state.mouse_y {
+                    state.mouse_x = px;
+                    state.mouse_y = py;
+                    state.needs_redraw = true;
+                }
 
                 let prev_hov = state.hovered;
                 state.hovered = state.hit_test(px, py);
@@ -518,18 +558,51 @@ pub extern "C" fn launcher_main() -> ! {
                     state.needs_redraw = true;
                 }
 
-                // Left button press (bit 0).
-                if buttons & 1 != 0 && state.hovered >= 0 && state.clicked < 0 {
+                // Left button down-edge (bit 0).
+                let left_down = (buttons & 1) != 0;
+                let prev_left_down = (state.last_buttons & 1) != 0;
+                if left_down && !prev_left_down && state.hovered >= 0 && state.clicked < 0 {
                     state.clicked = state.hovered;
                     state.needs_redraw = true;
                     click_flash = 3; // 3 event-loop iters of flash
                 }
+                state.last_buttons = buttons;
             }
             EV_KEY => {
                 let pressed = ev.flags != 0;
-                let sc = ev.a as u8;
-                if pressed && sc == 0x01 {
-                    // Escape — do nothing (no sub-app open)
+                let sc = ev.a; // scancode is u64
+                if pressed {
+                    let mut moved = false;
+                    let current = state.hovered;
+                    if sc == 0x4D || sc == 0xE04D || sc == 0x20 { // Right / D
+                        state.hovered = if current == -1 { 0 } else { (current + 1) % 6 };
+                        moved = true;
+                    } else if sc == 0x4B || sc == 0xE04B || sc == 0x1E { // Left / A
+                        state.hovered = if current == -1 { 0 } else { if current > 0 { current - 1 } else { 5 } };
+                        moved = true;
+                    } else if sc == 0x50 || sc == 0xE050 || sc == 0x1F { // Down / S
+                        state.hovered = if current == -1 { 0 } else { (current + 3) % 6 };
+                        moved = true;
+                    } else if sc == 0x48 || sc == 0xE048 || sc == 0x11 { // Up / W
+                        state.hovered = if current == -1 { 0 } else { if current >= 3 { current - 3 } else { current + 3 } };
+                        moved = true;
+                    } else if sc == 0x1C || sc == 0xE01C || sc == 0x39 { // Enter / Numpad Enter / Space
+                        if state.hovered >= 0 && state.clicked < 0 {
+                            state.clicked = state.hovered;
+                            state.needs_redraw = true;
+                            click_flash = 3;
+                        }
+                    } else if sc == 0x01 {
+                        // Escape — do nothing
+                    }
+                    if moved {
+                        if state.hovered >= 0 {
+                            let (tx, ty, tw, th) = state.tile_rect(state.hovered as usize);
+                            state.mouse_x = tx + (tw as i32 / 2);
+                            state.mouse_y = ty + (th as i32 / 2);
+                        }
+                        state.needs_redraw = true;
+                    }
                 }
             }
             _ => {}
@@ -654,3 +727,4 @@ const fn include_font() -> [[u8; 8]; 128] {
     g!(0x7E,0x00,0x00,0x00,0x76,0xDC,0x00,0x00,0x00); // ~
     f
 }
+

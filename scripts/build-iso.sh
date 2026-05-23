@@ -49,9 +49,11 @@ if [ -d "$INIT_DIR" ]; then
 
     INIT_BIN="$INIT_DIR/target/$INIT_TARGET/release/init"
     if [ -f "$INIT_BIN" ]; then
-        mkdir -p "$ROOT/initramfs"
+        mkdir -p "$ROOT/initramfs/bin"
+        cp "$INIT_BIN" "$ROOT/initramfs/bin/init"
+        # Copy to /init as a fallback in case launcher build is skipped or fails
         cp "$INIT_BIN" "$ROOT/initramfs/init"
-        echo "[0.5/4] userspace/init staged to initramfs/init ($(wc -c < "$INIT_BIN") bytes)"
+        echo "[0.5/4] userspace/init staged to initramfs/bin/init and /init fallback ($(wc -c < "$INIT_BIN") bytes)"
     fi
 fi
 
@@ -79,30 +81,30 @@ if [ -d "$HELLO_DIR" ]; then
     fi
 fi
 
-# Phase 62: Stage flutter-embedder as /init (PID 1 — real Flutter UI, not the Rust launcher).
-# The flutter-embedder was already built and staged to initramfs/bin/flutter-embedder in Phase 32-A.
-EMBEDDER_AS_INIT="$ROOT/initramfs/bin/flutter-embedder"
-if [ -f "$EMBEDDER_AS_INIT" ]; then
-    cp "$EMBEDDER_AS_INIT" "$ROOT/initramfs/init"
-    echo "[0.7/4] flutter-embedder staged as /init ($(wc -c < "$EMBEDDER_AS_INIT") bytes)"
-else
-    # Fallback: build and copy launcher if embedder not present
-    LAUNCHER_DIR="$ROOT/userspace/launcher"
-    LAUNCHER_TARGET="x86_64-unknown-none"
-    if [ -d "$LAUNCHER_DIR" ]; then
-        (cd "$LAUNCHER_DIR" && \
-            cargo +nightly build \
-                --release \
-                --target "$LAUNCHER_TARGET" \
-                -Z build-std=core,compiler_builtins \
-                -Z build-std-features=compiler-builtins-mem \
-                2>&1) || true
-        LAUNCHER_BIN="$LAUNCHER_DIR/target/$LAUNCHER_TARGET/release/launcher"
-        if [ -f "$LAUNCHER_BIN" ]; then
-            cp "$LAUNCHER_BIN" "$ROOT/initramfs/init"
-            echo "[0.7/4] WARNING: flutter-embedder missing, using Rust launcher as /init fallback"
-        fi
+# Phase 62: Build and stage launcher as the primary /init (PID 1)
+LAUNCHER_DIR="$ROOT/userspace/launcher"
+LAUNCHER_TARGET="x86_64-unknown-none"
+if [ -d "$LAUNCHER_DIR" ]; then
+    echo "[0.7/4] Building userspace/launcher ELF..."
+    (cd "$LAUNCHER_DIR" && \
+        cargo +nightly build \
+            --release \
+            --target "$LAUNCHER_TARGET" \
+            -Z build-std=core,compiler_builtins \
+            -Z build-std-features=compiler-builtins-mem \
+            2>&1) || {
+        echo "[0.7/4] WARNING: userspace/launcher build failed"
+    }
+
+    LAUNCHER_BIN="$LAUNCHER_DIR/target/$LAUNCHER_TARGET/release/launcher"
+    if [ -f "$LAUNCHER_BIN" ]; then
+        cp "$LAUNCHER_BIN" "$ROOT/initramfs/init"
+        echo "[0.7/4] userspace/launcher staged to initramfs/init ($(wc -c < "$LAUNCHER_BIN") bytes)"
+    else
+        echo "[0.7/4] WARNING: userspace/launcher binary not found, keeping fallback /init"
     fi
+else
+    echo "[0.7/4] WARNING: userspace/launcher directory not found, keeping fallback /init"
 fi
 
 # Phase 61: Build stub app (Files, Settings, Editor placeholders).

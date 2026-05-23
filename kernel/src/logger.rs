@@ -52,7 +52,7 @@ pub fn init(fb: Option<&limine::request::FramebufferResponse>) {
         crate::drivers::fb::init(fb_resp);
     }
     log::set_logger(&LOGGER).ok();
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(log::LevelFilter::Trace);
 }
 
 /// Write a raw string to COM1 without going through the log framework.
@@ -124,3 +124,4 @@ impl Write for SerialPort {
     core::arch::asm!("in al, dx", in("dx") port, out("al") val);
     val
 }
+

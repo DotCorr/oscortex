@@ -139,6 +139,8 @@ static FB_COLS:     AtomicU32 = AtomicU32::new(0);
 static FB_ROWS:     AtomicU32 = AtomicU32::new(0);
 /// Set to true once the framebuffer is ready.
 static FB_READY:    AtomicBool = AtomicBool::new(false);
+/// Set to true once framebuffer text logging should be silenced.
+static FB_SILENT:   AtomicBool = AtomicBool::new(false);
 
 /// Text cursor (col, row).
 static CURSOR: Mutex<(u32, u32)> = Mutex::new((0, 0));
@@ -305,9 +307,15 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
 /// `\r` (return to column 0).  All other control characters are skipped.
 pub fn write_str(s: &str) {
     if !FB_READY.load(Ordering::Acquire) { return; }
+    if FB_SILENT.load(Ordering::Relaxed) { return; }
     for b in s.bytes() {
         write_byte(b);
     }
+}
+
+/// Disable framebuffer console text logging (silences write_str).
+pub fn disable_fb_logging() {
+    FB_SILENT.store(true, Ordering::Release);
 }
 
 /// Return whether the framebuffer console is initialised.
@@ -483,6 +491,8 @@ fn write_byte(b: u8) {
 fn blit_char(ch: u8, col: u32, row: u32) {
     let addr     = FB_ADDR    .load(Ordering::Relaxed);
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed);
+    let width    = FB_WIDTH   .load(Ordering::Relaxed);
+    let height   = FB_HEIGHT  .load(Ordering::Relaxed);
 
     let glyph_idx = ch.wrapping_sub(0x20) as usize;
     let glyph = &FONT[glyph_idx];
@@ -490,20 +500,26 @@ fn blit_char(ch: u8, col: u32, row: u32) {
     let px0 = col * CHAR_W;
     let py0 = row * CHAR_H;
 
-    for gy in 0..CHAR_H {
+    let mut gy = 0;
+    while gy < CHAR_H {
         let row_bits = glyph[gy as usize];
-        for gx in 0..CHAR_W {
+        let mut gx = 0;
+        while gx < CHAR_W {
             let color = if (row_bits >> (7 - gx)) & 1 != 0 { FG } else { BG };
             let px = px0 + gx;
             let py = py0 + gy;
-            let offset = (py * pitch_px + px) as usize;
-            // Safety: addr is a Limine-provided virtual framebuffer address;
-            // offset is within bounds because col/row are validated by write_byte.
-            unsafe {
-                let ptr = addr as *mut u32;
-                ptr.add(offset).write_volatile(color);
+            if px < width && py < height {
+                let offset = (py * pitch_px + px) as usize;
+                // Safety: addr is a Limine-provided virtual framebuffer address;
+                // offset is guaranteed within bounds by px < width && py < height.
+                unsafe {
+                    let ptr = addr as *mut u32;
+                    ptr.add(offset).write_volatile(color);
+                }
             }
+            gx += 1;
         }
+        gy += 1;
     }
 }
 

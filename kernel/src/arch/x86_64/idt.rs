@@ -404,6 +404,12 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // after iretq.
     crate::arch::apic::eoi();
 
+    // Call wm::tick() to poll input on vsync boundary even when running userspace threads.
+    let vsync = crate::arch::apic::vsync_due();
+    if vsync {
+        crate::wm::tick();
+    }
+
     if preempted_user {
         let cur_pid = crate::process::current_pid();
         if cur_pid != 0 {
@@ -464,9 +470,8 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // Do NOT call sched::tick() or compositor while a user thread was running —
     // those are reserved for kernel-idle context only.
     crate::sched::tick();
-    if crate::arch::apic::vsync_due() {
+    if vsync {
         crate::compositor::tick();
-        crate::wm::tick();
     }
 }
 

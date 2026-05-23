@@ -1399,7 +1399,7 @@ fn sys_exec(path_ptr: u64, path_len: u64) -> i64 {
     }
 }
 
-/// Phase 47 — SYS_EXEC_WAIT (0x382): spawn a child, block the calling
+/// Phase 47 — SYS_EXEC_WAIT (0x39E): spawn a child, block the calling
 /// process, context-switch to the child immediately, and return the child's
 /// exit code when it calls sys_exit.
 ///
@@ -2532,6 +2532,8 @@ fn sys_fb_map(info_out_ptr: u64) -> i64 {
         dst.add(16).cast::<[u8;4]>().write_unaligned(pitch_bytes.to_le_bytes());
         dst.add(20).cast::<[u8;4]>().write_unaligned(32u32.to_le_bytes());
     }
+    // Disable early boot framebuffer logging during userspace display ownership
+    crate::drivers::fb::disable_fb_logging();
     // Signal compositor that a process now owns the FB directly.
     crate::compositor::set_fb_bypass(true);
     0
@@ -5622,7 +5624,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         eabi::SYS_SURFACE_FULLSCREEN => sys_surface_fullscreen(),
 
         // Phase 47 — exec + blocking wait (cooperative exec round-trip)
-        0x382 => sys_exec_wait(arg0, arg1),
+        0x39E => sys_exec_wait(arg0, arg1),
 
         // Phase 48 — UART 16550 serial console
         0x383 => sys_serial_read(arg0, arg1),
