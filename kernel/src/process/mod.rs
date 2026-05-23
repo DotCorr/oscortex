@@ -46,7 +46,7 @@ pub const USER_ELF_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 /// User stack top (grows downward; bottom = TOP − STACK_SIZE).
 pub const USER_STACK_TOP:  u64  = 0x0000_7FFF_FFFF_0000;
 pub const USER_STACK_SIZE: usize = 64 * 1024; // 64 KiB
-const SYSCALL_STACK_SIZE: usize = 8 * 1024;
+const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const XSTATE_SIZE: usize = 4096;
 
 // ── Process state ─────────────────────────────────────────────────────────────
@@ -131,6 +131,16 @@ pub struct Process {
     /// FS base has not yet been initialised (triggers per-thread bootstrap
     /// on the first syscall from this thread).
     pub fs_base: u64,
+    /// Errno value to deliver into SD_ERRNO (SYSDATA_VA+32) just before this
+    /// thread's next SYSRET.  Written to user memory after the CR3 switch so
+    /// that intermediate thread switches cannot overwrite it.  0 = nothing.
+    pub errno_to_deliver: u32,
+    /// True when this thread was preempted by the APIC timer ISR (not at a
+    /// SYSCALL boundary).  `enter_user_by_pid_noreturn` must use IRETQ (not
+    /// SYSRETQ) to restore all registers — including RCX, R11, and the exact
+    /// RFLAGS — instead of the SYSCALL-convention values.  Cleared whenever
+    /// `save_return_context` is called (syscall-based yield).
+    pub preempted_by_timer: bool,
 }
 
 impl Process {
@@ -158,6 +168,8 @@ impl Process {
             sig_mask:     0,
             sig_handlers: [0u64; 32],
             fs_base:      0,
+            errno_to_deliver: 0,
+            preempted_by_timer: false,
         }
     }
 }
@@ -431,6 +443,66 @@ pub fn restore_xstate(pid: u32) {
     unsafe { crate::arch::cpu::restore_xstate_from(ptr) };
 }
 
+/// Round-robin pick of next Running *user* thread that belongs to the same
+/// address space as `current` (i.e. shares its `parent_pid` group), excluding
+/// `current` itself. Returns `None` if no sibling thread is runnable.
+///
+/// Used to break user-space spin loops where the leader thread (e.g. pid 1)
+/// is busy-calling pthread primitives while its worker threads (Dart UI /
+/// Raster / IO workers) are technically Running but never get CPU time.
+pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
+    let _g = PTABLE_LOCK.lock();
+
+    // Determine the address-space group leader for `current`.
+    let group: u32 = {
+        let c = unsafe { &PTABLE[idx_of(current)] };
+        if c.pid != current { return None; }
+        if c.is_thread && c.parent_pid != 0 { c.parent_pid } else { c.pid }
+    };
+
+    let start = idx_of(current.wrapping_add(1));
+    for off in 0..MAX_PROCS {
+        let idx = (start + off) % MAX_PROCS;
+        let p = unsafe { &PTABLE[idx] };
+        if p.pid == 0 || p.pid == current { continue; }
+        if p.state != ProcState::Running { continue; }
+        // Member of the same address-space group?
+        let p_group = if p.is_thread && p.parent_pid != 0 { p.parent_pid } else { p.pid };
+        if p_group != group { continue; }
+        // Skip the leader itself when picking a sibling.
+        if p.pid == group { continue; }
+        return Some(p.pid);
+    }
+    None
+}
+
+/// Collect every pid that belongs to the same address-space group as
+/// `current` (including `current` itself and the group leader). Returns
+/// an empty Vec if `current` is unknown.
+///
+/// Used by the cond_var bridge to wake all sibling-thread waiters when a
+/// pthread_cond_broadcast on the leader finds zero waiters on the cond's
+/// own futex address (Flutter engine's cond addresses don't match any of
+/// the kernel's hardcoded futex target addresses).
+pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
+    let _g = PTABLE_LOCK.lock();
+    let mut out = alloc::vec::Vec::new();
+    let group: u32 = {
+        let c = unsafe { &PTABLE[idx_of(current)] };
+        if c.pid != current { return out; }
+        if c.is_thread && c.parent_pid != 0 { c.parent_pid } else { c.pid }
+    };
+    for idx in 0..MAX_PROCS {
+        let p = unsafe { &PTABLE[idx] };
+        if p.pid == 0 { continue; }
+        let p_group = if p.is_thread && p.parent_pid != 0 { p.parent_pid } else { p.pid };
+        if p_group == group {
+            out.push(p.pid);
+        }
+    }
+    out
+}
+
 /// Round-robin pick of next runnable process after `current`.
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let _g = PTABLE_LOCK.lock();
@@ -554,6 +626,7 @@ pub fn spawn_thread(
         free_syscall_stack(sys_stack_base);
         return Err("OOM: thread stack");
     }
+    log::warn!("[spawn_thread] alloc stack_va={:#x} pages={}", stack_va, stack_pages);
     let stack_top = stack_va + stack_size as u64;
 
     // Seed the bottom-most stack slot with the address of the internal
@@ -596,6 +669,7 @@ pub fn spawn_thread(
         free_syscall_stack(sys_stack_base);
         return Err("OOM: thread TLS");
     }
+    log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, tls_va, arg);
     unsafe { core::ptr::write_volatile(tls_va as *mut u64, tls_va); }
 
     {
@@ -692,22 +766,22 @@ pub fn schedule_user_launch(pid: u32) {
 
 pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
-         rbx, rbp, r8, r9, r10, r12, r13, r14, r15,
-         syscall_stack_top, fs_base) = {
+         rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
+         syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = {
         let _g = PTABLE_LOCK.lock();
-        let p = unsafe { &PTABLE[idx_of(pid)] };
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
+        let e = p.errno_to_deliver;
+        p.errno_to_deliver = 0; // consume it
+        let pbt = p.preempted_by_timer;
+        p.preempted_by_timer = false; // consume the flag
         (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
          p.regs.rdi, p.regs.rsi, p.regs.rdx,
          p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,
-         p.regs.r12, p.regs.r13, p.regs.r14, p.regs.r15,
-         p.syscall_stack_top, p.fs_base)
+         p.regs.r11, p.regs.r12, p.regs.r13, p.regs.r14, p.regs.r15,
+         p.regs.rcx,
+         p.syscall_stack_top, p.fs_base, e, pbt)
     };
-
-    log::warn!(
-        "[trace] enter_user pid={} rip={:#x} rsp={:#x} rax={:#x} fs={:#x} cr3={:#x}",
-        pid, rip, rsp, rax, fs_base, pml4_phys
-    );
 
     crate::process::set_current_pid(pid);
     crate::arch::syscall::set_active_stack_top(syscall_stack_top);
@@ -730,6 +804,90 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         );
     }
 
+    // Deliver pending errno (e.g. EINTR=4 from sys_epoll_wait_real) NOW,
+    // after the CR3 switch so we write into the resuming thread's own SYSDATA
+    // page.  This avoids the race where an intermediate thread switch
+    // overwrites the shared errno slot before the target thread reads it.
+    if errno_to_deliver != 0 {
+        unsafe {
+            core::ptr::write_volatile(
+                crate::process::posix_trampolines::SD_ERRNO as *mut u32,
+                errno_to_deliver,
+            );
+        }
+    }
+
+    if preempted_by_timer {
+        // ── IRET path ────────────────────────────────────────────────────────
+        // This thread was timer-preempted at an arbitrary user instruction, so
+        // we MUST restore every register (including RCX, R11, and the exact
+        // RFLAGS) before returning.  SYSRETQ is wrong here because it would
+        // set RIP=RCX and RFLAGS=R11, corrupting those registers and losing
+        // the real FLAGS state (e.g. CF/ZF from a cmp instruction).
+        //
+        // Layout of iret_frame (accessed via r11 as base register):
+        //   [r11 + 0x00]  RIP   ─┐
+        //   [r11 + 0x08]  CS      │ hardware IRET frame pushed onto
+        //   [r11 + 0x10]  RFLAGS  │ the kernel stack by the `push` sequence
+        //   [r11 + 0x18]  RSP    ─┘ (ring-3 switch includes RSP+SS)
+        //   [r11 + 0x20]  SS
+        //   [r11 + 0x28]  RAX .. R15  (all user GPRs, r11 loaded last)
+        let iret_frame: [u64; 20] = [
+            /* 0x00 */ rip,
+            /* 0x08 */ crate::arch::gdt::USER_CS as u64,   // 0x2B
+            /* 0x10 */ rflags | 0x200,  // ensure IF=1
+            /* 0x18 */ rsp,
+            /* 0x20 */ crate::arch::gdt::USER_DS as u64,   // 0x23
+            /* 0x28 */ rax,
+            /* 0x30 */ rbx,
+            /* 0x38 */ rcx,   // real RCX (not SYSCALL convention)
+            /* 0x40 */ rdx,
+            /* 0x48 */ rdi,
+            /* 0x50 */ rsi,
+            /* 0x58 */ rbp,
+            /* 0x60 */ r8,
+            /* 0x68 */ r9,
+            /* 0x70 */ r10,
+            /* 0x78 */ r11,   // real R11 (not RFLAGS convention)
+            /* 0x80 */ r12,
+            /* 0x88 */ r13,
+            /* 0x90 */ r14,
+            /* 0x98 */ r15,
+        ];
+        unsafe {
+            core::arch::asm!(
+                // Push the 5-word IRET frame: SS, RSP, RFLAGS, CS, RIP.
+                // These land on the current kernel stack; IRETQ will consume
+                // them and switch to the user stack (RSP) automatically.
+                "push qword ptr [r11 + 0x20]",  // SS
+                "push qword ptr [r11 + 0x18]",  // RSP
+                "push qword ptr [r11 + 0x10]",  // RFLAGS
+                "push qword ptr [r11 + 0x08]",  // CS
+                "push qword ptr [r11 + 0x00]",  // RIP
+                // Restore all user GPRs (r11 last because it is our base ptr).
+                "mov rax, [r11 + 0x28]",
+                "mov rbx, [r11 + 0x30]",
+                "mov rcx, [r11 + 0x38]",
+                "mov rdx, [r11 + 0x40]",
+                "mov rdi, [r11 + 0x48]",
+                "mov rsi, [r11 + 0x50]",
+                "mov rbp, [r11 + 0x58]",
+                "mov r8,  [r11 + 0x60]",
+                "mov r9,  [r11 + 0x68]",
+                "mov r10, [r11 + 0x70]",
+                "mov r12, [r11 + 0x80]",
+                "mov r13, [r11 + 0x88]",
+                "mov r14, [r11 + 0x90]",
+                "mov r15, [r11 + 0x98]",
+                "mov r11, [r11 + 0x78]",   // real R11 — must be last
+                "iretq",
+                in("r11") iret_frame.as_ptr(),
+                options(noreturn),
+            )
+        }
+    }
+
+    // ── SYSRET path (syscall-yield context) ──────────────────────────────────
     // Use SYSRET to enter user mode. This is the native x86_64 user-entry path
     // and mirrors how SYSCALL returns to user code. The full user GPR set is
     // restored so a thread that yielded via a syscall (e.g. futex_wait) sees
@@ -815,6 +973,64 @@ fn user_launch_task() {
 
 // ── Phase 47: parent-blocking helpers ────────────────────────────────────────
 
+/// Called from the APIC timer ISR when `cur_pid`'s user thread is being
+/// preempted.  Saves the full register state in `cur_regs` (captured from the
+/// hardware interrupt frame + hardware-pushed user RSP), marks the thread as
+/// timer-preempted so `enter_user_by_pid_noreturn` uses IRETQ on its next
+/// scheduled run, then finds the next runnable thread and returns its register
+/// set so the ISR can rewrite the interrupt frame.
+///
+/// Returns `None` if there is no other runnable thread (no switch occurs).
+pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs)> {
+    // Find the next runnable thread (acquires/releases PTABLE_LOCK internally).
+    let next_pid = next_runnable_pid(cur_pid)?;
+    if next_pid == cur_pid { return None; }
+
+    // Save the current thread's full context.
+    {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &mut PTABLE[idx_of(cur_pid)] };
+        if p.pid == cur_pid && p.state == ProcState::Running {
+            p.regs = *cur_regs;
+            p.regs.rflags |= 0x200; // ensure IF=1 on resume
+            p.preempted_by_timer = true;
+        }
+    }
+
+    // Save FPU/XSTATE for the outgoing thread.
+    save_xstate(cur_pid);
+
+    // Load the next thread's register context (acquires/releases PTABLE_LOCK).
+    let next_regs = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(next_pid)] };
+        if p.pid != next_pid || p.state != ProcState::Running {
+            // Thread vanished between the two lock windows; abort the switch.
+            // cur_pid's preempted_by_timer=true is harmless (see field docs).
+            return None;
+        }
+        p.regs
+    };
+
+    // Restore FPU/XSTATE for the incoming thread.
+    restore_xstate(next_pid);
+
+    // Update the per-CPU scheduler state.
+    set_current_pid(next_pid);
+
+    // Point the active syscall stack at the new thread's stack so the next
+    // syscall from the new thread uses the right kernel stack.
+    let (stack_top, fs_base) = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(next_pid)] };
+        (p.syscall_stack_top, p.fs_base)
+    };
+    crate::arch::syscall::set_active_stack_top(stack_top);
+    crate::arch::cpu::set_fs_base(fs_base);
+
+    Some((next_pid, next_regs))
+}
+
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
@@ -824,6 +1040,8 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
         p.regs.rip    = rip;
         p.regs.rsp    = rsp;
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
+        // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
+        p.preempted_by_timer = false;
     }
 }
 
@@ -860,11 +1078,72 @@ pub fn set_rax(pid: u32, val: u64) {
     if p.pid == pid { p.regs.rax = val; }
 }
 
+/// Schedule an errno value to be written into SD_ERRNO (SYSDATA_VA+32) for
+/// `pid` immediately after the CR3 switch in `enter_user_by_pid_noreturn`,
+/// before SYSRET.  This avoids the race where an intermediate thread switch
+/// overwrites the shared errno slot before the target thread reads it.
+pub fn set_errno_to_deliver(pid: u32, errno: u32) {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid { p.errno_to_deliver = errno; }
+}
+
+/// Read and clear the pending errno-to-deliver for `pid`.
+/// Used by the timer ISR to deliver errno when resuming a cooperative-yielded
+/// thread via IRETQ (bypassing `enter_user_by_pid_noreturn`).
+pub fn take_errno_to_deliver(pid: u32) -> u32 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid {
+        let e = p.errno_to_deliver;
+        p.errno_to_deliver = 0;
+        e
+    } else {
+        0
+    }
+}
+
+/// Read the saved rax for a pid (for diagnostics).
+pub fn get_saved_rax(pid: u32) -> u64 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid { p.regs.rax } else { 0 }
+}
+
 /// Force a process into the `Blocked` or `Running` state.
 pub fn set_state(pid: u32, state: ProcState) {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid { p.state = state; }
+}
+
+/// Dump a compact scheduler snapshot for the main Flutter bring-up threads.
+/// Used by syscall diagnostics to explain deadlock conditions.
+pub fn debug_dump_core_threads() {
+    let _g = PTABLE_LOCK.lock();
+    for &pid in &[1u32, 5u32, 6u32, 8u32] {
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid != pid {
+            log::warn!("[sched-snapshot] pid={} <absent>", pid);
+            continue;
+        }
+        let state = match p.state {
+            ProcState::Dead => "Dead",
+            ProcState::Running => "Running",
+            ProcState::Blocked => "Blocked",
+            ProcState::Zombie(_) => "Zombie",
+        };
+        log::warn!(
+            "[sched-snapshot] pid={} state={} rip={:#x} rsp={:#x} rax={:#x} cpu_ticks={} slice_left={}",
+            pid,
+            state,
+            p.regs.rip,
+            p.regs.rsp,
+            p.regs.rax,
+            p.cpu_ticks,
+            p.slice_left,
+        );
+    }
 }
 
 /// True if `pid` is currently `Blocked` (i.e. genuinely waiting in

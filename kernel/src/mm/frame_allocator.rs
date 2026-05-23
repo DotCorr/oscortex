@@ -141,3 +141,14 @@ pub fn free_frame(phys: u64) {
 pub fn hhdm_offset() -> u64 {
     HHDM_OFFSET.load(Ordering::Acquire)
 }
+
+/// Return number of frames currently in use.
+pub fn frames_used() -> usize {
+    BITMAP.lock().used
+}
+
+/// Return total usable frames (set at init).
+pub fn frames_total() -> usize {
+    BITMAP.lock().total
+}
+

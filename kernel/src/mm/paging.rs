@@ -347,8 +347,47 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
 
 /// Handle a demand-page fault. Returns `true` if the fault was resolved.
 pub fn demand_page(cr2: u64, error: u64) -> bool {
-    let _ = (cr2, error);
-    false
+    // Only handle user-mode not-present faults (bits: present=0, user=1).
+    // Ignore write-protection violations (bit1=1, bit0=1) and kernel faults.
+    if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
+    if error & 0x4 == 0 { return false; } // kernel mode fault — do not silently map
+
+    // Valid user-space VA range: 0x100000 – canonical limit (below kernel half).
+    // Exclude the trampoline pages at 0x7FFF_E000 (only 2GB mark — but user
+    // space extends to 128TB in x86_64). Reject anything at or above canonical
+    // kernel boundary (0xFFFF_8000_0000_0000) and below 1MB.
+    let page_va = cr2 & !0xFFF;
+    if page_va < 0x10_0000 || page_va >= 0x0000_8000_0000_0000 { return false; }
+    // Exclude the trampoline and sysdata pages.
+    if page_va == 0x7FFF_C000 || page_va == 0x7FFF_E000 || page_va == 0x7FFF_F000 { return false; }
+
+    // Allocate a zero physical frame and map it into the current PML4.
+    let phys = match crate::mm::frame_allocator::alloc_frame() {
+        Some(f) => f,
+        None => {
+            log::error!("[demand_page] OOM: cannot satisfy fault at {:#x}", cr2);
+            return false;
+        }
+    };
+
+    // Zero the frame via HHDM.
+    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+    unsafe { core::ptr::write_bytes(hhdm_va, 0, 4096); }
+
+    // Read current CR3 to get the active PML4.
+    let cr3_phys: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
+    let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
+
+    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE;
+    let _ = flags;
+    if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) } {
+        log::error!("[demand_page] map failed at {:#x}: {}", page_va, e);
+        crate::mm::frame_allocator::free_frame(phys);
+        return false;
+    }
+
+    true
 }
 
 // ── User address space helpers ────────────────────────────────────────────────

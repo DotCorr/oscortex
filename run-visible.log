@@ -10,13 +10,13 @@ vbe: Found matching mode 0x17a, attempting to set...
 vbe: Framebuffer address: 0xfd000000
 edid: Success.
 limine: Loading executable `boot():/boot/kernel`...
-limine: Physical base:   0x10525000
+limine: Physical base:   0x70394000
 limine: Virtual base:    0xffffffff80000000
 limine: Slide:           0x0
-limine: ELF entry point: 0xffffffff800a3160
+limine: ELF entry point: 0xffffffff800c7650
 limine: Base revision:   6
 limine: Requests count:  7
-limine: Top of HHDM:     0x40000000
+limine: Top of HHDM:     0x80000000
 acpi: Found RSDP at 0xf52e0
 limine: Loading module `boot():/boot/libflutter_engine.so`...
 vbe: Initialising...
@@ -33,11 +33,11 @@ vbe: Framebuffer address: 0xfd000000
 edid: Success.
 acpi: Found RSDP at 0xf52e0
 acpi: Found RSDP at 0xf52e0
-acpi: Found "FACP" at 0x1ffe222f
+acpi: Found "FACP" at 0x7ffe222f
 acpi: Found SMBIOS 32-bit entry point at 0xf5300
 paging: 1GiB pages are not supported!
 acpi: Found RSDP at 0xf52e0
-acpi: Found "APIC" at 0x1ffe22a3
+acpi: Found "APIC" at 0x7ffe22a3
 acpi: Found RSDP at 0xf52e0
 acpi: "DMAR" not found
 smp: [xAPIC] Found candidate AP for bring-up. LAPIC ID: 1
@@ -49,7 +49,7 @@ acpi: "DMAR" not found
 acpi: Found RSDP at 0xf52e0
 acpi: "IVRS" not found
 acpi: Found RSDP at 0xf52e0
-acpi: Found "APIC" at 0x1ffe22a3
+acpi: Found "APIC" at 0x7ffe22a3
 
 [OSCORTEX] kernel_main reached
 [OSCORTEX] HHDM offset: 0xffff800000000000
@@ -63,7 +63,7 @@ acpi: Found "APIC" at 0x1ffe22a3
 [ARCH] syscall::init
 [ARCH] early_init complete
 [OSCORTEX] arch::early_init done
-[MM::Paging] Virtual memory manager online (CR3=0x000000001ff85000)
+[MM::Paging] Virtual memory manager online (CR3=0x000000007ff85000)
 [MM::Heap] init base=0xffff800000100000 phys=0x0000000000100000
 [INFO] kernel: Framebuffer: 1280x800 bpp=32 pitch=5120 addr=0xffff8000fd000000
 [INFO] kernel: OSCortex kernel 0.1.0 booting...
@@ -110,8 +110,8 @@ acpi: Found "APIC" at 0x1ffe22a3
 [INFO] kernel::arch::x86_64::smp: [SMP] AP cpu=1 lapic_id=1 online
 [INFO] kernel::sched: [Sched] AP cpu=1 ready, parked (BSP-only scheduler)
 [INFO] kernel::arch::x86_64::smp: [SMP] 2/2 CPU(s) online
-[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=95676 filesz=95676 ro exec
-[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x4175c0 memsz=23039 filesz=23039 ro 
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=95692 filesz=95692 ro exec
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x4175d0 memsz=23063 filesz=23063 ro 
 [DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x41d000 memsz=32 filesz=0 rw 
 [INFO] kernel::process::elf: [ELF] Loaded: entry=0x400000
 [INFO] kernel::process: [Process] Spawned 'init' pid=1 entry=0x400000
@@ -123,387 +123,3 @@ acpi: Found "APIC" at 0x1ffe22a3
 [INFO] kernel::sched: [Sched] spawned 'cortex-bg' pid=2 stack=0xffff800000129df0
 [INFO] kernel::cortex: [Cortex::BG] background worker started — scheduler ALIVE
 [INFO] kernel::process: [Process] launching userspace pid=1 via SYSRET
-[WARN] kernel::process: [trace] enter_user pid=1 rip=0x400000 rsp=0x7ffffffefff8 rax=0x0 fs=0x0 cr3=0x1102000
-[WARN] kernel::syscall: [syscall] bootstrapped FS base pid=1 fs=0x7ffffffefdf0 rsp=0x7ffffffefff0
-![embedder] starting
-[embedder] host_register ok
-[embedder] ENGINE_CANARY_MODE=2 (full engine)
-[embedder] calling dlopen...
-[INFO] kernel::syscall: [dlopen] Serving libflutter_engine.so from Limine module (95866952 bytes)
-[INFO] kernel::process::dl: [dl] rela table sz=1288344 count=53681 applied: REL=53608 _64=1 GLOB=71 JMP=0 other=1 oob=0
-[INFO] kernel::process::dl: [dl] rela table sz=7944 count=331 applied: REL=0 _64=0 GLOB=0 JMP=331 other=0 oob=0
-[INFO] kernel::process::dl: [DL] pid=1 dlopen base=0x1000000 handle=1 exports=98
-[embedder] dlopen OK
-[embedder] running C++ ctors
-[embedder] calling DT_INIT
-[embedder] calling DT_INIT_ARRAY
-[embedder] ctors done
-[embedder] resolving symbols...
-[embedder] dlsym done
-[embedder] using GetProcAddresses path
-[embedder] proctable ready
-[embedder] proctable registered
-[embedder] creating surface...
-[embedder] surface capped to 640x360 for bootstrap
-[embedder/aot] syscall rc=0x0000000000000000
-[embedder/aot] syscall va=0x000000029b000000
-[embedder/aot] syscall sz=0x00000000003443b0
-[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)
-[embedder] JIT snapshot paths installed; engine will open them via file mmap
-[embedder] calling FlutterEngineRun...
-[WARN] kernel::syscall: [stat-trace] nr=0x45d path='/system/flutter/flutter_assets/kernel_blob.bin'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/kernel_blob.bin' → fd=3 (41584416 bytes)
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee110
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee110 size=0x200000
-[INFO] kernel::process: [Process] Thread tid=2 spawned in pid=1 entry=0x29c23e0 tls=0x2c8000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2c4000010 attr=0x7ffffffee110 entry=0x29c23e0 arg=0x2c6000010 stk=0x200000 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee110
-[WARN] kernel::syscall: [futex] yield pid=1 -> pid=2 uaddr=0x7ffffffee180 val=0 rip=0x7fffe39a
-[WARN] kernel::process: [trace] enter_user pid=2 rip=0x29c23e0 rsp=0x2c71ffff8 rax=0x0 fs=0x2c8000000 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x2c9000010 name_ptr=0x2c71fff69
-[WARN] kernel::process: [trace] enter_user pid=1 rip=0x7fffe39a rsp=0x7ffffffee128 rax=0x0 fs=0x7ffffffefdf0 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee110
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee110 size=0x200000
-[INFO] kernel::process: [Process] Thread tid=3 spawned in pid=1 entry=0x29c23e0 tls=0x2da000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2d6000010 attr=0x7ffffffee110 entry=0x29c23e0 arg=0x2d8000010 stk=0x200000 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee110
-[WARN] kernel::syscall: [futex] yield pid=1 -> pid=2 uaddr=0x7ffffffee180 val=0 rip=0x7fffe39a
-[WARN] kernel::process: [trace] enter_user pid=2 rip=0x7fffeefa rsp=0x2c71fff88 rax=0x0 fs=0x2c8000000 cr3=0x1102000
-[WARN] kernel::syscall: [trace] sys_thread_exit pid=2 code=0x0 rip=0x7ffff50a rsp=0x2c7200000
-[ERROR] kernel::syscall: [syscall-trace] last 64 syscall(s):
-[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x35b a0=0x0 a1=0x30 a2=0x0 rip=0x7ffff50a
-[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x3a1 a0=0x2c6000010 a1=0x30 a2=0x0 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x3a1 a0=0x2c5000010 a1=0x70 a2=0x0 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x3d4 a0=0x2ce000010 a1=0x2c71fff50 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3d3 a0=0x2ce000010 a1=0x0 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x3d4 a0=0x2ce000010 a1=0x0 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x3d3 a0=0x2ce000010 a1=0x2ce000010 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x405 a0=0x1 a1=0x2c71fff08 a2=0x1 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe39a
-[ERROR] kernel::syscall: [syscall-trace] #11 nr=0x3dd a0=0x7ffffffee180 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe39a
-[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x3d3 a0=0x7ffffffee1b0 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x3e8 a0=0x7ffffffee110 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe44a
-[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x35a a0=0x2d6000010 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe29a
-[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x3a0 a0=0x30 a1=0x200000 a2=0x7ffffffee3e0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x3e9 a0=0x7ffffffee110 a1=0x200000 a2=0x7ffffffee3e0 rip=0x7fffe45a
-[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x3e7 a0=0x7ffffffee110 a1=0x7ffffffee2a0 a2=0x7ffffffee3e0 rip=0x7fffe43a
-[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x3a0 a0=0x70 a1=0x7ffffffee250 a2=0x7ffffffee3e0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x3a0 a0=0x8 a1=0x7ffffffee1f0 a2=0x7ffffffee3e0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x3a0 a0=0x18 a1=0x7ffffffee1b0 a2=0x4 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #21 nr=0x3e0 a0=0x7ffffffee180 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe3ca
-[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3d4 a0=0x7ffffffee1b0 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x47b a0=0x40 a1=0x2c71fff98 a2=0x1 rip=0x7fffeefa
-[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3d4 a0=0x7ffffffee1b0 a1=0x2cc000010 a2=0x41 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x39d a0=0x7ffffffee180 a1=0x81 a2=0x1 rip=0x7fffe3aa
-[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x3de a0=0x7ffffffee180 a1=0x2cc000010 a2=0x41 rip=0x7fffe3aa
-[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3d3 a0=0x7ffffffee1b0 a1=0x2cc000010 a2=0x41 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x3fd a0=0x36f1c88 a1=0x2c71ffe78 a2=0x41 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x3a0 a0=0x18 a1=0x1 a2=0x41 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #32 nr=0x47a a0=0x40 a1=0x1 a2=0x41 rip=0x7fffeeea
-[ERROR] kernel::syscall: [syscall-trace] #33 nr=0x47f a0=0x1 a1=0x80800 a2=0x0 rip=0x7fffef3a
-[ERROR] kernel::syscall: [syscall-trace] #34 nr=0x478 a0=0x1 a1=0x0 a2=0x0 rip=0x7fffeeca
-[ERROR] kernel::syscall: [syscall-trace] #35 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #36 nr=0x3d4 a0=0x2ce000010 a1=0x0 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #37 nr=0x3d3 a0=0x2ce000010 a1=0x0 a2=0x2cd000010 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #38 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #39 nr=0x3d4 a0=0x2ce000010 a1=0x2d3000010 a2=0x2cb000010 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #40 nr=0x3a0 a0=0x30 a1=0x0 a2=0x2cb000010 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #41 nr=0x3a0 a0=0x80 a1=0x0 a2=0x2cb000010 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #42 nr=0x3a0 a0=0x50 a1=0x2ca000018 a2=0x2cb000010 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #43 nr=0x3d3 a0=0x2ce000010 a1=0x2ca000018 a2=0x2cb000010 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #44 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #45 nr=0x3d4 a0=0x372c708 a1=0x2ca000018 a2=0x2cb000010 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #46 nr=0x3d3 a0=0x372c708 a1=0x2ca000018 a2=0x2cb000010 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #47 nr=0x3a0 a0=0x4 a1=0x2ca000018 a2=0x2cb000010 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #48 nr=0x3a0 a0=0x18 a1=0x2ca000018 a2=0x36f3e00 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #49 nr=0x3fd a0=0x36f1c88 a1=0x2ca000018 a2=0x36f3e00 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #50 nr=0x3fd a0=0x36f1c88 a1=0x372c740 a2=0x0 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #51 nr=0x3a0 a0=0x50 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #52 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #53 nr=0x3d4 a0=0x372c708 a1=0x372c740 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #54 nr=0xba a0=0x372c740 a1=0x0 a2=0x7fffe2fa rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #55 nr=0x411 a0=0xba a1=0x372c740 a2=0x0 rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #56 nr=0x3d3 a0=0x372c708 a1=0x372c740 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #57 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #58 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #59 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #60 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a
-[ERROR] kernel::syscall: [syscall-trace] #61 nr=0x3fd a0=0x36f1c88 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #62 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #63 nr=0x3d4 a0=0x372c708 a1=0x372c730 a2=0x36f3e00 rip=0x7fffe30a
-[INFO] kernel::process: [Process] pid=2 exited with code 0
-[WARN] kernel::syscall: [trace] sys_exit: pid=2 → parent ppid=1 left untouched (zombie pending)
-[WARN] kernel::syscall: [trace] sys_exit: pid=2 no parent — falling through to scheduler
-[WARN] kernel::process: [trace] enter_user pid=3 rip=0x29c23e0 rsp=0x2d91ffff8 rax=0x0 fs=0x2da000000 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x2db000010 name_ptr=0x2d91fff69
-[WARN] kernel::process: [trace] enter_user pid=1 rip=0x7fffe39a rsp=0x7ffffffee128 rax=0x0 fs=0x7ffffffefdf0 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffee110
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffee110 size=0x200000
-[INFO] kernel::process: [Process] Thread tid=4 spawned in pid=1 entry=0x29c23e0 tls=0x2e9000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x2e5000010 attr=0x7ffffffee110 entry=0x29c23e0 arg=0x2e7000010 stk=0x200000 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x29c23e0 bytes=[53, 48, 89, fb, 48, 8b, 7f, 20, 48, 85, ff, 74, 37, 48, 8b, 07, ff, 50, 30, 48, 8b, 7b, 20, 48, 39, df, 74, 0c, b8, 28, 00, 00]
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffee110
-[WARN] kernel::syscall: [futex] yield pid=1 -> pid=3 uaddr=0x7ffffffee180 val=0 rip=0x7fffe39a
-[WARN] kernel::process: [trace] enter_user pid=3 rip=0x7fffeefa rsp=0x2d91fff88 rax=0x0 fs=0x2da000000 cr3=0x1102000
-[WARN] kernel::syscall: [trace] sys_thread_exit pid=3 code=0x0 rip=0x7ffff50a rsp=0x2d9200000
-[ERROR] kernel::syscall: [syscall-trace] last 64 syscall(s):
-[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x35b a0=0x0 a1=0x30 a2=0x1 rip=0x7ffff50a
-[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x3a1 a0=0x2d8000010 a1=0x30 a2=0x1 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x3a1 a0=0x2d7000010 a1=0x70 a2=0x1 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x3d4 a0=0x2ce000010 a1=0x2d91fff50 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3d3 a0=0x2ce000010 a1=0x1 a2=0x1 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x3d4 a0=0x2ce000010 a1=0x1 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x3d3 a0=0x2ce000010 a1=0x2ce000010 a2=0x1 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x405 a0=0x1 a1=0x2d91fff08 a2=0x1 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe39a
-[ERROR] kernel::syscall: [syscall-trace] #11 nr=0x3dd a0=0x7ffffffee180 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe39a
-[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x3d3 a0=0x7ffffffee1b0 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x3e8 a0=0x7ffffffee110 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe44a
-[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x35a a0=0x2e5000010 a1=0x7ffffffee110 a2=0x29c23e0 rip=0x7fffe29a
-[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x3a0 a0=0x30 a1=0x200000 a2=0x7ffffffee3b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x3e9 a0=0x7ffffffee110 a1=0x200000 a2=0x7ffffffee3b0 rip=0x7fffe45a
-[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x3e7 a0=0x7ffffffee110 a1=0x7ffffffee2a0 a2=0x7ffffffee3b0 rip=0x7fffe43a
-[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x3a0 a0=0x70 a1=0x7ffffffee250 a2=0x7ffffffee3b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x3a0 a0=0x8 a1=0x7ffffffee1f0 a2=0x7ffffffee3b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x3a0 a0=0x18 a1=0x7ffffffee1b0 a2=0x8 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #21 nr=0x3e0 a0=0x7ffffffee180 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe3ca
-[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3d4 a0=0x7ffffffee1b0 a1=0x7ffffffee1b0 a2=0x29c23e0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x47b a0=0x42 a1=0x2d91fff98 a2=0x1 rip=0x7fffeefa
-[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3d4 a0=0x7ffffffee1b0 a1=0x2de000010 a2=0x43 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x39d a0=0x7ffffffee180 a1=0x81 a2=0x1 rip=0x7fffe3aa
-[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x3de a0=0x7ffffffee180 a1=0x2de000010 a2=0x43 rip=0x7fffe3aa
-[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3d3 a0=0x7ffffffee1b0 a1=0x2de000010 a2=0x43 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x3fd a0=0x36f1c88 a1=0x2d91ffe78 a2=0x43 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x3a0 a0=0x18 a1=0x1 a2=0x43 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #32 nr=0x47a a0=0x42 a1=0x1 a2=0x43 rip=0x7fffeeea
-[ERROR] kernel::syscall: [syscall-trace] #33 nr=0x47f a0=0x1 a1=0x80800 a2=0x1 rip=0x7fffef3a
-[ERROR] kernel::syscall: [syscall-trace] #34 nr=0x478 a0=0x1 a1=0x1 a2=0x1 rip=0x7fffeeca
-[ERROR] kernel::syscall: [syscall-trace] #35 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #36 nr=0x3d4 a0=0x2ce000010 a1=0x1 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #37 nr=0x3d3 a0=0x2ce000010 a1=0x1 a2=0x2df000010 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #38 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #39 nr=0x3d4 a0=0x2ce000010 a1=0x2e2000010 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #40 nr=0x3a0 a0=0x30 a1=0x1 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #41 nr=0x3a0 a0=0x80 a1=0x0 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #42 nr=0x3a0 a0=0x50 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #43 nr=0x3d3 a0=0x2ce000010 a1=0x372c740 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #44 nr=0x3a0 a0=0x30 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #45 nr=0x3a0 a0=0x10 a1=0x372c740 a2=0x0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #46 nr=0x3a0 a0=0x18 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #47 nr=0x3da a0=0x1 a1=0x372c740 a2=0x36f3e00 rip=0x7fffe36a
-[ERROR] kernel::syscall: [syscall-trace] #48 nr=0x3fd a0=0x36f1c88 a1=0x2dc000008 a2=0x36f3e00 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #49 nr=0x3fd a0=0x36f1c88 a1=0x2d91fff69 a2=0xf rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #50 nr=0x3f4 a0=0x2db000010 a1=0x2d91fff69 a2=0xf rip=0x7fffe50a
-[ERROR] kernel::syscall: [syscall-trace] #51 nr=0x3b3 a0=0x2d91fff69 a1=0x2d7000061 a2=0xf rip=0x7fffe0ca
-[ERROR] kernel::syscall: [syscall-trace] #52 nr=0x3d1 a0=0x2d7000060 a1=0x2d7000060 a2=0x0 rip=0x7fffe2da
-[ERROR] kernel::syscall: [syscall-trace] #53 nr=0x35b a0=0x0 a1=0x30 a2=0x0 rip=0x7ffff50a
-[ERROR] kernel::syscall: [syscall-trace] #54 nr=0x3a1 a0=0x2c6000010 a1=0x30 a2=0x0 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #55 nr=0x3a1 a0=0x2c5000010 a1=0x70 a2=0x0 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #56 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #57 nr=0x3d4 a0=0x2ce000010 a1=0x2c71fff50 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #58 nr=0x3d3 a0=0x2ce000010 a1=0x0 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #59 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #60 nr=0x3d4 a0=0x2ce000010 a1=0x0 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #61 nr=0x3d3 a0=0x2ce000010 a1=0x2ce000010 a2=0x0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #62 nr=0x405 a0=0x1 a1=0x2c71fff08 a2=0x1 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #63 nr=0x39d a0=0x7ffffffee1b0 a1=0x81 a2=0x1 rip=0x7fffe39a
-[INFO] kernel::process: [Process] pid=3 exited with code 0
-[WARN] kernel::syscall: [trace] sys_exit: pid=3 → parent ppid=1 left untouched (zombie pending)
-[WARN] kernel::syscall: [trace] sys_exit: pid=3 no parent — falling through to scheduler
-[WARN] kernel::process: [trace] enter_user pid=4 rip=0x29c23e0 rsp=0x2e81ffff8 rax=0x0 fs=0x2e9000000 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x2ea000010 name_ptr=0x2e81fff69
-[WARN] kernel::process: [trace] enter_user pid=1 rip=0x7fffe39a rsp=0x7ffffffee128 rax=0x0 fs=0x7ffffffefdf0 cr3=0x1102000
-[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets' → fd=3 (dir)
-[WARN] kernel::syscall: [stat-trace] nr=0x101 path='kernel_blob.bin'
-[DEBUG] kernel::syscall: [openat] dirfd=3 rel='kernel_blob.bin' → '/system/flutter/flutter_assets/kernel_blob.bin'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/kernel_blob.bin' → fd=4 (41584416 bytes)
-[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0x27a8720 → va=0x301000000 (41584416 copied)
-[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/icudtl.dat'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/icudtl.dat' → fd=4 (862304 bytes)
-[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0xd2860 → va=0x317000000 (862304 copied)
-[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets/vm_snapshot_data'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/vm_snapshot_data' → fd=4 (15011 bytes)
-[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0x3aa3 → va=0x31b000000 (15011 copied)
-[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets/isolate_snapshot_data'
-[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/isolate_snapshot_data' → fd=4 (11028680 bytes)
-[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0xa848c8 → va=0x324000000 (11028680 copied)
-[INFO] kernel::process: [Process] Thread tid=5 spawned in pid=1 entry=0x29b9080 tls=0x33b000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x336000010 attr=0x0 entry=0x29b9080 arg=0x339000010 stk=0x0 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x29b9080 bytes=[41, 57, 41, 56, 41, 54, 53, 48, 83, ec, 38, 48, 89, fb, e8, 6d, c0, ff, ff, 48, 8b, 33, 48, c7, 03, 00, 00, 00, 00, 8b, 38, e8]
-[INFO] kernel::process: [Process] Thread tid=6 spawned in pid=1 entry=0x29b9080 tls=0x341000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x33c000018 attr=0x0 entry=0x29b9080 arg=0x33f000010 stk=0x0 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x29b9080 bytes=[41, 57, 41, 56, 41, 54, 53, 48, 83, ec, 38, 48, 89, fb, e8, 6d, c0, ff, ff, 48, 8b, 33, 48, c7, 03, 00, 00, 00, 00, 8b, 38, e8]
-[DEBUG] kernel::syscall: [pipe2] read_fd=4 write_fd=5 pipe_id=0 flags=0x80000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffed8f0
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setdetachstate attr=0x7ffffffed8f0 state=1
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffed8f0 size=0x100000
-[INFO] kernel::process: [Process] Thread tid=7 spawned in pid=1 entry=0x323bb20 tls=0x361000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x7ffffffed8e8 attr=0x7ffffffed8f0 entry=0x323bb20 arg=0x35f000010 stk=0x100000 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x323bb20 bytes=[41, 57, 41, 56, 41, 54, 53, 48, 83, ec, 18, 64, 48, 8b, 04, 25, 28, 00, 00, 00, 48, 89, 44, 24, 10, 48, 8b, 1f, 4c, 8b, 67, 08]
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffed8f0
-[ERROR] kernel::syscall::posix: [trace] pthread_attr/sched noop nr=0x3f5 a0=0x373000010 a1=0x374000010 a2=0x10
-[ERROR] kernel::syscall::posix: [trace] pthread_attr/sched noop nr=0x3f6 a0=0x373000010 a1=0x7ffffffed548 a2=0x10
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_getstack attr=0x7ffffffed548
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffed548
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_init attr=0x7ffffffed760
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_setstacksize attr=0x7ffffffed760 size=0x100000
-[INFO] kernel::process: [Process] Thread tid=8 spawned in pid=1 entry=0x338ed10 tls=0x454000000
-[ERROR] kernel::syscall: [trace] sys_thread_create POSIX out=0x7ffffffed758 attr=0x7ffffffed760 entry=0x338ed10 arg=0x452000010 stk=0x100000 -> 0
-[WARN] kernel::syscall: [trace] start_routine@0x338ed10 bytes=[41, 57, 41, 56, 41, 54, 53, 48, 81, ec, 98, 00, 00, 00, 64, 48, 8b, 04, 25, 28, 00, 00, 00, 48, 89, 84, 24, 90, 00, 00, 00, 31]
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_attr_destroy attr=0x7ffffffed760
-[ERROR] kernel::syscall::posix: [sys_abort] pid=1 aborting — dumping recent syscalls:
-[ERROR] kernel::syscall: [syscall-trace] last 32 syscall(s):
-[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x400 a0=0x493000010 a1=0x60 a2=0x59 rip=0x7fffe5aa
-[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x3a1 a0=0x493000010 a1=0x60 a2=0x59 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x3b1 a0=0x494000028 a1=0x493000010 a2=0x59 rip=0x7fffe0aa
-[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x3a0 a0=0x71 a1=0x7ffffffec4a0 a2=0x4 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x3b0 a0=0x493000010 a1=0x7ffffffec4a0 a2=0x4 rip=0x7fffe09a
-[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3a0 a0=0x60 a1=0x36f3e10 a2=0x4 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x3d4 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x3d3 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x3d4 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #11 nr=0xba a0=0x7ffffffec6c0 a1=0x17979d00851044cd a2=0x7fffe2fa rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x411 a0=0xba a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x3d3 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x405 a0=0x1 a1=0x7ffffffec4e8 a2=0x0 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x3d4 a0=0x2ce000010 a1=0x1 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x3d3 a0=0x2ce000010 a1=0x1 a2=0x3 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x3d4 a0=0x2ce000010 a1=0x3 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x3d3 a0=0x2ce000010 a1=0x3 a2=0x1 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #21 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x17979d00850af185 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x17979d00850af185 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3a0 a0=0x10 a1=0x466000058 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x3a0 a0=0x20 a1=0x466000058 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x39d a0=0x490000028 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3d4 a0=0x490000028 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x3d3 a0=0x490000028 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x3a0 a0=0x78 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3a1 a0=0x48f000010 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x405 a0=0x1 a1=0x7ffffffec4e8 a2=0x0 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [event-state] timerfd_table: 5 entries (now=10059307666ns)
-[ERROR] kernel::syscall: [event-state]   tfd=65 deadline=0ns (+0ns from now) period=0ns
-[ERROR] kernel::syscall: [event-state]   tfd=67 deadline=0ns (+0ns from now) period=0ns
-[ERROR] kernel::syscall: [event-state]   tfd=69 deadline=0ns (+0ns from now) period=0ns
-[ERROR] kernel::syscall: [event-state]   tfd=71 deadline=0ns (+0ns from now) period=0ns
-[ERROR] kernel::syscall: [event-state]   tfd=73 deadline=0ns (+0ns from now) period=0ns
-[ERROR] kernel::syscall: [event-state] epoll_table: 5 epfd(s)
-[ERROR] kernel::syscall: [event-state]   epfd=64 watching 1 fd(s):
-[ERROR] kernel::syscall: [event-state]     fd=65 events=0x1 data=0x41
-[ERROR] kernel::syscall: [event-state]   epfd=66 watching 1 fd(s):
-[ERROR] kernel::syscall: [event-state]     fd=67 events=0x1 data=0x43
-[ERROR] kernel::syscall: [event-state]   epfd=68 watching 1 fd(s):
-[ERROR] kernel::syscall: [event-state]     fd=69 events=0x1 data=0x45
-[ERROR] kernel::syscall: [event-state]   epfd=70 watching 1 fd(s):
-[ERROR] kernel::syscall: [event-state]     fd=71 events=0x1 data=0x47
-[ERROR] kernel::syscall: [event-state]   epfd=72 watching 2 fd(s):
-[ERROR] kernel::syscall: [event-state]     fd=4 events=0x1 data=0x0
-[ERROR] kernel::syscall: [event-state]     fd=73 events=0x1 data=0x49
-[ERROR] kernel::syscall: [backtrace] user_rip=0x7fffe5aa (flutter+0x7effe5aa) user_rsp=0x7ffffffec4c8 user_rbp=0x490000010
-[ERROR] kernel::syscall: [backtrace]   stk+0x0000 = 0x31a8229 (flutter+0x21a8229)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0010 = 0x366f0f0 (flutter+0x266f0f0)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0028 = 0x36f3e10 (flutter+0x26f3e10)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0040 = 0x31b5677 (flutter+0x21b5677)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0060 = 0x31a7137 (flutter+0x21a7137)
-[ERROR] kernel::syscall: [backtrace]   stk+0x01b8 = 0x366e170 (flutter+0x266e170)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0208 = 0x1156a5b (flutter+0x156a5b)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0280 = 0x29bc069 (flutter+0x19bc069)
-[ERROR] kernel::syscall: [backtrace]   stk+0x02e8 = 0x1156a5b (flutter+0x156a5b)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0350 = 0x31b7214 (flutter+0x21b7214)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0390 = 0x31b7172 (flutter+0x21b7172)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0400 = 0x31a6959 (flutter+0x21a6959)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0480 = 0x351a200 (flutter+0x251a200)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0600 = 0x34600da (flutter+0x24600da)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0608 = 0x366dd38 (flutter+0x266dd38)
-[ERROR] kernel::syscall: [backtrace]   stk+0x0660 = 0x34049df (flutter+0x24049df)
-[INFO] kernel::process: [Process] pid=1 exited with code -6
-[WARN] kernel::syscall: [trace] sys_exit: pid=1 no parent — falling through to scheduler
-[WARN] kernel::process: [trace] enter_user pid=4 rip=0x7fffeefa rsp=0x2e81fff88 rax=0x0 fs=0x2e9000000 cr3=0x1102000
-[WARN] kernel::syscall: [trace] sys_thread_exit pid=4 code=0x0 rip=0x7ffff50a rsp=0x2e8200000
-[ERROR] kernel::syscall: [syscall-trace] last 64 syscall(s):
-[ERROR] kernel::syscall: [syscall-trace] #00 nr=0x35b a0=0x0 a1=0x30 a2=0x2 rip=0x7ffff50a
-[ERROR] kernel::syscall: [syscall-trace] #01 nr=0x3a1 a0=0x2e7000010 a1=0x30 a2=0x2 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #02 nr=0x3a1 a0=0x2e6000010 a1=0x70 a2=0x2 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #03 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #04 nr=0x3d4 a0=0x2ce000010 a1=0x2e81fff50 a2=0x2 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #05 nr=0x3d3 a0=0x2ce000010 a1=0x2 a2=0x2 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #06 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #07 nr=0x3d4 a0=0x2ce000010 a1=0x2 a2=0x2 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #08 nr=0x3d3 a0=0x2ce000010 a1=0x2ce000010 a2=0x2 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #09 nr=0x405 a0=0x1 a1=0x2e81ffef8 a2=0x1 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #10 nr=0x400 a0=0x493000010 a1=0x60 a2=0x59 rip=0x7fffe5aa
-[ERROR] kernel::syscall: [syscall-trace] #11 nr=0x3a1 a0=0x493000010 a1=0x60 a2=0x59 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #12 nr=0x3b1 a0=0x494000028 a1=0x493000010 a2=0x59 rip=0x7fffe0aa
-[ERROR] kernel::syscall: [syscall-trace] #13 nr=0x3a0 a0=0x71 a1=0x7ffffffec4a0 a2=0x4 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #14 nr=0x3b0 a0=0x493000010 a1=0x7ffffffec4a0 a2=0x4 rip=0x7fffe09a
-[ERROR] kernel::syscall: [syscall-trace] #15 nr=0x3a0 a0=0x60 a1=0x36f3e10 a2=0x4 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #16 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #17 nr=0x3d4 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #18 nr=0x3d3 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #19 nr=0x39d a0=0x372c708 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #20 nr=0x3d4 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #21 nr=0xba a0=0x7ffffffec6c0 a1=0x17979d00851044cd a2=0x7fffe2fa rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #22 nr=0x411 a0=0xba a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe71a
-[ERROR] kernel::syscall: [syscall-trace] #23 nr=0x3d3 a0=0x372c708 a1=0x7ffffffec6c0 a2=0x17979d00851044cd rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #24 nr=0x405 a0=0x1 a1=0x7ffffffec4e8 a2=0x0 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #25 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #26 nr=0x3d4 a0=0x2ce000010 a1=0x1 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #27 nr=0x3d3 a0=0x2ce000010 a1=0x1 a2=0x3 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #28 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #29 nr=0x3d4 a0=0x2ce000010 a1=0x3 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #30 nr=0x3d3 a0=0x2ce000010 a1=0x3 a2=0x1 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #31 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x17979d00850af185 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #32 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x17979d00850af185 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #33 nr=0x3a0 a0=0x10 a1=0x466000058 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #34 nr=0x3a0 a0=0x20 a1=0x466000058 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #35 nr=0x39d a0=0x490000028 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #36 nr=0x3d4 a0=0x490000028 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #37 nr=0x3d3 a0=0x490000028 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #38 nr=0x3a0 a0=0x78 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #39 nr=0x3a1 a0=0x48f000010 a1=0x70 a2=0x17979d00850af185 rip=0x7fffe01a
-[ERROR] kernel::syscall: [syscall-trace] #40 nr=0x405 a0=0x1 a1=0x7ffffffec4e8 a2=0x0 rip=0x7fffe63a
-[ERROR] kernel::syscall: [syscall-trace] #41 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #42 nr=0x3d4 a0=0x2ce000010 a1=0x1 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #43 nr=0x3d3 a0=0x2ce000010 a1=0x1 a2=0x3 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #44 nr=0x39d a0=0x2ce000010 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #45 nr=0x3d4 a0=0x2ce000010 a1=0x3 a2=0x0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #46 nr=0x3d3 a0=0x2ce000010 a1=0x3 a2=0x1 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #47 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x7ffffffec2b0 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #48 nr=0x3fd a0=0x36f1c88 a1=0x7ffffffec6c0 a2=0x7ffffffec2b0 rip=0x7fffe59a
-[ERROR] kernel::syscall: [syscall-trace] #49 nr=0x3a0 a0=0x70 a1=0x7ffffffec680 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #50 nr=0x3a0 a0=0x60 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #51 nr=0x39d a0=0x48d000028 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #52 nr=0x3d4 a0=0x48d000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #53 nr=0x3d3 a0=0x48d000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #54 nr=0x3a0 a0=0x88 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #55 nr=0x39d a0=0x48c000028 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #56 nr=0x3d4 a0=0x48c000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #57 nr=0x3d3 a0=0x48c000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #58 nr=0x3a0 a0=0x90 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #59 nr=0x39d a0=0x48b000028 a1=0x81 a2=0x1 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #60 nr=0x3d4 a0=0x48b000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe30a
-[ERROR] kernel::syscall: [syscall-trace] #61 nr=0x3d3 a0=0x48b000028 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe2fa
-[ERROR] kernel::syscall: [syscall-trace] #62 nr=0x3a0 a0=0x80 a1=0x486000010 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[ERROR] kernel::syscall: [syscall-trace] #63 nr=0x3a0 a0=0x20 a1=0x46e000080 a2=0x7ffffffec2b0 rip=0x7fffe00a
-[INFO] kernel::process: [Process] pid=4 exited with code 0
-[WARN] kernel::syscall: [trace] sys_exit: pid=4 → parent ppid=1 left untouched (zombie pending)
-[WARN] kernel::syscall: [trace] sys_exit: pid=4 no parent — falling through to scheduler
-[WARN] kernel::process: [trace] enter_user pid=5 rip=0x29b9080 rsp=0x33a00fff8 rax=0x0 fs=0x33b000000 cr3=0x1102000
-[ERROR] kernel::syscall::posix: [trace] sys_pthread_setname_np thread=0x495000010 name_ptr=0x33a00ff59
-[WARN] kernel::syscall: [futex] yield pid=5 -> pid=6 uaddr=0x335000070 val=1 rip=0x7fffe39a
-[WARN] kernel::process: [trace] enter_user pid=6 rip=0x29b9080 rsp=0x34000fff8 rax=0x0 fs=0x341000000 cr3=0x1102000

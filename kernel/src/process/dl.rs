@@ -594,6 +594,149 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         h
     };
 
+    // ── Runtime patch: libflutter_engine.so ──────────────────────────────
+    // Identified by ELF size > 50 MiB (the engine is ~91 MiB; no other
+    // library we load comes close).
+    if elf_bytes.len() > 50 * 1024 * 1024 {
+        // Helper: write N bytes at a virtual address via HHDM.
+        let mut write_va = |va: u64, data: &[u8]| -> bool {
+            match crate::mm::paging::translate_user_page(pml4_phys, va) {
+                Some(page_phys) => {
+                    let off  = (va & 0xFFF) as usize;
+                    let hhdm = crate::mm::frame_allocator::hhdm_offset();
+                    let ptr  = (page_phys + hhdm + off as u64) as *mut u8;
+                    unsafe {
+                        for (i, &b) in data.iter().enumerate() {
+                            ptr.add(i).write_volatile(b);
+                        }
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+
+        // Patch 1: EmbedderTaskRunner::RunsTasksOnCurrentThread (nm 0x197b8a0)
+        //   B0 01 C3  →  mov al, 1; ret  (always return true)
+        // Patching this covers the EmbedderTaskRunner vtable path.
+        {
+            const NM: u64 = 0x197b8a0;
+            let va = load_base + NM;
+            if write_va(va, &[0xB0, 0x01, 0xC3]) {
+                log::info!("[DL] Patch1 RunsTasksOnCurrentThread @ {:#x} → mov al,1; ret", va);
+            } else {
+                log::warn!("[DL] Patch1 FAILED: translate @ {:#x}", va);
+            }
+        }
+
+        // Patch 2: ~promise<RuntimeStageBackend> (nm 0x21a81b0)
+        //   C3  →  ret  (suppress broken_promise abort)
+        // The promise destructor calls std::terminate when the promise was
+        // never satisfied.  Silencing it lets CreateShellOnPlatformThread
+        // continue even when the raster-runner task is posted rather than
+        // executed inline.
+        {
+            const NM: u64 = 0x21a81b0;
+            let va = load_base + NM;
+            if write_va(va, &[0xC3]) {
+                log::info!("[DL] Patch2 ~promise<RTB>        @ {:#x} → ret", va);
+            } else {
+                log::warn!("[DL] Patch2 FAILED: translate @ {:#x}", va);
+            }
+        }
+
+        // Patch 3: fml::TaskRunner::RunNowOrPostTask (nm 0x19bfd00)
+        //   Find the `84 C0  74 16` pair (test al,al ; je +0x16) after the
+        //   RunsTasksOnCurrentThread vtable call. Replace ALL FOUR bytes
+        //   with 4×nop so the post-branch is unconditionally skipped and
+        //   the lambda runs inline on the calling thread.
+        //
+        //   The earlier 2-byte patch (test → mov al,1) was BROKEN because
+        //   `mov al,1` does not modify EFLAGS — the following `je` then
+        //   branched on stale flags from the prior callq, producing
+        //   non-deterministic behaviour. NOPping the entire test+je is
+        //   correct and idempotent.
+        {
+            const NM: u64 = 0x19bfd00;
+            let va   = load_base + NM;
+            let hhdm = crate::mm::frame_allocator::hhdm_offset();
+            let mut patched3 = false;
+            'scan: for byte_off in 0u64..128 {
+                let scan_va = va + byte_off;
+                let mut buf = [0u8; 4];
+                let mut ok  = true;
+                for i in 0..4u64 {
+                    match crate::mm::paging::translate_user_page(pml4_phys, scan_va + i) {
+                        Some(pp) => {
+                            let off = ((scan_va + i) & 0xFFF) as usize;
+                            buf[i as usize] = unsafe { *((pp + hhdm + off as u64) as *const u8) };
+                        }
+                        None => { ok = false; break; }
+                    }
+                }
+                if !ok { continue; }
+                // Match: 84 C0 74 16  (test al,al ; je +0x16)
+                if buf[0] == 0x84 && buf[1] == 0xC0 && buf[2] == 0x74 && buf[3] == 0x16 {
+                    if write_va(scan_va, &[0x90, 0x90, 0x90, 0x90]) {
+                        log::info!(
+                            "[DL] Patch3 RunNowOrPostTask `test;je` @ {:#x}+{} → 4×nop (force inline)",
+                            va, byte_off
+                        );
+                        patched3 = true;
+                    }
+                    break 'scan;
+                }
+            }
+            if !patched3 {
+                log::warn!("[DL] Patch3 RunNowOrPostTask: `test al,al ; je +16` not found in first 128 bytes @ {:#x}", va);
+            }
+        }
+
+        // Patch 4: NOP the single `call AutoResetWaitableEvent::Wait` inside
+        // Shell::Create at file offset 0x21a6999 (verified by objdump).
+        //
+        //   e8 02 91 81 ff   →   90 90 90 90 90   (5-byte NOP slide)
+        //
+        // Rationale: Shell::Create posts CreateShellOnPlatformThread to the
+        // platform task runner via RunNowOrPostTask, then calls latch.Wait().
+        // With Patch3 making RunNowOrPostTask run inline on the caller's
+        // thread, the posted lambda — and its Signal() — execute BEFORE the
+        // following Wait(). The latch is therefore already signaled, and
+        // Wait() should return immediately. But our cond_var path can lose
+        // that early Signal (the wait pre-records `seq` and futex_wait sees
+        // unchanged seq → blocks).  NOPping the call removes the spurious
+        // park entirely. Targeted to this one call site only — leaves the
+        // global Wait function intact so worker threads that legitimately
+        // need to block still can.
+        {
+            const CALL_VA: u64 = 0x21a6999;
+            let va = load_base + CALL_VA;
+            // Verify the bytes before overwriting (safety guard).
+            let hhdm = crate::mm::frame_allocator::hhdm_offset();
+            let mut matches = true;
+            const EXPECTED: [u8; 5] = [0xE8, 0x02, 0x91, 0x81, 0xFF];
+            for i in 0..5 {
+                if let Some(pp) = crate::mm::paging::translate_user_page(pml4_phys, va + i) {
+                    let off = ((va + i) & 0xFFF) as usize;
+                    let b = unsafe { *((pp + hhdm + off as u64) as *const u8) };
+                    if b != EXPECTED[i as usize] { matches = false; break; }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                if write_va(va, &[0x90, 0x90, 0x90, 0x90, 0x90]) {
+                    log::info!("[DL] Patch4 Shell::Create latch.Wait()  @ {:#x} → 5×nop", va);
+                } else {
+                    log::warn!("[DL] Patch4 FAILED: translate @ {:#x}", va);
+                }
+            } else {
+                log::warn!("[DL] Patch4 SKIPPED: bytes @ {:#x} do not match expected call insn", va);
+            }
+        }
+    }
+
     log::info!("[DL] pid={} dlopen base={:#x} handle={} exports={}", pid, load_base, handle, export_count);
     Ok(handle)
 }
@@ -680,7 +823,29 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
             LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
         }
     } else {
-        LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
+        // Bump-allocate, but skip over any already-mapped ranges. This
+        // prevents the TLS/stack allocator from clobbering a region that
+        // was previously mmap'd by userspace (e.g. a Dart heap chunk that
+        // sits at the same VA the bump cursor would return next).
+        let mut candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
+        for _ in 0..64 {
+            let mut clear = true;
+            for p in 0..pages {
+                let v = candidate + (p * 4096) as u64;
+                if paging::translate_user_page(pml4_phys, v).is_some() {
+                    if v >= 0x33b000000 && v < 0x33e000000 {
+                        log::warn!("[mmap_anon] collision detected at {:#x} for candidate {:#x}", v, candidate);
+                    }
+                    clear = false;
+                    break;
+                }
+            }
+            if clear { break; }
+            log::warn!("[mmap_anon] bump candidate {:#x} pages={} conflicts; advancing",
+                candidate, pages);
+            candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
+        }
+        candidate
     };
 
     for p in 0..pages {

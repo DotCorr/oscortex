@@ -267,3 +267,4 @@ pub fn schedule() {
     // by a prior context_switch.  Called with IF=0 (inside ISR or idle halt).
     unsafe { crate::arch::context_switch(old_sp_ptr, new_sp_val); }
 }
+

@@ -715,9 +715,10 @@ fn map_sysdata_page(pml4_phys: u64) -> Result<(), &'static str> {
         page[o..o + 4].copy_from_slice(&vb);
     }
 
-    // Map as read-only (data page, not executable).
+    // Map as read-write (data page, not executable). errno and other mutable
+    // fields (SD_ERRNO etc.) are written directly by user code via pointers.
     unsafe {
-        paging::map_user_page_with_flags(pml4_phys, SYSDATA_VA, phys, false, false)?;
+        paging::map_user_page_with_flags(pml4_phys, SYSDATA_VA, phys, true, false)?;
     }
     Ok(())
 }

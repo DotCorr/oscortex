@@ -228,7 +228,28 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
     };
     crate::cortex::interrupt_hook(14, &legacy, Some(frame.err));
 
-    if !crate::cortex::handle_page_fault(cr2, frame.err) {
+    let resolved = crate::cortex::handle_page_fault(cr2, frame.err);
+    if resolved {
+        // Demand paging can intentionally resolve user not-present faults.
+        // Log a small sample so silent fault loops are visible in serial logs.
+        static RESOLVED_PF_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = RESOLVED_PF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 64 {
+            log::warn!(
+                "[PageFault-resolved] #{} pid={} addr={:#x} err={:#x} ip={:#x} sp={:#x}",
+                n,
+                crate::process::current_pid(),
+                cr2,
+                frame.err,
+                frame.rip,
+                frame.rsp
+            );
+        }
+        return;
+    }
+
+    if !resolved {
         let user_mode = (frame.err & 0x4) != 0;
         if user_mode {
             let pid = crate::process::current_pid();
@@ -379,37 +400,71 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     let frame = unsafe { &mut *frame_ptr };
     let preempted_user = (frame.cs & 0x3) == 0x3;
 
-    // Early userspace bring-up mode: keep timer interrupts lightweight when
-    // preempting user code. Full user-preemptive scheduling is intentionally
-    // disabled for v0.1 to avoid pathological timer-starvation at a fixed
-    // user RIP on QEMU.
-    let _ = preempted_user;
-
     // EOI first so the APIC can generate the next timer interrupt immediately
-    // after iret.
+    // after iretq.
     crate::arch::apic::eoi();
 
-    // Do not run the kernel-task scheduler while handling a user-mode timer
-    // interrupt. User preemption/switching is handled by the process path
-    // above by rewriting the interrupt frame + CR3 directly; invoking
-    // sched::tick() here can context-switch kernel stacks from inside a user
-    // interrupt frame and corrupt return flow.
-    if !preempted_user {
-        crate::sched::tick();
+    if preempted_user {
+        let cur_pid = crate::process::current_pid();
+        if cur_pid != 0 {
+            // The hardware-pushed user RSP lives just above the TimerTrapFrame
+            // struct (18 fields × 8 bytes = 0x90 bytes past frame_ptr).
+            let user_rsp = unsafe {
+                *((frame_ptr as usize + 18 * 8) as *const u64)
+            };
+            let cur_regs = crate::process::UserRegs {
+                rip:    frame.rip,
+                rsp:    user_rsp,
+                rflags: frame.rflags,
+                rax: frame.rax, rbx: frame.rbx, rcx: frame.rcx, rdx: frame.rdx,
+                rdi: frame.rdi, rsi: frame.rsi, rbp: frame.rbp,
+                r8:  frame.r8,  r9:  frame.r9,  r10: frame.r10, r11: frame.r11,
+                r12: frame.r12, r13: frame.r13, r14: frame.r14, r15: frame.r15,
+            };
+            if let Some((next_pid, next_regs)) =
+                crate::process::timer_preempt_switch(cur_pid, &cur_regs)
+            {
+                // Rewrite the interrupt frame so the iretq in the asm epilog
+                // resumes the next thread rather than the preempted one.
+                // CS and SS stay as-is (both are ring-3 user segments 0x2B/0x23).
+                frame.rip    = next_regs.rip;
+                frame.rflags = next_regs.rflags | 0x200; // ensure IF=1
+                frame.rax = next_regs.rax; frame.rbx = next_regs.rbx;
+                frame.rcx = next_regs.rcx; frame.rdx = next_regs.rdx;
+                frame.rdi = next_regs.rdi; frame.rsi = next_regs.rsi;
+                frame.rbp = next_regs.rbp; frame.r8  = next_regs.r8;
+                frame.r9  = next_regs.r9;  frame.r10 = next_regs.r10;
+                frame.r11 = next_regs.r11; frame.r12 = next_regs.r12;
+                frame.r13 = next_regs.r13; frame.r14 = next_regs.r14;
+                frame.r15 = next_regs.r15;
+                // Update the hardware-pushed user RSP slot for the new thread.
+                unsafe {
+                    *((frame_ptr as usize + 18 * 8) as *mut u64) = next_regs.rsp;
+                }
+                // Deliver pending errno (e.g. EINTR from epoll_wait) for threads
+                // resumed via IRETQ rather than enter_user_by_pid_noreturn.
+                // Safe: timer ISR runs with user CR3 still loaded; SD_ERRNO is
+                // in the user VA space already mapped.
+                let pending_errno = crate::process::take_errno_to_deliver(next_pid);
+                if pending_errno != 0 {
+                    unsafe {
+                        core::ptr::write_volatile(
+                            crate::process::posix_trampolines::SD_ERRNO as *mut u32,
+                            pending_errno,
+                        );
+                    }
+                }
+            }
+        }
+        // iretq in the asm epilog returns to (possibly new) ring-3 thread.
+        return;
     }
 
-    // Phase 33-A: fire compositor + WM heartbeat at the configured vsync rate
-    // (TSC-gated at 60 or 120 Hz).  This replaces the idle-loop compositor::tick()
-    // with a hardware-timed call so frame delivery is cadence-accurate.
-    //
-    // v0.1 STABILITY FIX: never run compositor/WM work while a user thread
-    // was preempted. These calls are heavy enough on QEMU (~tens to hundreds
-    // of ms) that with a 60 Hz periodic LAPIC timer the ISR overruns the
-    // tick interval, leaving the next tick already pending the instant we
-    // IRET back to user — user mode is starved of all CPU. Compositor/WM
-    // work runs only when the kernel itself was preempted (i.e. idle loop
-    // or kernel task), which is the safe context for that work anyway.
-    if !preempted_user && crate::arch::apic::vsync_due() {
+    // Kernel-mode preemption: run cooperative scheduler + compositor heartbeat.
+    // Do NOT call sched::tick() or compositor while a user thread was running —
+    // those are reserved for kernel-idle context only.
+    crate::sched::tick();
+    if crate::arch::apic::vsync_due() {
         crate::compositor::tick();
         crate::wm::tick();
     }

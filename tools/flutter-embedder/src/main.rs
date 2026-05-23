@@ -562,13 +562,15 @@ extern "C" fn main_embedder() {
     static ARG0: &[u8] = b"oscortex-flutter\0";
     static ARG1: &[u8] = b"--enable-impeller=false\0";
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
+    static ARG3: &[u8] = b"--disable-vm-service\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 3]);
+    struct ArgvPtrs([*const u8; 4]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs = ArgvPtrs([
         ARG0.as_ptr(),
         ARG1.as_ptr(),
         ARG2.as_ptr(),
+        ARG3.as_ptr(),
     ]);
 
     let mut project_args = FlutterProjectArgsRaw { bytes: [0; FLUTTER_PROJECT_ARGS_SIZE] };
@@ -679,6 +681,12 @@ extern "C" fn main_embedder() {
                 hx[25 + i] = digits[nyb];
             }
             write(&hx);
+            // On error, engine_out may be partially set by the engine but the
+            // handle is unusable. Force it to 0 so we skip all engine calls
+            // below — otherwise we crash dereferencing junk inside the
+            // engine. We still enter the event loop so the embedder stays
+            // alive (for kernel triage / next-step diagnosis).
+            engine_out = 0;
         } else {
             write(b"[embedder] FlutterEngineRun OK\n");
         }
