@@ -333,6 +333,8 @@ type RunFn               = unsafe extern "C" fn(
     engine:  *mut u64,
 ) -> i32;
 type SendWindowMetricsFn = unsafe extern "C" fn(engine: u64, evt: *const FlutterWindowMetricsEvent) -> i32;
+type ScheduleFrameFn    = unsafe extern "C" fn(engine: u64) -> i32;
+type SendPlatformMessageFn = unsafe extern "C" fn(engine: u64, msg: *const FlutterPlatformMessage) -> i32;
 type SendPointerEventFn  = unsafe extern "C" fn(engine: u64, evts: *const FlutterPointerEvent, n: usize) -> i32;
 type SendKeyEventFn      = unsafe extern "C" fn(engine: u64, evt: *const FlutterKeyEvent, cb: u64, ud: u64) -> i32;
 type OnVsyncFn           = unsafe extern "C" fn(engine: u64, baton: usize, start_ns: u64, target_ns: u64) -> i32;
@@ -814,55 +816,20 @@ extern "C" fn main_embedder() {
         log_message_callback as *const () as u64,
     );
 
-    let aot_snapshot = aot_loader::load_dart_snapshot(b"/system/flutter/app.aot\0");
-    // NOTE: our shipped libflutter_engine.so is the linux-x64 (debug/JIT) build.
-    // Feeding it AOT snapshot pointers triggers kInvalidArguments ("JIT runtime
-    // cannot run a precompiled snapshot"). Force JIT mode regardless.
-    let _ = aot_snapshot;
-    if false {
-        // (legacy AOT branch kept disabled; re-enable if/when we ship the AOT engine)
-    } else {
-        // JIT mode: our libflutter_engine.so is the linux-x64 (debug/JIT)
-        // build that Flutter publishes as `linux-x64-embedder.zip`. The engine
-        // does *not* auto-load `vm_snapshot_data` / `isolate_snapshot_data`
-        // from `assets_path` — those files contain the VM/isolate snapshots
-        // and MUST be provided via the legacy `vm_snapshot_*` /
-        // `isolate_snapshot_*` pointer fields in `FlutterProjectArgs`. (The
-        // engine *will* still load `kernel_blob.bin` from `assets_path`.)
-        //
-        // CRITICAL: In this libflutter_engine.so build, the
-        // `FlutterProjectArgs.{vm,isolate}_snapshot_data` fields are
-        // interpreted as NULL-TERMINATED FILE PATH STRINGS, NOT as binary
-        // buffers. The engine's PopulateJITSnapshotMappingCallbacks wraps
-        // each pointer in a lambda that calls
-        // `fml::FileMapping::CreateReadOnly(std::string{ptr})`.
-        //
-        // Disassembly evidence (libflutter_engine.so):
-        //   0x196c0dd  callq strlen(0x8(this))                # treat as cstr
-        //   0x196c1ee  callq fml::FileMapping::CreateReadOnly # open+mmap
-        //
-        // So we pass the asset PATHS here and let the engine open() and
-        // mmap() them via our file-backed mmap path (already proven to
-        // work for kernel_blob.bin + icudtl.dat).
-        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
+    // JIT mode: pass snapshot asset PATHS to the legacy snapshot pointer
+    // fields. This engine build reads those fields as C strings and maps
+    // files from disk.
+    write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
 
-        // Static, NUL-terminated path strings — must outlive FlutterEngineRun.
-        static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
-        static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
+    static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
+    static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
 
-        let vm_ptr  = VM_PATH.as_ptr()  as u64;
-        let iso_ptr = ISO_PATH.as_ptr() as u64;
+    write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, VM_PATH.as_ptr() as u64);
+    write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
+    write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
+    write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
 
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,       vm_ptr);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE,  (VM_PATH.len()  - 1) as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA,      iso_ptr);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
-        // JIT instructions are NULL — the kernel_blob carries the executable
-        // bytecode, not native machine code.
-
-        let _ = aot_snapshot;
-        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
-    }
+    write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
     let mut rsp: u64;
@@ -878,6 +845,13 @@ extern "C" fn main_embedder() {
         OFF_PROJECT_ARGS_CUSTOM_TASK_RUNNERS,
         &CUSTOM_TASK_RUNNERS as *const _ as u64,
     );
+
+    // Initialize the MessageLoop for the main thread so that task observers can query it without assertions.
+    write(b"[embedder] initializing main thread message loop...\n");
+    let ensure_initialized_va = 0x0100_0000u64 + 0x19bbd40u64;
+    let ensure_initialized: unsafe extern "C" fn() = unsafe { core::mem::transmute(ensure_initialized_va) };
+    unsafe { ensure_initialized(); }
+    write(b"[embedder] message loop initialized!\n");
 
     // 8. Initialize the engine synchronously on the main thread
     write(b"[embedder] calling FlutterEngineInitialize...\n");
@@ -967,6 +941,49 @@ extern "C" fn main_embedder() {
         let rc = unsafe { send_metrics(engine_out, &metrics as *const _) };
         if rc == 0 {
             write(b"[embedder] initial window metrics sent successfully!\n");
+            if proctable.schedule_frame != 0 {
+                let schedule_frame: ScheduleFrameFn = unsafe { core::mem::transmute(proctable.schedule_frame) };
+                let rc_sf = unsafe { schedule_frame(engine_out) };
+                if rc_sf == 0 {
+                    write(b"[embedder] FlutterEngineScheduleFrame OK\n");
+                } else {
+                    let mut hex = *b"[embedder] FlutterEngineScheduleFrame FAILED rc=0x________\n";
+                    let digits = b"0123456789abcdef";
+                    let r = rc_sf as u32;
+                    for i in 0..8 {
+                        let nyb = ((r >> ((7 - i) * 4)) & 0xF) as usize;
+                        hex[51 + i] = digits[nyb];
+                    }
+                    write(&hex);
+                }
+            }
+
+            if proctable.send_platform_message != 0 {
+                static LIFECYCLE_CH: &[u8] = b"flutter/lifecycle\0";
+                static LIFECYCLE_MSG: &[u8] = b"AppLifecycleState.resumed";
+                let msg = FlutterPlatformMessage {
+                    struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+                    channel: LIFECYCLE_CH.as_ptr() as u64,
+                    message: LIFECYCLE_MSG.as_ptr() as u64,
+                    message_size: LIFECYCLE_MSG.len(),
+                    response_handle: 0,
+                };
+                let send_platform_message: SendPlatformMessageFn =
+                    unsafe { core::mem::transmute(proctable.send_platform_message) };
+                let rc_pm = unsafe { send_platform_message(engine_out, &msg as *const _) };
+                if rc_pm == 0 {
+                    write(b"[embedder] lifecycle resumed message sent\n");
+                } else {
+                    let mut hex = *b"[embedder] lifecycle message FAILED rc=0x________\n";
+                    let digits = b"0123456789abcdef";
+                    let r = rc_pm as u32;
+                    for i in 0..8 {
+                        let nyb = ((r >> ((7 - i) * 4)) & 0xF) as usize;
+                        hex[44 + i] = digits[nyb];
+                    }
+                    write(&hex);
+                }
+            }
         } else {
             let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
             let digits = b"0123456789abcdef";

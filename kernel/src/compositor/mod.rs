@@ -113,6 +113,9 @@ pub fn init() {
 
     // Boot-time visual self-test so M13 progress is visible immediately.
     if crate::drivers::fb::is_ready() {
+        crate::drivers::fb::set_double_buffer(true);
+        crate::drivers::fb::disable_fb_logging();
+
         if let Ok(id) = create_surface_for(0, 220, 120) {
             let _ = move_surface_for(0, id, 12, 140, 10);
             let mut c = COMP.lock();
@@ -142,15 +145,21 @@ fn create_surface_internal(owner_pid: u32, width: u32, height: u32) -> Result<u3
 
     let mut c = COMP.lock();
     // Enforce per-pid surface limit.
-    if owner_pid != 0 {
+    let owner_leader = if owner_pid != 0 {
+        crate::process::get_group_leader(owner_pid)
+    } else {
+        0
+    };
+    if owner_leader != 0 {
         let owned = c.surfaces.iter().enumerate()
-            .filter(|(idx, s)| s.in_use && c.owners[*idx] == owner_pid)
+            .filter(|(idx, s)| s.in_use && c.owners[*idx] == owner_leader)
             .count();
         if owned >= MAX_SURFACES_PER_PID {
             return Err("per-pid surface limit reached");
         }
     }
     let id = c.next_id;
+    let mut allocated_idx = None;
     for (idx, s) in c.surfaces.iter_mut().enumerate() {
         if !s.in_use {
             *s = Surface {
@@ -172,14 +181,32 @@ fn create_surface_internal(owner_pid: u32, width: u32, height: u32) -> Result<u3
                 has_damage: false,
                 in_use: true,
             };
-            c.owners[idx] = owner_pid;
+            c.owners[idx] = owner_leader;
             c.buffers[idx] = Some(vec![0u32; pixels]);
             c.presented[idx] = false;
             c.next_id = c.next_id.wrapping_add(1).max(1);
-            return Ok(id);
+            allocated_idx = Some(idx);
+            break;
         }
     }
-    Err("surface table full")
+
+    if let Some(_idx) = allocated_idx {
+        if c.demo_id != 0 && owner_pid != 0 {
+            let demo_id = c.demo_id;
+            c.demo_id = 0;
+            if let Some(demo_idx) = c.surfaces.iter().position(|s| s.in_use && s.id == demo_id) {
+                c.surfaces[demo_idx] = Surface::empty();
+                c.owners[demo_idx] = 0;
+                c.buffers[demo_idx] = None;
+                c.back_buffers[demo_idx] = None;
+                c.back_pending[demo_idx] = false;
+                c.presented[demo_idx] = false;
+            }
+        }
+        Ok(id)
+    } else {
+        Err("surface table full")
+    }
 }
 
 pub fn move_surface(id: u32, x: i32, y: i32, z: i32) -> Result<(), &'static str> {
@@ -192,8 +219,11 @@ pub fn move_surface_for(caller_pid: u32, id: u32, x: i32, y: i32, z: i32) -> Res
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     c.surfaces[idx].x = x;
     c.surfaces[idx].y = y;
@@ -211,8 +241,11 @@ pub fn destroy_surface_for(caller_pid: u32, id: u32) -> Result<(), &'static str>
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     c.surfaces[idx] = Surface::empty();
     c.owners[idx] = 0;
@@ -246,8 +279,11 @@ pub fn surface_z_set_for(caller_pid: u32, id: u32, z: i32) -> Result<(), &'stati
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     c.surfaces[idx].z = z;
     Ok(())
@@ -301,8 +337,11 @@ pub fn surface_geometry_set_for(caller_pid: u32, id: u32, x: i32, y: i32, width:
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     c.surfaces[idx].x = x;
     c.surfaces[idx].y = y;
@@ -323,8 +362,11 @@ pub fn surface_visibility_set_for(caller_pid: u32, id: u32, visible: bool) -> Re
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     c.surfaces[idx].visible = visible;
     Ok(())
@@ -336,8 +378,11 @@ pub fn surface_clip_set_for(caller_pid: u32, id: u32, x: i32, y: i32, w: u32, h:
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     // Clamp clip region to surface bounds.
     let s = &c.surfaces[idx];
@@ -355,11 +400,16 @@ pub fn surface_clip_set_for(caller_pid: u32, id: u32, x: i32, y: i32, w: u32, h:
     Ok(())
 }
 
-/// Return the number of surfaces currently owned by the given PID.
+/// Return the number of surfaces currently owned by the given PID's thread group.
 pub fn surface_count_for(pid: u32) -> usize {
+    let leader = if pid != 0 {
+        crate::process::get_group_leader(pid)
+    } else {
+        0
+    };
     let c = COMP.lock();
     c.surfaces.iter().enumerate()
-        .filter(|(idx, s)| s.in_use && c.owners[*idx] == pid)
+        .filter(|(idx, s)| s.in_use && c.owners[*idx] == leader)
         .count()
 }
 
@@ -371,8 +421,11 @@ pub fn surface_damage_set_for(caller_pid: u32, id: u32, x: i32, y: i32, w: u32, 
         Some(v) => v,
         None => return Err("no such surface"),
     };
-    if caller_pid != 0 && c.owners[idx] != caller_pid {
-        return Err("permission denied");
+    if caller_pid != 0 {
+        let caller_leader = crate::process::get_group_leader(caller_pid);
+        if c.owners[idx] != caller_leader {
+            return Err("permission denied");
+        }
     }
     let s = &c.surfaces[idx];
     let max_w = s.width as i32;
@@ -405,8 +458,11 @@ pub fn surface_flip_for(caller_pid: u32, id: u32) -> Result<(), &'static str> {
             Some(v) => v,
             None => return Err("no such surface"),
         };
-        if caller_pid != 0 && c.owners[idx] != caller_pid {
-            return Err("permission denied");
+        if caller_pid != 0 {
+            let caller_leader = crate::process::get_group_leader(caller_pid);
+            if c.owners[idx] != caller_leader {
+                return Err("permission denied");
+            }
         }
         let pixels = c.surfaces[idx].width as usize * c.surfaces[idx].height as usize;
         // Lazy back-buffer allocation: copy front on first flip.
@@ -437,8 +493,11 @@ pub fn upload_surface_rgba32_for(caller_pid: u32, id: u32, payload: &[u8]) -> Re
     let mut c = COMP.lock();
     for (idx, s) in c.surfaces.iter().enumerate() {
         if s.in_use && s.id == id {
-            if caller_pid != 0 && c.owners[idx] != caller_pid {
-                return Err("permission denied");
+            if caller_pid != 0 {
+                let caller_leader = crate::process::get_group_leader(caller_pid);
+                if c.owners[idx] != caller_leader {
+                    return Err("permission denied");
+                }
             }
             let pixels = s.width as usize * s.height as usize;
             let expect = pixels * 4;
@@ -486,8 +545,11 @@ pub fn present_surface_for(caller_pid: u32, id: u32) -> Result<(), &'static str>
         let mut found = false;
         for (idx, s) in c.surfaces.iter().enumerate() {
             if s.in_use && s.id == id {
-                if caller_pid != 0 && c.owners[idx] != caller_pid {
-                    return Err("permission denied");
+                if caller_pid != 0 {
+                    let caller_leader = crate::process::get_group_leader(caller_pid);
+                    if c.owners[idx] != caller_leader {
+                        return Err("permission denied");
+                    }
                 }
                 c.presented[idx] = true;
                 found = true;
@@ -513,8 +575,11 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
     let mut c = COMP.lock();
     for (idx, s) in c.surfaces.iter().enumerate() {
         if s.in_use && s.id == id {
-            if caller_pid != 0 && c.owners[idx] != caller_pid {
-                return Err("permission denied");
+            if caller_pid != 0 {
+                let caller_leader = crate::process::get_group_leader(caller_pid);
+                if c.owners[idx] != caller_leader {
+                    return Err("permission denied");
+                }
             }
             let pixels = s.width as usize * s.height as usize;
             let expect = pixels * 4;
@@ -574,7 +639,11 @@ pub fn gpu_submit_strided_for(
 
     // Fast path: no stride conversion needed.
     if row_bytes == 0 || row_bytes == tight_stride {
-        return gpu_submit_for(caller_pid, id, payload);
+        let expected_bytes = tight_stride * height;
+        if payload.len() < expected_bytes {
+            return Err("bad payload size");
+        }
+        return gpu_submit_for(caller_pid, id, &payload[..expected_bytes]);
     }
 
     // Validate that the buffer is large enough for the strided layout.
@@ -703,6 +772,7 @@ pub fn render_frame() {
     // ── Hardware cursor overlay ──────────────────────────────────────────────
     drop(c); // release compositor lock before calling into fb
     draw_cursor();
+    crate::drivers::fb::swap_buffers();
     // Re-acquire to update frame counter.
     let mut c = COMP.lock();
     c.frame_counter = c.frame_counter.wrapping_add(1);

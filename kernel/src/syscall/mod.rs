@@ -3223,7 +3223,7 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
     let mut total = 0u32;
     // Phase A: try the hardcoded "well-known" pid1/worker/handoff futex
     // addresses (kept for back-compat with earlier surgical fixes).
-    for &addr in &[FUTEX_ADDR_PID1_WAIT, FUTEX_ADDR_WORKER_WAIT, FUTEX_ADDR_HANDOFF] {
+    for &addr in &[FUTEX_ADDR_PID1_WAIT, FUTEX_ADDR_WORKER_WAIT] {
         if addr == cond { continue; }
         let waiters = futex_target_waiter_count(addr);
         if waiters == 0 { continue; }
@@ -3247,7 +3247,7 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
     // arbitrary mutex-internal seq futexes (0x338000070, 0x457000040, ...).
     // Without this fallback the engine deadlocks: pid 1 broadcasts forever
     // with woke=0 while pids 5/6/8 sit in futex_wait on unrelated addrs.
-    if total == 0 {
+    if total == 0 && wake_count == 1 {
         let pid = crate::process::current_pid();
         let siblings = crate::process::sibling_pids(pid);
         if siblings.len() > 1 {
@@ -3256,7 +3256,10 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                 let t = FUTEX_WAITERS.lock();
                 t.iter()
                     .filter_map(|(addr, waiters)| {
-                        if *addr == cond { return None; }
+                        // Never bridge condition-variable wakes to the mutex
+                        // handoff futex. Mutex waiters must be released by
+                        // unlock, not by cond_signal/cond_broadcast.
+                        if *addr == cond || *addr == FUTEX_ADDR_HANDOFF { return None; }
                         // Any waiter that is a sibling?
                         if waiters.iter().any(|w| siblings.contains(w)) {
                             Some(*addr)
@@ -3430,7 +3433,7 @@ fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
     n as i64
 }
 
-fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
+fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
     let op_base = op & 0x7F; // strip FUTEX_PRIVATE_FLAG etc.
     match op_base {
         FUTEX_WAIT => {
@@ -3539,6 +3542,18 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
                 unsafe {
                     core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                 }
+                if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if next != pid {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_full_user_gprs(pid);
+                        crate::process::set_rax(pid, sys_nr);
+                        crate::process::save_xstate(pid);
+                        crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                        crate::process::enter_user_by_pid_noreturn(next);
+                    }
+                }
             }
 
             futex_waiter_remove(uaddr, pid);
@@ -3625,6 +3640,18 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
+                if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if next != pid {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_full_user_gprs(pid);
+                        crate::process::set_rax(pid, sys_nr);
+                        crate::process::save_xstate(pid);
+                        crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                        crate::process::enter_user_by_pid_noreturn(next);
+                    }
                 }
             }
             futex_waiter_remove(uaddr, pid);
@@ -4374,6 +4401,18 @@ mod posix {
                 unsafe {
                     core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                 }
+                if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if next != pid {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_full_user_gprs(pid);
+                        crate::process::set_rax(pid, sys_nr);
+                        crate::process::save_xstate(pid);
+                        crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                        crate::process::enter_user_by_pid_noreturn(next);
+                    }
+                }
             }
 
             super::futex_waiter_remove(mutex, pid);
@@ -4408,7 +4447,7 @@ mod posix {
         if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() { 0 } else { 16 }
     }
 
-    pub fn sys_pthread_once(once: u64, func: u64) -> i64 {
+    pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
         if once < 0x1000 || func == 0 {
             log::error!("[pthread-err] once EINVAL pid={} once={:#x} func={:#x} rip={:#x}",
                 crate::process::current_pid(), once, func, crate::arch::syscall::user_rip());
@@ -4463,7 +4502,7 @@ mod posix {
                     // Save context pointing to the syscall instruction itself so we retry on re-entry.
                     crate::process::save_return_context(pid, urip - 2, ursp);
                     crate::process::save_full_user_gprs(pid);
-                    crate::process::set_rax(pid, 0x3d7); // sys_pthread_once syscall number
+                    crate::process::set_rax(pid, sys_nr); // sys_pthread_once syscall number
                     crate::process::save_xstate(pid);
                     crate::process::set_state(pid, crate::process::ProcState::Blocked);
                     crate::process::enter_user_by_pid_noreturn(next);
@@ -4475,6 +4514,18 @@ mod posix {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
+                if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if next != pid {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_full_user_gprs(pid);
+                        crate::process::set_rax(pid, sys_nr);
+                        crate::process::save_xstate(pid);
+                        crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                        crate::process::enter_user_by_pid_noreturn(next);
+                    }
                 }
             }
 
@@ -4575,6 +4626,18 @@ mod posix {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        }
+                        if let Some(next) = crate::process::next_runnable_pid(pid) {
+                            if next != pid {
+                                let urip = crate::arch::syscall::user_rip();
+                                let ursp = crate::arch::syscall::user_rsp();
+                                crate::process::save_return_context(pid, urip - 2, ursp);
+                                crate::process::save_full_user_gprs(pid);
+                                crate::process::set_rax(pid, sys_nr);
+                                crate::process::save_xstate(pid);
+                                crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                                crate::process::enter_user_by_pid_noreturn(next);
+                            }
                         }
                     }
 
@@ -5156,9 +5219,8 @@ mod posix {
     }
 
     pub fn sys_setlocale(_category: u64, _locale_ptr: u64) -> i64 {
-        // Return pointer to a stable locale string "C".
-        static C_LOCALE: &[u8] = b"C\0";
-        C_LOCALE.as_ptr() as i64
+        // Return pointer to a stable locale string "C" in user space.
+        crate::process::posix_trampolines::SD_LOCALE_C as i64
     }
 
     pub fn sys_uselocale(locale: u64) -> i64 {
@@ -5345,8 +5407,9 @@ mod posix {
         mut next_int: impl FnMut() -> u64,
     ) -> i64 {
         let fmt_valid = fmt_ptr >= 0x10000 && fmt_ptr < 0x0000_8000_0000_0000;
-        let buf_valid = buf  >= 0x10000 && buf  < 0x0000_8000_0000_0000;
-        if !fmt_valid || !buf_valid { return 0; }
+        if !fmt_valid { return 0; }
+        let buf_valid = buf >= 0x10000 && buf < 0x0000_8000_0000_0000;
+        if size > 0 && !buf_valid { return 0; }
 
         let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
 
@@ -5372,23 +5435,35 @@ mod posix {
         let flen = read_cstr(fmt_ptr, &mut fbuf);
         let fmt = &fbuf[..flen];
 
-        let max_out = ((size as usize).saturating_sub(1)).min(511);
         let mut out_buf = [0u8; 512];
         let mut out_len = 0usize;
+        let mut total_len = 0usize;
         let mut i = 0usize;
 
-        while i < flen && out_len < max_out {
+        // Helper to append a slice to the formatted output
+        let mut append_bytes = |bytes: &[u8]| {
+            let limit = (511usize.saturating_sub(out_len)).min(bytes.len());
+            if limit > 0 {
+                out_buf[out_len..out_len + limit].copy_from_slice(&bytes[..limit]);
+                out_len += limit;
+            }
+            total_len += bytes.len();
+        };
+
+        while i < flen {
             let c = fmt[i];
             if c != b'%' || i + 1 >= flen {
-                out_buf[out_len] = c;
-                out_len += 1;
+                append_bytes(&[c]);
                 i += 1;
                 continue;
             }
 
-            // Skip format spec modifiers
+            // Skip format spec modifiers and consume variable width/precision arguments
             let mut j = i + 1;
-            while j < flen && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#') {
+            while j < flen && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#'|b'*') {
+                if fmt[j] == b'*' {
+                    let _ = next_int();
+                }
                 j += 1;
             }
             if j >= flen { break; }
@@ -5403,9 +5478,7 @@ mod posix {
                     while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
                     if neg { tmp[n] = b'-'; n += 1; }
                     tmp[..n].reverse();
-                    let limit = (max_out - out_len).min(n);
-                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
-                    out_len += limit;
+                    append_bytes(&tmp[..n]);
                 }
                 b'u' => {
                     let mut u = next_int();
@@ -5413,57 +5486,39 @@ mod posix {
                     if u == 0 { tmp[n] = b'0'; n += 1; }
                     while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
                     tmp[..n].reverse();
-                    let limit = (max_out - out_len).min(n);
-                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
-                    out_len += limit;
+                    append_bytes(&tmp[..n]);
                 }
                 b'x' | b'X' | b'p' => {
                     let mut u = next_int();
                     if conv == b'p' {
-                        if out_len + 2 <= max_out {
-                            out_buf[out_len..out_len+2].copy_from_slice(b"0x");
-                            out_len += 2;
-                        }
+                        append_bytes(b"0x");
                     }
                     let hexd = if conv == b'X' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
                     let mut n = 0usize;
                     if u == 0 { tmp[n] = b'0'; n += 1; }
                     while u > 0 { tmp[n] = hexd[(u & 0xF) as usize]; n += 1; u >>= 4; }
                     tmp[..n].reverse();
-                    let limit = (max_out - out_len).min(n);
-                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
-                    out_len += limit;
+                    append_bytes(&tmp[..n]);
                 }
                 b's' => {
                     let p = next_int();
                     let mut sbuf = [0u8; 256];
                     let sn = read_cstr(p, &mut sbuf);
-                    let limit = (max_out - out_len).min(sn);
-                    out_buf[out_len..out_len + limit].copy_from_slice(&sbuf[..limit]);
-                    out_len += limit;
+                    append_bytes(&sbuf[..sn]);
                 }
                 b'c' => {
                     let v = next_int() as u8;
-                    out_buf[out_len] = v;
-                    out_len += 1;
+                    append_bytes(&[v]);
                 }
                 b'%' => {
-                    out_buf[out_len] = b'%';
-                    out_len += 1;
+                    append_bytes(b"%");
                 }
                 _ => {
-                    out_buf[out_len] = b'%';
-                    out_len += 1;
-                    if out_len < max_out {
-                        out_buf[out_len] = conv;
-                        out_len += 1;
-                    }
+                    append_bytes(&[b'%', conv]);
                 }
             }
             i = j + 1;
         }
-
-        out_buf[out_len] = 0;
 
         let fmt_str = core::str::from_utf8(fmt).unwrap_or("<non-utf8>");
         let is_error = flen >= 5 && (fmt_str.contains("error") || fmt_str.contains("expected") || fmt_str.contains("assert") || fmt_str.contains("fail") || fmt_str.contains("FATAL"));
@@ -5479,10 +5534,14 @@ mod posix {
         }
 
         // Write formatted result to the caller's buffer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(out_buf.as_ptr(), buf as *mut u8, out_len + 1);
+        if size > 0 && buf_valid {
+            let copy_len = (size as usize - 1).min(out_len);
+            unsafe {
+                core::ptr::copy_nonoverlapping(out_buf.as_ptr(), buf as *mut u8, copy_len);
+                core::ptr::write((buf as *mut u8).add(copy_len), 0);
+            }
         }
-        out_len as i64
+        total_len as i64
     }
 
     pub fn sys_snprintf(buf: u64, size: u64, fmt_ptr: u64, first_vararg: u64, second_vararg: u64) -> i64 {
@@ -5518,8 +5577,11 @@ mod posix {
                 }
             } else { (48, 0, 0) };
 
+        log::warn!("[vsnprintf-debug] pid={} ap={:#x} gp_off={} reg_save={:#x} ovf={:#x}",
+            crate::process::current_pid(), ap, gp_off, reg_save, ovf);
+
         let mut next_int = || -> u64 {
-            if gp_off < 48 && plausible_user(reg_save) {
+            let val = if gp_off < 48 && plausible_user(reg_save) {
                 let v = unsafe { core::ptr::read_unaligned((reg_save + gp_off as u64) as *const u64) };
                 gp_off += 8;
                 v
@@ -5527,7 +5589,9 @@ mod posix {
                 let v = unsafe { core::ptr::read_unaligned(ovf as *const u64) };
                 ovf += 8;
                 v
-            } else { 0 }
+            } else { 0 };
+            log::warn!("[vsnprintf-debug] arg={:#x}", val);
+            val
         };
 
         format_into(buf, size, fmt_ptr, next_int)
@@ -5638,9 +5702,12 @@ mod posix {
                 continue;
             }
             // Skip flags/width — minimal: read a single conversion char,
-            // ignoring length modifiers ('l','ll','h','z').
+            // ignoring length modifiers ('l','ll','h','z') and consuming variable arguments for '*'.
             let mut j = i + 1;
-            while j < fmt.len() && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#') {
+            while j < fmt.len() && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#'|b'*') {
+                if fmt[j] == b'*' {
+                    let _ = next_int();
+                }
                 j += 1;
             }
             if j >= fmt.len() { break; }
@@ -6014,7 +6081,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         62  => sys_kill(arg0, arg1),
         158 => sys_arch_prctl(arg0, arg1), // Linux arch_prctl (TLS FS base)
         186 => sys_gettid(),                 // gettid (each thread has a slot)
-        202 => sys_futex(arg0, arg1 as u32, arg2 as u32), // Linux SYS_futex — libc++ std::future uses this directly
+        202 => sys_futex(arg0, arg1 as u32, arg2 as u32, number), // Linux SYS_futex — libc++ std::future uses this directly
         // Native Linux epoll/poll/timerfd — GLib/Dart call these with Linux ABI numbers
         // directly (not through our POSIX trampolines). Without handlers these
         // return -38 (ENOSYS) which causes Flutter's MessageLoopLinux to fail its
@@ -6248,7 +6315,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x39C => sys_nvme_write(arg0, arg1, arg2, arg3),
 
         // Phase 62 — Futex (needed by pthreads / Flutter Dart VM)
-        0x39D => sys_futex(arg0, arg1 as u32, arg2 as u32),
+        0x39D => sys_futex(arg0, arg1 as u32, arg2 as u32, number),
 
         // Phase 31 Slice C — threads
         eabi::SYS_THREAD_CREATE => sys_thread_create(arg0, arg1, arg2, arg3),
@@ -6305,7 +6372,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x3D4 => posix::sys_pthread_mutex_unlock(arg0),
         0x3D5 => 0, // pthread_mutex_destroy noop
         0x3D6 => posix::sys_pthread_mutex_trylock(arg0),
-        0x3D7 => posix::sys_pthread_once(arg0, arg1),
+        0x3D7 => posix::sys_pthread_once(arg0, arg1, number),
         0x3D8 => posix::sys_pthread_key_create(arg0, arg1),
         0x3D9 => 0, // pthread_key_delete noop
         0x3DA => posix::sys_pthread_setspecific(arg0, arg1),

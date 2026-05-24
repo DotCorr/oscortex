@@ -6,6 +6,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
+use alloc::vec;
+use alloc::vec::Vec;
 
 // ── Font constants ────────────────────────────────────────────────────────────
 
@@ -144,6 +146,46 @@ static FB_SILENT:   AtomicBool = AtomicBool::new(false);
 
 /// Text cursor (col, row).
 static CURSOR: Mutex<(u32, u32)> = Mutex::new((0, 0));
+
+static DOUBLE_BUFFER: Mutex<Option<Vec<u32>>> = Mutex::new(None);
+static DOUBLE_BUFFER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+struct InterruptGuard {
+    rflags: u64,
+}
+
+impl InterruptGuard {
+    #[inline(always)]
+    fn new() -> Self {
+        let rflags: u64;
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!(
+                "pushfq",
+                "pop {}",
+                out(reg) rflags,
+                options(nomem, preserves_flags)
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            { rflags = 0; }
+            #[cfg(target_arch = "x86_64")]
+            core::arch::asm!("cli", options(nomem, nostack));
+        }
+        Self { rflags }
+    }
+}
+
+impl Drop for InterruptGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if (self.rflags & 0x200) != 0 {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                core::arch::asm!("sti", options(nomem, nostack));
+            }
+        }
+    }
+}
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -358,6 +400,13 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
     let height = FB_HEIGHT.load(Ordering::Relaxed);
     if x >= width || y >= height { return; }
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
+    if DOUBLE_BUFFER_ACTIVE.load(Ordering::Relaxed) {
+        let _guard = InterruptGuard::new();
+        if let Some(ref mut buf) = *DOUBLE_BUFFER.lock() {
+            buf[y as usize * pitch_px + x as usize] = color;
+            return;
+        }
+    }
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
     unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(color); }
 }
@@ -370,7 +419,6 @@ pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
     let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
     let height = FB_HEIGHT.load(Ordering::Relaxed) as i32;
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
-    let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
 
     let x0 = x.max(0).min(width);
     let y0 = y.max(0).min(height);
@@ -381,6 +429,20 @@ pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
         return;
     }
 
+    if DOUBLE_BUFFER_ACTIVE.load(Ordering::Relaxed) {
+        let _guard = InterruptGuard::new();
+        if let Some(ref mut buf) = *DOUBLE_BUFFER.lock() {
+            for py in y0 as usize..y1 as usize {
+                let row_offset = py * pitch_px;
+                for px in x0 as usize..x1 as usize {
+                    buf[row_offset + px] = color;
+                }
+            }
+            return;
+        }
+    }
+
+    let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
     unsafe {
         for py in y0 as usize..y1 as usize {
             let row = addr.add(py * pitch_px);
@@ -408,7 +470,6 @@ pub fn blit_rgba32(x: i32, y: i32, src_w: u32, src_h: u32, src: &[u32]) {
     let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
     let height = FB_HEIGHT.load(Ordering::Relaxed) as i32;
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
-    let dst_base = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
 
     let x0 = x.max(0).min(width);
     let y0 = y.max(0).min(height);
@@ -425,6 +486,28 @@ pub fn blit_rgba32(x: i32, y: i32, src_w: u32, src_h: u32, src: &[u32]) {
     let src_y0 = (y0 - y) as usize;
     let src_stride = src_w as usize;
 
+    if DOUBLE_BUFFER_ACTIVE.load(Ordering::Relaxed) {
+        let _guard = InterruptGuard::new();
+        if let Some(ref mut buf) = *DOUBLE_BUFFER.lock() {
+            for row in 0..clip_h {
+                let sy = src_y0 + row;
+                let dy = y0 as usize + row;
+                let src_row = sy * src_stride + src_x0;
+                let dst_row = dy * pitch_px + x0 as usize;
+                for col in 0..clip_w {
+                    let px = src[src_row + col];
+                    let r = px & 0x0000_00FF;
+                    let g = (px & 0x0000_FF00) >> 8;
+                    let b = (px & 0x00FF_0000) >> 16;
+                    let xrgb = (r << 16) | (g << 8) | b;
+                    buf[dst_row + col] = xrgb;
+                }
+            }
+            return;
+        }
+    }
+
+    let dst_base = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
     unsafe {
         for row in 0..clip_h {
             let sy = src_y0 + row;
@@ -440,6 +523,37 @@ pub fn blit_rgba32(x: i32, y: i32, src_w: u32, src_h: u32, src: &[u32]) {
                 let xrgb = (r << 16) | (g << 8) | b;
                 dst_base.add(dst_row + col).write_volatile(xrgb);
             }
+        }
+    }
+}
+
+pub fn set_double_buffer(active: bool) {
+    DOUBLE_BUFFER_ACTIVE.store(active, Ordering::SeqCst);
+    if active {
+        let _guard = InterruptGuard::new();
+        let mut db = DOUBLE_BUFFER.lock();
+        if db.is_none() {
+            let height = FB_HEIGHT.load(Ordering::Relaxed);
+            let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed);
+            let size = pitch_px as usize * height as usize;
+            *db = Some(vec![0u32; size]);
+        }
+    }
+}
+
+pub fn swap_buffers() {
+    if !is_ready() || !DOUBLE_BUFFER_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let _guard = InterruptGuard::new();
+    let db = DOUBLE_BUFFER.lock();
+    if let Some(ref buf) = *db {
+        let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
+        let height = FB_HEIGHT.load(Ordering::Relaxed) as usize;
+        let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
+        let total = height * pitch_px;
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), addr, total);
         }
     }
 }

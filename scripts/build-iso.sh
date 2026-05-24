@@ -22,14 +22,66 @@ if [ -d "$EMBEDDER_DIR" ]; then
             --target "$EMBEDDER_TARGET" \
             -Z build-std=core,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem \
-            2>&1) || echo "[0/4] flutter-embedder build failed (non-fatal — kernel build continues)"
+            2>&1)
 
     EMBEDDER_BIN="$EMBEDDER_DIR/target/$EMBEDDER_TARGET/release/flutter-embedder"
     if [ -f "$EMBEDDER_BIN" ]; then
         mkdir -p "$ROOT/initramfs/bin"
         cp "$EMBEDDER_BIN" "$ROOT/initramfs/bin/flutter-embedder"
         echo "[0/4] flutter-embedder staged to initramfs/bin/flutter-embedder"
+    else
+        echo "ERROR: flutter-embedder binary not found after build: $EMBEDDER_BIN" >&2
+        exit 1
     fi
+else
+    echo "ERROR: flutter-embedder directory missing: $EMBEDDER_DIR" >&2
+    exit 1
+fi
+
+# Sync Flutter app assets into initramfs so engine/snapshot inputs stay consistent.
+APP_DIR="$ROOT/apps/oscortex_app"
+APP_ASSETS_DIR="$APP_DIR/build/flutter_assets"
+if [ -d "$APP_DIR" ]; then
+    echo "[0.3/4] Building oscortex_app Flutter bundle (debug/JIT assets)..."
+    (
+        cd "$APP_DIR"
+        flutter --suppress-analytics build bundle --debug
+    )
+else
+    echo "ERROR: Flutter app directory missing: $APP_DIR" >&2
+    exit 1
+fi
+
+if [ -d "$APP_ASSETS_DIR" ]; then
+    echo "[0.4/4] Syncing oscortex_app Flutter assets into initramfs..."
+    mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
+
+    for f in kernel_blob.bin vm_snapshot_data isolate_snapshot_data; do
+        if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
+            echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
+            exit 1
+        fi
+        cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
+        # Keep top-level copies for compatibility with older runtime paths.
+        cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/$f"
+    done
+
+    for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
+        if [ -f "$APP_ASSETS_DIR/$f" ]; then
+            cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
+        fi
+    done
+
+    for d in fonts packages shaders; do
+        if [ -d "$APP_ASSETS_DIR/$d" ]; then
+            rm -rf "$ROOT/initramfs/system/flutter/flutter_assets/$d"
+            cp -R "$APP_ASSETS_DIR/$d" "$ROOT/initramfs/system/flutter/flutter_assets/$d"
+        fi
+    done
+else
+    echo "ERROR: Flutter app assets directory missing: $APP_ASSETS_DIR" >&2
+    echo "       Build it first with: cd apps/oscortex_app && flutter build bundle" >&2
+    exit 1
 fi
 
 # Phase 42: Build the real /init userspace binary and stage it to initramfs.
@@ -45,104 +97,43 @@ if [ -d "$INIT_DIR" ]; then
             -Z build-std=core,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem \
             2>&1) || {
-        echo "[0.5/4] WARNING: userspace/init build failed — falling back to placeholder"
+        echo "[0.5/4] WARNING: userspace/init build failed (non-fatal)"
     }
 
     INIT_BIN="$INIT_DIR/target/$INIT_TARGET/release/init"
     if [ -f "$INIT_BIN" ]; then
         mkdir -p "$ROOT/initramfs/bin"
         cp "$INIT_BIN" "$ROOT/initramfs/bin/init"
-        # Copy to /init as a fallback in case launcher build is skipped or fails
-        cp "$INIT_BIN" "$ROOT/initramfs/init"
-        echo "[0.5/4] userspace/init staged to initramfs/bin/init and /init fallback ($(wc -c < "$INIT_BIN") bytes)"
+        echo "[0.5/4] userspace/init staged to initramfs/bin/init ($(wc -c < "$INIT_BIN") bytes)"
     fi
 fi
 
-# Phase 47: Build /bin/hello and stage it to initramfs.
-HELLO_DIR="$ROOT/userspace/hello"
-HELLO_TARGET="x86_64-unknown-none"
-
-if [ -d "$HELLO_DIR" ]; then
-    echo "[0.6/4] Building userspace/hello ELF..."
-    (cd "$HELLO_DIR" && \
-        cargo +nightly build \
-            --release \
-            --target "$HELLO_TARGET" \
-            -Z build-std=core,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1) || {
-        echo "[0.6/4] WARNING: userspace/hello build failed (non-fatal)"
-    }
-
-    HELLO_BIN="$HELLO_DIR/target/$HELLO_TARGET/release/hello"
-    if [ -f "$HELLO_BIN" ]; then
-        mkdir -p "$ROOT/initramfs/bin"
-        cp "$HELLO_BIN" "$ROOT/initramfs/bin/hello"
-        echo "[0.6/4] userspace/hello staged to initramfs/bin/hello ($(wc -c < "$HELLO_BIN") bytes)"
-    fi
-fi
-
-# Phase 62: Build and stage launcher as the primary /init (PID 1)
-LAUNCHER_DIR="$ROOT/userspace/launcher"
-LAUNCHER_TARGET="x86_64-unknown-none"
-if [ -d "$LAUNCHER_DIR" ]; then
-    echo "[0.7/4] Building userspace/launcher ELF..."
-    (cd "$LAUNCHER_DIR" && \
-        cargo +nightly build \
-            --release \
-            --target "$LAUNCHER_TARGET" \
-            -Z build-std=core,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1) || {
-        echo "[0.7/4] WARNING: userspace/launcher build failed"
-    }
-
-    LAUNCHER_BIN="$LAUNCHER_DIR/target/$LAUNCHER_TARGET/release/launcher"
-    if [ -f "$LAUNCHER_BIN" ]; then
-        cp "$LAUNCHER_BIN" "$ROOT/initramfs/init"
-        echo "[0.7/4] userspace/launcher staged to initramfs/init ($(wc -c < "$LAUNCHER_BIN") bytes)"
-    else
-        echo "[0.7/4] WARNING: userspace/launcher binary not found, keeping fallback /init"
-    fi
-else
-    echo "[0.7/4] WARNING: userspace/launcher directory not found, keeping fallback /init"
-fi
-
-# Phase 61: Build stub app (Files, Settings, Editor placeholders).
-STUB_DIR="$ROOT/userspace/stub"
-STUB_TARGET="x86_64-unknown-none"
-
-if [ -d "$STUB_DIR" ]; then
-    echo "[0.8/4] Building userspace/stub ELF..."
-    (cd "$STUB_DIR" && \
-        cargo +nightly build \
-            --release \
-            --target "$STUB_TARGET" \
-            -Z build-std=core,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1) || {
-        echo "[0.8/4] WARNING: userspace/stub build failed (non-fatal)"
-    }
-
-    STUB_BIN="$STUB_DIR/target/$STUB_TARGET/release/stub"
-    if [ -f "$STUB_BIN" ]; then
-        mkdir -p "$ROOT/initramfs/bin"
-        for APP in files settings editor; do
-            cp "$STUB_BIN" "$ROOT/initramfs/bin/$APP"
-        done
-        echo "[0.8/4] stub staged to initramfs/bin/{files,settings,editor} ($(wc -c < "$STUB_BIN") bytes each)"
-    fi
-fi
-
-# Force flutter-embedder to be the primary /init (PID 1)
+# Flutter-only boot policy: flutter-embedder is always /init (PID 1)
 EMBEDDER_BIN="$ROOT/tools/flutter-embedder/target/x86_64-unknown-none/release/flutter-embedder"
 if [ -f "$EMBEDDER_BIN" ]; then
     cp "$EMBEDDER_BIN" "$ROOT/initramfs/init"
-    echo "[0.9/4] FORCE: Staged flutter-embedder to initramfs/init as PID 1"
+    echo "[0.6/4] Staged flutter-embedder to initramfs/init as PID 1"
 else
     echo "ERROR: flutter-embedder binary not found! Cannot stage as PID 1." >&2
     exit 1
 fi
+
+# Required Flutter runtime assets for the embedder path.
+REQUIRED_FILES=(
+    "$ROOT/initramfs/init"
+    "$ROOT/initramfs/bin/flutter-embedder"
+    "$ROOT/initramfs/system/flutter/icudtl.dat"
+    "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+    "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
+    "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
+    "$ROOT/tools/flutter-engine/libflutter_engine.so"
+)
+for req in "${REQUIRED_FILES[@]}"; do
+    if [ ! -f "$req" ]; then
+        echo "ERROR: required Flutter artifact missing: $req" >&2
+        exit 1
+    fi
+done
 
 echo "[1/4] Building kernel ELF..."
 cd "$ROOT"
@@ -187,12 +178,8 @@ EOF
 
 # Stage Flutter engine as a Limine module (so the kernel can dlopen it at runtime).
 FLUTTER_ENGINE_SO="$ROOT/tools/flutter-engine/libflutter_engine.so"
-if [ -f "$FLUTTER_ENGINE_SO" ]; then
-    cp "$FLUTTER_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
-    echo "[2/4] Staged libflutter_engine.so ($(du -sh "$FLUTTER_ENGINE_SO" | cut -f1)) as Limine module"
-else
-    echo "[2/4] WARNING: tools/flutter-engine/libflutter_engine.so not found — engine will not load"
-fi
+cp "$FLUTTER_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
+echo "[2/4] Staged libflutter_engine.so ($(du -sh "$FLUTTER_ENGINE_SO" | cut -f1)) as Limine module"
 
 # Some UEFI firmwares load Limine from EFI removable path and expect config
 # near the loader/root. Keep mirrored copies for maximum compatibility.

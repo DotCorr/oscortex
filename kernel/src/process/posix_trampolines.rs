@@ -55,6 +55,7 @@ const SD_CTYPE_B_TABLE:   u64 = SYSDATA_VA + 80;   // u16[384] = 768 bytes
 const SD_CTYPE_LO_TABLE:  u64 = SYSDATA_VA + 848;  // i32[384] = 1536 bytes
 const SD_CTYPE_UP_TABLE:  u64 = SYSDATA_VA + 2384; // i32[384] = 1536 bytes
 // Total: 2384 + 1536 = 3920 bytes < 4096 ✓
+pub const SD_LOCALE_C: u64 = SYSDATA_VA + 3920;
 
 // Pointer values written into sysdata page at init time:
 const CTYPE_B_PTR_VAL:  u64 = SD_CTYPE_B_TABLE  + 128 * 2; // &ctype_b_table[128]
@@ -79,6 +80,14 @@ enum StubKind {
     /// return value (e.g. pthread_exit invoked implicitly via `ret` from the
     /// thread start routine — RAX holds the routine's return value).
     SyscallRetAsArg0(u32),
+    /// Custom inline userspace qsort implementation (136 bytes, spans 9 slots)
+    Qsort,
+    /// Padding for multi-slot custom code (noop during encoding)
+    Padding,
+    /// Custom inline userspace _setjmp implementation (44 bytes, spans 3 slots)
+    Setjmp,
+    /// Custom inline userspace longjmp implementation (48 bytes, spans 3 slots)
+    Longjmp,
 }
 
 // ── Master symbol list ────────────────────────────────────────────────────────
@@ -134,7 +143,7 @@ const STUBS: &[(&str, StubKind)] = &[
     /* 35 */ ("strtod",               StubKind::Syscall(0x3C9)),
     /* 36 */ ("atoi",                 StubKind::Syscall(0x3CA)),
     /* 37 */ ("atol",                 StubKind::Syscall(0x3CA)),  // alias atoi
-    /* 38 */ ("qsort",                StubKind::Syscall(0x3CB)),
+    /* 38 */ ("__qsort_old",          StubKind::Syscall(0x3CB)),
     /* 39 */ ("rand",                 StubKind::Syscall(0x3CC)),
     /* 40 */ ("srand",                StubKind::Syscall(0x3CD)),
     // ── Threading ──────────────────────────────────────────────────────────
@@ -356,8 +365,8 @@ const STUBS: &[(&str, StubKind)] = &[
     /* 242 */ ("sigemptyset",         StubKind::Syscall(0x483)),
     /* 243 */ ("sigaddset",           StubKind::Syscall(0x484)),
     /* 244 */ ("sigfillset",          StubKind::Syscall(0x485)),
-    /* 245 */ ("_setjmp",             StubKind::Syscall(0x486)),
-    /* 246 */ ("longjmp",             StubKind::Syscall(0x487)),
+    /* 245 */ ("__setjmp_old",        StubKind::Syscall(0x486)),
+    /* 246 */ ("__longjmp_old",       StubKind::Syscall(0x487)),
     // ── Locale / wchar ──────────────────────────────────────────────────────
     /* 247 */ ("wcslen",              StubKind::Syscall(0x488)),
     /* 248 */ ("mbrtowc",             StubKind::Syscall(0x489)),
@@ -450,6 +459,21 @@ const STUBS: &[(&str, StubKind)] = &[
     // The leading "__oscortex_" name prefix guarantees no libc symbol can
     // accidentally resolve here. See THREAD_RETURN_TRAMPOLINE_VA below.
     /* 329 */ ("__oscortex_thread_return",   StubKind::SyscallRetAsArg0(0x35B)),
+    /* 330 */ ("qsort",                      StubKind::Qsort),
+    /* 331 */ ("__qsort_pad1",               StubKind::Padding),
+    /* 332 */ ("__qsort_pad2",               StubKind::Padding),
+    /* 333 */ ("__qsort_pad3",               StubKind::Padding),
+    /* 334 */ ("__qsort_pad4",               StubKind::Padding),
+    /* 335 */ ("__qsort_pad5",               StubKind::Padding),
+    /* 336 */ ("__qsort_pad6",               StubKind::Padding),
+    /* 337 */ ("__qsort_pad7",               StubKind::Padding),
+    /* 338 */ ("__qsort_pad8",               StubKind::Padding),
+    /* 339 */ ("_setjmp",                    StubKind::Setjmp),
+    /* 340 */ ("__setjmp_pad1",              StubKind::Padding),
+    /* 341 */ ("__setjmp_pad2",              StubKind::Padding),
+    /* 342 */ ("longjmp",                    StubKind::Longjmp),
+    /* 343 */ ("__longjmp_pad1",             StubKind::Padding),
+    /* 344 */ ("__longjmp_pad2",             StubKind::Padding),
 ];
 
 /// Data symbols: resolve to a fixed VA in SYSDATA page (no trampoline needed).
@@ -670,6 +694,37 @@ fn encode_stub(page: &mut [u8], off: usize, kind: StubKind) {
             page[off + 11] = 0x0B;
             // bytes 12-15 already 0x90
         }
+        StubKind::Qsort => {
+            let code: &[u8] = &[
+                0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x49, 0x89, 0xfc, 0x49, 0x89, 0xf5,
+                0x49, 0x89, 0xd6, 0x49, 0x89, 0xcf, 0x49, 0x83, 0xfd, 0x02, 0x72, 0x61, 0x48, 0xc7, 0xc3, 0x01,
+                0x00, 0x00, 0x00, 0x4c, 0x39, 0xeb, 0x73, 0x55, 0x48, 0x89, 0xdd, 0x48, 0x85, 0xed, 0x74, 0x48,
+                0x48, 0x89, 0xe8, 0x49, 0x0f, 0xaf, 0xc6, 0x4c, 0x01, 0xe0, 0x48, 0x89, 0xc7, 0x4c, 0x29, 0xf0,
+                0x48, 0x89, 0xc6, 0x41, 0xff, 0xd7, 0x85, 0xc0, 0x7d, 0x2e, 0x48, 0x89, 0xef, 0x49, 0x0f, 0xaf,
+                0xfe, 0x4c, 0x01, 0xe7, 0x48, 0x89, 0xfe, 0x4c, 0x29, 0xf6, 0x48, 0x31, 0xc9, 0x4c, 0x39, 0xf1,
+                0x73, 0x11, 0x8a, 0x04, 0x0f, 0x8a, 0x14, 0x0e, 0x88, 0x04, 0x0e, 0x88, 0x14, 0x0f, 0x48, 0xff,
+                0xc1, 0xeb, 0xea, 0x48, 0xff, 0xcd, 0xeb, 0xb3, 0x48, 0xff, 0xc3, 0xeb, 0xa6, 0x41, 0x5f, 0x41,
+                0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5d, 0x5b, 0xc3
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
+        StubKind::Padding => {}
+        StubKind::Setjmp => {
+            let code: &[u8] = &[
+                0x48, 0x89, 0x1f, 0x48, 0x8d, 0x44, 0x24, 0x08, 0x48, 0x89, 0x47, 0x08, 0x48, 0x89, 0x6f, 0x10,
+                0x4c, 0x89, 0x67, 0x18, 0x4c, 0x89, 0x6f, 0x20, 0x4c, 0x89, 0x77, 0x28, 0x4c, 0x89, 0x7f, 0x30,
+                0x48, 0x8b, 0x04, 0x24, 0x48, 0x89, 0x47, 0x38, 0x48, 0x31, 0xc0, 0xc3
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
+        StubKind::Longjmp => {
+            let code: &[u8] = &[
+                0x48, 0x8b, 0x1f, 0x48, 0x8b, 0x67, 0x08, 0x48, 0x8b, 0x6f, 0x10, 0x4c, 0x8b, 0x67, 0x18, 0x4c,
+                0x8b, 0x6f, 0x20, 0x4c, 0x8b, 0x77, 0x28, 0x4c, 0x8b, 0x7f, 0x30, 0x48, 0x8b, 0x57, 0x38, 0x48,
+                0x89, 0xf0, 0x48, 0x85, 0xc0, 0x75, 0x07, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0xff, 0xe2
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
     }
 }
 
@@ -686,7 +741,12 @@ fn map_sysdata_page(pml4_phys: u64) -> Result<(), &'static str> {
     write_u64_le(page, 8,  CTYPE_LO_PTR_VAL);  // SD_CTYPE_LO_PTR
     write_u64_le(page, 16, CTYPE_UP_PTR_VAL);  // SD_CTYPE_UP_PTR
     // SD_ERRNO at offset 32: already 0
-    // SD_ENVIRON/STDIN/STDOUT/STDERR at 48/56/64/72: already 0 (null ptrs)
+    // SD_ENVIRON pointing to SYSDATA_VA + 24 (which contains 0 = empty environment array)
+    write_u64_le(page, 48, SYSDATA_VA + 24);
+    // SD_STDIN/STDOUT/STDERR pointing to 0, 1, 2 to match file handles
+    write_u64_le(page, 56, 0);
+    write_u64_le(page, 64, 1);
+    write_u64_le(page, 72, 2);
 
     // Write ctype_b table at offset 80.
     let ctype_b = gen_ctype_b();
@@ -714,6 +774,10 @@ fn map_sysdata_page(pml4_phys: u64) -> Result<(), &'static str> {
         let vb = v.to_le_bytes();
         page[o..o + 4].copy_from_slice(&vb);
     }
+
+    // Write stable "C" locale string at offset 3920.
+    page[3920] = b'C';
+    page[3921] = 0;
 
     // Map as read-write (data page, not executable). errno and other mutable
     // fields (SD_ERRNO etc.) are written directly by user code via pointers.

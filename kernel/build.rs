@@ -19,8 +19,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
     // ── Initramfs ─────────────────────────────────────────────────────────
-    // Phase 32-A: auto-build from `initramfs/` directory if it exists,
-    // then inject the generated stub libflutter_engine.so ELF.
+    // Build directly from `initramfs/` contents. Boot policy and required
+    // artifacts are enforced by scripts/build-iso.sh.
     let ws_root      = std::path::Path::new(&dir).parent().unwrap().to_path_buf();
     let out_tar      = std::path::Path::new(&out).join("initramfs.tar");
     let initramfs_dir = ws_root.join("initramfs");
@@ -32,18 +32,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", initramfs_dir.display());
         collect_dir(&initramfs_dir, &initramfs_dir, &mut entries);
     }
-
-    // Ensure a placeholder init exists.
-    if !entries.iter().any(|(n, _)| n == "init") {
-        entries.push(("init".to_string(), b"# OSCortex placeholder init\n".to_vec()));
-    }
-
-    // Inject stub libflutter_engine.so (replaces any copy from the directory).
-    entries.retain(|(n, _)| n != "system/lib/libflutter_engine.so");
-    entries.push((
-        "system/lib/libflutter_engine.so".to_string(),
-        generate_flutter_engine_stub(),
-    ));
 
     // Phase 33-B: inject liboscortex.so syscall shim.
     entries.retain(|(n, _)| n != "system/lib/liboscortex.so");
@@ -58,19 +46,6 @@ fn main() {
         "system/lib/liboscortex_embedder.so".to_string(),
         generate_liboscortex_embedder_shim(),
     ));
-
-    // Phase 47: inject /bin/hello if pre-built by build-iso.sh.
-    let hello_bin = ws_root
-        .join("userspace/hello/target/x86_64-unknown-none/release/hello");
-    if hello_bin.is_file() {
-        println!("cargo:rerun-if-changed={}", hello_bin.display());
-        let data = std::fs::read(&hello_bin).unwrap_or_default();
-        if !data.is_empty() {
-            entries.retain(|(n, _)| n != "bin/hello");
-            entries.push(("bin/hello".to_string(), data));
-            println!("cargo:warning=[build.rs] embedded /bin/hello ({} bytes)", hello_bin.metadata().map(|m|m.len()).unwrap_or(0));
-        }
-    }
 
     // Write the USTAR tar to OUT_DIR.
     let tar_bytes = build_ustar_tar(&entries);
@@ -162,171 +137,6 @@ fn ustar_append(out: &mut Vec<u8>, name: &str, data: &[u8]) {
     // Pad data to 512-byte boundary.
     let rem = (512 - (data.len() % 512)) % 512;
     out.extend(std::iter::repeat(0u8).take(rem));
-}
-
-// ── Stub libflutter_engine.so ELF generator ──────────────────────────────────
-
-/// Generate a minimal ELF64 ET_DYN shared library that exports all Flutter
-/// engine API symbols as `ret`-stubs (xor eax,eax; ret; nop; nop).
-///
-/// This lets the kernel's dlopen/dlsym path resolve Flutter symbols without
-/// needing the real 100 MiB engine binary.  The embedder then replaces the
-/// stub fn-pointers via `FlutterEngineGetProcAddresses` before calling Run.
-fn generate_flutter_engine_stub() -> Vec<u8> {
-    // Symbols exported by the real engine (subset covering the embedder ABI).
-    const SYMS: &[&str] = &[
-        "FlutterEngineRun",
-        "FlutterEngineShutdown",
-        "FlutterEngineInitialize",
-        "FlutterEngineDeinitialize",
-        "FlutterEngineRunInitialized",
-        "FlutterEngineSendWindowMetricsEvent",
-        "FlutterEngineSendPointerEvent",
-        "FlutterEngineSendKeyEvent",
-        "FlutterEngineOnVsync",
-        "FlutterEngineScheduleFrame",
-        "FlutterEngineGetProcAddresses",
-        "FlutterEngineSendPlatformMessage",
-        "FlutterEngineSendPlatformMessageResponse",
-        "FlutterEngineCreateAOTData",
-        "FlutterEngineCollectAOTData",
-        "FlutterEngineGetCurrentTime",
-        "FlutterEngineNotifyDisplayUpdate",
-        "FlutterEngineAddView",
-        "FlutterEngineRemoveView",
-    ];
-
-    let n = SYMS.len();
-
-    // ── Layout (all offsets relative to file start = load base) ──────────
-    //   0x0000 : ELF64 header       (64 bytes)
-    //   0x0040 : PT_LOAD phdr       (56 bytes)  — covers entire file
-    //   0x0078 : PT_DYNAMIC phdr    (56 bytes)
-    //   0x00B0 : .text              (n * 4 bytes, each stub = 4 bytes)
-    //   (align8) : .dynsym          ((n+1) * 24 bytes, entry 0 = NULL)
-    //   (next)   : .dynstr          (1 + sum(name_len+1))
-    //   (align8) : .dynamic         (5 * 16 bytes)
-
-    let text_off  = 0x00B0usize;
-    let text_size = n * 4;
-    let dynsym_off = align8(text_off + text_size);
-    let sym_ent   = 24usize;
-    let n_sym_ent = n + 1; // +1 for null symbol
-    let dynsym_sz = n_sym_ent * sym_ent;
-    let dynstr_off = dynsym_off + dynsym_sz;
-
-    // Build .dynstr: leading null byte + each name + null.
-    let mut dynstr = vec![0u8; 1]; // index 0 = empty name for null symbol
-    let mut name_offs: Vec<u32> = Vec::with_capacity(n);
-    for &sym in SYMS {
-        name_offs.push(dynstr.len() as u32);
-        dynstr.extend_from_slice(sym.as_bytes());
-        dynstr.push(0);
-    }
-    let dynstr_sz = dynstr.len();
-
-    let dynamic_off = align8(dynstr_off + dynstr_sz);
-    let n_dyn       = 5usize; // DT_SYMTAB, DT_STRTAB, DT_SYMENT, DT_STRSZ, DT_NULL
-    let dynamic_sz  = n_dyn * 16;
-    let file_sz     = dynamic_off + dynamic_sz;
-
-    let mut elf = vec![0u8; file_sz];
-
-    // ── ELF header ────────────────────────────────────────────────────────
-    // e_ident
-    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
-    elf[4] = 2; // ELFCLASS64
-    elf[5] = 1; // ELFDATA2LSB
-    elf[6] = 1; // EV_CURRENT
-    elf[7] = 0; // ELFOSABI_NONE
-    // e_type: ET_DYN = 3
-    write_u16(&mut elf, 16, 3);
-    // e_machine: EM_X86_64 = 62
-    write_u16(&mut elf, 18, 62);
-    // e_version: 1
-    write_u32(&mut elf, 20, 1);
-    // e_entry: 0
-    // e_phoff: 64 (program headers start right after ELF header)
-    write_u64(&mut elf, 32, 64);
-    // e_shoff: 0
-    // e_flags: 0
-    // e_ehsize: 64
-    write_u16(&mut elf, 52, 64);
-    // e_phentsize: 56
-    write_u16(&mut elf, 54, 56);
-    // e_phnum: 2
-    write_u16(&mut elf, 56, 2);
-    // e_shentsize: 64
-    write_u16(&mut elf, 58, 64);
-    // e_shnum: 0
-    // e_shstrndx: 0
-
-    // ── PT_LOAD (covers whole file as RWX) ────────────────────────────────
-    let p0 = 64usize;
-    write_u32(&mut elf, p0,      1);             // p_type = PT_LOAD
-    write_u32(&mut elf, p0 + 4,  7);             // p_flags = PF_R|PF_W|PF_X
-    write_u64(&mut elf, p0 + 8,  0);             // p_offset = 0
-    write_u64(&mut elf, p0 + 16, 0);             // p_vaddr = 0
-    write_u64(&mut elf, p0 + 24, 0);             // p_paddr = 0
-    write_u64(&mut elf, p0 + 32, file_sz as u64);// p_filesz
-    write_u64(&mut elf, p0 + 40, file_sz as u64);// p_memsz
-    write_u64(&mut elf, p0 + 48, 0x1000);        // p_align = 4096
-
-    // ── PT_DYNAMIC ────────────────────────────────────────────────────────
-    let p1 = 64 + 56;
-    write_u32(&mut elf, p1,      2);                     // p_type = PT_DYNAMIC
-    write_u32(&mut elf, p1 + 4,  6);                     // p_flags = PF_R|PF_W
-    write_u64(&mut elf, p1 + 8,  dynamic_off as u64);    // p_offset
-    write_u64(&mut elf, p1 + 16, dynamic_off as u64);    // p_vaddr (= file offset since base=0)
-    write_u64(&mut elf, p1 + 24, dynamic_off as u64);    // p_paddr
-    write_u64(&mut elf, p1 + 32, dynamic_sz as u64);     // p_filesz
-    write_u64(&mut elf, p1 + 40, dynamic_sz as u64);     // p_memsz
-    write_u64(&mut elf, p1 + 48, 8);                     // p_align
-
-    // ── .text: N stubs (xor eax,eax; ret; nop; nop) ──────────────────────
-    for i in 0..n {
-        let off = text_off + i * 4;
-        elf[off]     = 0x31; // xor
-        elf[off + 1] = 0xC0; // eax, eax
-        elf[off + 2] = 0xC3; // ret
-        elf[off + 3] = 0x90; // nop
-    }
-
-    // ── .dynsym ───────────────────────────────────────────────────────────
-    // Entry 0: null symbol (all zeros, already done)
-    for i in 0..n {
-        let entry_off = dynsym_off + (i + 1) * sym_ent;
-        let st_value  = (text_off + i * 4) as u64; // VA = file offset (base = 0)
-        // st_name: u32 offset into .dynstr
-        write_u32_le(&mut elf, entry_off,      name_offs[i]);
-        // st_info: STB_GLOBAL(1) << 4 | STT_FUNC(2) = 0x12
-        elf[entry_off + 4]  = 0x12;
-        // st_other: STV_DEFAULT = 0
-        elf[entry_off + 5]  = 0;
-        // st_shndx: SHN_ABS = 0xFFF1 (absolute symbol — value is the VA directly)
-        write_u16(&mut elf, entry_off + 6,  0xFFF1);
-        // st_value: VA of the stub in .text
-        write_u64(&mut elf, entry_off + 8,  st_value);
-        // st_size: 4 bytes per stub
-        write_u64(&mut elf, entry_off + 16, 4);
-    }
-
-    // ── .dynstr ───────────────────────────────────────────────────────────
-    elf[dynstr_off..dynstr_off + dynstr_sz].copy_from_slice(&dynstr);
-
-    // ── .dynamic ─────────────────────────────────────────────────────────
-    // DT_SYMTAB = 6, value = VA of .dynsym
-    write_dyn(&mut elf, dynamic_off,       6,  dynsym_off as u64);
-    // DT_STRTAB = 5, value = VA of .dynstr
-    write_dyn(&mut elf, dynamic_off + 16,  5,  dynstr_off as u64);
-    // DT_SYMENT = 11, value = 24
-    write_dyn(&mut elf, dynamic_off + 32,  11, sym_ent as u64);
-    // DT_STRSZ = 10, value = size of .dynstr
-    write_dyn(&mut elf, dynamic_off + 48,  10, dynstr_sz as u64);
-    // DT_NULL = 0
-    write_dyn(&mut elf, dynamic_off + 64,  0,  0);
-
-    elf
 }
 
 // ── liboscortex.so syscall shim ELF generator (Phase 33-B) ───────────────────
