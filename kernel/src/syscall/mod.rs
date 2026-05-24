@@ -4974,7 +4974,12 @@ mod posix {
             // _SC_PAGESIZE / _SC_PAGE_SIZE
             30 | 47 => 4096,
             // _SC_NPROCESSORS_ONLN / _SC_NPROCESSORS_CONF
-            84 | 83 => 2,
+            // Report 1 CPU: the Dart VM scales JIT worker thread count by CPU
+            // count. With 2 CPUs it spawns 2 parallel JIT workers (pids 8 and 9)
+            // that race on the class table, triggering ASSERT(previous_cid <
+            // current_cid) in il.cc. Under our single-CPU cooperative scheduler
+            // with a single BSP, 1 worker is both correct and sufficient.
+            84 | 83 => 1,
             // _SC_PHYS_PAGES
             85 => 131072, // 512 MiB / 4096
             // _SC_CLK_TCK
@@ -5333,7 +5338,12 @@ mod posix {
         r
     }
 
-    pub fn sys_snprintf(buf: u64, size: u64, fmt_ptr: u64, first_vararg: u64, second_vararg: u64) -> i64 {
+    fn format_into(
+        buf: u64,
+        size: u64,
+        fmt_ptr: u64,
+        mut next_int: impl FnMut() -> u64,
+    ) -> i64 {
         let fmt_valid = fmt_ptr >= 0x10000 && fmt_ptr < 0x0000_8000_0000_0000;
         let buf_valid = buf  >= 0x10000 && buf  < 0x0000_8000_0000_0000;
         if !fmt_valid || !buf_valid { return 0; }
@@ -5362,9 +5372,123 @@ mod posix {
         let flen = read_cstr(fmt_ptr, &mut fbuf);
         let fmt = &fbuf[..flen];
 
-        // Collect up to 4 variadic string args (SysV: rcx, r8, r9, then stack).
+        let max_out = ((size as usize).saturating_sub(1)).min(511);
+        let mut out_buf = [0u8; 512];
+        let mut out_len = 0usize;
+        let mut i = 0usize;
+
+        while i < flen && out_len < max_out {
+            let c = fmt[i];
+            if c != b'%' || i + 1 >= flen {
+                out_buf[out_len] = c;
+                out_len += 1;
+                i += 1;
+                continue;
+            }
+
+            // Skip format spec modifiers
+            let mut j = i + 1;
+            while j < flen && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#') {
+                j += 1;
+            }
+            if j >= flen { break; }
+            let conv = fmt[j];
+            let mut tmp = [0u8; 32];
+            match conv {
+                b'd' | b'i' => {
+                    let v = next_int() as i64;
+                    let mut n = 0usize;
+                    let (neg, mut u) = if v < 0 { (true, (v.wrapping_neg()) as u64) } else { (false, v as u64) };
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                    if neg { tmp[n] = b'-'; n += 1; }
+                    tmp[..n].reverse();
+                    let limit = (max_out - out_len).min(n);
+                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
+                    out_len += limit;
+                }
+                b'u' => {
+                    let mut u = next_int();
+                    let mut n = 0usize;
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                    tmp[..n].reverse();
+                    let limit = (max_out - out_len).min(n);
+                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
+                    out_len += limit;
+                }
+                b'x' | b'X' | b'p' => {
+                    let mut u = next_int();
+                    if conv == b'p' {
+                        if out_len + 2 <= max_out {
+                            out_buf[out_len..out_len+2].copy_from_slice(b"0x");
+                            out_len += 2;
+                        }
+                    }
+                    let hexd = if conv == b'X' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+                    let mut n = 0usize;
+                    if u == 0 { tmp[n] = b'0'; n += 1; }
+                    while u > 0 { tmp[n] = hexd[(u & 0xF) as usize]; n += 1; u >>= 4; }
+                    tmp[..n].reverse();
+                    let limit = (max_out - out_len).min(n);
+                    out_buf[out_len..out_len + limit].copy_from_slice(&tmp[..limit]);
+                    out_len += limit;
+                }
+                b's' => {
+                    let p = next_int();
+                    let mut sbuf = [0u8; 256];
+                    let sn = read_cstr(p, &mut sbuf);
+                    let limit = (max_out - out_len).min(sn);
+                    out_buf[out_len..out_len + limit].copy_from_slice(&sbuf[..limit]);
+                    out_len += limit;
+                }
+                b'c' => {
+                    let v = next_int() as u8;
+                    out_buf[out_len] = v;
+                    out_len += 1;
+                }
+                b'%' => {
+                    out_buf[out_len] = b'%';
+                    out_len += 1;
+                }
+                _ => {
+                    out_buf[out_len] = b'%';
+                    out_len += 1;
+                    if out_len < max_out {
+                        out_buf[out_len] = conv;
+                        out_len += 1;
+                    }
+                }
+            }
+            i = j + 1;
+        }
+
+        out_buf[out_len] = 0;
+
+        let fmt_str = core::str::from_utf8(fmt).unwrap_or("<non-utf8>");
+        let is_error = flen >= 5 && (fmt_str.contains("error") || fmt_str.contains("expected") || fmt_str.contains("assert") || fmt_str.contains("fail") || fmt_str.contains("FATAL"));
+        if is_error {
+            static SNPRINTF_ERR_COUNT: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = SNPRINTF_ERR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 16 {
+                let msg = core::str::from_utf8(&out_buf[..out_len]).unwrap_or("<non-utf8>");
+                log::error!("[snprintf-error] pid={} #{}: msg=\"{}\" fmt=\"{}\"",
+                    crate::process::current_pid(), n, msg, fmt_str);
+            }
+        }
+
+        // Write formatted result to the caller's buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(out_buf.as_ptr(), buf as *mut u8, out_len + 1);
+        }
+        out_len as i64
+    }
+
+    pub fn sys_snprintf(buf: u64, size: u64, fmt_ptr: u64, first_vararg: u64, second_vararg: u64) -> i64 {
         let user_rsp = crate::arch::syscall::user_rsp();
         let third_vararg  = crate::arch::syscall::user_r9();
+        let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
         let safe_qword = |off: u64| -> u64 {
             let addr = user_rsp.wrapping_add(off);
             if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
@@ -5375,71 +5499,38 @@ mod posix {
         let fifth_vararg  = safe_qword(16);
         let varargs = [first_vararg, second_vararg, third_vararg, fourth_vararg, fifth_vararg];
         let mut varg_idx = 0usize;
+        format_into(buf, size, fmt_ptr, || {
+            let val = if varg_idx < varargs.len() { varargs[varg_idx] } else { 0 };
+            varg_idx += 1;
+            val
+        })
+    }
 
-        // Perform minimal printf formatting (%s only; others are passed through).
-        let max_out = ((size as usize).saturating_sub(1)).min(511);
-        let mut out = [0u8; 512];
-        let mut out_len = 0usize;
-        let mut i = 0usize;
-        while i < flen && out_len < max_out {
-            if fmt[i] == b'%' && i + 1 < flen {
-                match fmt[i + 1] {
-                    b's' => {
-                        let arg = if varg_idx < varargs.len() { varargs[varg_idx] } else { 0 };
-                        varg_idx += 1;
-                        i += 2;
-                        let mut sbuf = [0u8; 256];
-                        let sn = read_cstr(arg, &mut sbuf);
-                        for &c in &sbuf[..sn] {
-                            if out_len >= max_out { break; }
-                            out[out_len] = c;
-                            out_len += 1;
-                        }
-                    }
-                    b'd' | b'i' | b'u' | b'x' | b'p' | b'z' | b'l' => {
-                        // Skip numeric format specs (consume the vararg slot).
-                        varg_idx += 1;
-                        i += 2;
-                        // Emit a placeholder so the string isn't truncated.
-                        if out_len < max_out { out[out_len] = b'?'; out_len += 1; }
-                    }
-                    b'%' => {
-                        i += 2;
-                        if out_len < max_out { out[out_len] = b'%'; out_len += 1; }
-                    }
-                    _ => {
-                        out[out_len] = fmt[i];
-                        out_len += 1;
-                        i += 1;
-                    }
+    pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
+        let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
+        let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) =
+            if plausible_user(ap) {
+                unsafe {
+                    let g = core::ptr::read_unaligned((ap as *const u32));
+                    let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
+                    let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
+                    (g, r, o)
                 }
-            } else {
-                out[out_len] = fmt[i];
-                out_len += 1;
-                i += 1;
-            }
-        }
-        out[out_len] = 0;
+            } else { (48, 0, 0) };
 
-        // Log only error/fatal format strings so we can diagnose engine crashes.
-        // Use a counter to suppress repeated identical messages.
-        let is_error = flen >= 5 && (&fmt[..5] == b"error" || (flen >= 8 && &fmt[..8] == b"expected"));
-        if is_error {
-            static SNPRINTF_ERR_COUNT: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = SNPRINTF_ERR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 16 {
-                let msg = core::str::from_utf8(&out[..out_len]).unwrap_or("<non-utf8>");
-                log::error!("[snprintf-error] pid={} #{}: {}",
-                    crate::process::current_pid(), n, msg);
-            }
-        }
+        let mut next_int = || -> u64 {
+            if gp_off < 48 && plausible_user(reg_save) {
+                let v = unsafe { core::ptr::read_unaligned((reg_save + gp_off as u64) as *const u64) };
+                gp_off += 8;
+                v
+            } else if plausible_user(ovf) {
+                let v = unsafe { core::ptr::read_unaligned(ovf as *const u64) };
+                ovf += 8;
+                v
+            } else { 0 }
+        };
 
-        // Write formatted result to the caller's buffer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(out.as_ptr(), buf as *mut u8, out_len + 1);
-        }
-        out_len as i64
+        format_into(buf, size, fmt_ptr, next_int)
     }
 
     pub fn sys_printf(fmt_ptr: u64, _fmt_len: u64) -> i64 {
@@ -6310,7 +6401,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x432 => posix::sys_fprintf(arg0, arg1, arg2),
         0x433 => posix::sys_fprintf(arg0, arg1, arg2), // vfprintf alias
         0x434 => posix::sys_snprintf(arg0, arg1, arg2, arg3, arg4),
-        0x435 => posix::sys_snprintf(arg0, arg1, arg2, arg3, arg4), // vsnprintf alias
+        0x435 => posix::sys_vsnprintf(arg0, arg1, arg2, arg3), // vsnprintf
         0x436 => posix::sys_snprintf(arg0, arg1, arg2, arg3, arg4), // sprintf alias
         0x437 => posix::sys_printf(arg0, arg1),
         0x438 => posix::sys_puts(arg0),
