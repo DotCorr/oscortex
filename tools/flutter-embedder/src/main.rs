@@ -439,6 +439,14 @@ impl Drop for SpinlockGuard<'_> {
 static PLATFORM_TASKS_LOCK: Spinlock = Spinlock::new();
 static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
 static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
+static SEND_PLATFORM_MESSAGE_FN: AtomicU64 = AtomicU64::new(0);
+
+const APPS_REQUEST_CHANNEL: &[u8] = b"oscortex/apps/request";
+const APPS_CATALOG_CHANNEL_Z: &[u8] = b"oscortex/apps/catalog\0";
+const APPS_REGISTRY_PATH_Z: &[u8] = b"/system/apps/registry.json\0";
+const AT_FDCWD: i64 = -100;
+const O_RDONLY: u64 = 0;
+const EMPTY_APPS_JSON: &[u8] = b"{\"apps\":[]}";
 
 unsafe extern "C" fn runs_task_on_current_thread_callback(_user_data: *mut ()) -> bool {
     let tid = unsafe { syscall0(186) };
@@ -538,16 +546,65 @@ unsafe extern "C" fn platform_message_callback(
 ) {
     if msg_ptr.is_null() { return; }
     let msg = unsafe { &*msg_ptr };
-    if msg.message == 0 || msg.message_size == 0 { return; }
     let channel_slice = if msg.channel != 0 {
         unsafe { cstr_to_slice(msg.channel as *const u8) }
     } else {
         b"unknown"
     };
-    let payload = unsafe {
-        core::slice::from_raw_parts(msg.message as *const u8, msg.message_size)
-    };
+
+    if channel_slice == APPS_REQUEST_CHANNEL {
+        publish_subsystem_apps_catalog();
+        return;
+    }
+
+    if msg.message == 0 || msg.message_size == 0 {
+        return;
+    }
+    let payload = unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) };
     platform_msg_post(channel_slice, payload);
+}
+
+fn publish_subsystem_apps_catalog() {
+    let mut buf = [0u8; 8192];
+    let len = read_small_file(APPS_REGISTRY_PATH_Z, &mut buf);
+    let payload = if len > 0 { &buf[..len] } else { EMPTY_APPS_JSON };
+    let _ = send_platform_message_direct(APPS_CATALOG_CHANNEL_Z, payload);
+}
+
+fn read_small_file(path_z: &[u8], dst: &mut [u8]) -> usize {
+    let fd = openat(AT_FDCWD, path_z, O_RDONLY, 0);
+    if fd < 0 {
+        return 0;
+    }
+
+    let mut used = 0usize;
+    while used < dst.len() {
+        let n = read(fd, &mut dst[used..]);
+        if n <= 0 {
+            break;
+        }
+        used = used.saturating_add(n as usize);
+    }
+    let _ = close(fd);
+    used
+}
+
+fn send_platform_message_direct(channel_z: &[u8], payload: &[u8]) -> bool {
+    let engine = ENGINE.load(Ordering::SeqCst);
+    let send_fn_va = SEND_PLATFORM_MESSAGE_FN.load(Ordering::SeqCst);
+    if engine == 0 || send_fn_va == 0 {
+        return false;
+    }
+
+    let msg = FlutterPlatformMessage {
+        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+        channel: channel_z.as_ptr() as u64,
+        message: payload.as_ptr() as u64,
+        message_size: payload.len(),
+        response_handle: 0,
+    };
+    let send_platform_message: SendPlatformMessageFn = unsafe { core::mem::transmute(send_fn_va) };
+    unsafe { send_platform_message(engine, &msg as *const _) == 0 }
 }
 
 /// Log callback — writes to the kernel's serial debug output.
@@ -581,8 +638,8 @@ unsafe fn cstr_to_slice<'a>(ptr: *const u8) -> &'a [u8] {
 
 const ENGINE_LIB_PATH: &[u8] = b"/system/lib/libflutter_engine.so";
 
-// 0 = force standalone, 1 = ctor/TLS canary then standalone, 2 = full engine path.
-const ENGINE_CANARY_MODE: u8 = 2;
+// Strict engine mode: do not fall back to standalone UI paths.
+const STRICT_ENGINE_MODE: bool = true;
 
 // ── Main embedder logic ───────────────────────────────────────────────────────
 
@@ -600,25 +657,16 @@ extern "C" fn main_embedder() {
     // 1b. Phase 33-A: request 60 Hz vsync cadence from the compositor.
     vsync_set_hz(60);
 
-    if ENGINE_CANARY_MODE == 0 {
-        write(b"[embedder] FORCE_STANDALONE=1 (engine path disabled)\n");
-        run_standalone_demo();
-        exit(0);
-    }
-
-    if ENGINE_CANARY_MODE == 1 {
-        write(b"[embedder] ENGINE_CANARY_MODE=1 (ctors-only)\n");
-    } else {
-        write(b"[embedder] ENGINE_CANARY_MODE=2 (full engine)\n");
+    if STRICT_ENGINE_MODE {
+        write(b"[embedder] strict engine mode enabled\n");
     }
 
     // 2. Open the engine library.
     write(b"[embedder] calling dlopen...\n");
     let handle = dlopen(ENGINE_LIB_PATH, 0);
     if handle <= 0 {
-        write(b"[embedder] dlopen failed -- entering standalone demo mode\n");
-        run_standalone_demo();
-        exit(0);
+        write(b"[embedder] dlopen failed for /system/lib/libflutter_engine.so\n");
+        exit(-1);
     }
     let handle = handle as u32;
     write(b"[embedder] dlopen OK\n");
@@ -646,12 +694,6 @@ extern "C" fn main_embedder() {
             }
         }
         write(b"[embedder] ctors done\n");
-    }
-
-    if ENGINE_CANARY_MODE == 1 {
-        write(b"[embedder] canary: ctors completed, entering standalone\n");
-        run_standalone_demo();
-        exit(0);
     }
 
     write(b"[embedder] resolving symbols...\n");
@@ -684,6 +726,7 @@ extern "C" fn main_embedder() {
         proctable.on_vsync              = api_table.on_vsync;
         proctable.schedule_frame        = api_table.schedule_frame;
         proctable.send_platform_message = api_table.send_platform_message;
+        SEND_PLATFORM_MESSAGE_FN.store(api_table.send_platform_message, Ordering::SeqCst);
 
         initialize_va                   = api_table.initialize;
         run_initialized_va              = api_table.run_initialized;
@@ -700,6 +743,7 @@ extern "C" fn main_embedder() {
         proctable.on_vsync              = dlsym(handle, b"FlutterEngineOnVsync");
         proctable.schedule_frame        = dlsym(handle, b"FlutterEngineScheduleFrame");
         proctable.send_platform_message = dlsym(handle, b"FlutterEngineSendPlatformMessage");
+        SEND_PLATFORM_MESSAGE_FN.store(proctable.send_platform_message, Ordering::SeqCst);
 
         initialize_va                   = dlsym(handle, b"FlutterEngineInitialize");
         run_initialized_va              = dlsym(handle, b"FlutterEngineRunInitialized");
@@ -984,6 +1028,9 @@ extern "C" fn main_embedder() {
                     write(&hex);
                 }
             }
+
+            // Push the subsystem app registry to Flutter shell once at startup.
+            publish_subsystem_apps_catalog();
         } else {
             let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
             let digits = b"0123456789abcdef";

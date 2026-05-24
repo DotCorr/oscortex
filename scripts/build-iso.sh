@@ -13,6 +13,7 @@ OUTPUT="$ROOT/oscortex.iso"
 # then stage it into the initramfs directory before the kernel build.
 EMBEDDER_DIR="$ROOT/tools/flutter-embedder"
 EMBEDDER_TARGET="x86_64-unknown-none"
+FLUTTER_ENGINE_SO="$ROOT/tools/flutter-engine/libflutter_engine.so"
 
 if [ -d "$EMBEDDER_DIR" ]; then
     echo "[0/4] Building flutter-embedder userspace binary..."
@@ -62,9 +63,14 @@ if [ -d "$APP_ASSETS_DIR" ]; then
             exit 1
         fi
         cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
-        # Keep top-level copies for compatibility with older runtime paths.
-        cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/$f"
     done
+
+    # Strict path contract: snapshots are only consumed from
+    # /system/flutter/flutter_assets. Clear stale legacy top-level copies.
+    rm -f \
+        "$ROOT/initramfs/system/flutter/kernel_blob.bin" \
+        "$ROOT/initramfs/system/flutter/vm_snapshot_data" \
+        "$ROOT/initramfs/system/flutter/isolate_snapshot_data"
 
     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
         if [ -f "$APP_ASSETS_DIR/$f" ]; then
@@ -83,6 +89,76 @@ else
     echo "       Build it first with: cd apps/oscortex_app && flutter build bundle" >&2
     exit 1
 fi
+
+echo "[0.42/4] Staging subsystem app packages and registry..."
+mkdir -p "$ROOT/initramfs/system/apps"
+REGISTRY_JSON="$ROOT/initramfs/system/apps/registry.json"
+REGISTRY_TMP="$ROOT/initramfs/system/apps/.registry.tmp"
+printf '{\n  "apps": [\n' > "$REGISTRY_TMP"
+first=1
+
+for app_path in "$ROOT"/apps/*; do
+    [ -d "$app_path" ] || continue
+    [ -f "$app_path/pubspec.yaml" ] || continue
+
+    app_id="$(basename "$app_path")"
+    app_assets="$app_path/build/flutter_assets"
+
+    if [ ! -d "$app_assets" ] || [ ! -f "$app_assets/kernel_blob.bin" ] || [ ! -f "$app_assets/vm_snapshot_data" ] || [ ! -f "$app_assets/isolate_snapshot_data" ]; then
+        echo "[0.42/4] Building subsystem Flutter app bundle: $app_id"
+        (
+            cd "$app_path"
+            flutter --suppress-analytics build bundle --debug
+        )
+    fi
+
+    if [ ! -d "$app_assets" ]; then
+        echo "ERROR: app assets missing for subsystem app: $app_id ($app_assets)" >&2
+        exit 1
+    fi
+
+    dst="$ROOT/initramfs/system/apps/$app_id"
+    mkdir -p "$dst/flutter_assets"
+
+    for f in kernel_blob.bin vm_snapshot_data isolate_snapshot_data; do
+        if [ ! -f "$app_assets/$f" ]; then
+            echo "ERROR: required subsystem app asset missing: $app_assets/$f" >&2
+            exit 1
+        fi
+        cp "$app_assets/$f" "$dst/flutter_assets/$f"
+    done
+
+    for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
+        if [ -f "$app_assets/$f" ]; then
+            cp "$app_assets/$f" "$dst/flutter_assets/$f"
+        fi
+    done
+
+    for d in fonts packages shaders; do
+        if [ -d "$app_assets/$d" ]; then
+            rm -rf "$dst/flutter_assets/$d"
+            cp -R "$app_assets/$d" "$dst/flutter_assets/$d"
+        fi
+    done
+
+    if [ "$first" -eq 0 ]; then
+        printf ',\n' >> "$REGISTRY_TMP"
+    fi
+    first=0
+    printf '    {"id":"%s","title":"%s","bundle_path":"/system/apps/%s/flutter_assets"}' "$app_id" "$app_id" "$app_id" >> "$REGISTRY_TMP"
+done
+
+printf '\n  ]\n}\n' >> "$REGISTRY_TMP"
+mv "$REGISTRY_TMP" "$REGISTRY_JSON"
+cp "$REGISTRY_JSON" "$ROOT/initramfs/system/flutter/flutter_assets/system_apps_registry.json"
+
+echo "[0.45/4] Staging Flutter engine runtime into initramfs subsystem..."
+if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
+    echo "ERROR: missing Flutter engine binary: $FLUTTER_ENGINE_SO" >&2
+    exit 1
+fi
+mkdir -p "$ROOT/initramfs/system/lib"
+cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
 
 # Phase 42: Build the real /init userspace binary and stage it to initramfs.
 INIT_DIR="$ROOT/userspace/init"
@@ -122,11 +198,13 @@ fi
 REQUIRED_FILES=(
     "$ROOT/initramfs/init"
     "$ROOT/initramfs/bin/flutter-embedder"
+    "$ROOT/initramfs/system/lib/libflutter_engine.so"
+    "$ROOT/initramfs/system/apps/registry.json"
     "$ROOT/initramfs/system/flutter/icudtl.dat"
     "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
     "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
     "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
-    "$ROOT/tools/flutter-engine/libflutter_engine.so"
+    "$ROOT/initramfs/system/flutter/flutter_assets/system_apps_registry.json"
 )
 for req in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$req" ]; then
@@ -176,10 +254,10 @@ verbose: yes
     module_cmdline: libflutter_engine.so
 EOF
 
-# Stage Flutter engine as a Limine module (so the kernel can dlopen it at runtime).
-FLUTTER_ENGINE_SO="$ROOT/tools/flutter-engine/libflutter_engine.so"
-cp "$FLUTTER_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
-echo "[2/4] Staged libflutter_engine.so ($(du -sh "$FLUTTER_ENGINE_SO" | cut -f1)) as Limine module"
+# Stage the exact same engine binary from initramfs into the Limine module.
+STAGED_ENGINE_SO="$ROOT/initramfs/system/lib/libflutter_engine.so"
+cp "$STAGED_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
+echo "[2/4] Staged libflutter_engine.so ($(du -sh "$STAGED_ENGINE_SO" | cut -f1)) as Limine module"
 
 # Some UEFI firmwares load Limine from EFI removable path and expect config
 # near the loader/root. Keep mirrored copies for maximum compatibility.

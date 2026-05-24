@@ -770,8 +770,12 @@ pub fn render_frame() {
     }
 
     // ── Hardware cursor overlay ──────────────────────────────────────────────
+    // In framebuffer bypass mode, userspace (Flutter shell) owns cursor
+    // rendering. Keep kernel cursor off to avoid double-cursor artifacts.
     drop(c); // release compositor lock before calling into fb
-    draw_cursor();
+    if !is_fb_bypass() {
+        draw_cursor();
+    }
     crate::drivers::fb::swap_buffers();
     // Re-acquire to update frame counter.
     let mut c = COMP.lock();
@@ -833,7 +837,6 @@ pub fn tick() {
         return;
     }
     if is_fb_bypass() {
-        draw_cursor();
         if let Some(mut c) = COMP.try_lock() {
             c.frame_counter = c.frame_counter.wrapping_add(1);
             crate::wm::push_vsync(c.frame_counter);

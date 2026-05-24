@@ -3247,10 +3247,13 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
     // arbitrary mutex-internal seq futexes (0x338000070, 0x457000040, ...).
     // Without this fallback the engine deadlocks: pid 1 broadcasts forever
     // with woke=0 while pids 5/6/8 sit in futex_wait on unrelated addrs.
-    if total == 0 && wake_count == 1 {
+    if total == 0 {
         let pid = crate::process::current_pid();
         let siblings = crate::process::sibling_pids(pid);
         if siblings.len() > 1 {
+            // Keep sibling fallback available for broadcast paths, but wake
+            // only one waiter per futex address to avoid wake storms.
+            let bridge_wake_count = if wake_count > 1 { 1 } else { wake_count };
             // Snapshot waiter table addresses.
             let addrs: alloc::vec::Vec<u64> = {
                 let t = FUTEX_WAITERS.lock();
@@ -3270,13 +3273,22 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                     .collect()
             };
             for addr in addrs {
-                let bridged = futex_wake_waiters(addr, wake_count);
+                let bridged = futex_wake_waiters(addr, bridge_wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);
-                    log::info!(
-                        "[cond-bridge-sib] cond={:#x} -> futex={:#x} wake_count={} bridged={}",
-                        cond, addr, wake_count, bridged
-                    );
+                    static COND_BRIDGE_SIB_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = COND_BRIDGE_SIB_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 64 || n % 512 == 0 {
+                        log::info!(
+                            "[cond-bridge-sib] #{} cond={:#x} -> futex={:#x} wake_count={} bridged={}",
+                            n,
+                            cond,
+                            addr,
+                            bridge_wake_count,
+                            bridged
+                        );
+                    }
                 }
             }
         }

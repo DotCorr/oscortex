@@ -12,6 +12,9 @@ use core::arch::asm;
 // ── Syscall number constants (mirrors kernel/src/embedder/abi.rs) ─────────────
 
 pub const SYS_WRITE:                    u64 = 1;
+pub const SYS_READ:                     u64 = 0;
+pub const SYS_CLOSE:                    u64 = 3;
+pub const SYS_OPENAT:                   u64 = 257;
 pub const SYS_GETPID:                   u64 = 39;
 pub const SYS_EXIT:                     u64 = 60;
 
@@ -193,6 +196,37 @@ pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 /// Write `buf` to a kernel-side serial/debug output (fd 1 = stdout).
 pub fn write(buf: &[u8]) -> i64 {
     unsafe { syscall3(SYS_WRITE, 1, buf.as_ptr() as u64, buf.len() as u64) }
+}
+
+pub fn read(fd: i64, buf: &mut [u8]) -> i64 {
+    if fd < 0 {
+        return -1;
+    }
+    unsafe { syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+pub fn close(fd: i64) -> i64 {
+    if fd < 0 {
+        return -1;
+    }
+    unsafe { syscall1(SYS_CLOSE, fd as u64) }
+}
+
+/// Open a path relative to `dirfd` using Linux openat semantics.
+/// `path_z` must be NUL-terminated.
+pub fn openat(dirfd: i64, path_z: &[u8], flags: u64, mode: u64) -> i64 {
+    if path_z.is_empty() {
+        return -1;
+    }
+    unsafe {
+        syscall4(
+            SYS_OPENAT,
+            dirfd as u64,
+            path_z.as_ptr() as u64,
+            flags,
+            mode,
+        )
+    }
 }
 
 /// Terminate the calling process with exit code `code`.
