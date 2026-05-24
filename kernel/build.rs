@@ -99,6 +99,7 @@ fn collect_dir(
             // Skip .gitkeep markers and hidden files.
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.starts_with('.') { continue; }
+            println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {
                 Ok(b) => b,
                 Err(_) => continue,

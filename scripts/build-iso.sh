@@ -133,6 +133,16 @@ if [ -d "$STUB_DIR" ]; then
     fi
 fi
 
+# Force flutter-embedder to be the primary /init (PID 1)
+EMBEDDER_BIN="$ROOT/tools/flutter-embedder/target/x86_64-unknown-none/debug/flutter-embedder"
+if [ -f "$EMBEDDER_BIN" ]; then
+    cp "$EMBEDDER_BIN" "$ROOT/initramfs/init"
+    echo "[0.9/4] FORCE: Staged flutter-embedder to initramfs/init as PID 1"
+else
+    echo "ERROR: flutter-embedder binary not found! Cannot stage as PID 1." >&2
+    exit 1
+fi
+
 echo "[1/4] Building kernel ELF..."
 cd "$ROOT"
 cargo +nightly build \

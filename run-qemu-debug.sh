@@ -36,8 +36,7 @@ qemu-system-x86_64 \
     -serial file:"$SERIAL_LOG" \
     -display cocoa \
     -vga std \
-    -d int,cpu_reset \
-    -D "$SCRIPT_DIR/qemu-debug.log" \
+    -monitor unix:/tmp/qemu-monitor.sock,server,nowait \
     -no-reboot &
 
 QEMU_PID=$!

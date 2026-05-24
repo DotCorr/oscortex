@@ -619,7 +619,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         // Patch 1: EmbedderTaskRunner::RunsTasksOnCurrentThread (nm 0x197b8a0)
         //   B0 01 C3  →  mov al, 1; ret  (always return true)
         // Patching this covers the EmbedderTaskRunner vtable path.
-        {
+        if false {
             const NM: u64 = 0x197b8a0;
             let va = load_base + NM;
             if write_va(va, &[0xB0, 0x01, 0xC3]) {
@@ -645,6 +645,18 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
             }
         }
 
+        // Patch 6: ~promise<std::shared_ptr<impeller::Context>> (nm 0x21a8230)
+        //   C3  →  ret  (suppress broken_promise abort)
+        {
+            const NM: u64 = 0x21a8230;
+            let va = load_base + NM;
+            if write_va(va, &[0xC3]) {
+                log::info!("[DL] Patch6 ~promise<impeller::Context> @ {:#x} → ret", va);
+            } else {
+                log::warn!("[DL] Patch6 FAILED: translate @ {:#x}", va);
+            }
+        }
+
         // Patch 3: fml::TaskRunner::RunNowOrPostTask (nm 0x19bfd00)
         //   Find the `84 C0  74 16` pair (test al,al ; je +0x16) after the
         //   RunsTasksOnCurrentThread vtable call. Replace ALL FOUR bytes
@@ -656,7 +668,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         //   branched on stale flags from the prior callq, producing
         //   non-deterministic behaviour. NOPping the entire test+je is
         //   correct and idempotent.
-        {
+        if false {
             const NM: u64 = 0x19bfd00;
             let va   = load_base + NM;
             let hhdm = crate::mm::frame_allocator::hhdm_offset();
@@ -708,7 +720,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         // park entirely. Targeted to this one call site only — leaves the
         // global Wait function intact so worker threads that legitimately
         // need to block still can.
-        {
+        if false {
             const CALL_VA: u64 = 0x21a6999;
             let va = load_base + CALL_VA;
             // Verify the bytes before overwriting (safety guard).
@@ -733,6 +745,43 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
                 }
             } else {
                 log::warn!("[DL] Patch4 SKIPPED: bytes @ {:#x} do not match expected call insn", va);
+            }
+        }
+
+        // Patch 5: NOP the single `call fml::ManualResetWaitableEvent::Wait` inside
+        // PlatformView::NotifyCreated at file offset 0x219da5f.
+        //
+        //   e8 dc 20 82 ff   →   90 90 90 90 90   (5-byte NOP slide)
+        //
+        // Rationale: PlatformView::NotifyCreated posts tasks to the raster thread
+        // and then waits for the raster thread to create the rendering surface.
+        // Since we execute tasks inline, the surface is created immediately,
+        // so waiting is unnecessary and deadlocks on the lost signal problem.
+        if false {
+            const CALL_VA: u64 = 0x219da5f;
+            let va = load_base + CALL_VA;
+            // Verify the bytes before overwriting (safety guard).
+            let hhdm = crate::mm::frame_allocator::hhdm_offset();
+            let mut matches = true;
+            const EXPECTED: [u8; 5] = [0xE8, 0xDC, 0x20, 0x82, 0xFF];
+            for i in 0..5 {
+                if let Some(pp) = crate::mm::paging::translate_user_page(pml4_phys, va + i) {
+                    let off = ((va + i) & 0xFFF) as usize;
+                    let b = unsafe { *((pp + hhdm + off as u64) as *const u8) };
+                    if b != EXPECTED[i as usize] { matches = false; break; }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                if write_va(va, &[0x90, 0x90, 0x90, 0x90, 0x90]) {
+                    log::info!("[DL] Patch5 PlatformView::NotifyCreated latch.Wait() @ {:#x} → 5×nop", va);
+                } else {
+                    log::warn!("[DL] Patch5 FAILED: translate @ {:#x}", va);
+                }
+            } else {
+                log::warn!("[DL] Patch5 SKIPPED: bytes @ {:#x} do not match expected call insn", va);
             }
         }
     }

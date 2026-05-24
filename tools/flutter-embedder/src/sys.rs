@@ -321,6 +321,11 @@ pub fn engine_vsync_baton_post(baton: u64) -> i64 {
     unsafe { syscall1(SYS_ENGINE_VSYNC_BATON_POST, baton) }
 }
 
+/// Create a new thread using raw OSCortex ABI.
+pub fn thread_create(entry: unsafe extern "C" fn(*mut ()), arg: *mut ()) -> i64 {
+    unsafe { syscall3(SYS_THREAD_CREATE, entry as *const () as u64, arg as u64, 0) }
+}
+
 /// Poll for the next WM event for this process.
 /// Returns 1 if an event was written to `ev`, 0 if queue empty.
 pub fn wm_event_poll(ev: &mut WmEvent) -> i64 {

@@ -52,7 +52,7 @@ pub fn init(fb: Option<&limine::request::FramebufferResponse>) {
         crate::drivers::fb::init(fb_resp);
     }
     log::set_logger(&LOGGER).ok();
-    log::set_max_level(log::LevelFilter::Trace);
+    log::set_max_level(log::LevelFilter::Debug);
 }
 
 /// Write a raw string to COM1 without going through the log framework.

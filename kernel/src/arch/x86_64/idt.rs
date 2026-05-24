@@ -397,6 +397,17 @@ unsafe extern "C" fn apic_timer_entry() {
 }
 
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
+    crate::syscall::check_timerfds_and_wake();
+
+    static DUMP_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = DUMP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count < 10 {
+        log::info!("[APIC TIMER] tick count={}", count);
+    }
+    if count > 0 && count % 500 == 0 {
+        crate::process::debug_dump_processes();
+    }
+
     let frame = unsafe { &mut *frame_ptr };
     let preempted_user = (frame.cs & 0x3) == 0x3;
 
@@ -404,10 +415,12 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // after iretq.
     crate::arch::apic::eoi();
 
-    // Call wm::tick() to poll input on vsync boundary even when running userspace threads.
+    // Call wm::tick() and compositor::tick() on vsync boundary even when running userspace threads.
     let vsync = crate::arch::apic::vsync_due();
     if vsync {
         crate::wm::tick();
+        crate::compositor::tick();
+        crate::arch::apic::reset_vsync_last_tsc();
     }
 
     if preempted_user {
@@ -466,13 +479,10 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         return;
     }
 
-    // Kernel-mode preemption: run cooperative scheduler + compositor heartbeat.
-    // Do NOT call sched::tick() or compositor while a user thread was running —
+    // Kernel-mode preemption: run cooperative scheduler.
+    // Do NOT call sched::tick() while a user thread was running —
     // those are reserved for kernel-idle context only.
     crate::sched::tick();
-    if vsync {
-        crate::compositor::tick();
-    }
 }
 
 /// CPU-provided interrupt frame (pushed by hardware).

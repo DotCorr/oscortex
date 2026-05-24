@@ -149,11 +149,15 @@ fn cortex_background() {
     let mut n: u64 = 0;
     loop {
         n = n.wrapping_add(1);
-        // Log a heartbeat every ~100 K iterations to confirm liveness.
-        if n % 100_000 == 0 {
-            log::warn!("[Cortex::BG] heartbeat n={}k", n / 1_000);
+        // Log a heartbeat every ~10 M iterations to confirm liveness.
+        // Each iteration sleeps via hlt (~1 ms between timer interrupts),
+        // so 10M iterations ≈ ~10 seconds between heartbeats.
+        if n % 10_000_000 == 0 {
+            log::info!("[Cortex::BG] heartbeat n={}M", n / 1_000_000);
         }
-        core::hint::spin_loop();
+        // Halt until the next interrupt fires (APIC timer, ~1 ms).
+        // This prevents the BG task from burning 100% CPU and flooding the serial log.
+        crate::arch::halt();
     }
 }
 

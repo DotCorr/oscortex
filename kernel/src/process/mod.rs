@@ -141,6 +141,11 @@ pub struct Process {
     /// RFLAGS — instead of the SYSCALL-convention values.  Cleared whenever
     /// `save_return_context` is called (syscall-based yield).
     pub preempted_by_timer: bool,
+    /// Base virtual address of this thread/process's user-space stack.
+    /// Used by sys_pthread_attr_getstack so the Dart VM can validate stack bounds.
+    pub user_stack_base: u64,
+    /// Size in bytes of this thread/process's user-space stack.
+    pub user_stack_size: u64,
 }
 
 impl Process {
@@ -170,6 +175,8 @@ impl Process {
             fs_base:      0,
             errno_to_deliver: 0,
             preempted_by_timer: false,
+            user_stack_base: 0,
+            user_stack_size: 0,
         }
     }
 }
@@ -189,6 +196,18 @@ pub fn get_proc_fs_base(pid: u32) -> u64 {
     if p.pid == pid { p.fs_base } else { 0 }
 }
 
+/// Return the (base, size) of the user-space stack for `pid`.
+/// Returns (0, 0) if `pid` is unknown or the slot has no recorded stack.
+pub fn get_user_stack_bounds(pid: u32) -> (u64, u64) {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid {
+        (p.user_stack_base, p.user_stack_size)
+    } else {
+        (0, 0)
+    }
+}
+
 /// Returns true if `pid` is a pthread (clone-thread) of another process.
 /// Used by the syscall FS-bootstrap to skip auto-assigning a fake FS base
 /// for new threads — pthread runtimes set their own FS via arch_prctl.
@@ -198,14 +217,33 @@ pub fn is_thread(pid: u32) -> bool {
     p.pid == pid && p.is_thread
 }
 
+/// Walk up the thread parent chain to resolve the root thread group leader.
+pub fn get_group_leader(pid: u32) -> u32 {
+    let _g = PTABLE_LOCK.lock();
+    get_group_leader_locked(pid)
+}
+
+pub(crate) fn get_group_leader_locked(pid: u32) -> u32 {
+    let mut curr = pid;
+    loop {
+        let p = unsafe { &PTABLE[idx_of(curr)] };
+        if p.pid == curr && p.is_thread && p.parent_pid != 0 {
+            curr = p.parent_pid;
+        } else {
+            break;
+        }
+    }
+    curr
+}
+
 // ── Global process table ──────────────────────────────────────────────────────
 
 // Safety: all mutations are protected by `PTABLE_LOCK`.
-static mut PTABLE: [Process; MAX_PROCS] = {
+pub(crate) static mut PTABLE: [Process; MAX_PROCS] = {
     // SAFETY: Process::empty() is a const fn, array is zero-initialised.
     [const { Process::empty() }; MAX_PROCS]
 };
-static PTABLE_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static PTABLE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Next PID to hand out (starts at 1; PID 0 is the kernel).
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
@@ -231,7 +269,7 @@ fn alloc_pid() -> Option<u32> {
     None
 }
 
-fn idx_of(pid: u32) -> usize {
+pub fn idx_of(pid: u32) -> usize {
     pid as usize % MAX_PROCS
 }
 
@@ -323,6 +361,9 @@ pub fn spawn(elf_bytes: &[u8], name: &str) -> Result<u32, &'static str> {
         p.is_thread  = false;
         p.parent_pid = 0;
         p.fs_base    = 0;
+        // Record user stack bounds so pthread_attr_getstack can return them.
+        p.user_stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
+        p.user_stack_size = USER_STACK_SIZE as u64;
     }
 
     log::info!("[Process] Spawned '{}' pid={} entry={:#x}", name, pid, entry);
@@ -457,7 +498,7 @@ pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
     let group: u32 = {
         let c = unsafe { &PTABLE[idx_of(current)] };
         if c.pid != current { return None; }
-        if c.is_thread && c.parent_pid != 0 { c.parent_pid } else { c.pid }
+        get_group_leader_locked(current)
     };
 
     let start = idx_of(current.wrapping_add(1));
@@ -467,7 +508,7 @@ pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
         if p.pid == 0 || p.pid == current { continue; }
         if p.state != ProcState::Running { continue; }
         // Member of the same address-space group?
-        let p_group = if p.is_thread && p.parent_pid != 0 { p.parent_pid } else { p.pid };
+        let p_group = get_group_leader_locked(p.pid);
         if p_group != group { continue; }
         // Skip the leader itself when picking a sibling.
         if p.pid == group { continue; }
@@ -490,12 +531,12 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
     let group: u32 = {
         let c = unsafe { &PTABLE[idx_of(current)] };
         if c.pid != current { return out; }
-        if c.is_thread && c.parent_pid != 0 { c.parent_pid } else { c.pid }
+        get_group_leader_locked(current)
     };
     for idx in 0..MAX_PROCS {
         let p = unsafe { &PTABLE[idx] };
         if p.pid == 0 { continue; }
-        let p_group = if p.is_thread && p.parent_pid != 0 { p.parent_pid } else { p.pid };
+        let p_group = get_group_leader_locked(p.pid);
         if p_group == group {
             out.push(p.pid);
         }
@@ -592,14 +633,14 @@ pub fn spawn_thread(
     arg: u64,
     stack_size: usize,
 ) -> Result<u32, &'static str> {
-    let parent_pml4_phys = {
+    let (parent_pml4_phys, owning_pid) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(parent_pid)] };
         if p.pid != parent_pid || p.state == ProcState::Dead {
             log::error!("[spawn_thread] parent not found pid={}", parent_pid);
             return Err("parent not found");
         }
-        p.pml4_phys
+        (p.pml4_phys, get_group_leader_locked(parent_pid))
     };
 
     let tid = match alloc_pid() {
@@ -684,12 +725,15 @@ pub fn spawn_thread(
         p.syscall_stack_top  = sys_stack_top;
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
-        p.parent_pid         = parent_pid;
+        p.parent_pid         = owning_pid;
         p.fs_base            = tls_va;
+        // Record user stack bounds so pthread_attr_getstack can return them.
+        p.user_stack_base    = stack_va;
+        p.user_stack_size    = stack_size as u64;
     }
 
     log::info!("[Process] Thread tid={} spawned in pid={} entry={:#x} tls={:#x}",
-        tid, parent_pid, entry_fn, tls_va);
+        tid, owning_pid, entry_fn, tls_va);
     Ok(tid)
 }
 
@@ -707,13 +751,13 @@ pub fn clone_thread(
     child_rip: u64,
     child_rsp: u64,
 ) -> Result<u32, &'static str> {
-    let parent_pml4_phys = {
+    let (parent_pml4_phys, owning_pid) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(parent_pid)] };
         if p.pid != parent_pid || p.state == ProcState::Dead {
             return Err("parent not found");
         }
-        p.pml4_phys
+        (p.pml4_phys, get_group_leader_locked(parent_pid))
     };
 
     let tid = alloc_pid().ok_or("process table full")?;
@@ -743,11 +787,11 @@ pub fn clone_thread(
         p.syscall_stack_top  = sys_stack_top;
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
-        p.parent_pid         = parent_pid;
+        p.parent_pid         = owning_pid;
         p.fs_base            = 0;
     }
 
-    log::info!("[Process] clone_thread tid={} in pid={} rip={:#x}", tid, parent_pid, child_rip);
+    log::info!("[Process] clone_thread tid={} in pid={} rip={:#x}", tid, owning_pid, child_rip);
     Ok(tid)
 }
 
@@ -784,6 +828,22 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     };
 
     crate::process::set_current_pid(pid);
+    if pid == 8 || pid == 9 {
+        static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log::warn!(
+                "[enter-user-89] #{} pid={} rip={:#x} rsp={:#x} fs={:#x} preempted={} errno={}",
+                n,
+                pid,
+                rip,
+                rsp,
+                fs_base,
+                preempted_by_timer,
+                errno_to_deliver
+            );
+        }
+    }
     crate::arch::syscall::set_active_stack_top(syscall_stack_top);
     crate::process::restore_xstate(pid);
     // Restore this thread's TLS pointer.  Always write the MSR (even with
@@ -917,7 +977,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         /* 0x70 */ r14,
         /* 0x78 */ r15,
     ];
-    log::info!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
+    log::trace!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
     unsafe {
         core::arch::asm!(
             // Pin the frame base in r11. r11 is consumed by SYSRET (as user
@@ -1372,5 +1432,49 @@ unsafe fn deep_copy_pt(src_entry: u64, hhdm: u64, level: u8) -> Result<u64, &'st
     // Preserve flags from the source entry, but point to new table.
     let flags = src_entry & 0xFFF;
     Ok(new_phys | flags)
+}
+
+/// Find a thread ID (PID) by its FS base (TCB pointer).
+pub fn find_tid_by_fs_base(fs_base: u64) -> Option<u32> {
+    let _g = PTABLE_LOCK.lock();
+    for p in unsafe { PTABLE.iter() } {
+        if p.state != ProcState::Dead && p.fs_base == fs_base {
+            return Some(p.pid);
+        }
+    }
+    None
+}
+
+/// Get the FS base (TLS pointer) for a thread.
+pub fn get_fs_base(pid: u32) -> u64 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state != ProcState::Dead {
+        p.fs_base
+    } else {
+        0
+    }
+}
+
+/// Dump a list of all active user threads/processes.
+pub fn debug_dump_processes() {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        log::info!("=== Process Table Dump ===");
+        for p in unsafe { PTABLE.iter() } {
+            if p.state != ProcState::Dead {
+                let state_str = match p.state {
+                    ProcState::Dead => "Dead",
+                    ProcState::Running => "Running",
+                    ProcState::Blocked => "Blocked",
+                    ProcState::Zombie(_code) => "Zombie",
+                };
+                log::info!(
+                    "  pid={} state={} is_thread={} parent_pid={} rip={:#x} rsp={:#x} fs_base={:#x} ticks={}",
+                    p.pid, state_str, p.is_thread, p.parent_pid, p.regs.rip, p.regs.rsp, p.fs_base, p.cpu_ticks
+                );
+            }
+        }
+        log::info!("==========================");
+    }
 }
 

@@ -89,6 +89,13 @@ pub fn vsync_due() -> bool {
     }
 }
 
+/// Reset the vsync timer base to the current TSC.
+/// Call this after slow vsync tasks (like compositor rendering) to prevent
+/// immediate catch-up interrupts.
+pub fn reset_vsync_last_tsc() {
+    VSYNC_LAST_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
+}
+
 /// Return the current vsync Hz.
 pub fn vsync_hz() -> u32 {
     VSYNC_HZ.load(Ordering::Relaxed)

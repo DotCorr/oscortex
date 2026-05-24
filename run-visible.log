@@ -10,10 +10,10 @@ vbe: Found matching mode 0x17a, attempting to set...
 vbe: Framebuffer address: 0xfd000000
 edid: Success.
 limine: Loading executable `boot():/boot/kernel`...
-limine: Physical base:   0x70394000
+limine: Physical base:   0x702a1000
 limine: Virtual base:    0xffffffff80000000
 limine: Slide:           0x0
-limine: ELF entry point: 0xffffffff800c7650
+limine: ELF entry point: 0xffffffff800db930
 limine: Base revision:   6
 limine: Requests count:  7
 limine: Top of HHDM:     0x80000000
@@ -110,9 +110,9 @@ acpi: Found "APIC" at 0x7ffe22a3
 [INFO] kernel::arch::x86_64::smp: [SMP] AP cpu=1 lapic_id=1 online
 [INFO] kernel::sched: [Sched] AP cpu=1 ready, parked (BSP-only scheduler)
 [INFO] kernel::arch::x86_64::smp: [SMP] 2/2 CPU(s) online
-[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=95692 filesz=95692 ro exec
-[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x4175d0 memsz=23063 filesz=23063 ro 
-[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x41d000 memsz=32 filesz=0 rw 
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x400000 memsz=103292 filesz=103292 ro exec
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x419380 memsz=26039 filesz=26039 ro 
+[DEBUG] kernel::process::elf: [ELF] PT_LOAD vaddr=0x420000 memsz=72 filesz=0 rw 
 [INFO] kernel::process::elf: [ELF] Loaded: entry=0x400000
 [INFO] kernel::process: [Process] Spawned 'init' pid=1 entry=0x400000
 [INFO] kernel::sched: [Sched] spawned 'user-init' pid=0 stack=0xffff800000121df0
@@ -121,5 +121,146 @@ acpi: Found "APIC" at 0x7ffe22a3
 [INFO] kernel: OSCortex kernel init complete — entering Cortex-managed loop
 [INFO] kernel::sched: [Sched] registered 'cortex-idle' as task-1 (pid=1)
 [INFO] kernel::sched: [Sched] spawned 'cortex-bg' pid=2 stack=0xffff800000129df0
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=0
+[INFO] kernel::compositor: [Compositor] debug_surf: idx=0 id=1 x=18 y=140 w=220 h=120 z=10 presented=false
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=1
 [INFO] kernel::cortex: [Cortex::BG] background worker started — scheduler ALIVE
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=2
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=3
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=4
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=5
 [INFO] kernel::process: [Process] launching userspace pid=1 via SYSRET
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=6
+[WARN] kernel::syscall: [syscall] bootstrapped FS base pid=1 fs=0x7ffffffefdf0 rsp=0x7ffffffefff0
+![embedder] starting
+[embedder] host_register ok
+[embedder] ENGINE_CANARY_MODE=2 (full engine)
+[embedder] calling dlopen...
+[INFO] kernel::syscall: [dlopen] Serving libflutter_engine.so from Limine module (95866952 bytes)
+[INFO] kernel::process::dl: [dl] rela table sz=1288344 count=53681 applied: REL=53608 _64=1 GLOB=71 JMP=0 other=1 oob=0
+[INFO] kernel::process::dl: [dl] rela table sz=7944 count=331 applied: REL=0 _64=0 GLOB=0 JMP=331 other=0 oob=0
+[INFO] kernel::process::dl: [DL] Patch2 ~promise<RTB>        @ 0x31a81b0 → ret
+[INFO] kernel::process::dl: [DL] Patch6 ~promise<impeller::Context> @ 0x31a8230 → ret
+[INFO] kernel::process::dl: [DL] pid=1 dlopen base=0x1000000 handle=1 exports=98
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=7
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=8
+[embedder] dlopen OK
+[embedder] running C++ ctors
+[embedder] calling DT_INIT
+[embedder] calling DT_INIT_ARRAY
+[INFO] kernel::arch::x86_64::idt: [APIC TIMER] tick count=9
+[embedder] ctors done
+[embedder] resolving symbols...
+[embedder] dlsym done
+[embedder] using GetProcAddresses path
+[embedder] proctable ready
+[embedder] proctable registered
+[embedder] creating surface...
+[embedder] viewport fb00000500_00000320_ chosen00000500_00000320_
+[INFO] kernel::compositor: [Compositor] debug_surf: idx=0 id=1 x=72 y=140 w=220 h=120 z=10 presented=false
+[INFO] kernel::compositor: [Compositor] debug_surf: idx=1 id=2 x=0 y=0 w=1280 h=800 z=0 presented=false
+[embedder/aot] syscall rc=0x0000000000000000
+[embedder/aot] syscall va=0x000000029b000000
+[embedder/aot] syscall sz=0x00000000003443b0
+[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)
+[embedder] JIT snapshot paths installed; engine will open them via file mmap
+[embedder] spawning engine thread (Initialize+RunInitialized)...
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x29c000000 pages=16
+[WARN] kernel::process: [spawn_thread] tid=2 tls_va=0x29d000000 arg=0x0
+[INFO] kernel::process: [Process] Thread tid=2 spawned in pid=1 entry=0x407120 tls=0x29d000000
+[engine-thread] starting Flutter engine via Initialize+RunInitialized...
+[engine-thread] FlutterRendererConfig 0120of=____
+[WARN] kernel::syscall: [stat-trace] nr=0x45d path='/system/flutter/flutter_assets/kernel_blob.bin'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/kernel_blob.bin' → fd=3 (41627552 bytes)
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x2cc000000 pages=512
+[WARN] kernel::process: [spawn_thread] tid=3 tls_va=0x2cd000000 arg=0x2cb000010
+[INFO] kernel::process: [Process] Thread tid=3 spawned in pid=1 entry=0x29c23e0 tls=0x2cd000000
+[WARN] kernel::syscall: [thread-create] spawned child=3 entry=0x29c23e0
+[WARN] kernel::syscall: [epoll_create] pid=3 → fd=64
+[embedder] spawned engine thread ti00000002____
+[embedder] entering event loop
+[embedder] engine-stage=00000002
+[WARN] kernel::syscall: [timerfd_create] pid=3 → fd=65
+[WARN] kernel::syscall: [epoll_ctl] pid=3 epfd=64 op=1 fd=65 events=0x1
+[WARN] kernel::syscall: [epoll_ctl_raw] raw_bytes=[1, 0, 0, 0, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+[INFO] kernel::syscall: [platform-recv] #0 pid=1 req_buf_len=512 wrote=0
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x2dd000000 pages=512
+[WARN] kernel::process: [spawn_thread] tid=4 tls_va=0x2de000000 arg=0x2dc000010
+[INFO] kernel::process: [Process] Thread tid=4 spawned in pid=1 entry=0x29c23e0 tls=0x2de000000
+[WARN] kernel::syscall: [thread-create] spawned child=4 entry=0x29c23e0
+[WARN] kernel::syscall: [epoll_wait] #0 pid=3 epfd=64 max=1 to=4294967295
+[WARN] kernel::syscall: [epoll_create] pid=4 → fd=66
+[INFO] kernel::syscall: [platform-recv] #1 pid=1 req_buf_len=512 wrote=0
+[WARN] kernel::syscall: [timerfd_create] pid=4 → fd=67
+[WARN] kernel::syscall: [epoll_ctl] pid=4 epfd=66 op=1 fd=67 events=0x1
+[WARN] kernel::syscall: [epoll_ctl_raw] raw_bytes=[1, 0, 0, 0, 67, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+[INFO] kernel::syscall: [platform-recv] #2 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000002
+[INFO] kernel::syscall: [platform-recv] #3 pid=1 req_buf_len=512 wrote=0
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x2eb000000 pages=512
+[WARN] kernel::process: [spawn_thread] tid=5 tls_va=0x2ec000000 arg=0x2ea000010
+[INFO] kernel::process: [Process] Thread tid=5 spawned in pid=1 entry=0x29c23e0 tls=0x2ec000000
+[WARN] kernel::syscall: [thread-create] spawned child=5 entry=0x29c23e0
+[WARN] kernel::syscall: [epoll_wait] #1 pid=4 epfd=66 max=1 to=4294967295
+[WARN] kernel::syscall: [epoll_create] pid=5 → fd=68
+[WARN] kernel::syscall: [timerfd_create] pid=5 → fd=69
+[INFO] kernel::syscall: [platform-recv] #4 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000002
+[WARN] kernel::syscall: [epoll_ctl] pid=5 epfd=68 op=1 fd=69 events=0x1
+[WARN] kernel::syscall: [epoll_ctl_raw] raw_bytes=[1, 0, 0, 0, 69, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+[INFO] kernel::syscall: [platform-recv] #5 pid=1 req_buf_len=512 wrote=0
+[INFO] kernel::syscall: [platform-recv] #6 pid=1 req_buf_len=512 wrote=0
+[WARN] kernel::syscall: [epoll_wait] #2 pid=5 epfd=68 max=1 to=4294967295
+[WARN] kernel::syscall: [epoll_create] pid=2 → fd=70
+[WARN] kernel::syscall: [timerfd_create] pid=2 → fd=71
+[WARN] kernel::syscall: [epoll_ctl] pid=2 epfd=70 op=1 fd=71 events=0x1
+[WARN] kernel::syscall: [epoll_ctl_raw] raw_bytes=[1, 0, 0, 0, 71, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets' → fd=3 (dir)
+[INFO] kernel::syscall: [platform-recv] #7 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000002
+[WARN] kernel::syscall: [stat-trace] nr=0x101 path='kernel_blob.bin'
+[DEBUG] kernel::syscall: [openat] dirfd=3 rel='kernel_blob.bin' → '/system/flutter/flutter_assets/kernel_blob.bin'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/kernel_blob.bin' → fd=4 (41627552 bytes)
+[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0x27b2fa0 → va=0x303000000 (41627552 copied)
+[engine-thread] FlutterEngineInitialize OK
+[INFO] kernel::syscall: [platform-recv] #8 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000004
+[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/icudtl.dat'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/icudtl.dat' → fd=4 (862304 bytes)
+[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0xd2860 → va=0x319000000 (862304 copied)
+[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets/vm_snapshot_data'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/vm_snapshot_data' → fd=4 (15011 bytes)
+[INFO] kernel::syscall: [platform-recv] #9 pid=1 req_buf_len=512 wrote=0
+[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0x3aa3 → va=0x31d000000 (15011 copied)
+[WARN] kernel::syscall: [stat-trace] nr=0x101 path='/system/flutter/flutter_assets/isolate_snapshot_data'
+[DEBUG] kernel::syscall: [sys_open] '/system/flutter/flutter_assets/isolate_snapshot_data' → fd=4 (11028680 bytes)
+[INFO] kernel::syscall: [platform-recv] #10 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000004
+[embedder] metrics try sz=00000060 w=00000500 h=00000320
+embedder.cc (?): 'FlutterEngineSendWindowMetricsEvent' returned 'kInvalidArguments'. Viewport metrics were invalid.
+[embedder] send metrics failed, rc = 000000002_
+[DEBUG] kernel::syscall: [mmap] file-backed fd=4 off=0x0 len=0xa848c8 → va=0x326000000 (11028680 copied)
+[INFO] kernel::syscall: [platform-recv] #11 pid=1 req_buf_len=512 wrote=0
+[embedder] metrics try sz=00000060 w=00000500 h=00000320
+embedder.cc (?): 'FlutterEngineSendWindowMetricsEvent' returned 'kInvalidArguments'. Viewport metrics were invalid.
+[embedder] send metrics failed, rc = 000000002_
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x33c000000 pages=16
+[WARN] kernel::process: [spawn_thread] tid=6 tls_va=0x33d000000 arg=0x33b000010
+[INFO] kernel::process: [Process] Thread tid=6 spawned in pid=1 entry=0x29b9080 tls=0x33d000000
+[WARN] kernel::syscall: [thread-create] spawned child=6 entry=0x29b9080
+[WARN] kernel::process: [spawn_thread] alloc stack_va=0x342000000 pages=16
+[WARN] kernel::process: [spawn_thread] tid=7 tls_va=0x343000000 arg=0x341000010
+[INFO] kernel::process: [Process] Thread tid=7 spawned in pid=1 entry=0x29b9080 tls=0x343000000
+[WARN] kernel::syscall: [thread-create] spawned child=7 entry=0x29b9080
+[INFO] kernel::syscall: [platform-recv] #12 pid=1 req_buf_len=512 wrote=0
+[embedder] engine-stage=00000004
+[embedder] metrics try sz=00000060 w=00000500 h=00000320
+embedder.cc (?): 'FlutterEngineSendWindowMetricsEvent' returned 'kInvalidArguments'. Viewport metrics were invalid.
+[embedder] send metrics failed, rc = 000000002_
+[INFO] kernel::syscall: [platform-recv] #13 pid=1 req_buf_len=512 wrote=0
+[DEBUG] kernel::syscall: [pipe2] read_fd=4 write_fd=5 pipe_id=0 flags=0x80000
+[WARN] kernel::syscall: [epoll_create] pid=2 → fd=72
+[WARN] kernel::syscall: [epoll_ctl] pid=2 epfd=72 op=1 fd=4 events=0x1
+[WARN] kernel::syscall: [epoll_ctl_raw] raw_bytes=[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0, 0, 93]
+[INFO] kernel::syscall: [platform-recv] #14 pid=1 req_buf_len=512 wrote=0

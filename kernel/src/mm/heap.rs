@@ -9,7 +9,7 @@ use linked_list_allocator::LockedHeap;
 #[global_allocator]
 static HEAP: LockedHeap = LockedHeap::empty();
 
-const INITIAL_HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MiB initial heap
+const INITIAL_HEAP_SIZE: usize = 64 * 1024 * 1024; // 64 MiB — needed for Flutter double-buffers
 const HEAP_ALIGN: usize = 4096;
 
 fn early_print_hex_u64(v: u64) {

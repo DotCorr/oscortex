@@ -101,6 +101,7 @@ const SYSCALL_TRACE_DEPTH: usize = 64;
 
 #[derive(Clone, Copy)]
 struct SyscallTraceEntry {
+    pid: u32,
     nr: u64,
     a0: u64,
     a1: u64,
@@ -109,7 +110,7 @@ struct SyscallTraceEntry {
 }
 
 static SYSCALL_TRACE_BUF: spin::Mutex<[SyscallTraceEntry; SYSCALL_TRACE_DEPTH]> = spin::Mutex::new(
-    [const { SyscallTraceEntry { nr: 0, a0: 0, a1: 0, a2: 0, rip: 0 } }; SYSCALL_TRACE_DEPTH]
+    [const { SyscallTraceEntry { pid: 0, nr: 0, a0: 0, a1: 0, a2: 0, rip: 0 } }; SYSCALL_TRACE_DEPTH]
 );
 static SYSCALL_TRACE_HEAD: AtomicU32 = AtomicU32::new(0);
 static FUTEX_WAITERS: spin::Mutex<BTreeMap<u64, Vec<u32>>> = spin::Mutex::new(BTreeMap::new());
@@ -119,6 +120,14 @@ static FUTEX_WAITERS: spin::Mutex<BTreeMap<u64, Vec<u32>>> = spin::Mutex::new(BT
 // fix for the busy-spin: cond broadcasts bridge to PID1_WAIT before pid 1 has
 // actually parked, so without this, the wake is lost and pid 1 sleeps forever.
 static FUTEX_PENDING_WAKES: spin::Mutex<BTreeMap<u64, u32>> = spin::Mutex::new(BTreeMap::new());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CondWaitState {
+    Waiting { cond: u64, mutex: u64, seq: u32 },
+    AcquiringMutex { mutex: u64 },
+}
+
+static COND_WAIT_STATE: spin::Mutex<BTreeMap<u32, CondWaitState>> = spin::Mutex::new(BTreeMap::new());
 
 // ── Post-exit syscall trace window ────────────────────────────────────────────
 // When pid=2 exits, activate a one-shot bounded trace that logs the next
@@ -177,12 +186,12 @@ static EPOLL_BLOCKED: spin::Mutex<BTreeMap<u32, u32>> = spin::Mutex::new(BTreeMa
 /// Called after a timerfd is armed. The blocked thread already has rax=1 and a
 /// fake EPOLLIN event written to its events_out buffer; it will resume and call
 /// TimerDrain, which will then successfully read the now-armed timerfd.
-fn epoll_wake_on_timerfd(tfd: u32) {
-    // Step 1: find all epfds that watch this timerfd (lock EPOLL_TABLE, then drop).
+fn epoll_wake(fd: u32) {
+    // Step 1: find all epfds that watch this fd (lock EPOLL_TABLE, then drop).
     let watching_epfds: Vec<u32> = {
         let epoll_tbl = EPOLL_TABLE.lock();
         epoll_tbl.iter()
-            .filter(|(_, entries)| entries.iter().any(|e| e.fd == tfd))
+            .filter(|(_, entries)| entries.iter().any(|e| e.fd == fd))
             .map(|(&epfd, _)| epfd)
             .collect()
     };
@@ -219,18 +228,17 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
         let tbl = TIMERFD_TABLE.lock();
         tbl.keys().copied().collect()
     };
-    if tfds.is_empty() {
-        return (0, 0);
-    }
-    // Mark each timerfd as pending (one expiration), so the next
+    // Mark each armed timerfd as pending (one expiration), so the next
     // epoll_collect_ready call returns EPOLLIN immediately.
+    let mut armed_tfds = Vec::new();
     {
         let mut tbl = TIMERFD_TABLE.lock();
         for fd in &tfds {
             if let Some(t) = tbl.get_mut(fd) {
-                t.pending = t.pending.saturating_add(1);
-                // Leave deadline alone so periodic timers still re-arm normally;
-                // pending count alone is enough for epoll_collect_ready to report.
+                if t.deadline_ns != 0 {
+                    t.pending = t.pending.saturating_add(1);
+                    armed_tfds.push(*fd);
+                }
             }
         }
     }
@@ -248,7 +256,7 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
         }
     }
     // Release every epoll waiter whose epfd watches any of these fds.
-    let touched: Vec<u32> = tfds.iter().chain(efds.iter()).copied().collect();
+    let touched: Vec<u32> = armed_tfds.iter().chain(efds.iter()).copied().collect();
     let watching_epfds: Vec<u32> = {
         let epoll_tbl = EPOLL_TABLE.lock();
         epoll_tbl.iter()
@@ -272,13 +280,38 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
     static FORCE_WAKE_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let n = FORCE_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
-    if n < 64 || n % 32 == 0 {
-        log::warn!(
+    if n < 8 {
+        log::trace!(
             "[force-wake] #{} reason={} timerfds={} eventfds={} epoll_waiters_released={}",
             n, reason, tfds.len(), efds.len(), woken
         );
     }
     (tfds.len() + efds.len(), woken)
+}
+
+pub fn check_timerfds_and_wake() {
+    let now = monotonic_ns();
+    let mut to_wake = Vec::new();
+    {
+        let mut tbl = TIMERFD_TABLE.lock();
+        for (&fd, t) in tbl.iter_mut() {
+            if t.deadline_ns != 0 && now >= t.deadline_ns {
+                if t.period_ns != 0 {
+                    let elapsed = now.saturating_sub(t.deadline_ns);
+                    let n = 1u64 + elapsed / t.period_ns;
+                    t.deadline_ns = t.deadline_ns.saturating_add(n * t.period_ns);
+                    t.pending = t.pending.saturating_add(n);
+                } else {
+                    t.deadline_ns = 0; // disarm one-shot
+                    t.pending = t.pending.saturating_add(1);
+                }
+                to_wake.push(fd);
+            }
+        }
+    }
+    for fd in to_wake {
+        epoll_wake(fd);
+    }
 }
 
 #[inline]
@@ -329,26 +362,7 @@ fn eventfd_write(fd: u32, val: u64) {
         }
     };
     if new_count > 0 {
-        // Wake any epoll that watches this fd.
-        let watching_epfds: Vec<u32> = {
-            let epoll_tbl = EPOLL_TABLE.lock();
-            epoll_tbl.iter()
-                .filter(|(_, entries)| entries.iter().any(|e| e.fd == fd))
-                .map(|(&epfd, _)| epfd)
-                .collect()
-        };
-        let pids_to_wake: Vec<u32> = {
-            let mut blocked = EPOLL_BLOCKED.lock();
-            let pids: Vec<u32> = blocked.iter()
-                .filter(|(_, &epfd)| watching_epfds.contains(&epfd))
-                .map(|(&pid, _)| pid)
-                .collect();
-            for &pid in &pids { blocked.remove(&pid); }
-            pids
-        };
-        for pid in pids_to_wake {
-            crate::process::set_state(pid, crate::process::ProcState::Running);
-        }
+        epoll_wake(fd);
     }
 }
 
@@ -368,20 +382,19 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
             core::ptr::read_unaligned((new_value + 24) as *const i64),
         )
     };
+    let raw_bytes = unsafe { core::slice::from_raw_parts(new_value as *const u8, 32) };
+    let n = TFD_SETTIME_LOG.load(Ordering::Relaxed);
+    if n < 32 {
+        log::warn!("[tfd-debug] fd={} raw: {:x?}", fd, raw_bytes);
+        log::warn!("[tfd-debug] fd={} fields: int_s={} int_ns={} val_s={} val_ns={}", fd, int_s, int_ns, val_s, val_ns);
+    }
     let period_ns = (int_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(int_ns.max(0) as u64);
     let value_ns = (val_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(val_ns.max(0) as u64);
     let now = monotonic_ns();
-    let deadline = if value_ns == 0 && period_ns == 0 {
-        // Flutter's TimerRearm clamps negative delays to 0 and calls
-        // timerfd_settime(value={0,0}) to mean "fire immediately / wake up
-        // now because a task is ready".  POSIX says this is a disarm, but
-        // on our kernel we honour Flutter's intent: deadline = now so that
-        // the next epoll_collect_ready immediately sees the event as fired.
-        now
-    } else if value_ns == 0 {
-        0 // interval-only arm: disarm initial fire (unusual, not used by Flutter)
+    let deadline = if value_ns == 0 {
+        0 // POSIX: if it_value is zero, the timer is disarmed.
     } else if flags & 1 != 0 {
         value_ns // TFD_TIMER_ABSTIME: caller already has absolute ns timestamp
     } else {
@@ -420,7 +433,7 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
     drop(tbl);
     // Wake any thread blocked in epoll_wait on an epoll that watches this timerfd,
     // so it retries and picks up the newly armed event.
-    epoll_wake_on_timerfd(fd as u32);
+    epoll_wake(fd as u32);
     0
 }
 
@@ -444,6 +457,13 @@ fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> i64 {
             } else { 0 };
             log::warn!("[epoll_ctl] pid={} epfd={} op={} fd={} events={:#x}",
                 crate::process::current_pid(), epfd, op, fd as i64, events_val);
+            if event_ptr != 0 {
+                let mut bytes = [0u8; 16];
+                for i in 0..16 {
+                    bytes[i] = unsafe { core::ptr::read_unaligned((event_ptr + i as u64) as *const u8) };
+                }
+                log::warn!("[epoll_ctl_raw] raw_bytes={:?}", bytes);
+            }
         }
     }
     let mut tbl = EPOLL_TABLE.lock();
@@ -604,10 +624,73 @@ fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, timeout_ms: u
             );
         }
     }
+    if epfd == 72 || cur == 8 {
+        static EPOLL_72_ENTER_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = EPOLL_72_ENTER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            let watched = {
+                let tbl = EPOLL_TABLE.lock();
+                tbl.get(&(epfd as u32))
+                    .map(|list| {
+                        list.iter()
+                            .map(|e| (e.fd, e.events, e.data))
+                            .collect::<alloc::vec::Vec<(u32, u32, u64)>>()
+                    })
+                    .unwrap_or_default()
+            };
+            log::warn!(
+                "[epoll72-enter] #{} pid={} epfd={} max={} to={} watched={:?}",
+                n,
+                cur,
+                epfd,
+                maxevents,
+                timeout_signed,
+                watched
+            );
+
+            // Deadlock breaker (diagnostic): if the epfd72 loop never receives
+            // pipe writes or timer arming, force one synthetic tick on fd73 so
+            // we can observe the next stage instead of stalling forever.
+            if epfd == 72 {
+                static EPOLL_72_BOOTSTRAP: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !EPOLL_72_BOOTSTRAP.swap(true, core::sync::atomic::Ordering::AcqRel) {
+                    let mut tbl = TIMERFD_TABLE.lock();
+                    if let Some(t) = tbl.get_mut(&73u32) {
+                        t.pending = t.pending.saturating_add(1);
+                        log::warn!("[epoll72-bootstrap] injected pending tick on tfd=73");
+                    } else {
+                        log::warn!("[epoll72-bootstrap] tfd=73 missing from TIMERFD_TABLE");
+                    }
+                    drop(tbl);
+                    epoll_wake(73);
+                }
+            }
+        }
+    }
 
     // Fast path: any events already ready?
     let ready = epoll_collect_ready(epfd as u32, events_out, max);
     if ready > 0 {
+        if epfd == 72 || cur == 8 {
+            static EPOLL_72_READY_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = EPOLL_72_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 24 && events_out != 0 {
+                let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
+                let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
+                log::warn!(
+                    "[epoll72-ready-fast] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
+                    n,
+                    cur,
+                    epfd,
+                    ready,
+                    ev,
+                    data
+                );
+            }
+        }
         static EW_FIRE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = EW_FIRE_LOG.fetch_add(1, Ordering::Relaxed);
         if n < 32 {
@@ -625,74 +708,76 @@ fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, timeout_ms: u
     }
     if timeout_signed == 0 { return 0; }
 
-    // The Dart EventHandler's Poll() function checks:
-    //   cmpl $-1, %eax; je errno_check_for_EINTR
-    //   testl %eax, %eax; jg HandleEvents
-    //   ; falls through when eax == 0 (no events) → reads errno, calls perror unless EINTR/EAGAIN
-    //
-    // Returning 0 causes the fall-through and triggers perror("Poll failed") because
-    // errno is 0 (not EINTR=4 or EAGAIN=11).
-    //
-    // The correct return for "no events yet, please retry" is -1 with errno=EINTR(4),
-    // which makes the event loop restart the epoll_wait call cleanly.
-    #[inline(always)]
-    fn set_errno_eintr() {
-        // Write EINTR=4 to SD_ERRNO (SYSDATA_VA + 32) in the current process's
-        // address space. We run with the user's CR3 (syscall doesn't switch CR3),
-        // so this writes to the current thread's errno slot directly.
-        unsafe {
-            core::ptr::write_volatile(
-                crate::process::posix_trampolines::SD_ERRNO as *mut u32,
-                4, // EINTR
-            );
-        }
-    }
-
-    if cur != 0 {
-        if let Some(next) = crate::process::next_runnable_pid(cur) {
-            if next != cur {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip, ursp);
-                crate::process::save_full_user_gprs(cur);
-                // Schedule errno=EINTR delivery for *after* the CR3 switch
-                // (in enter_user_by_pid_noreturn) so no intermediate thread
-                // can overwrite the shared SD_ERRNO slot before pid=cur reads it.
-                crate::process::set_errno_to_deliver(cur, 4); // EINTR
-                crate::process::set_rax(cur, (-1i64) as u64);
-                crate::process::save_xstate(cur);
-                crate::process::enter_user_by_pid_noreturn(next);
-            }
-        }
-    }
-
-    // No sibling or only thread — spin briefly so real events can arrive,
-    // then return -1 + EINTR so Dart retries without printing "Poll failed:".
-    let spin_until = monotonic_ns().saturating_add(1_000_000); // 1 ms cap
+    let start = monotonic_ns();
     loop {
         let ready = epoll_collect_ready(epfd as u32, events_out, max);
-        if ready > 0 { return ready as i64; }
-        if monotonic_ns() >= spin_until {
-            if epfd == 70 {
-                static EPOLL_70_TIMEOUT_LOG: core::sync::atomic::AtomicU32 =
+        if ready > 0 {
+            if epfd == 72 || cur == 8 {
+                static EPOLL_72_READY_LOOP_LOG: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);
-                let n = EPOLL_70_TIMEOUT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 128 {
-                    log::warn!("[epoll70-timeout] #{} pid={} -> EINTR", n, cur);
+                let n = EPOLL_72_READY_LOOP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 24 && events_out != 0 {
+                    let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
+                    let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
+                    log::warn!(
+                        "[epoll72-ready-loop] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
+                        n,
+                        cur,
+                        epfd,
+                        ready,
+                        ev,
+                        data
+                    );
                 }
             }
-            set_errno_eintr();
-            return -1;
+            static EW_FIRE_LOOP_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let n = EW_FIRE_LOOP_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                log::warn!("[epoll_fire_loop] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
+            }
+            return ready as i64;
         }
-        for _ in 0..1_000 { core::hint::spin_loop(); }
+        if !infinite {
+            let elapsed_ms = (monotonic_ns().saturating_sub(start)) / 1_000_000;
+            if elapsed_ms >= timeout_ms {
+                return 0; // timeout expired
+            }
+        }
+
+        if cur != 0 {
+            if let Some(next) = crate::process::next_runnable_pid(cur) {
+                if next != cur {
+                    // Block ourselves on epoll
+                    {
+                        let mut blocked = EPOLL_BLOCKED.lock();
+                        blocked.insert(cur as u32, epfd as u32);
+                    }
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(cur, urip, ursp);
+                    crate::process::save_full_user_gprs(cur);
+                    crate::process::set_errno_to_deliver(cur, 4); // EINTR
+                    crate::process::set_rax(cur, (-1i64) as u64);
+                    crate::process::save_xstate(cur);
+                    crate::process::set_state(cur, crate::process::ProcState::Blocked);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        }
     }
 }
 
 #[inline]
 fn record_syscall_trace(nr: u64, a0: u64, a1: u64, a2: u64, rip: u64) {
+    let pid = crate::process::current_pid();
     let idx = (SYSCALL_TRACE_HEAD.fetch_add(1, Ordering::Relaxed) as usize) % SYSCALL_TRACE_DEPTH;
     let mut buf = SYSCALL_TRACE_BUF.lock();
-    buf[idx] = SyscallTraceEntry { nr, a0, a1, a2, rip };
+    buf[idx] = SyscallTraceEntry { pid, nr, a0, a1, a2, rip };
 }
 
 pub fn dump_recent_syscalls(limit: usize) {
@@ -709,8 +794,9 @@ pub fn dump_recent_syscalls(limit: usize) {
             continue;
         }
         log::error!(
-            "[syscall-trace] #{:02} nr={:#x} a0={:#x} a1={:#x} a2={:#x} rip={:#x}",
+            "[syscall-trace] #{:02} pid={} nr={:#x} a0={:#x} a1={:#x} a2={:#x} rip={:#x}",
             i,
+            e.pid,
             e.nr,
             e.a0,
             e.a1,
@@ -776,6 +862,7 @@ pub fn dump_user_backtrace(depth: usize) {
         log::error!("[backtrace] bad rsp — aborting scan");
         return;
     }
+    let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
     let mut printed = 0usize;
     // Scan up to 4 KiB of stack (512 qwords).
     let max_words = 512usize;
@@ -783,6 +870,9 @@ pub fn dump_user_backtrace(depth: usize) {
         let addr = ursp + (i as u64) * 8;
         // Avoid stepping into a guard page near the top.
         if addr >= 0x0000_8000_0000_0000 { break; }
+        if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_none() {
+            break;
+        }
         let val = unsafe { core::ptr::read_volatile(addr as *const u64) };
         if val >= FLUTTER_BASE && val < FLUTTER_END {
             log::error!(
@@ -943,12 +1033,12 @@ fn fd_dir_path(fd: u64) -> Option<alloc::string::String> {
 /// In a real kernel this would use access_ok + copy_from_user.
 /// Here we accept the pointer directly as kernel == user space pre-M13.
 unsafe fn read_user_bytes(ptr: u64, len: usize) -> Option<&'static [u8]> {
-    if ptr == 0 || len > 0x20_0000 { return None; }
+    if ptr == 0 || len > 0x200_0000 { return None; }
     Some(unsafe { core::slice::from_raw_parts(ptr as *const u8, len) })
 }
 
 unsafe fn write_user_bytes(ptr: u64, src: &[u8]) -> bool {
-    if ptr == 0 || src.len() > 0x20_0000 {
+    if ptr == 0 || src.len() > 0x200_0000 {
         return false;
     }
     unsafe {
@@ -982,7 +1072,46 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 p.tail = (p.tail + 1) % PIPE_BUF_SIZE;
             }
             p.len += n;
-            return if n == 0 { -11 } else { n as i64 }; // EAGAIN if full
+            let written = n;
+            {
+                static PIPE_WRITE_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                // epfd=72 currently watches read_fd=4 on pipe_id=0; the paired
+                // write end is fd=5. Trace this path to verify wake source.
+                if fd == 5 || pid == 0 {
+                    let k = PIPE_WRITE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if k < 32 {
+                        log::warn!(
+                            "[pipe-write] #{} pid={} fd={} pipe_id={} req_len={} wrote={} pipe_len={} free_before={}",
+                            k,
+                            crate::process::current_pid(),
+                            fd,
+                            pid,
+                            len,
+                            written,
+                            p.len,
+                            free
+                        );
+                    }
+                }
+            }
+            drop(pipes);
+
+            if written > 0 {
+                let mut read_fds = alloc::vec::Vec::new();
+                {
+                    let open = OPEN_FILES.lock();
+                    for r_fd in 0..MAX_OPEN_FILES {
+                        if open[r_fd].used && open[r_fd].pipe_id == pid as i16 && !open[r_fd].pipe_is_write {
+                            read_fds.push(r_fd as u32);
+                        }
+                    }
+                }
+                for r_fd in read_fds {
+                    epoll_wake(r_fd);
+                }
+            }
+            return if written == 0 { -11 } else { written as i64 }; // EAGAIN if full
         }
         drop(tbl);
         // Timerfd write: Dart uses write(tfd, &count, 8) to signal wakeup.
@@ -998,7 +1127,7 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 }
                 log::warn!("[sys_write] timerfd write fd={} pending={}", fd, ts.pending);
                 drop(tfd_tbl);
-                epoll_wake_on_timerfd(fd as u32);
+                epoll_wake(fd as u32);
                 return len as i64;
             }
         }
@@ -1031,6 +1160,40 @@ fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     len as i64
 }
 
+#[repr(C)]
+struct LinuxIovec {
+    base: u64,
+    len: u64,
+}
+
+fn sys_writev(fd: u64, iov_ptr: u64, iov_cnt: u64) -> i64 {
+    if iov_ptr == 0 || iov_cnt == 0 {
+        return 0;
+    }
+    if iov_cnt > 1024 {
+        return -22; // EINVAL
+    }
+
+    let mut total: i64 = 0;
+    for i in 0..iov_cnt {
+        let ent_ptr = iov_ptr + i * core::mem::size_of::<LinuxIovec>() as u64;
+        let ent = unsafe { core::ptr::read_unaligned(ent_ptr as *const LinuxIovec) };
+        if ent.len == 0 {
+            continue;
+        }
+        let n = sys_write(fd, ent.base, ent.len);
+        if n < 0 {
+            return if total > 0 { total } else { n };
+        }
+        total += n;
+        if n as u64 != ent.len {
+            // Short write (e.g. pipe full): stop and return bytes written so far.
+            break;
+        }
+    }
+    total
+}
+
 fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     if len == 0 { return 0; }
     if buf_ptr == 0 { return -14; } // EFAULT
@@ -1059,6 +1222,16 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 ts.pending = 0;
                 drop(tfd_tbl);
                 let pid = crate::process::current_pid();
+                log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
+                unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
+                return 8;
+            } else {
+                // Not yet fired (or not armed) — EAGAIN.
+                return -11;
+            }
+        }
+    }
+
     // Eventfd read: drain counter atomically, return 8 bytes.
     {
         let mut efd_tbl = EVENTFD_TABLE.lock();
@@ -1070,16 +1243,6 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
             drop(efd_tbl);
             unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, val); }
             return 8;
-        }
-    }
-
-                log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
-                unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
-                return 8;
-            } else {
-                // Not yet fired (or not armed) — EAGAIN.
-                return -11;
-            }
         }
     }
 
@@ -1240,6 +1403,14 @@ fn sys_fstat(fd: u64, stat_ptr: u64) -> i64 {
 }
 
 fn sys_getpid() -> i64 {
+    let pid = crate::process::current_pid();
+    if pid == 0 {
+        return 1;
+    }
+    crate::process::get_group_leader(pid) as i64
+}
+
+fn sys_gettid() -> i64 {
     let pid = crate::process::current_pid();
     if pid == 0 { 1 } else { pid as i64 }
 }
@@ -1867,10 +2038,9 @@ fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, _max_halts: u64) -> i64 {
         }
     }
 
-    // No sibling — single brief hlt then return EAGAIN.
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+    // No sibling — spin briefly then return EAGAIN.
+    for _ in 0..10_000 {
+        core::hint::spin_loop();
     }
     let n2 = sys_wm_event_read(ev_ptr, ev_len);
     if n2 >= 0 { n2 } else { -11 }
@@ -2076,6 +2246,8 @@ fn sys_gpu_submit(surface_id: u64, pixel_ptr: u64, pixel_len: u64) -> i64 {
 /// `arg0` = channel_ptr, `arg1` = channel_len, `arg2` = data_ptr, `arg3` = data_len
 /// Returns the `u64` sequence number on success, or a negative errno.
 fn sys_platform_msg_post(ch_ptr: u64, ch_len: u64, data_ptr: u64, data_len: u64) -> i64 {
+    static PLATFORM_POST_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
     let channel = match unsafe { read_user_bytes(ch_ptr, ch_len as usize) } {
         Some(b) => b,
         None => return -14, // EFAULT
@@ -2085,6 +2257,16 @@ fn sys_platform_msg_post(ch_ptr: u64, ch_len: u64, data_ptr: u64, data_len: u64)
         None => return -14,
     };
     let pid = crate::process::current_pid();
+    let k = PLATFORM_POST_LOG.fetch_add(1, Ordering::Relaxed);
+    if k < 16 {
+        log::info!(
+            "[platform-post] #{} pid={} ch_len={} payload_len={}",
+            k,
+            pid,
+            channel.len(),
+            payload.len()
+        );
+    }
     match crate::platform_channel::post(pid, channel, payload) {
         Ok(seq) => {
             // Compute a quick FNV-1a hash of the channel name for the WM event.
@@ -2104,6 +2286,8 @@ fn sys_platform_msg_post(ch_ptr: u64, ch_len: u64, data_ptr: u64, data_len: u64)
 /// `arg0` = buf_ptr, `arg1` = buf_len
 /// Returns the number of bytes written, or 0 if no message is pending.
 fn sys_platform_msg_recv(buf_ptr: u64, buf_len: u64) -> i64 {
+    static PLATFORM_RECV_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
     if buf_ptr == 0 || buf_len == 0 {
         return -14; // EFAULT
     }
@@ -2111,6 +2295,16 @@ fn sys_platform_msg_recv(buf_ptr: u64, buf_len: u64) -> i64 {
     let len = buf_len as usize;
     let mut kbuf: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     let written = crate::platform_channel::recv_into(&mut kbuf);
+    let k = PLATFORM_RECV_LOG.fetch_add(1, Ordering::Relaxed);
+    if k < 16 {
+        log::info!(
+            "[platform-recv] #{} pid={} req_buf_len={} wrote={}",
+            k,
+            crate::process::current_pid(),
+            len,
+            written
+        );
+    }
     if written == 0 {
         return 0;
     }
@@ -2124,10 +2318,22 @@ fn sys_platform_msg_recv(buf_ptr: u64, buf_len: u64) -> i64 {
 /// Record the engine's reply for a platform-channel message.
 /// `arg0` = seq, `arg1` = data_ptr, `arg2` = data_len
 fn sys_platform_msg_reply(seq: u64, data_ptr: u64, data_len: u64) -> i64 {
+    static PLATFORM_REPLY_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
     let payload = match unsafe { read_user_bytes(data_ptr, data_len as usize) } {
         Some(b) => b,
         None => return -14,
     };
+    let k = PLATFORM_REPLY_LOG.fetch_add(1, Ordering::Relaxed);
+    if k < 16 {
+        log::info!(
+            "[platform-reply] #{} pid={} seq={} payload_len={}",
+            k,
+            crate::process::current_pid(),
+            seq,
+            payload.len()
+        );
+    }
     match crate::platform_channel::reply(seq, payload) {
         Ok(()) => 0,
         Err(_) => -3, // ESRCH
@@ -2138,12 +2344,25 @@ fn sys_platform_msg_reply(seq: u64, data_ptr: u64, data_len: u64) -> i64 {
 /// remove the message from the queue.  Returns byte count or 0 if not ready.
 /// `arg0` = seq, `arg1` = buf_ptr, `arg2` = buf_len
 fn sys_platform_msg_ack(seq: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+    static PLATFORM_ACK_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
     if buf_ptr == 0 || buf_len == 0 {
         return -14;
     }
     let len = buf_len as usize;
     let mut kbuf: alloc::vec::Vec<u8> = alloc::vec![0u8; len];
     let n = crate::platform_channel::ack(seq, &mut kbuf);
+    let k = PLATFORM_ACK_LOG.fetch_add(1, Ordering::Relaxed);
+    if k < 16 {
+        log::info!(
+            "[platform-ack] #{} pid={} seq={} req_buf_len={} wrote={}",
+            k,
+            crate::process::current_pid(),
+            seq,
+            len,
+            n
+        );
+    }
     if n == 0 {
         return 0;
     }
@@ -3005,7 +3224,7 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
         if addr == cond { continue; }
         let waiters = futex_target_waiter_count(addr);
         if waiters == 0 { continue; }
-        let bridged = sys_futex(addr, FUTEX_WAKE, wake_count);
+        let bridged = futex_wake_waiters(addr, wake_count);
         if bridged > 0 {
             total = total.saturating_add(bridged as u32);
             log::warn!(
@@ -3045,10 +3264,10 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                     .collect()
             };
             for addr in addrs {
-                let bridged = sys_futex(addr, FUTEX_WAKE, wake_count);
+                let bridged = futex_wake_waiters(addr, wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);
-                    log::warn!(
+                    log::info!(
                         "[cond-bridge-sib] cond={:#x} -> futex={:#x} wake_count={} bridged={}",
                         cond, addr, wake_count, bridged
                     );
@@ -3123,7 +3342,7 @@ fn futex_wake_all_known_waiters() -> u32 {
     };
     let mut total = 0u32;
     for addr in addrs {
-        let n = sys_futex(addr, FUTEX_WAKE, u32::MAX);
+        let n = futex_wake_waiters(addr, u32::MAX);
         if n > 0 {
             total = total.saturating_add(n as u32);
         }
@@ -3180,7 +3399,7 @@ fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
     let n = wake_list.len();
     if n > 0 {
         let wpid = crate::process::current_pid();
-        log::warn!("[futex-wake] caller={} addr={:#x} woke={}", wpid, addr, n);
+        log::trace!("[futex-wake] caller={} addr={:#x} woke={}", wpid, addr, n);
         if futex_addr_is_target(addr) {
             static FUTEX_WAKE_TARGET_LOG: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
@@ -3309,16 +3528,14 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
                 }
             }
 
-            // No sibling to switch into — fall back to a bounded spin so the
-            // single-thread case still makes forward progress on a real wake.
-            let mut iters: u32 = 0;
-            const FUTEX_MAX_SPIN: u32 = 4_000_000;
-            while iters < FUTEX_MAX_SPIN
-                && unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
+            // No sibling to switch into — sleep loop using sti; hlt; cli
+            while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                core::hint::spin_loop();
-                iters = iters.wrapping_add(1);
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
             }
 
             futex_waiter_remove(uaddr, pid);
@@ -3334,25 +3551,24 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
             }
             let n = futex_wake_waiters(uaddr, val);
             let wpid = crate::process::current_pid();
-            // If nobody was woken (woke=0), the caller is likely spinning waiting
-            // for a newly-spawned thread to register a wait. Yield cooperatively
-            // to let newly-spawned threads (UIThread, RasterThread, EventHandler)
-            // run and set up their wait state.
-            if n == 0 && wpid != 0 {
-                static WAKE_YIELD_COUNTER: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let cnt = WAKE_YIELD_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                // Yield every 16th unproductive WAKE to avoid excessive context switches
-                // while still giving other threads forward progress.
-                if cnt % 16 == 15 {
+            if wpid != 0 {
+                let should_yield = if n > 0 {
+                    true
+                } else {
+                    static WAKE_YIELD_COUNTER: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let cnt = WAKE_YIELD_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    cnt % 16 == 15
+                };
+                if should_yield {
                     if let Some(next) = crate::process::next_runnable_pid(wpid) {
                         if next != wpid {
                             let urip = crate::arch::syscall::user_rip();
                             let ursp = crate::arch::syscall::user_rsp();
                             crate::process::save_return_context(wpid, urip, ursp);
                             crate::process::save_full_user_gprs(wpid);
-                            // Return value of futex_wake (n=0) will be in rax after resume.
-                            crate::process::set_rax(wpid, 0);
+                            // Return value of futex_wake (n) will be in rax after resume.
+                            crate::process::set_rax(wpid, n as u64);
                             crate::process::save_xstate(wpid);
                             crate::process::enter_user_by_pid_noreturn(next);
                         }
@@ -3400,17 +3616,13 @@ fn sys_futex(uaddr: u64, op: u32, val: u32) -> i64 {
                     crate::process::enter_user_by_pid_noreturn(next);
                 }
             }
-            let mut iters: u32 = 0;
-            const FUTEX_BITSET_MAX_SPIN: u32 = 4_000_000;
-            while iters < FUTEX_BITSET_MAX_SPIN
-                && unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
+            while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                core::hint::spin_loop();
-                iters = iters.wrapping_add(1);
-            }
-            if iters >= FUTEX_BITSET_MAX_SPIN {
-                log::warn!("[futex-bitset] SPIN-TIMEOUT pid={} uaddr={:#x} val={} (returning ETIMEDOUT)", pid, uaddr, val);
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
             }
             futex_waiter_remove(uaddr, pid);
             0
@@ -3486,15 +3698,30 @@ fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
         }
         let (r, child_pid_opt) = match spawn(arg2, arg3, stack_size) {
             Ok(tid) => {
-                unsafe { *(arg0 as *mut u64) = tid as u64; }
+                let fs_base = crate::process::get_fs_base(tid);
+                unsafe { *(arg0 as *mut u64) = fs_base; }
                 (0_i64, Some(tid))
             }
             Err(errno) => (-errno, None),
         };
-        log::error!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
+        log::trace!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
             arg0, arg1, arg2, arg3, stack_size, r);
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
+
+            // Give the newborn thread one immediate slice. Without this, the
+            // creator can monopolize userspace and delay child startup long
+            // enough to starve wake-source setup (pipe/timer arming).
+            let parent = crate::process::current_pid();
+            if parent != 0 && child_pid != parent {
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(parent, urip, ursp);
+                crate::process::save_full_user_gprs(parent);
+                crate::process::set_rax(parent, 0);
+                crate::process::save_xstate(parent);
+                crate::process::enter_user_by_pid_noreturn(child_pid);
+            }
         }
         r
     } else {
@@ -3526,8 +3753,17 @@ fn sys_thread_exit(code: u64) -> i64 {
 }
 
 /// Wait for a thread to finish and return its exit code.
-fn sys_thread_join(tid: u64) -> i64 {
-    match crate::process::waitpid(tid as u32) {
+fn sys_thread_join(thread_handle: u64) -> i64 {
+    let tid = if thread_handle > 0x100000 {
+        match crate::process::find_tid_by_fs_base(thread_handle) {
+            Some(t) => t,
+            None => return -10, // ECHILD
+        }
+    } else {
+        thread_handle as u32
+    };
+
+    match crate::process::waitpid(tid) {
         Ok(code) => code as i64,
         Err("not exited") => -11,  // EAGAIN
         Err(_) => -10,             // ECHILD
@@ -4057,6 +4293,11 @@ mod posix {
         let tid = process::current_pid();
         if tid == 0 { return 0; }
 
+        let fs_base = crate::process::get_fs_base(tid);
+        if fs_base != 0 {
+            return fs_base as i64;
+        }
+
         // Fast path: already allocated for this tid.
         if let Some(&va) = PTHREAD_SELF_TABLE.lock().get(&tid) {
             return va as i64;
@@ -4089,18 +4330,50 @@ mod posix {
         0
     }
 
-    pub fn sys_pthread_mutex_lock(mutex: u64) -> i64 {
+    pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
         if mutex < 0x1000 {
             log::warn!("[mutex] pthread_mutex_lock bogus addr={:#x}, returning 0", mutex);
             return 0;
         }
         let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
+        let pid = crate::process::current_pid();
+
         loop {
             if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
                 return 0;
             }
-            // Wait for the owner to clear the mutex word, then retry.
-            let _ = super::sys_futex(mutex, super::FUTEX_WAIT, 1);
+
+            if pid == 0 {
+                return 0;
+            }
+
+            // Add the process to the futex waiters list
+            super::futex_waiter_add(mutex, pid);
+
+            // Yield if there is a sibling runnable thread
+            if let Some(next) = crate::process::next_runnable_pid(pid) {
+                if next != pid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    // Save context pointing to the syscall instruction itself so we retry on re-entry.
+                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_full_user_gprs(pid);
+                    crate::process::set_rax(pid, sys_nr); // Restore the original syscall number
+                    crate::process::save_xstate(pid);
+                    crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+
+            // No sibling thread — loop in kernel space using hlt
+            while atom.load(Ordering::Acquire) != 0 && super::futex_waiter_present(mutex, pid) {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
+            }
+
+            super::futex_waiter_remove(mutex, pid);
         }
     }
 
@@ -4108,7 +4381,21 @@ mod posix {
         if mutex < 0x1000 { return 0; }
         let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
         atom.store(0, Ordering::Release);
-        sys_futex_wake(mutex, 1);
+        let n = super::futex_wake_waiters(mutex, 1);
+        let wpid = crate::process::current_pid();
+        if wpid != 0 && n > 0 {
+            if let Some(next) = crate::process::next_runnable_pid(wpid) {
+                if next != wpid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(wpid, urip, ursp);
+                    crate::process::save_full_user_gprs(wpid);
+                    crate::process::set_rax(wpid, 0);
+                    crate::process::save_xstate(wpid);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
         0
     }
 
@@ -4125,25 +4412,71 @@ mod posix {
             return 22;
         }
         let atom = unsafe { &*(once as *const core::sync::atomic::AtomicU32) };
-        // State: 0=uninit, 1=in-progress, 2=done
-        if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
-            // We won the race — call func.
-            let f: extern "C" fn() = unsafe { core::mem::transmute(func) };
-            f();
-            atom.store(2, Ordering::Release);
-            // Wake all threads blocked waiting for the init to complete.
-            sys_futex_wake(once, u32::MAX);
-        } else {
-            // Block (via futex) until the initializer completes.
-            // A kernel-mode spin would deadlock if IF=0 prevents timer preemption.
-            loop {
-                let v = atom.load(Ordering::Acquire);
-                if v == 2 { break; }
-                // Wait for the value to change away from 1.
-                let _ = super::sys_futex(once, super::FUTEX_WAIT, v);
+        let pid = crate::process::current_pid();
+
+        loop {
+            // State: 0=uninit, 1=in-progress, 2=done
+            let state = atom.load(Ordering::Acquire);
+            if state == 2 {
+                return 0;
             }
+            if state == 0 {
+                if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+                    // We won the race — call func.
+                    let f: extern "C" fn() = unsafe { core::mem::transmute(func) };
+                    f();
+                    atom.store(2, Ordering::Release);
+                    // Wake all threads blocked waiting for the init to complete.
+                    let n = super::futex_wake_waiters(once, u32::MAX);
+                    let wpid = crate::process::current_pid();
+                    if wpid != 0 && n > 0 {
+                        if let Some(next) = crate::process::next_runnable_pid(wpid) {
+                            if next != wpid {
+                                let urip = crate::arch::syscall::user_rip();
+                                let ursp = crate::arch::syscall::user_rsp();
+                                crate::process::save_return_context(wpid, urip, ursp);
+                                crate::process::save_full_user_gprs(wpid);
+                                crate::process::set_rax(wpid, 0);
+                                crate::process::save_xstate(wpid);
+                                crate::process::enter_user_by_pid_noreturn(next);
+                            }
+                        }
+                    }
+                    return 0;
+                }
+            }
+
+            // If state == 1, block until it becomes 2.
+            if pid == 0 {
+                return 0;
+            }
+
+            super::futex_waiter_add(once, pid);
+
+            if let Some(next) = crate::process::next_runnable_pid(pid) {
+                if next != pid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    // Save context pointing to the syscall instruction itself so we retry on re-entry.
+                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_full_user_gprs(pid);
+                    crate::process::set_rax(pid, 0x3d7); // sys_pthread_once syscall number
+                    crate::process::save_xstate(pid);
+                    crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+
+            // No sibling runnable thread — loop using hlt in the kernel until state is 2.
+            while atom.load(Ordering::Acquire) != 2 && super::futex_waiter_present(once, pid) {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                }
+            }
+
+            super::futex_waiter_remove(once, pid);
         }
-        0
     }
 
     pub fn sys_pthread_key_create(key_ptr: u64, _dtor: u64) -> i64 {
@@ -4165,98 +4498,109 @@ mod posix {
         KEY_TABLE.lock().get(&(pid, tid, key as u32)).copied().unwrap_or(0) as i64
     }
 
-    pub fn sys_pthread_cond_wait(cond: u64, mutex: u64) -> i64 {
+    pub fn sys_pthread_cond_wait(cond: u64, mutex: u64, sys_nr: u64) -> i64 {
         if cond < 0x1000 || mutex < 0x1000 {
             log::error!("[pthread-err] cond_wait EINVAL pid={} cond={:#x} mutex={:#x} rip={:#x}",
                 crate::process::current_pid(), cond, mutex, crate::arch::syscall::user_rip());
             return 22;
         }
+
+        let pid = crate::process::current_pid();
         let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
-        let seq = atom.load(Ordering::Acquire);
-        // Release the mutex, sleep until the condvar sequence advances, then
-        // reacquire the mutex before returning.
-        sys_pthread_mutex_unlock(mutex);
-        let mut bypass_wait = false;
-        if cond == super::FUTEX_ADDR_PID1_WAIT && crate::process::current_pid() == 1 {
-            static PID1_COND_BYPASS_ONCE: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = PID1_COND_BYPASS_ONCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n == 0 {
-                bypass_wait = true;
-                log::warn!(
-                    "[cond-bypass] pid=1 cond={:#x} seq={} bypassing one wait to force startup transition",
-                    cond,
-                    seq
-                );
-            } else {
-                // DEADLOCK BREAKER: pid 1 is about to sleep on PID1_WAIT, but
-                // the only things that could wake it are workers (pid 5/6/8)
-                // and task runners (pid 2/3/4/7), all of which are themselves
-                // parked. Before parking, kick every potentially-stuck thread
-                // so they get a chance to make progress and signal back.
-                static PID1_KICK_LOG: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let k = PID1_KICK_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if k < 16 || k % 64 == 0 {
-                    log::warn!(
-                        "[pid1-wait-kick] #{} cond={:#x} seq={} kicking workers+runners before park",
-                        k, cond, seq
-                    );
+
+        // Check if we have an active wait state
+        let mut state = {
+            let table = super::COND_WAIT_STATE.lock();
+            table.get(&pid).copied()
+        };
+
+        if state.is_none() {
+            // First time: unlock mutex and enter Waiting state.
+            let seq = atom.load(Ordering::Acquire);
+            sys_pthread_mutex_unlock(mutex);
+            let next_state = super::CondWaitState::Waiting { cond, mutex, seq };
+            super::COND_WAIT_STATE.lock().insert(pid, next_state);
+            state = Some(next_state);
+        }
+
+        // Now process the state machine
+        loop {
+            match state.unwrap() {
+                super::CondWaitState::Waiting { cond, mutex, seq } => {
+                    let cur_seq = atom.load(Ordering::Acquire);
+                    if cur_seq != seq {
+                        // The condvar was signaled!
+                        super::futex_waiter_remove(cond, pid);
+                        let next_state = super::CondWaitState::AcquiringMutex { mutex };
+                        super::COND_WAIT_STATE.lock().insert(pid, next_state);
+                        state = Some(next_state);
+                        // Continue to try and acquire the mutex
+                        continue;
+                    }
+
+                    // Otherwise, we must wait (yield or hlt)
+                    if pid != 0 {
+                        super::futex_waiter_add(cond, pid);
+                        if let Some(next) = crate::process::next_runnable_pid(pid) {
+                            if next != pid {
+                                let urip = crate::arch::syscall::user_rip();
+                                let ursp = crate::arch::syscall::user_rsp();
+                                crate::process::save_return_context(pid, urip - 2, ursp);
+                                crate::process::save_full_user_gprs(pid);
+                                crate::process::set_rax(pid, sys_nr); // Restore the original syscall number
+                                crate::process::save_xstate(pid);
+                                crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                                crate::process::enter_user_by_pid_noreturn(next);
+                            }
+                        }
+                    }
+
+                    // No sibling runnable thread — loop using hlt in the kernel until sequence changes
+                    while atom.load(Ordering::Acquire) == seq && super::futex_waiter_present(cond, pid) {
+                        #[cfg(target_arch = "x86_64")]
+                        unsafe {
+                            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        }
+                    }
+
+                    super::futex_waiter_remove(cond, pid);
+                    let next_state = super::CondWaitState::AcquiringMutex { mutex };
+                    super::COND_WAIT_STATE.lock().insert(pid, next_state);
+                    state = Some(next_state);
                 }
-                // Wake every parked worker on the shared worker channel.
-                let _ = super::sys_futex(super::FUTEX_ADDR_WORKER_WAIT, super::FUTEX_WAKE, u32::MAX);
-                let _ = super::sys_futex(super::FUTEX_ADDR_HANDOFF, super::FUTEX_WAKE, u32::MAX);
-                // Force-wake every task runner so they get a chance to process
-                // any pending engine tasks.
-                let _ = super::force_wake_all_task_runners("pid1-cond-wait");
-                // BRUTE-FORCE: also wake every thread parked on any other
-                // futex address — pid 2/3/4 may be stuck on engine-internal
-                // mutexes (e.g. 0x2d1000010) not in our bridge target list.
-                // Without this they never get a chance to retry their lock
-                // and feed the engine.
-                let woke_all = super::futex_wake_all_known_waiters();
-                if k < 8 || k % 32 == 0 {
-                    log::warn!("[pid1-wait-kick] woke {} unknown-addr waiters", woke_all);
+
+                super::CondWaitState::AcquiringMutex { mutex } => {
+                    // Try to acquire the mutex (using the new sys_pthread_mutex_lock logic, retrying sys_nr on yield)
+                    let rc = sys_pthread_mutex_lock(mutex, sys_nr);
+                    if rc == 0 {
+                        // Successfully acquired the mutex! Clear wait state and return 0
+                        super::COND_WAIT_STATE.lock().remove(&pid);
+                        return 0;
+                    } else {
+                        // yielded inside sys_pthread_mutex_lock
+                        return rc;
+                    }
                 }
             }
         }
-        if !bypass_wait {
-            let _ = super::sys_futex(cond, super::FUTEX_WAIT, seq);
-        }
-        sys_pthread_mutex_lock(mutex)
     }
 
-    pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, _timeout: u64) -> i64 {
-        sys_pthread_cond_wait(cond, mutex)
+    pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, _timeout: u64, sys_nr: u64) -> i64 {
+        sys_pthread_cond_wait(cond, mutex, sys_nr)
     }
 
     #[inline]
-    fn cond_broadcast_loop_handoff(_pid: u32, _cond: u64, _n: i64, _bridged: u32) {
-        // The aggressive forced context-switch version of this routine
-        // suppressed pid 1's user-space progress, so it was disabled. However
-        // the platform task-runner threads (pids 2/3/4 in the embedder) park
-        // in epoll_wait on timerfds/eventfds; if pid 1 posts a task by writing
-        // to one of those fds without using our logged epoll/eventfd path,
-        // they can stay asleep forever. Periodically poke them so any pending
-        // wake hits the epoll waiters. This is a light-weight nudge: no
-        // context switch, no GPR save — pid 1 returns into user space
-        // immediately afterwards.
-        static LOOP_COUNTER: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        let k = LOOP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if k % 4 == 0 {
-            let _ = super::force_wake_all_task_runners("cond-broadcast-nudge");
-        }
-    }
+    fn cond_broadcast_loop_handoff(_pid: u32, _cond: u64, _n: i64, _bridged: u32) {}
 
     pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
         if cond == 0 { return 22; }
         let pid = crate::process::current_pid();
         let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
         let old_seq = atom.fetch_add(1, Ordering::Release);
-        let n = super::sys_futex(cond, super::FUTEX_WAKE, 1);
+        let n = super::futex_wake_waiters(cond, 1);
+        let mut bridged = 0u32;
         if n == 0 {
-            let bridged = super::cond_miss_bridge(cond, 1);
+            bridged = super::cond_miss_bridge(cond, 1);
             if bridged > 0 {
                 log::warn!(
                     "[cond-signal-bridged] pid={} cond={:#x} woke={} bridged={}",
@@ -4267,11 +4611,21 @@ mod posix {
                 );
             }
         }
-        log::warn!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
-        // POSIX: pthread_cond_signal returns 0 on success regardless of how
-        // many threads were actually woken. Returning the wake count was
-        // causing Dart's VALIDATE_PTHREAD_RESULT to abort with
-        // "pthread error: ?" the moment an actual waiter was woken.
+        log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
+        let wpid = crate::process::current_pid();
+        if wpid != 0 && n > 0 {
+            if let Some(next) = crate::process::next_runnable_pid(wpid) {
+                if next != wpid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(wpid, urip, ursp);
+                    crate::process::save_full_user_gprs(wpid);
+                    crate::process::set_rax(wpid, 0);
+                    crate::process::save_xstate(wpid);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
         0
     }
 
@@ -4280,9 +4634,24 @@ mod posix {
         let pid = crate::process::current_pid();
         let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
         let old_seq = atom.fetch_add(1, Ordering::Release);
-        let n = super::sys_futex(cond, super::FUTEX_WAKE, i32::MAX as u32);
+        let n = super::futex_wake_waiters(cond, i32::MAX as u32);
         let mut bridged = 0u32;
-        if n == 0 {
+        let mut skip_bridge = false;
+        if n == 0 && pid == 2 {
+            let ursp = crate::arch::syscall::user_rsp();
+            let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
+            if ursp != 0 && crate::mm::paging::translate_user_page(cur_cr3, ursp & !0xfff).is_some() {
+                let caller = unsafe { core::ptr::read_unaligned(ursp as *const u64) };
+                // Flutter engine Dart VM `ConditionVariable::NotifyAll` callsite
+                // after `pthread_cond_broadcast@plt` (see mapped addr 0x326d61e).
+                // Bridging this path causes a synthetic wake storm.
+                if caller == 0x326d61e {
+                    skip_bridge = true;
+                }
+            }
+        }
+
+        if n == 0 && !skip_bridge {
             bridged = super::cond_miss_bridge(cond, i32::MAX as u32);
             if bridged > 0 {
                 log::warn!(
@@ -4295,58 +4664,94 @@ mod posix {
             }
         }
         cond_broadcast_loop_handoff(pid, cond, n, bridged);
-        let urip = crate::arch::syscall::user_rip();
-        let ursp = crate::arch::syscall::user_rsp();
-        // Read [rsp] = caller's return address (where in libflutter_engine
-        // the cond_broadcast was called from). The syscall-stub RIP is not
-        // useful for identifying the call site.
-        let caller = if ursp != 0 {
-            unsafe { core::ptr::read_unaligned(ursp as *const u64) }
-        } else { 0 };
-        // dart::ConditionVariable::NotifyAll has a 0x428-byte frame (push rbx + sub $0x420).
-        // Read its caller's return address so we can identify the *true* call site.
-        let caller2 = if ursp != 0 {
-            unsafe { core::ptr::read_unaligned((ursp.wrapping_add(0x430)) as *const u64) }
-        } else { 0 };
-        log::warn!("[cond-broadcast] pid={} cond={:#x} seq {}→{} woke={} rip={:#x} caller={:#x} caller2={:#x}", pid, cond, old_seq, old_seq+1, n, urip, caller, caller2);
-        // POSIX: pthread_cond_broadcast returns 0 on success regardless of how
-        // many threads were woken. Returning `n` was triggering Dart VM aborts.
+
+        log::trace!(
+            "[cond-broadcast] pid={} cond={:#x} seq {}→{} woke={}",
+            pid,
+            cond,
+            old_seq,
+            old_seq + 1,
+            n
+        );
+        
+        let wpid = crate::process::current_pid();
+        if wpid != 0 && n > 0 {
+            if let Some(next) = crate::process::next_runnable_pid(wpid) {
+                if next != wpid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(wpid, urip, ursp);
+                    crate::process::save_full_user_gprs(wpid);
+                    crate::process::set_rax(wpid, 0);
+                    crate::process::save_xstate(wpid);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
         0
     }
 
     pub fn sys_pthread_attr_init(attr: u64) -> i64 {
-        log::error!("[trace] sys_pthread_attr_init attr={:#x}", attr);
+        log::trace!("[trace] sys_pthread_attr_init attr={:#x}", attr);
         // pthread_attr_t is typically 56 bytes; zero it out.
         if attr != 0 { unsafe { core::ptr::write_bytes(attr as *mut u8, 0, 56); } }
         0
     }
 
     pub fn sys_pthread_attr_destroy(attr: u64) -> i64 {
-        log::error!("[trace] sys_pthread_attr_destroy attr={:#x}", attr);
+        log::trace!("[trace] sys_pthread_attr_destroy attr={:#x}", attr);
         0
     }
 
     pub fn sys_pthread_attr_setstacksize(attr: u64, stacksize: u64) -> i64 {
-        log::error!("[trace] sys_pthread_attr_setstacksize attr={:#x} size={:#x}", attr, stacksize);
+        log::trace!("[trace] sys_pthread_attr_setstacksize attr={:#x} size={:#x}", attr, stacksize);
         // Store stacksize at offset 8 of the attr struct (glibc layout).
         if attr != 0 { unsafe { *((attr + 8) as *mut u64) = stacksize; } }
         0
     }
 
     pub fn sys_pthread_attr_setdetachstate(attr: u64, state: u64) -> i64 {
-        log::error!("[trace] sys_pthread_attr_setdetachstate attr={:#x} state={}", attr, state);
+        log::trace!("[trace] sys_pthread_attr_setdetachstate attr={:#x} state={}", attr, state);
         // Store detach state at offset 0.
         if attr != 0 { unsafe { *(attr as *mut u64) = state; } }
         0
     }
 
     pub fn sys_pthread_attr_getstack(attr: u64, base_out: u64, size_out: u64) -> i64 {
-        log::error!("[trace] sys_pthread_attr_getstack attr={:#x}", attr);
-        unsafe { write_u64_user(base_out, 0); write_u64_user(size_out, 0); }
+        // The Dart VM calls pthread_getattr_np(self, &attr) then
+        // pthread_attr_getstack(&attr, &base, &size) to validate stack bounds.
+        // If we return 0,0 the VM aborts with "GetAndValidateThreadStackBounds failed".
+        // Look up the current thread's recorded user-space stack bounds.
+        let tid = crate::process::current_pid();
+        let (base, size) = crate::process::get_user_stack_bounds(tid);
+
+        // Also check if the attr struct was pre-filled by pthread_getattr_np
+        // (stored at attr+0x10 = base, attr+0x18 = size).
+        let (eff_base, eff_size) = if base != 0 {
+            (base, size)
+        } else if attr >= 0x1000 {
+            // Try reading what pthread_getattr_np may have written into attr.
+            let a_base = unsafe { *(attr.wrapping_add(0x10) as *const u64) };
+            let a_size = unsafe { *(attr.wrapping_add(0x18) as *const u64) };
+            if a_base != 0 && a_size != 0 { (a_base, a_size) } else { (0, 0) }
+        } else {
+            (0, 0)
+        };
+
+        log::debug!("[pthread_attr_getstack] tid={} base={:#x} size={:#x}", tid, eff_base, eff_size);
+        unsafe {
+            if base_out != 0 { *(base_out as *mut u64) = eff_base; }
+            if size_out != 0 { *(size_out as *mut u64) = eff_size; }
+        }
         0
     }
 
     pub fn sys_pthread_setname_np(thread: u64, name: u64) -> i64 {
+        let tid = if thread > 0x100000 {
+            crate::process::find_tid_by_fs_base(thread).unwrap_or(0)
+        } else {
+            thread as u32
+        };
         let name_str = if name > 0x1000 {
             let bytes = unsafe {
                 let p = name as *const u8;
@@ -4356,12 +4761,12 @@ mod posix {
             };
             core::str::from_utf8(bytes).unwrap_or("?")
         } else { "?" };
-        log::error!("[trace] sys_pthread_setname_np thread={:#x} name=\"{}\"", thread, name_str);
+        log::trace!("[trace] sys_pthread_setname_np thread={:#x} (tid={}) name=\"{}\"", thread, tid, name_str);
         0
     }
 
     pub fn sys_pthread_attr_getter_noop(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-        log::error!("[trace] pthread_attr/sched noop nr={:#x} a0={:#x} a1={:#x} a2={:#x}", nr, a0, a1, a2);
+        log::trace!("[trace] pthread_attr/sched noop nr={:#x} a0={:#x} a1={:#x} a2={:#x}", nr, a0, a1, a2);
         0
     }
 
@@ -4623,6 +5028,7 @@ mod posix {
 
     /// Return a static error string for the given errno.
     pub fn sys_strerror(errnum: i32) -> i64 {
+        log::warn!("[strerror] errnum={}", errnum);
         // Embed static strings at a fixed kernel address.
         // The user gets a pointer to read-only kernel text — valid since
         // user processes can read the kernel text in our current model.
@@ -4634,10 +5040,12 @@ mod posix {
             12 => b"Out of memory\0",
             13 => b"Permission denied\0",
             14 => b"Bad address\0",
+            16 => b"Device or resource busy\0", // EBUSY
             17 => b"File exists\0",
             19 => b"No such device\0",
             22 => b"Invalid argument\0",
             28 => b"No space left on device\0",
+            35 => b"Resource deadlock would occur\0", // EDEADLK
             38 => b"Function not implemented\0",
             _  => b"Unknown error\0",
         };
@@ -4645,13 +5053,14 @@ mod posix {
     }
 
     pub fn sys_strerror_r(errnum: i32, buf: u64, n: u64) -> i64 {
+        log::warn!("[strerror_r] errnum={} buf={:#x} n={}", errnum, buf, n);
         let s_ptr = sys_strerror(errnum) as u64;
         let s_len = sys_strlen(s_ptr) as u64 + 1;
         let copy = s_len.min(n);
         if buf != 0 && copy > 0 {
             sys_memcpy(buf, s_ptr, copy);
         }
-        0
+        buf as i64
     }
 
     pub fn sys_passthrough_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
@@ -5369,10 +5778,31 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         let s = core::str::from_utf8(&buf[..n]).unwrap_or("<non-utf8>");
         log::warn!("[stat-trace] nr={:#x} path='{}'", number, s);
     }
+
+    if cur_pid == 8 || cur_pid == 9 {
+        static PID89_SC_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = PID89_SC_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 128 {
+            log::warn!(
+                "[pid89-sys] #{} pid={} nr={:#x} a0={:#x} a1={:#x} a2={:#x} a3={:#x} rip={:#x}",
+                n,
+                cur_pid,
+                number,
+                arg0,
+                arg1,
+                arg2,
+                arg3,
+                user_rip
+            );
+        }
+    }
+
     match number {
         // POSIX-compatible
         0   => sys_read(arg0, arg1, arg2),
         1   => sys_write(arg0, arg1, arg2),
+        20  => sys_writev(arg0, arg1, arg2),
         2   => sys_open(arg0, arg1, arg2),
         3   => sys_close(arg0),
         4   => sys_stat_path(arg0, arg1),    // Linux stat (path, statbuf)
@@ -5436,7 +5866,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         61  => sys_waitpid(arg0, arg1, arg2),
         62  => sys_kill(arg0, arg1),
         158 => sys_arch_prctl(arg0, arg1), // Linux arch_prctl (TLS FS base)
-        186 => sys_getpid(),                 // gettid → same as getpid (each thread has a slot)
+        186 => sys_gettid(),                 // gettid (each thread has a slot)
         202 => sys_futex(arg0, arg1 as u32, arg2 as u32), // Linux SYS_futex — libc++ std::future uses this directly
         // Native Linux epoll/poll/timerfd — GLib/Dart call these with Linux ABI numbers
         // directly (not through our POSIX trampolines). Without handlers these
@@ -5724,7 +6154,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x3D0 => 0, // pthread_detach noop
         0x3D1 => posix::sys_pthread_self(),
         0x3D2 => posix::sys_pthread_mutex_init(arg0),
-        0x3D3 => posix::sys_pthread_mutex_lock(arg0),
+        0x3D3 => posix::sys_pthread_mutex_lock(arg0, number),
         0x3D4 => posix::sys_pthread_mutex_unlock(arg0),
         0x3D5 => 0, // pthread_mutex_destroy noop
         0x3D6 => posix::sys_pthread_mutex_trylock(arg0),
@@ -5734,13 +6164,13 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x3DA => posix::sys_pthread_setspecific(arg0, arg1),
         0x3DB => posix::sys_pthread_getspecific(arg0),
         0x3DC => posix::sys_pthread_mutex_init(arg0), // cond_init: zero the struct
-        0x3DD => posix::sys_pthread_cond_wait(arg0, arg1),
+        0x3DD => posix::sys_pthread_cond_wait(arg0, arg1, number),
         0x3DE => posix::sys_pthread_cond_signal(arg0),
         0x3DF => posix::sys_pthread_cond_broadcast(arg0),
         0x3E0 => 0, // cond_destroy noop
-        0x3E1 => posix::sys_pthread_cond_timedwait(arg0, arg1, arg2),
-        0x3E2 => posix::sys_pthread_mutex_lock(arg0),   // rwlock_rdlock
-        0x3E3 => posix::sys_pthread_mutex_lock(arg0),   // rwlock_wrlock
+        0x3E1 => posix::sys_pthread_cond_timedwait(arg0, arg1, arg2, number),
+        0x3E2 => posix::sys_pthread_mutex_lock(arg0, number),   // rwlock_rdlock
+        0x3E3 => posix::sys_pthread_mutex_lock(arg0, number),   // rwlock_wrlock
         0x3E4 => posix::sys_pthread_mutex_unlock(arg0), // rwlock_unlock
         0x3E5 => posix::sys_pthread_mutex_init(arg0),   // rwlock_init
         0x3E6 => 0, // rwlock_destroy
@@ -5754,7 +6184,22 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x3F2 => 0, // pthread_sigmask noop
         0x3F3 => 0, // pthread_kill noop
         0x3F4 => posix::sys_pthread_setname_np(arg0, arg1),
-        0x3F5..=0x3F7 => posix::sys_pthread_attr_getter_noop(number, arg0, arg1, arg2),
+        0x3F5 | 0x3F7 => posix::sys_pthread_attr_getter_noop(number, arg0, arg1, arg2),
+        // pthread_getattr_np(pthread_t thread, attr*) — fill attr with thread's
+        // stack bounds so the Dart VM can call pthread_attr_getstack on it.
+        0x3F6 => {
+            let tid = crate::process::current_pid();
+            let (base, size) = crate::process::get_user_stack_bounds(tid);
+            if arg1 >= 0x1000 && base != 0 {
+                // Store base at attr+0x10, size at attr+0x18 (common layout).
+                unsafe {
+                    *((arg1 as usize + 0x10) as *mut u64) = base;
+                    *((arg1 as usize + 0x18) as *mut u64) = size;
+                }
+            }
+            log::debug!("[pthread_getattr_np] tid={} base={:#x} size={:#x}", tid, base, size);
+            0
+        },
         // Semaphores
         0x3F8 => posix::sys_sem_init(arg0, arg1, arg2),
         0x3F9 => 0, // sem_destroy noop

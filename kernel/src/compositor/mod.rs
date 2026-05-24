@@ -638,6 +638,18 @@ pub fn render_frame() {
 
     let mut c = COMP.lock();
 
+    // Debug: print active surfaces when count changes
+    static mut LAST_COUNT: usize = 999;
+    let in_use_count = c.surfaces.iter().filter(|s| s.in_use).count();
+    if in_use_count != unsafe { LAST_COUNT } {
+        unsafe { LAST_COUNT = in_use_count; }
+        for (i, s) in c.surfaces.iter().enumerate() {
+            if s.in_use {
+                log::info!("[Compositor] debug_surf: idx={} id={} x={} y={} w={} h={} z={} presented={}", i, s.id, s.x, s.y, s.width, s.height, s.z, c.presented[i]);
+            }
+        }
+    }
+
     // Phase 33-C: flip any pending back→front buffers at the vsync boundary.
     // This is the only place we swap buffers, so all blits happen at one
     // coherent point per frame — eliminating tearing.
@@ -751,17 +763,20 @@ pub fn tick() {
     if !crate::drivers::fb::is_ready() {
         return;
     }
-    // When a process owns the FB directly (bypass), still draw the mouse
-    // cursor on top so the user can see pointer position.  Skip all other
-    // compositor work (surfaces, background) to avoid corrupting the process's
-    // own rendering.
     if is_fb_bypass() {
         draw_cursor();
+        if let Some(mut c) = COMP.try_lock() {
+            c.frame_counter = c.frame_counter.wrapping_add(1);
+            crate::wm::push_vsync(c.frame_counter);
+        }
         return;
     }
 
     {
-        let mut c = COMP.lock();
+        let mut c = match COMP.try_lock() {
+            Some(guard) => guard,
+            None => return,
+        };
         if c.demo_id != 0 {
             if let Some((w, _h)) = crate::drivers::fb::size_px() {
                 let mut demo_w = 220i32;
