@@ -758,7 +758,6 @@ fn draw_cursor() {
     }
 }
 
-/// Called from kernel tick path. Updates demo animation and renders a frame.
 pub fn tick() {
     if !crate::drivers::fb::is_ready() {
         return;
@@ -772,41 +771,80 @@ pub fn tick() {
         return;
     }
 
+    let mut c = match COMP.try_lock() {
+        Some(guard) => guard,
+        None => return,
+    };
+
+    let mut dirty = false;
+
+    // 1. Check if any surfaces changed (creation, destruction, moving, resizing, visibility, clip, etc.)
     {
-        let mut c = match COMP.try_lock() {
-            Some(guard) => guard,
-            None => return,
-        };
-        if c.demo_id != 0 {
-            if let Some((w, _h)) = crate::drivers::fb::size_px() {
-                let mut demo_w = 220i32;
-                for s in c.surfaces.iter() {
-                    if s.in_use && s.id == c.demo_id {
-                        demo_w = s.width as i32;
-                        break;
-                    }
+        static mut LAST_SURFACES: [Surface; MAX_SURFACES] = [const { Surface::empty() }; MAX_SURFACES];
+        if c.surfaces != unsafe { LAST_SURFACES } {
+            unsafe { LAST_SURFACES = c.surfaces; }
+            dirty = true;
+        }
+    }
+
+    // 2. Check if any back buffers are pending swap/flip
+    for idx in 0..MAX_SURFACES {
+        if c.back_pending[idx] {
+            dirty = true;
+            break;
+        }
+    }
+
+    // 3. Check if mouse cursor moved
+    let (mx, my) = crate::drivers::ps2::cursor_pos();
+    static mut LAST_MX: i32 = -1;
+    static mut LAST_MY: i32 = -1;
+    if mx != unsafe { LAST_MX } || my != unsafe { LAST_MY } {
+        unsafe {
+            LAST_MX = mx;
+            LAST_MY = my;
+        }
+        dirty = true;
+    }
+
+    // 4. Update demo animation if active
+    if c.demo_id != 0 {
+        dirty = true;
+        if let Some((w, _h)) = crate::drivers::fb::size_px() {
+            let mut demo_w = 220i32;
+            for s in c.surfaces.iter() {
+                if s.in_use && s.id == c.demo_id {
+                    demo_w = s.width as i32;
+                    break;
                 }
-                let max_x = (w as i32 - demo_w).max(0);
-                c.demo_x += c.demo_dx;
-                if c.demo_x <= 0 {
-                    c.demo_x = 0;
-                    c.demo_dx = c.demo_dx.abs();
-                } else if c.demo_x >= max_x {
-                    c.demo_x = max_x;
-                    c.demo_dx = -c.demo_dx.abs();
-                }
-                let demo_id = c.demo_id;
-                let demo_x = c.demo_x;
-                for s in &mut c.surfaces {
-                    if s.in_use && s.id == demo_id {
-                        s.x = demo_x;
-                        break;
-                    }
+            }
+            let max_x = (w as i32 - demo_w).max(0);
+            c.demo_x += c.demo_dx;
+            if c.demo_x <= 0 {
+                c.demo_x = 0;
+                c.demo_dx = c.demo_dx.abs();
+            } else if c.demo_x >= max_x {
+                c.demo_x = max_x;
+                c.demo_dx = -c.demo_dx.abs();
+            }
+            let demo_id = c.demo_id;
+            let demo_x = c.demo_x;
+            for s in &mut c.surfaces {
+                if s.in_use && s.id == demo_id {
+                    s.x = demo_x;
+                    break;
                 }
             }
         }
     }
 
-    render_frame();
+    if dirty {
+        drop(c);
+        render_frame();
+    } else {
+        // Even if we don't render, keep pushing vsync to notify event consumers
+        c.frame_counter = c.frame_counter.wrapping_add(1);
+        crate::wm::push_vsync(c.frame_counter);
+    }
 }
 

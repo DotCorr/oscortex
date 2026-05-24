@@ -18,12 +18,13 @@ if [ -d "$EMBEDDER_DIR" ]; then
     echo "[0/4] Building flutter-embedder userspace binary..."
     (cd "$EMBEDDER_DIR" && \
         cargo +nightly build \
+            --release \
             --target "$EMBEDDER_TARGET" \
             -Z build-std=core,compiler_builtins \
             -Z build-std-features=compiler-builtins-mem \
             2>&1) || echo "[0/4] flutter-embedder build failed (non-fatal — kernel build continues)"
 
-    EMBEDDER_BIN="$EMBEDDER_DIR/target/$EMBEDDER_TARGET/debug/flutter-embedder"
+    EMBEDDER_BIN="$EMBEDDER_DIR/target/$EMBEDDER_TARGET/release/flutter-embedder"
     if [ -f "$EMBEDDER_BIN" ]; then
         mkdir -p "$ROOT/initramfs/bin"
         cp "$EMBEDDER_BIN" "$ROOT/initramfs/bin/flutter-embedder"
@@ -134,7 +135,7 @@ if [ -d "$STUB_DIR" ]; then
 fi
 
 # Force flutter-embedder to be the primary /init (PID 1)
-EMBEDDER_BIN="$ROOT/tools/flutter-embedder/target/x86_64-unknown-none/debug/flutter-embedder"
+EMBEDDER_BIN="$ROOT/tools/flutter-embedder/target/x86_64-unknown-none/release/flutter-embedder"
 if [ -f "$EMBEDDER_BIN" ]; then
     cp "$EMBEDDER_BIN" "$ROOT/initramfs/init"
     echo "[0.9/4] FORCE: Staged flutter-embedder to initramfs/init as PID 1"
@@ -146,12 +147,13 @@ fi
 echo "[1/4] Building kernel ELF..."
 cd "$ROOT"
 cargo +nightly build \
+    --release \
     --package oscortex-kernel \
     --target x86_64-unknown-none \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem
 
-KERNEL_ELF="$ROOT/target/x86_64-unknown-none/debug/kernel"
+KERNEL_ELF="$ROOT/target/x86_64-unknown-none/release/kernel"
 
 echo "[2/4] Staging ISO root..."
 rm -rf "$ISO_ROOT"

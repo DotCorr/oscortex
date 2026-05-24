@@ -123,8 +123,8 @@ static FUTEX_PENDING_WAKES: spin::Mutex<BTreeMap<u64, u32>> = spin::Mutex::new(B
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CondWaitState {
-    Waiting { cond: u64, mutex: u64, seq: u32 },
-    AcquiringMutex { mutex: u64 },
+    Waiting { cond: u64, mutex: u64, seq: u32, timeout_ns: u64 },
+    AcquiringMutex { mutex: u64, timed_out: bool },
 }
 
 static COND_WAIT_STATE: spin::Mutex<BTreeMap<u32, CondWaitState>> = spin::Mutex::new(BTreeMap::new());
@@ -393,24 +393,28 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
     let value_ns = (val_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(val_ns.max(0) as u64);
     let now = monotonic_ns();
-    let deadline = if value_ns == 0 {
+    let mut deadline = if value_ns == 0 {
         0 // POSIX: if it_value is zero, the timer is disarmed.
     } else if flags & 1 != 0 {
         value_ns // TFD_TIMER_ABSTIME: caller already has absolute ns timestamp
     } else {
         now.saturating_add(value_ns)
     };
+    let original_expired = deadline != 0 && deadline <= now;
+    if original_expired {
+        // Force a minimum 1ms delay (1,000,000 ns) to prevent CPU starvation/hot loops
+        deadline = now.saturating_add(1_000_000);
+    }
     let mut tbl = TIMERFD_TABLE.lock();
     // Auto-register if user-space called settime on an fd we didn't see
     // through timerfd_create (shouldn't happen, but be lenient).
-    // If deadline <= now, the timer already expired: mark one pending expiration.
-    let already_expired = deadline != 0 && deadline <= now;
+    let already_expired = false;
     {
         let n = TFD_SETTIME_LOG.fetch_add(1, Ordering::Relaxed);
         let pid = crate::process::current_pid();
         if n < 32 {
-            if already_expired {
-                log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → fired-immediately (now={}ns)",
+            if original_expired {
+                log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → forced-delay-1ms (now={}ns)",
                     n, pid, fd, flags, value_ns, period_ns, now);
             } else {
                 log::warn!("[tfd-settime] #{} pid={} fd={} flags={} deadline={}ns now={}ns delta={}ns period={}ns",
@@ -420,15 +424,14 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
     }
     tbl.entry(fd as u32)
         .and_modify(|t| {
-            t.deadline_ns = if already_expired { 0 } else { deadline };
+            t.deadline_ns = deadline;
             t.period_ns = period_ns;
-            if already_expired { t.pending = t.pending.saturating_add(1); }
-            else { t.pending = 0; } // re-arm resets pending
+            t.pending = 0; // re-arm resets pending
         })
         .or_insert(TimerState {
-            deadline_ns: if already_expired { 0 } else { deadline },
+            deadline_ns: deadline,
             period_ns,
-            pending: if already_expired { 1 } else { 0 },
+            pending: 0,
         });
     drop(tbl);
     // Wake any thread blocked in epoll_wait on an epoll that watches this timerfd,
@@ -3812,7 +3815,7 @@ mod posix {
     //! Implementations of POSIX/glibc functions dispatched via syscall stubs
     //! from the trampoline page mapped by posix_trampolines.rs.
 
-    use super::{read_user_bytes, write_user_bytes};
+    use super::{read_user_bytes, write_user_bytes, monotonic_ns};
     use crate::process::{self, dl::mmap_anon};
     use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use spin::Mutex;
@@ -4498,7 +4501,7 @@ mod posix {
         KEY_TABLE.lock().get(&(pid, tid, key as u32)).copied().unwrap_or(0) as i64
     }
 
-    pub fn sys_pthread_cond_wait(cond: u64, mutex: u64, sys_nr: u64) -> i64 {
+    pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys_nr: u64) -> i64 {
         if cond < 0x1000 || mutex < 0x1000 {
             log::error!("[pthread-err] cond_wait EINVAL pid={} cond={:#x} mutex={:#x} rip={:#x}",
                 crate::process::current_pid(), cond, mutex, crate::arch::syscall::user_rip());
@@ -4518,7 +4521,7 @@ mod posix {
             // First time: unlock mutex and enter Waiting state.
             let seq = atom.load(Ordering::Acquire);
             sys_pthread_mutex_unlock(mutex);
-            let next_state = super::CondWaitState::Waiting { cond, mutex, seq };
+            let next_state = super::CondWaitState::Waiting { cond, mutex, seq, timeout_ns };
             super::COND_WAIT_STATE.lock().insert(pid, next_state);
             state = Some(next_state);
         }
@@ -4526,15 +4529,24 @@ mod posix {
         // Now process the state machine
         loop {
             match state.unwrap() {
-                super::CondWaitState::Waiting { cond, mutex, seq } => {
+                super::CondWaitState::Waiting { cond, mutex, seq, timeout_ns } => {
                     let cur_seq = atom.load(Ordering::Acquire);
                     if cur_seq != seq {
                         // The condvar was signaled!
                         super::futex_waiter_remove(cond, pid);
-                        let next_state = super::CondWaitState::AcquiringMutex { mutex };
+                        let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: false };
                         super::COND_WAIT_STATE.lock().insert(pid, next_state);
                         state = Some(next_state);
                         // Continue to try and acquire the mutex
+                        continue;
+                    }
+
+                    // Check for timeout
+                    if timeout_ns != 0 && monotonic_ns() >= timeout_ns {
+                        super::futex_waiter_remove(cond, pid);
+                        let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                        super::COND_WAIT_STATE.lock().insert(pid, next_state);
+                        state = Some(next_state);
                         continue;
                     }
 
@@ -4555,27 +4567,43 @@ mod posix {
                         }
                     }
 
-                    // No sibling runnable thread — loop using hlt in the kernel until sequence changes
-                    while atom.load(Ordering::Acquire) == seq && super::futex_waiter_present(cond, pid) {
+                    // No sibling runnable thread — loop using hlt in the kernel until sequence changes or timeout
+                    while atom.load(Ordering::Acquire) == seq 
+                        && (timeout_ns == 0 || monotonic_ns() < timeout_ns)
+                        && super::futex_waiter_present(cond, pid) 
+                    {
                         #[cfg(target_arch = "x86_64")]
                         unsafe {
                             core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                         }
                     }
 
-                    super::futex_waiter_remove(cond, pid);
-                    let next_state = super::CondWaitState::AcquiringMutex { mutex };
-                    super::COND_WAIT_STATE.lock().insert(pid, next_state);
-                    state = Some(next_state);
+                    // Re-evaluate condition after waking up
+                    let cur_seq = atom.load(Ordering::Acquire);
+                    if cur_seq != seq {
+                        super::futex_waiter_remove(cond, pid);
+                        let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: false };
+                        super::COND_WAIT_STATE.lock().insert(pid, next_state);
+                        state = Some(next_state);
+                        continue;
+                    }
+
+                    if timeout_ns != 0 && monotonic_ns() >= timeout_ns {
+                        super::futex_waiter_remove(cond, pid);
+                        let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                        super::COND_WAIT_STATE.lock().insert(pid, next_state);
+                        state = Some(next_state);
+                        continue;
+                    }
                 }
 
-                super::CondWaitState::AcquiringMutex { mutex } => {
+                super::CondWaitState::AcquiringMutex { mutex, timed_out } => {
                     // Try to acquire the mutex (using the new sys_pthread_mutex_lock logic, retrying sys_nr on yield)
                     let rc = sys_pthread_mutex_lock(mutex, sys_nr);
                     if rc == 0 {
-                        // Successfully acquired the mutex! Clear wait state and return 0
+                        // Successfully acquired the mutex! Clear wait state and return
                         super::COND_WAIT_STATE.lock().remove(&pid);
-                        return 0;
+                        return if timed_out { 110 } else { 0 }; // 110 = ETIMEDOUT
                     } else {
                         // yielded inside sys_pthread_mutex_lock
                         return rc;
@@ -4585,8 +4613,36 @@ mod posix {
         }
     }
 
-    pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, _timeout: u64, sys_nr: u64) -> i64 {
-        sys_pthread_cond_wait(cond, mutex, sys_nr)
+    pub fn sys_pthread_cond_wait(cond: u64, mutex: u64, sys_nr: u64) -> i64 {
+        sys_pthread_cond_wait_timeout(cond, mutex, 0, sys_nr)
+    }
+
+    pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, timeout: u64, sys_nr: u64) -> i64 {
+        let (sec, nsec) = if timeout != 0 {
+            unsafe {
+                (
+                    core::ptr::read_unaligned(timeout as *const i64),
+                    core::ptr::read_unaligned((timeout + 8) as *const i64),
+                )
+            }
+        } else {
+            (0, 0)
+        };
+        let timeout_ns = if timeout != 0 {
+            (sec.max(0) as u64).saturating_mul(1_000_000_000)
+                .saturating_add(nsec.max(0) as u64)
+        } else {
+            0
+        };
+
+        static TIMEDWAIT_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = TIMEDWAIT_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log::warn!("[timedwait] #{} pid={} cond={:#x} mutex={:#x} timeout_ns={} now={}",
+                n, crate::process::current_pid(), cond, mutex, timeout_ns, monotonic_ns());
+        }
+
+        sys_pthread_cond_wait_timeout(cond, mutex, timeout_ns, sys_nr)
     }
 
     #[inline]
@@ -4613,7 +4669,7 @@ mod posix {
         }
         log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
         let wpid = crate::process::current_pid();
-        if wpid != 0 && n > 0 {
+        if wpid != 0 && (n > 0 || bridged > 0) {
             if let Some(next) = crate::process::next_runnable_pid(wpid) {
                 if next != wpid {
                     let urip = crate::arch::syscall::user_rip();
@@ -4675,7 +4731,7 @@ mod posix {
         );
         
         let wpid = crate::process::current_pid();
-        if wpid != 0 && n > 0 {
+        if wpid != 0 && (n > 0 || bridged > 0) {
             if let Some(next) = crate::process::next_runnable_pid(wpid) {
                 if next != wpid {
                     let urip = crate::arch::syscall::user_rip();

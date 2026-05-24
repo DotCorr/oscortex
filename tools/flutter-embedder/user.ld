@@ -14,6 +14,7 @@ SECTIONS {
     .text : {
         KEEP(*(.text._start))
         *(.text .text.*)
+        *(.plt*)
     }
 
     .rodata : {
@@ -24,6 +25,7 @@ SECTIONS {
 
     .data : {
         *(.data .data.*)
+        *(.got*)
     }
 
     .bss : {
@@ -41,8 +43,6 @@ SECTIONS {
         *(.dynsym)
         *(.dynstr)
         *(.dynamic)
-        *(.plt*)
-        *(.got*)
         *(.rel*)
         *(.rela*)
     }

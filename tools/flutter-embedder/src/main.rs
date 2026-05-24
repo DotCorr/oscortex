@@ -363,123 +363,133 @@ static mut SURFACE_H: u32 = 0;
 static ENGINE: AtomicU64 = AtomicU64::new(0);
 static NOTIFY_DISPLAY_UPDATE: AtomicU64 = AtomicU64::new(0);
 
-struct EngineThreadData {
-    initialize_fn:          u64,
-    run_initialized_fn:     u64,
-    send_metrics_fn:        u64,
-    notify_display_update: u64,
-    renderer_config:        u64,
-    project_args:           u64,
-    width:                  u32,
-    height:                 u32,
+// Custom task runner ABI structs
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlutterTaskRunnerDescription {
+    pub struct_size: usize,
+    pub user_data: *mut (),
+    pub runs_task_on_current_thread_callback: unsafe extern "C" fn(*mut ()) -> bool,
+    pub post_task_callback: unsafe extern "C" fn(FlutterTask, u64, *mut ()),
+    pub identifier: usize,
+    pub destruction_callback: unsafe extern "C" fn(*mut ()),
+}
+unsafe impl Sync for FlutterTaskRunnerDescription {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlutterCustomTaskRunners {
+    pub struct_size: usize,
+    pub platform_task_runner: *const FlutterTaskRunnerDescription,
+    pub render_task_runner: *const FlutterTaskRunnerDescription,
+    pub thread_priority_setter: u64,
+    pub ui_task_runner: *const FlutterTaskRunnerDescription,
+}
+unsafe impl Sync for FlutterCustomTaskRunners {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlutterTask {
+    pub runner: u64,
+    pub task: u64,
 }
 
-static mut ENGINE_THREAD_DATA: EngineThreadData = EngineThreadData {
-    initialize_fn:          0,
-    run_initialized_fn:     0,
-    send_metrics_fn:        0,
-    notify_display_update: 0,
-    renderer_config:        0,
-    project_args:           0,
-    width:                  0,
-    height:                 0,
+#[derive(Clone, Copy)]
+struct PlatformTask {
+    pub task: FlutterTask,
+    pub target_time_ns: u64,
+    pub active: bool,
+}
+
+static mut PLATFORM_TASKS: [PlatformTask; 256] = [PlatformTask {
+    task: FlutterTask { runner: 0, task: 0 },
+    target_time_ns: 0,
+    active: false,
+}; 256];
+
+struct Spinlock {
+    locked: core::sync::atomic::AtomicBool,
+}
+
+impl Spinlock {
+    const fn new() -> Self {
+        Self { locked: core::sync::atomic::AtomicBool::new(false) }
+    }
+
+    fn lock(&self) -> SpinlockGuard {
+        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        SpinlockGuard { locked: &self.locked }
+    }
+}
+
+struct SpinlockGuard<'a> {
+    locked: &'a core::sync::atomic::AtomicBool,
+}
+
+impl Drop for SpinlockGuard<'_> {
+    fn drop(&mut self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+static PLATFORM_TASKS_LOCK: Spinlock = Spinlock::new();
+static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
+static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn runs_task_on_current_thread_callback(_user_data: *mut ()) -> bool {
+    let tid = unsafe { syscall0(186) };
+    static CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+    let count = CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 10 {
+        write_hex_u64(b"[embedder] runs_task_on_current_thread tid=", tid as u64);
+    }
+    tid == 1
+}
+
+unsafe extern "C" fn post_task_callback(
+    task: FlutterTask,
+    target_time_ns: u64,
+    _user_data: *mut (),
+) {
+    let now = rdtsc_ns();
+    write(b"[embedder] post_task_callback:\n");
+    write_hex_u64(b"  now   = ", now);
+    write_hex_u64(b"  target= ", target_time_ns);
+    let _guard = PLATFORM_TASKS_LOCK.lock();
+    for slot in unsafe { &mut PLATFORM_TASKS } {
+        if !slot.active {
+            slot.task = task;
+            slot.target_time_ns = target_time_ns;
+            slot.active = true;
+            return;
+        }
+    }
+    write(b"[embedder] ERROR: PLATFORM_TASKS queue full!\n");
+}
+
+unsafe extern "C" fn platform_destruction_callback(_user_data: *mut ()) {}
+
+static PLATFORM_TASK_RUNNER_DESC: FlutterTaskRunnerDescription = FlutterTaskRunnerDescription {
+    struct_size: core::mem::size_of::<FlutterTaskRunnerDescription>(),
+    user_data: core::ptr::null_mut(),
+    runs_task_on_current_thread_callback,
+    post_task_callback,
+    identifier: 1,
+    destruction_callback: platform_destruction_callback,
 };
 
-unsafe fn dump_metrics(metrics: &FlutterWindowMetricsEvent) {
-    let ptr = metrics as *const _ as *const u64;
-    let len = core::mem::size_of::<FlutterWindowMetricsEvent>();
-    write(b"[embedder-debug] metrics hex dump:\n");
-    let digits = b"0123456789abcdef";
-    for chunk in 0..(len / 8) {
-        let mut hex = *b"  0x________: ________________\n";
-        let addr = chunk * 8;
-        // write offset
-        let mut t = addr as u32;
-        for i in 0..8 {
-            let nyb = ((t >> ((7 - i) * 4)) & 0xF) as usize;
-            hex[4 + i] = digits[nyb];
-        }
-        // read u64 at offset
-        let val = unsafe { *ptr.add(chunk) };
-        // write val in hex
-        for i in 0..16 {
-            let nyb = ((val >> ((15 - i) * 4)) & 0xF) as usize;
-            hex[14 + i] = digits[nyb];
-        }
-        write(&hex);
-    }
-}
-
-unsafe extern "C" fn engine_thread_main(_arg: *mut ()) {
-    ENGINE_STAGE.store(1, Ordering::SeqCst);
-    write(b"[engine-thread] starting Flutter engine via Initialize+RunInitialized...\n");
-    let initialize_fn: InitializeFn = unsafe { core::mem::transmute(ENGINE_THREAD_DATA.initialize_fn) };
-    let run_initialized_fn: RunInitializedFn = unsafe { core::mem::transmute(ENGINE_THREAD_DATA.run_initialized_fn) };
-    let renderer_config = ENGINE_THREAD_DATA.renderer_config as *const FlutterRendererConfig;
-    let project_args    = ENGINE_THREAD_DATA.project_args    as *const FlutterProjectArgsRaw;
-
-    // Log struct sizes so we can verify ABI correctness from the serial log.
-    {
-        let mut buf = *b"[engine-thread] FlutterRendererConfig sizeof=____\n";
-        let sz = core::mem::size_of::<FlutterRendererConfig>() as u32;
-        let d = b"0123456789";
-        buf[38] = d[((sz / 1000) % 10) as usize];
-        buf[39] = d[((sz / 100)  % 10) as usize];
-        buf[40] = d[((sz / 10)   % 10) as usize];
-        buf[41] = d[(sz          % 10) as usize];
-        write(&buf);
-    }
-
-    let mut engine_out: u64 = 0;
-    ENGINE_STAGE.store(2, Ordering::SeqCst);
-    let rc_init = unsafe {
-        initialize_fn(
-            1,
-            renderer_config,
-            project_args,
-            core::ptr::null_mut(),
-            &mut engine_out as *mut u64,
-        )
-    };
-
-    if rc_init != 0 {
-        let mut hex = *b"[engine-thread] FlutterEngineInitialize FAILED rc=0x________\n";
-        let d = b"0123456789abcdef";
-        let r = rc_init as u32;
-        for i in 0..8 { hex[45 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
-        write(&hex);
-        exit(-1);
-    }
-    ENGINE_STAGE.store(3, Ordering::SeqCst);
-    write(b"[engine-thread] FlutterEngineInitialize OK\n");
-
-    // Store engine handle so the main thread can call SendWindowMetrics etc.
-    ENGINE.store(engine_out, Ordering::SeqCst);
-
-    ENGINE_STAGE.store(4, Ordering::SeqCst);
-    let rc_run = unsafe { run_initialized_fn(engine_out) };
-    if rc_run != 0 {
-        let mut hex = *b"[engine-thread] FlutterEngineRunInitialized FAILED rc=0x________\n";
-        let d = b"0123456789abcdef";
-        let r = rc_run as u32;
-        for i in 0..8 { hex[49 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
-        write(&hex);
-        exit(-1);
-    }
-    ENGINE_STAGE.store(5, Ordering::SeqCst);
-    write(b"[engine-thread] FlutterEngineRunInitialized OK\n");
-
-    // Keep this thread alive so the engine's internal thread can reference its
-    // thread-local FML state. The engine's own threads do all the work.
-    loop {
-        let mut ev = WmEvent::default();
-        wm_event_wait(&mut ev, 10000);
-    }
-}
+static CUSTOM_TASK_RUNNERS: FlutterCustomTaskRunners = FlutterCustomTaskRunners {
+    struct_size: core::mem::size_of::<FlutterCustomTaskRunners>(),
+    platform_task_runner: &PLATFORM_TASK_RUNNER_DESC,
+    render_task_runner: core::ptr::null(),
+    thread_priority_setter: 0,
+    ui_task_runner: core::ptr::null(),
+};
 
 static PRESENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 static VSYNC_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
-static ENGINE_STAGE: AtomicU32 = AtomicU32::new(0);
 
 /// Present a rendered frame.  Called by the engine on the raster thread.
 /// `allocation` is a row-major RGBA8 buffer; `row_bytes` may be > width*4.
@@ -676,6 +686,7 @@ extern "C" fn main_embedder() {
         initialize_va                   = api_table.initialize;
         run_initialized_va              = api_table.run_initialized;
         notify_display_update_va        = api_table.notify_display_update;
+        RUN_TASK_FN.store(api_table.run_task, Ordering::SeqCst);
     } else {
         write(b"[embedder] manual symbol resolution path\n");
         // Stub path: resolve each symbol manually.
@@ -691,10 +702,11 @@ extern "C" fn main_embedder() {
         initialize_va                   = dlsym(handle, b"FlutterEngineInitialize");
         run_initialized_va              = dlsym(handle, b"FlutterEngineRunInitialized");
         notify_display_update_va        = dlsym(handle, b"FlutterEngineNotifyDisplayUpdate");
+        RUN_TASK_FN.store(dlsym(handle, b"FlutterEngineRunTask"), Ordering::SeqCst);
     }
 
-    if initialize_va == 0 || run_initialized_va == 0 || notify_display_update_va == 0 {
-        write(b"[embedder] ERROR: FlutterEngineInitialize, RunInitialized or NotifyDisplayUpdate not found!\n");
+    if initialize_va == 0 || run_initialized_va == 0 || notify_display_update_va == 0 || RUN_TASK_FN.load(Ordering::SeqCst) == 0 {
+        write(b"[embedder] ERROR: FlutterEngineInitialize, RunInitialized, NotifyDisplayUpdate or RunTask not found!\n");
         exit(-1);
     }
     write(b"[embedder] proctable ready\n");
@@ -792,7 +804,7 @@ extern "C" fn main_embedder() {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_VSYNC_CALLBACK,
-        0,
+        vsync_callback as *const () as u64,
     );
     write_i32_at(&mut project_args.bytes, OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGC, 0);
     write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGV, 0);
@@ -852,177 +864,185 @@ extern "C" fn main_embedder() {
         write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
     }
 
-    NOTIFY_DISPLAY_UPDATE.store(notify_display_update_va, Ordering::SeqCst);
-
-    // 8. Spawn the background thread to run the Flutter engine.
-    write(b"[embedder] spawning engine thread (Initialize+RunInitialized)...\n");
+    // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
+    let mut rsp: u64;
     unsafe {
-        ENGINE_THREAD_DATA.initialize_fn         = initialize_va;
-        ENGINE_THREAD_DATA.run_initialized_fn    = run_initialized_va;
-        ENGINE_THREAD_DATA.send_metrics_fn       = proctable.send_window_metrics;
-        ENGINE_THREAD_DATA.notify_display_update = notify_display_update_va;
-        ENGINE_THREAD_DATA.renderer_config       = &renderer_config as *const _ as u64;
-        ENGINE_THREAD_DATA.project_args          = &project_args    as *const _ as u64;
-        ENGINE_THREAD_DATA.width                 = w;
-        ENGINE_THREAD_DATA.height                = h;
+        asm!("mov {}, rsp", out(reg) rsp);
     }
+    PLATFORM_THREAD_RSP.store(rsp, Ordering::SeqCst);
 
-    let tid = thread_create(engine_thread_main, core::ptr::null_mut());
-    if tid < 0 {
-        write(b"[embedder] thread_create failed!\n");
+    // Install Custom Task Runners in project args.
+    const OFF_PROJECT_ARGS_CUSTOM_TASK_RUNNERS: usize = 184;
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_CUSTOM_TASK_RUNNERS,
+        &CUSTOM_TASK_RUNNERS as *const _ as u64,
+    );
+
+    // 8. Initialize the engine synchronously on the main thread
+    write(b"[embedder] calling FlutterEngineInitialize...\n");
+    let mut engine_out: u64 = 0;
+    let rc_init = unsafe {
+        let initialize_fn: InitializeFn = unsafe { core::mem::transmute(initialize_va) };
+        initialize_fn(
+            1,
+            &renderer_config as *const _,
+            &project_args as *const _,
+            core::ptr::null_mut(),
+            &mut engine_out as *mut u64,
+        )
+    };
+
+    if rc_init != 0 {
+        let mut hex = *b"[embedder] FlutterEngineInitialize FAILED rc=0x________\n";
+        let d = b"0123456789abcdef";
+        let r = rc_init as u32;
+        for i in 0..8 { hex[41 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+        write(&hex);
         exit(-1);
     }
+    write(b"[embedder] FlutterEngineInitialize OK\n");
+    ENGINE.store(engine_out, Ordering::SeqCst);
 
-    let mut hex = *b"[embedder] spawned engine thread tid=0x________\n";
-    let digits = b"0123456789abcdef";
-    let t = tid as u32;
-    for i in 0..8 {
-        let nyb = ((t >> ((7 - i) * 4)) & 0xF) as usize;
-        hex[35 + i] = digits[nyb];
+    // 9. Run the engine on the main thread (starts the shell)
+    write(b"[embedder] calling FlutterEngineRunInitialized...\n");
+    let rc_run = unsafe {
+        let run_initialized_fn: RunInitializedFn = unsafe { core::mem::transmute(run_initialized_va) };
+        run_initialized_fn(engine_out)
+    };
+    if rc_run != 0 {
+        let mut hex = *b"[embedder] FlutterEngineRunInitialized FAILED rc=0x________\n";
+        let d = b"0123456789abcdef";
+        let r = rc_run as u32;
+        for i in 0..8 { hex[45 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+        write(&hex);
+        exit(-1);
     }
-    write(&hex);
+    write(b"[embedder] FlutterEngineRunInitialized OK\n");
+
+    // 10. Immediately notify display topology (now that shell exists)
+    {
+        let display = FlutterEngineDisplay {
+            struct_size:        core::mem::size_of::<FlutterEngineDisplay>(),
+            display_id:         0,
+            single_display:     true,
+            _pad0:              [0; 7],
+            refresh_rate:       60.0,
+            width:              w as usize,
+            height:             h as usize,
+            device_pixel_ratio: 1.0,
+        };
+        write(b"[embedder] notifying display update...\n");
+        let notify_display: NotifyDisplayUpdateFn = unsafe { core::mem::transmute(notify_display_update_va) };
+        let rc_disp = unsafe { notify_display(engine_out, 0, &display as *const _, 1) };
+        if rc_disp == 0 {
+            write(b"[embedder] FlutterEngineNotifyDisplayUpdate OK!\n");
+        } else {
+            let mut hex = *b"[embedder] FlutterEngineNotifyDisplayUpdate FAILED rc=0x________\n";
+            let d = b"0123456789abcdef";
+            let r = rc_disp as u32;
+            for i in 0..8 { hex[54 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+            write(&hex);
+        }
+    }
+
+    // 11. Immediately send initial window metrics
+    {
+        let metrics = FlutterWindowMetricsEvent {
+            struct_size:                core::mem::size_of::<FlutterWindowMetricsEvent>(),
+            width:                      w as usize,
+            height:                     h as usize,
+            pixel_ratio:                1.0,
+            left:                       0,
+            top:                        0,
+            physical_view_inset_top:    0.0,
+            physical_view_inset_right:  0.0,
+            physical_view_inset_bottom: 0.0,
+            physical_view_inset_left:   0.0,
+            display_id:                 0,
+            view_id:                    0,
+        };
+        write(b"[embedder] sending initial window metrics...\n");
+        let send_metrics: SendWindowMetricsFn = unsafe { core::mem::transmute(proctable.send_window_metrics) };
+        let rc = unsafe { send_metrics(engine_out, &metrics as *const _) };
+        if rc == 0 {
+            write(b"[embedder] initial window metrics sent successfully!\n");
+        } else {
+            let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
+            let digits = b"0123456789abcdef";
+            let r = rc as u32;
+            for i in 0..8 {
+                let nyb = ((r >> ((7 - i) * 4)) & 0xF) as usize;
+                hex[38 + i] = digits[nyb];
+            }
+            write(&hex);
+        }
+    }
 
     write(b"[embedder] entering event loop\n");
 
-    // 9. Event loop: dispatch vsync / pointer / key / platform-channel events.
+    // 12. Event loop: dispatch vsync / pointer / key / platform-channel events,
+    // and run custom task runner platform tasks.
     let mut ev = WmEvent::default();
     let mut platform_buf = [0u8; 512];
-    let mut metrics_sent = false;
-    let mut last_retry_time = 0u64;
-    let mut engine_seen_at = 0u64;
-    let mut last_stage_log = 0u64;
-    let mut display_notified = false;
-    let mut display_notified_at = 0u64;
-    let mut run_initialized_seen_at = 0u64;
 
     loop {
-        let engine = ENGINE.load(Ordering::SeqCst);
+        // Run pending platform tasks
         let now = rdtsc_ns();
-        if now.saturating_sub(last_stage_log) >= 1_000_000_000 {
-            last_stage_log = now;
-            let stage = ENGINE_STAGE.load(Ordering::SeqCst);
-            let mut msg = *b"[embedder] engine-stage=________\n";
-            let d = b"0123456789abcdef";
-            for i in 0..8 {
-                msg[24 + i] = d[((stage >> ((7 - i) * 4)) & 0xF) as usize];
-            }
-            write(&msg);
-        }
-        if engine != 0 && engine_seen_at == 0 {
-            engine_seen_at = now;
-        }
-
-        let stage = ENGINE_STAGE.load(Ordering::SeqCst);
-        if stage >= 4 && run_initialized_seen_at == 0 {
-            run_initialized_seen_at = now;
-        }
-
-        // Notify display first (after waiting 1.2 seconds to let shell start)
-        if stage >= 4 && !display_notified && run_initialized_seen_at != 0 {
-            if now.saturating_sub(run_initialized_seen_at) >= 1_200_000_000 {
-                let notify_display_va = NOTIFY_DISPLAY_UPDATE.load(Ordering::SeqCst);
-                if notify_display_va != 0 && engine != 0 {
-                    let display = FlutterEngineDisplay {
-                        struct_size:        core::mem::size_of::<FlutterEngineDisplay>(),
-                        display_id:         0,
-                        single_display:     true,
-                        _pad0:              [0; 7],
-                        refresh_rate:       60.0,
-                        width:              w as usize,
-                        height:             h as usize,
-                        device_pixel_ratio: 1.0,
-                    };
-                    {
-                        let mut msg = *b"[embedder] notifying display update: w=________ h=________\n";
-                        let d = b"0123456789abcdef";
-                        let dw = display.width as u32;
-                        let dh = display.height as u32;
-                        for i in 0..8 {
-                            msg[37 + i] = d[((dw >> ((7 - i) * 4)) & 0xF) as usize];
-                            msg[48 + i] = d[((dh >> ((7 - i) * 4)) & 0xF) as usize];
-                        }
-                        write(&msg);
-                    }
-                    let notify_display: NotifyDisplayUpdateFn = unsafe { core::mem::transmute(notify_display_va) };
-                    let rc = unsafe { notify_display(engine, 0, &display as *const _, 1) };
-                    if rc == 0 {
-                        write(b"[embedder] FlutterEngineNotifyDisplayUpdate OK from main thread!\n");
-                        display_notified = true;
-                        display_notified_at = now;
-                    } else {
-                        let mut hex = *b"[embedder] FlutterEngineNotifyDisplayUpdate FAILED rc=0x________\n";
-                        let d = b"0123456789abcdef";
-                        let r = rc as u32;
-                        for i in 0..8 { hex[54 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
-                        write(&hex);
-                        // Back off slightly on failure
-                        run_initialized_seen_at = now;
-                    }
-                }
-            }
-        }
-
-        // Send metrics after display is notified (wait 200ms)
-        if display_notified && !metrics_sent && proctable.send_window_metrics != 0 {
-            if now.saturating_sub(display_notified_at) >= 200_000_000
-                && now.saturating_sub(last_retry_time) >= 100_000_000
+        loop {
+            let mut task_to_run = None;
             {
-                last_retry_time = now;
-                let metrics = FlutterWindowMetricsEvent {
-                    struct_size:                core::mem::size_of::<FlutterWindowMetricsEvent>(),
-                    width:                      w as usize,
-                    height:                     h as usize,
-                    pixel_ratio:                1.0,
-                    left:                       0,
-                    top:                        0,
-                    physical_view_inset_top:    0.0,
-                    physical_view_inset_right:  0.0,
-                    physical_view_inset_bottom: 0.0,
-                    physical_view_inset_left:   0.0,
-                    display_id:                 0,
-                    view_id:                    0,
-                };
-                {
-                    let mut msg = *b"[embedder] metrics try sz=________ w=________ h=________\n";
-                    let d = b"0123456789abcdef";
-                    let sz = metrics.struct_size as u32;
-                    let mw = metrics.width as u32;
-                    let mh = metrics.height as u32;
-                    for i in 0..8 {
-                        msg[26 + i] = d[((sz >> ((7 - i) * 4)) & 0xF) as usize];
-                        msg[37 + i] = d[((mw >> ((7 - i) * 4)) & 0xF) as usize];
-                        msg[48 + i] = d[((mh >> ((7 - i) * 4)) & 0xF) as usize];
+                let _guard = PLATFORM_TASKS_LOCK.lock();
+                for slot in unsafe { &mut PLATFORM_TASKS } {
+                    if slot.active && now >= slot.target_time_ns {
+                        task_to_run = Some(slot.task);
+                        slot.active = false;
+                        break;
                     }
-                    write(&msg);
                 }
-                let send_metrics: SendWindowMetricsFn = unsafe { core::mem::transmute(proctable.send_window_metrics) };
-                let rc = unsafe { send_metrics(engine, &metrics as *const _) };
-                if rc == 0 {
-                    write(b"[embedder] initial window metrics sent successfully from main thread!\n");
-                    metrics_sent = true;
-                } else {
-                    let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
-                    let digits = b"0123456789abcdef";
-                    let r = rc as u32;
-                    for i in 0..8 {
-                        let nyb = ((r >> ((7 - i) * 4)) & 0xF) as usize;
-                        hex[38 + i] = digits[nyb];
-                    }
-                    write(&hex);
+            }
+            if let Some(task) = task_to_run {
+                write(b"[embedder] executing platform task\n");
+                let run_task_fn: unsafe extern "C" fn(u64, *const FlutterTask) -> i32 =
+                    unsafe { core::mem::transmute(RUN_TASK_FN.load(Ordering::SeqCst)) };
+                unsafe {
+                    run_task_fn(engine_out, &task as *const _);
                 }
+            } else {
+                break;
             }
         }
 
-        let r = wm_event_wait(&mut ev, 16 /* ms */);
+        // Calculate timeout for next task (wait up to 16ms)
+        let now = rdtsc_ns();
+        let mut next_task_due = u64::MAX;
+        {
+            let _guard = PLATFORM_TASKS_LOCK.lock();
+            for slot in unsafe { &PLATFORM_TASKS } {
+                if slot.active {
+                    if slot.target_time_ns < next_task_due {
+                        next_task_due = slot.target_time_ns;
+                    }
+                }
+            }
+        }
+        let timeout_ms = if next_task_due == u64::MAX {
+            16
+        } else if next_task_due <= now {
+            0
+        } else {
+            let diff_ns = next_task_due - now;
+            let diff_ms = diff_ns / 1_000_000;
+            diff_ms.min(16).max(1)
+        };
+
+        let r = wm_event_wait(&mut ev, timeout_ms);
         if r <= 0 {
             // No event or error — check for pending platform messages.
             let n = platform_msg_recv(&mut platform_buf);
             if n > 0 {
-                // Simple echo-reply for testing.
-                // Wire format: [seq:u64][ch_len:u16][data_len:u32][ch...][data...]
                 if (n as usize) >= 8 + 2 + 4 {
                     let seq = u64::from_le_bytes(platform_buf[0..8].try_into().unwrap_or([0; 8]));
-                    // Reply with an empty OK response.
                     platform_msg_reply(seq, b"ok");
                 }
             }
@@ -1031,43 +1051,34 @@ extern "C" fn main_embedder() {
 
         match ev.kind {
             EV_VSYNC => {
-                // ev.b carries the baton posted by vsync_callback via
-                // engine_vsync_baton_post.  Call FlutterEngineOnVsync so the
-                // engine can schedule the next frame.
                 let baton  = ev.b as usize;
-                let engine = ENGINE.load(Ordering::SeqCst);
-                if engine != 0 && proctable.on_vsync != 0 && baton != 0 {
+                if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
                     write(b"[embedder] sending vsync to engine with baton\n");
                     let now_ns    = rdtsc_ns();
-                    let target_ns = now_ns + 16_666_666; // ~60 Hz budget
+                    let target_ns = now_ns + 16_666_666;
                     let f: OnVsyncFn =
                         unsafe { core::mem::transmute(proctable.on_vsync) };
-                    unsafe { f(engine, baton, now_ns, target_ns) };
+                    unsafe { f(engine_out, baton, now_ns, target_ns) };
                 }
             }
             EV_POINTER => {
                 let buttons = ev.flags as i64;
-                let engine  = ENGINE.load(Ordering::SeqCst);
-                if engine != 0 && proctable.send_pointer_event != 0 {
-                    // i16→f64 casts use the __floatsidf compiler-builtin which
-                    // LLD failed to relax from GOTPCREL; keep them inside the
-                    // engine-valid guard so a stub-engine run can't reach the
-                    // unresolved relocation.
+                if engine_out != 0 && proctable.send_pointer_event != 0 {
                     let x       = ((ev.a >> 48) as i16) as f64;
                     let y       = (((ev.a >> 32) & 0xFFFF) as i16) as f64;
-                    let phase = if buttons != 0 { 2i32 } else { 1i32 }; // kDown / kHover
+                    let phase = if buttons != 0 { 2i32 } else { 1i32 };
                     let evt = FlutterPointerEvent {
                         struct_size:    core::mem::size_of::<FlutterPointerEvent>(),
                         phase,
                         _pad0:          0,
-                        timestamp:      rdtsc_ns() / 1000, // microseconds
+                        timestamp:      rdtsc_ns() / 1000,
                         x,
                         y,
                         device:         0,
                         signal_kind:    0,
                         scroll_delta_x: 0.0,
                         scroll_delta_y: 0.0,
-                        device_kind:    1, // kMouse
+                        device_kind:    1,
                         _pad1:          0,
                         buttons,
                         pan_x:          0.0,
@@ -1078,28 +1089,27 @@ extern "C" fn main_embedder() {
                     };
                     let f: SendPointerEventFn =
                         unsafe { core::mem::transmute(proctable.send_pointer_event) };
-                    unsafe { f(engine, &evt as *const _, 1) };
+                    unsafe { f(engine_out, &evt as *const _, 1) };
                 }
             }
             EV_KEY => {
                 let scancode = ev.a as u32;
                 let pressed  = (ev.flags & 1) != 0;
-                let engine   = ENGINE.load(Ordering::SeqCst);
-                if engine != 0 && proctable.send_key_event != 0 {
+                if engine_out != 0 && proctable.send_key_event != 0 {
                     let evt = FlutterKeyEvent {
                         struct_size:  core::mem::size_of::<FlutterKeyEvent>(),
-                        timestamp:    (rdtsc_ns() / 1_000_000) as f64, // milliseconds
-                        kind:         if pressed { 0 } else { 1 },     // kDown / kUp
+                        timestamp:    (rdtsc_ns() / 1_000_000) as f64,
+                        kind:         if pressed { 0 } else { 1 },
                         _pad:         0,
                         physical:     scancode as u64,
-                        logical:      scancode as u64, // identity map (no keymap yet)
+                        logical:      scancode as u64,
                         character:    0,
                         synthesized:  false,
                         _tail:        [0; 7],
                     };
                     let f: SendKeyEventFn =
                         unsafe { core::mem::transmute(proctable.send_key_event) };
-                    unsafe { f(engine, &evt as *const _, 0, 0) };
+                    unsafe { f(engine_out, &evt as *const _, 0, 0) };
                 }
             }
             EV_PLATFORM_MSG => {
@@ -1373,6 +1383,17 @@ const fn make_demo_font() -> [[u8; 8]; 128] {
 }
 
 // ── TSC timestamp helper ──────────────────────────────────────────────────────
+
+fn write_hex_u64(label: &[u8], val: u64) {
+    write(label);
+    let mut buf = *b"0x________________\n";
+    let digits = b"0123456789abcdef";
+    for i in 0..16 {
+        let nyb = ((val >> ((15 - i) * 4)) & 0xF) as usize;
+        buf[2 + i] = digits[nyb];
+    }
+    write(&buf);
+}
 
 /// Read the x86 TSC and return an approximate nanosecond timestamp.
 /// Uses a nominal 3 GHz frequency (Phase 33-A keeps the kernel calibrated).
