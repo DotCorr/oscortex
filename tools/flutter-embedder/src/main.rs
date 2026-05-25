@@ -463,10 +463,13 @@ unsafe extern "C" fn post_task_callback(
     target_time_ns: u64,
     _user_data: *mut (),
 ) {
-    let now = rdtsc_ns();
-    write(b"[embedder] post_task_callback:\n");
-    write_hex_u64(b"  now   = ", now);
-    write_hex_u64(b"  target= ", target_time_ns);
+    static POST_TASK_LOG: AtomicU32 = AtomicU32::new(0);
+    let log_n = POST_TASK_LOG.fetch_add(1, Ordering::Relaxed);
+    if log_n < 5 || log_n % 256 == 255 {
+        write(b"[embedder] post_task_callback #");
+        write_hex_u64(b"n=", log_n as u64);
+        write_hex_u64(b"  target=", target_time_ns);
+    }
     let _guard = PLATFORM_TASKS_LOCK.lock();
     for slot in unsafe { &mut PLATFORM_TASKS } {
         if !slot.active {
@@ -891,11 +894,10 @@ extern "C" fn main_embedder() {
     );
 
     // Initialize the MessageLoop for the main thread so that task observers can query it without assertions.
-    write(b"[embedder] initializing main thread message loop...\n");
-    let ensure_initialized_va = 0x0100_0000u64 + 0x19bbd40u64;
-    let ensure_initialized: unsafe extern "C" fn() = unsafe { core::mem::transmute(ensure_initialized_va) };
-    unsafe { ensure_initialized(); }
-    write(b"[embedder] message loop initialized!\n");
+    // NOTE: ensure_initialized_va call removed — hardcoded offset into
+    // libflutter_engine.so for fml::MessageLoop::EnsureInitializedForCurrentThread().
+    // With render_task_runner=null Flutter manages its own threads' MessageLoops.
+    // Calling a stale/wrong offset would silently corrupt engine state.
 
     // 8. Initialize the engine synchronously on the main thread
     write(b"[embedder] calling FlutterEngineInitialize...\n");
@@ -1066,7 +1068,12 @@ extern "C" fn main_embedder() {
                 }
             }
             if let Some(task) = task_to_run {
-                write(b"[embedder] executing platform task\n");
+                static RUN_TASK_LOG: AtomicU32 = AtomicU32::new(0);
+                let rn = RUN_TASK_LOG.fetch_add(1, Ordering::Relaxed);
+                if rn < 10 || rn % 100 == 0 {
+                    write(b"[embedder] run_platform_task #");
+                    write_hex_u64(b"n=", rn as u64);
+                }
                 let run_task_fn: unsafe extern "C" fn(u64, *const FlutterTask) -> i32 =
                     unsafe { core::mem::transmute(RUN_TASK_FN.load(Ordering::SeqCst)) };
                 unsafe {
@@ -1117,12 +1124,30 @@ extern "C" fn main_embedder() {
             EV_VSYNC => {
                 let baton  = ev.b as usize;
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
-                    write(b"[embedder] sending vsync to engine with baton\n");
+                    static VSYNC_SEND_LOG: AtomicU32 = AtomicU32::new(0);
+                    let vsync_n = VSYNC_SEND_LOG.fetch_add(1, Ordering::Relaxed);
+                    if vsync_n < 5 || vsync_n % 60 == 0 {
+                        write(b"[embedder] vsync->engine #");
+                        write_hex_u64(b"n=", vsync_n as u64);
+                        write_hex_u64(b"  baton=", baton as u64);
+                    }
                     let now_ns    = rdtsc_ns();
                     let target_ns = now_ns + 16_666_666;
                     let f: OnVsyncFn =
                         unsafe { core::mem::transmute(proctable.on_vsync) };
                     unsafe { f(engine_out, baton, now_ns, target_ns) };
+                    // After vsync, check if any platform tasks were queued
+                    if vsync_n < 5 {
+                        let pending = {
+                            let _g = PLATFORM_TASKS_LOCK.lock();
+                            let mut n = 0u32;
+                            for slot in unsafe { &PLATFORM_TASKS } {
+                                if slot.active { n += 1; }
+                            }
+                            n
+                        };
+                        write_hex_u64(b"  [vsync] platform_tasks_pending=", pending as u64);
+                    }
                 }
             }
             EV_POINTER => {

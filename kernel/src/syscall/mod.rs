@@ -361,6 +361,21 @@ fn eventfd_write(fd: u32, val: u64) {
             return;
         }
     };
+    {
+        static EFD_WRITE_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = EFD_WRITE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 64 {
+            log::warn!(
+                "[eventfd-write] #{} pid={} fd={} val={} new_count={}",
+                n,
+                crate::process::current_pid(),
+                fd,
+                val.max(1),
+                new_count
+            );
+        }
+    }
     if new_count > 0 {
         epoll_wake(fd);
     }
@@ -388,10 +403,14 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
         log::warn!("[tfd-debug] fd={} raw: {:x?}", fd, raw_bytes);
         log::warn!("[tfd-debug] fd={} fields: int_s={} int_ns={} val_s={} val_ns={}", fd, int_s, int_ns, val_s, val_ns);
     }
-    let period_ns = (int_s.max(0) as u64).saturating_mul(1_000_000_000)
+    let mut period_ns = (int_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(int_ns.max(0) as u64);
     let value_ns = (val_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(val_ns.max(0) as u64);
+    if (flags & 1 != 0) && value_ns > 0 && period_ns == value_ns {
+        // Treat as a one-shot timer if it was set via TFD_TIMER_ABSTIME and it_interval == it_value
+        period_ns = 0;
+    }
     let now = monotonic_ns();
     let mut deadline = if value_ns == 0 {
         0 // POSIX: if it_value is zero, the timer is disarmed.
@@ -563,8 +582,21 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
             }
         } else {
             // Check eventfd readability first (counter > 0 → EPOLLIN).
-            let eventfd_ready = EVENTFD_TABLE.lock().get(&entry.fd).map_or(false, |&c| c > 0);
-            if eventfd_ready {
+            let eventfd_count = EVENTFD_TABLE.lock().get(&entry.fd).copied().unwrap_or(0);
+            if eventfd_count > 0 {
+                static EPOLL_EFD_READY_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = EPOLL_EFD_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 64 {
+                    log::warn!(
+                        "[epoll-ready-efd] #{} pid={} epfd={} efd={} count={}",
+                        n,
+                        crate::process::current_pid(),
+                        epfd,
+                        entry.fd,
+                        eventfd_count
+                    );
+                }
                 let slot = events_out + (count as u64) * 12;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
@@ -2202,6 +2234,17 @@ fn sys_engine_proctable_ptr_get() -> i64 {
 /// the EV_VSYNC event carries `b = baton` → embedder reads it and calls
 /// `FlutterEngineOnVsync(engine, baton, start_ns, target_ns)`.
 fn sys_engine_vsync_baton_post(baton: u64) -> i64 {
+    static VSYNC_BATON_POST_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let n = VSYNC_BATON_POST_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 32 || n % 256 == 0 {
+        log::warn!(
+            "[vsync-baton-post] #{} pid={} baton={:#x}",
+            n,
+            crate::process::current_pid(),
+            baton
+        );
+    }
     crate::wm::set_vsync_baton(baton);
     0
 }
@@ -3257,14 +3300,26 @@ fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
             // Snapshot waiter table addresses.
             let addrs: alloc::vec::Vec<u64> = {
                 let t = FUTEX_WAITERS.lock();
+                let cond_states = COND_WAIT_STATE.lock();
                 t.iter()
                     .filter_map(|(addr, waiters)| {
                         // Never bridge condition-variable wakes to the mutex
                         // handoff futex. Mutex waiters must be released by
                         // unlock, not by cond_signal/cond_broadcast.
                         if *addr == cond || *addr == FUTEX_ADDR_HANDOFF { return None; }
-                        // Any waiter that is a sibling?
-                        if waiters.iter().any(|w| siblings.contains(w)) {
+                        // Any waiter that is a sibling AND has a changed sequence number?
+                        let has_matching_sibling = waiters.iter().any(|&wpid| {
+                            if siblings.contains(&wpid) {
+                                if let Some(&CondWaitState::Waiting { cond: wcond, seq: wseq, .. }) = cond_states.get(&wpid) {
+                                    if wcond == *addr {
+                                        let cur_seq = unsafe { &*(wcond as *const core::sync::atomic::AtomicU32) }.load(Ordering::Acquire);
+                                        return cur_seq != wseq;
+                                    }
+                                }
+                            }
+                            false
+                        });
+                        if has_matching_sibling {
                             Some(*addr)
                         } else {
                             None
@@ -4581,8 +4636,11 @@ mod posix {
         };
 
         if state.is_none() {
-            // First time: unlock mutex and enter Waiting state.
+            // First time: register waiter, then unlock mutex and enter Waiting state.
             let seq = atom.load(Ordering::Acquire);
+            if pid != 0 {
+                super::futex_waiter_add(cond, pid);
+            }
             sys_pthread_mutex_unlock(mutex);
             let next_state = super::CondWaitState::Waiting { cond, mutex, seq, timeout_ns };
             super::COND_WAIT_STATE.lock().insert(pid, next_state);
@@ -4733,13 +4791,19 @@ mod posix {
         if n == 0 {
             bridged = super::cond_miss_bridge(cond, 1);
             if bridged > 0 {
-                log::warn!(
-                    "[cond-signal-bridged] pid={} cond={:#x} woke={} bridged={}",
-                    pid,
-                    cond,
-                    n,
-                    bridged
-                );
+                static COND_SIGNAL_BRIDGED_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let k = COND_SIGNAL_BRIDGED_LOG.fetch_add(1, Ordering::Relaxed);
+                if k < 16 || k % 256 == 0 {
+                    log::warn!(
+                        "[cond-signal-bridged] #{} pid={} cond={:#x} woke={} bridged={}",
+                        k,
+                        pid,
+                        cond,
+                        n,
+                        bridged
+                    );
+                }
             }
         }
         log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
@@ -4785,13 +4849,19 @@ mod posix {
         if n == 0 && !skip_bridge {
             bridged = super::cond_miss_bridge(cond, i32::MAX as u32);
             if bridged > 0 {
-                log::warn!(
-                    "[cond-broadcast-bridged] pid={} cond={:#x} woke={} bridged={}",
-                    pid,
-                    cond,
-                    n,
-                    bridged
-                );
+                static COND_BROADCAST_BRIDGED_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let k = COND_BROADCAST_BRIDGED_LOG.fetch_add(1, Ordering::Relaxed);
+                if k < 16 || k % 512 == 0 {
+                    log::warn!(
+                        "[cond-broadcast-bridged] #{} pid={} cond={:#x} woke={} bridged={}",
+                        k,
+                        pid,
+                        cond,
+                        n,
+                        bridged
+                    );
+                }
             }
         }
         cond_broadcast_loop_handoff(pid, cond, n, bridged);
@@ -5589,8 +5659,20 @@ mod posix {
                 }
             } else { (48, 0, 0) };
 
-        log::warn!("[vsnprintf-debug] pid={} ap={:#x} gp_off={} reg_save={:#x} ovf={:#x}",
-            crate::process::current_pid(), ap, gp_off, reg_save, ovf);
+        static VSNPRINTF_DEBUG_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let dbg_n = VSNPRINTF_DEBUG_LOG.fetch_add(1, Ordering::Relaxed);
+        if dbg_n < 8 {
+            log::warn!(
+                "[vsnprintf-debug] #{} pid={} ap={:#x} gp_off={} reg_save={:#x} ovf={:#x}",
+                dbg_n,
+                crate::process::current_pid(),
+                ap,
+                gp_off,
+                reg_save,
+                ovf
+            );
+        }
 
         let mut next_int = || -> u64 {
             let val = if gp_off < 48 && plausible_user(reg_save) {
@@ -5602,7 +5684,9 @@ mod posix {
                 ovf += 8;
                 v
             } else { 0 };
-            log::warn!("[vsnprintf-debug] arg={:#x}", val);
+            if dbg_n < 8 {
+                log::warn!("[vsnprintf-debug] arg={:#x}", val);
+            }
             val
         };
 
