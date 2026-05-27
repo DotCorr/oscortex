@@ -237,6 +237,43 @@ mod x86_64_impl {
         }
     }
 
+    pub unsafe fn update_user_page_flags(
+        pml4_phys: u64,
+        virt: u64,
+        writable: bool,
+        exec: bool,
+    ) -> Result<(), &'static str> {
+        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
+        let present  = PageFlags::PRESENT.bits();
+
+        let pml4 = phys_to_virt(pml4_phys) as *mut u64;
+        let pml4e = pml4.add(pml4_idx).read_volatile();
+        if pml4e & present == 0 { return Err("not present"); }
+        let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read_volatile();
+        if pdpte & present == 0 { return Err("not present"); }
+        let pd = phys_to_virt(pdpte & PHYS_MASK) as *mut u64;
+        let pde = pd.add(pd_idx).read_volatile();
+        if pde & present == 0 { return Err("not present"); }
+        let pt = phys_to_virt(pde & PHYS_MASK) as *mut u64;
+        let pte_ptr = pt.add(pt_idx);
+        let pte = pte_ptr.read_volatile();
+        if pte & present == 0 { return Err("not present"); }
+
+        let phys = pte & PHYS_MASK;
+        let mut flags = PageFlags::PRESENT | PageFlags::USER;
+        if writable { flags |= PageFlags::WRITABLE; }
+        if !exec    { flags |= PageFlags::NO_EXECUTE; }
+
+        pte_ptr.write_volatile(phys | flags.bits());
+        invlpg(virt);
+        Ok(())
+    }
+
+
     /// Walk a user PML4 and free every page frame reachable through it
     /// (but not the kernel-half entries 256–511, which are shared).
     pub fn free_user_pml4(pml4_phys: u64) {
@@ -453,4 +490,26 @@ pub fn free_user_pml4(pml4_phys: u64) {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = pml4_phys;
 }
+
+/// Update the page flags of an existing mapped user page.
+///
+/// # Safety
+/// `pml4_phys` must be a valid allocated PML4.
+pub unsafe fn update_user_page(
+    pml4_phys: u64,
+    virt: u64,
+    writable: bool,
+    exec: bool,
+) -> Result<(), &'static str> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { x86_64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (pml4_phys, virt, writable, exec);
+        Ok(())
+    }
+}
+
 

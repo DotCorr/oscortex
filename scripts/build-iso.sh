@@ -53,6 +53,49 @@ else
     exit 1
 fi
 
+# AOT compilation: compile Dart app to native x86_64 ELF (libapp.so).
+# This eliminates Dart JIT startup cost which is prohibitive on QEMU TCG.
+echo "[0.38/4] Compiling Dart app to AOT ELF (gen_snapshot_x64)..."
+DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
+FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
+SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
+GEN_SNAP="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
+PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
+APP_MAIN="$APP_DIR/lib/main.dart"
+AOT_DILL="$APP_DIR/build/app_aot.dill"
+LIBAPP_SO_DEST="$ROOT/initramfs/system/flutter/libapp.so"
+
+# Step A: compile Dart to AOT kernel with TFA (tree-flow analysis metadata required by gen_snapshot)
+"$DARTAOT" "$FRONTEND_SERVER" \
+    --sdk-root "$SDK_ROOT_PRODUCT" \
+    --target=flutter \
+    --aot \
+    --tfa \
+    --packages="$PKG_CONFIG" \
+    --output-dill "$AOT_DILL" \
+    "$APP_MAIN" 2>&1 | grep -v '^+' | tail -5
+
+if [ ! -f "$AOT_DILL" ]; then
+    echo "ERROR: AOT kernel compilation failed — app_aot.dill not produced" >&2
+    exit 1
+fi
+echo "[0.38/4] AOT kernel: $(wc -c < "$AOT_DILL") bytes"
+
+# Step B: compile AOT kernel to native x86_64 ELF shared object
+mkdir -p "$ROOT/initramfs/system/flutter"
+"$GEN_SNAP" \
+    --deterministic \
+    --snapshot_kind=app-aot-elf \
+    --elf="$LIBAPP_SO_DEST" \
+    --strip \
+    "$AOT_DILL" 2>&1
+
+if [ ! -f "$LIBAPP_SO_DEST" ]; then
+    echo "ERROR: gen_snapshot_x64 failed — libapp.so not produced" >&2
+    exit 1
+fi
+echo "[0.38/4] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes (x86_64 AOT ELF)"
+
 if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/4] Syncing oscortex_app Flutter assets into initramfs..."
     mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
@@ -64,6 +107,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         fi
         cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
     done
+    python3 "$ROOT/scratch/patch_kernel_blob.py" "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
 
     # Strict path contract: snapshots are only consumed from
     # /system/flutter/flutter_assets. Clear stale legacy top-level copies.
@@ -127,6 +171,7 @@ for app_path in "$ROOT"/apps/*; do
         fi
         cp "$app_assets/$f" "$dst/flutter_assets/$f"
     done
+    python3 "$ROOT/scratch/patch_kernel_blob.py" "$dst/flutter_assets/kernel_blob.bin"
 
     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
         if [ -f "$app_assets/$f" ]; then

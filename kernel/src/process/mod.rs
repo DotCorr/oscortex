@@ -553,24 +553,31 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
         start = 0;
     }
 
+    let mut res = None;
     for off in 0..MAX_PROCS {
         let idx = (start + off) % MAX_PROCS;
         let p = unsafe { &PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
             if current == 0 || p.pid != current {
-                return Some(p.pid);
+                res = Some(p.pid);
+                break;
             }
         }
     }
 
-    if current != 0 {
+    if res.is_none() && current != 0 {
         let c = unsafe { &PTABLE[idx_of(current)] };
         if c.pid == current && c.state == ProcState::Running {
-            return Some(current);
+            res = Some(current);
         }
     }
 
-    None
+    static SCHED_LOG_LIMIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let l = SCHED_LOG_LIMIT.fetch_add(1, Ordering::Relaxed);
+    if l < 256 || l % 512 == 0 {
+        log::warn!("[sched-debug] next_runnable_pid(curr={}) -> {:?}", current, res);
+    }
+    res
 }
 
 /// Snapshot of user execution context used by timer preemption switching.
@@ -1469,11 +1476,12 @@ pub fn debug_dump_processes() {
                     ProcState::Zombie(_code) => "Zombie",
                 };
                 log::info!(
-                    "  pid={} state={} is_thread={} parent_pid={} rip={:#x} rsp={:#x} fs_base={:#x} ticks={}",
-                    p.pid, state_str, p.is_thread, p.parent_pid, p.regs.rip, p.regs.rsp, p.fs_base, p.cpu_ticks
+                    "  pid={} state={} is_thread={} parent_pid={} rip={:#x} rsp={:#x} rax={:#x} rdi={:#x} rsi={:#x} fs_base={:#x} ticks={}",
+                    p.pid, state_str, p.is_thread, p.parent_pid, p.regs.rip, p.regs.rsp, p.regs.rax, p.regs.rdi, p.regs.rsi, p.fs_base, p.cpu_ticks
                 );
             }
         }
+        crate::syscall::debug_dump_sync_states();
         log::info!("==========================");
     }
 }

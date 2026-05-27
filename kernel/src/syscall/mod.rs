@@ -95,6 +95,8 @@ const ENGINE_LIBRARY_PATH: &str = "/system/lib/libflutter_engine.so";
 static ENGINE_HOST_PID: AtomicU32 = AtomicU32::new(0);
 /// VA of the `FlutterEngineProcTable` registered by the engine host.
 static ENGINE_PROC_TABLE_PTR: AtomicU64 = AtomicU64::new(0);
+static WM_WAITER_PID: AtomicU32 = AtomicU32::new(0);
+static WM_WAITER_DEADLINE: AtomicU64 = AtomicU64::new(0);
 static FS_BOOTSTRAP_LOGGED: AtomicU32 = AtomicU32::new(0);
 
 const SYSCALL_TRACE_DEPTH: usize = 64;
@@ -129,6 +131,43 @@ pub enum CondWaitState {
 
 static COND_WAIT_STATE: spin::Mutex<BTreeMap<u32, CondWaitState>> = spin::Mutex::new(BTreeMap::new());
 
+pub fn debug_dump_sync_states() {
+    let safe_read_u32 = |ptr: u64| -> Option<u32> {
+        if ptr < 0x1000 || ptr > 0x7fff_ffff_ffff { return None; }
+        unsafe { Some(*(ptr as *const u32)) }
+    };
+
+    if let Some(cws) = COND_WAIT_STATE.try_lock() {
+        if !cws.is_empty() {
+            log::info!("=== Cond Wait States ===");
+            for (&pid, state) in cws.iter() {
+                match state {
+                    CondWaitState::Waiting { cond, mutex, seq, timeout_ns } => {
+                        let c_val = safe_read_u32(*cond).map_or(-1, |v| v as i32);
+                        let m_val = safe_read_u32(*mutex).map_or(-1, |v| v as i32);
+                        log::info!("  pid={}: Waiting {{ cond: {:#x} (val={}), mutex: {:#x} (val={}), seq: {}, timeout_ns: {} }}",
+                            pid, cond, c_val, mutex, m_val, seq, timeout_ns);
+                    }
+                    CondWaitState::AcquiringMutex { mutex, timed_out } => {
+                        let m_val = safe_read_u32(*mutex).map_or(-1, |v| v as i32);
+                        log::info!("  pid={}: AcquiringMutex {{ mutex: {:#x} (val={}), timed_out: {} }}",
+                            pid, mutex, m_val, timed_out);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(fw) = FUTEX_WAITERS.try_lock() {
+        if !fw.is_empty() {
+            log::info!("=== Futex Waiters ===");
+            for (&addr, pids) in fw.iter() {
+                let val = safe_read_u32(addr).map_or(-1, |v| v as i32);
+                log::info!("  addr={:#x} (val={}): {:?}", addr, val, pids);
+            }
+        }
+    }
+}
+
 // ── Post-exit syscall trace window ────────────────────────────────────────────
 // When pid=2 exits, activate a one-shot bounded trace that logs the next
 // POSTEXIT_TRACE_LIMIT syscalls (any pid) so we can see what pid=1 does after
@@ -136,6 +175,13 @@ static COND_WAIT_STATE: spin::Mutex<BTreeMap<u32, CondWaitState>> = spin::Mutex:
 const POSTEXIT_TRACE_LIMIT: u32 = 5000;
 static POSTEXIT_TRACE_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static POSTEXIT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Set by the APIC timer ISR (lock-free atomic store only) every ~500 ms.
+/// Consumed in syscall context by `sys_pthread_mutex_unlock` or
+/// `sys_wm_event_wait` to safely call `force_wake_all_task_runners`.
+/// Using this deferred pattern avoids calling lock-bearing functions from ISR.
+pub static KICK_REQUESTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
 // epoll_create / inotify_init1 / timerfd_create return integer fds that
@@ -228,17 +274,19 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
         let tbl = TIMERFD_TABLE.lock();
         tbl.keys().copied().collect()
     };
-    // Mark each armed timerfd as pending (one expiration), so the next
-    // epoll_collect_ready call returns EPOLLIN immediately.
-    let mut armed_tfds = Vec::new();
+    // Mark EVERY timerfd as pending (one expiration), armed or not.
+    // CRITICAL: disarmed timerfds (deadline_ns=0, pending=0) are treated as
+    // ready by epoll_collect_ready when pending>0.  This breaks the stall
+    // where the raster thread (pid=3) holds a mutex while blocked in an
+    // infinite epoll_wait on a disarmed timerfd: incrementing pending causes
+    // epoll_wait to return, pid=3 runs, and eventually releases the mutex.
+    let mut all_tfds = Vec::new();
     {
         let mut tbl = TIMERFD_TABLE.lock();
         for fd in &tfds {
             if let Some(t) = tbl.get_mut(fd) {
-                if t.deadline_ns != 0 {
-                    t.pending = t.pending.saturating_add(1);
-                    armed_tfds.push(*fd);
-                }
+                t.pending = t.pending.saturating_add(1);
+                all_tfds.push(*fd);
             }
         }
     }
@@ -256,7 +304,7 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
         }
     }
     // Release every epoll waiter whose epfd watches any of these fds.
-    let touched: Vec<u32> = armed_tfds.iter().chain(efds.iter()).copied().collect();
+    let touched: Vec<u32> = all_tfds.iter().chain(efds.iter()).copied().collect();
     let watching_epfds: Vec<u32> = {
         let epoll_tbl = EPOLL_TABLE.lock();
         epoll_tbl.iter()
@@ -282,8 +330,8 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
     let n = FORCE_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
         log::trace!(
-            "[force-wake] #{} reason={} timerfds={} eventfds={} epoll_waiters_released={}",
-            n, reason, tfds.len(), efds.len(), woken
+            "[force-wake] #{} reason={} timerfds={} (all poked) eventfds={} epoll_waiters_released={}",
+            n, reason, all_tfds.len(), efds.len(), woken
         );
     }
     (tfds.len() + efds.len(), woken)
@@ -311,6 +359,52 @@ pub fn check_timerfds_and_wake() {
     }
     for fd in to_wake {
         epoll_wake(fd);
+    }
+
+    // Expire timed-out pthread_cond_timedwait waiters.
+    // Without this, Blocked threads whose deadline passed never get rescheduled
+    // because next_runnable_pid only considers ProcState::Running threads and
+    // the cond-wait state machine only advances when re-entered via syscall.
+    let mut expired: Vec<(u32, u64, u64)> = Vec::new(); // (pid, cond, mutex)
+    {
+        let mut cws = COND_WAIT_STATE.lock();
+        for (&pid, state) in cws.iter_mut() {
+            if let CondWaitState::Waiting { cond, mutex, timeout_ns, .. } = *state {
+                if timeout_ns != 0 && now >= timeout_ns {
+                    *state = CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                    expired.push((pid, cond, mutex));
+                }
+            }
+        }
+    }
+    for (pid, cond, _mutex) in expired {
+        futex_waiter_remove(cond, pid);
+        // Mark Running so next_runnable_pid picks it up; the re-entered
+        // sys_pthread_cond_wait_timeout will see AcquiringMutex and proceed.
+        crate::process::set_state(pid, crate::process::ProcState::Running);
+        static TIMEOUT_EXPIRE_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = TIMEOUT_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 64 == 0 {
+            log::warn!("[cond-timeout-expire] #{} pid={} cond={:#x}", n, pid, cond);
+        }
+    }
+
+    // Expire timed-out WM event waiters.
+    let wm_deadline = WM_WAITER_DEADLINE.load(Ordering::Acquire);
+    if wm_deadline != 0 && now >= wm_deadline {
+        WM_WAITER_DEADLINE.store(0, Ordering::Release);
+        let wm_waiter = WM_WAITER_PID.load(Ordering::Acquire);
+        if wm_waiter != 0 {
+            crate::wm::set_wm_waiter(0);
+            crate::process::set_state(wm_waiter, crate::process::ProcState::Running);
+            static WM_TIMEOUT_EXPIRE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = WM_TIMEOUT_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 16 || n % 64 == 0 {
+                log::warn!("[wm-timeout-expire] #{} pid={}", n, wm_waiter);
+            }
+        }
     }
 }
 
@@ -399,7 +493,7 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
     };
     let raw_bytes = unsafe { core::slice::from_raw_parts(new_value as *const u8, 32) };
     let n = TFD_SETTIME_LOG.load(Ordering::Relaxed);
-    if n < 32 {
+    if n < 0 {
         log::warn!("[tfd-debug] fd={} raw: {:x?}", fd, raw_bytes);
         log::warn!("[tfd-debug] fd={} fields: int_s={} int_ns={} val_s={} val_ns={}", fd, int_s, int_ns, val_s, val_ns);
     }
@@ -420,37 +514,75 @@ fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old_value: u64
         now.saturating_add(value_ns)
     };
     let original_expired = deadline != 0 && deadline <= now;
-    if original_expired {
-        // Force a minimum 1ms delay (1,000,000 ns) to prevent CPU starvation/hot loops
+    // When a one-shot timer's deadline is already in the past, POSIX semantics
+    // are that it fires immediately (pending becomes 1 on the next read).
+    // Previously we forced a 1ms artificial delay AND reset pending=0, which
+    // meant every WakeUp() call from Flutter's message loop (all of which have
+    // orig_exp=true because the task is always already due) would reset the
+    // timer to "not ready" and prevent pid=2 from ever reading tfd=65 post-vsync.
+    //
+    // Fix: for one-shot (period=0) already-expired timers, disarm the deadline
+    // and set pending=1 so the very next epoll_collect_ready sees it as ready.
+    // For periodic timers, keep the 1ms delay to avoid CPU starvation.
+    if original_expired && period_ns != 0 {
+        // Periodic timer already past first fire: force 1ms delay to avoid hotloop.
         deadline = now.saturating_add(1_000_000);
     }
+    // For one-shot already-expired (original_expired && period_ns==0): deadline
+    // stays at the original (past) value; the and_modify below will set pending=1.
     let mut tbl = TIMERFD_TABLE.lock();
-    // Auto-register if user-space called settime on an fd we didn't see
-    // through timerfd_create (shouldn't happen, but be lenient).
-    let already_expired = false;
     {
         let n = TFD_SETTIME_LOG.fetch_add(1, Ordering::Relaxed);
         let pid = crate::process::current_pid();
         if n < 32 {
             if original_expired {
-                log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → forced-delay-1ms (now={}ns)",
+                log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → fire-now (now={}ns)",
                     n, pid, fd, flags, value_ns, period_ns, now);
             } else {
                 log::warn!("[tfd-settime] #{} pid={} fd={} flags={} deadline={}ns now={}ns delta={}ns period={}ns",
                     n, pid, fd, flags, deadline, now, deadline.saturating_sub(now), period_ns);
             }
         }
+        // Always-on logging for the UI thread timerfd (65) and raster thread timerfd (67).
+        // These are rate-limited separately to 300 entries each so post-vsync arming is visible.
+        if fd == 65 {
+            static TFD65_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let k = TFD65_LOG.fetch_add(1, Ordering::Relaxed);
+            if k < 300 {
+                log::warn!("[tfd65-arm] #{} pid={} delta={}ns period={}ns orig_exp={}",
+                    k, pid, deadline.saturating_sub(now), period_ns, original_expired);
+            }
+        } else if fd == 67 {
+            static TFD67_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let k = TFD67_LOG.fetch_add(1, Ordering::Relaxed);
+            if k < 300 {
+                log::warn!("[tfd67-arm] #{} pid={} delta={}ns period={}ns orig_exp={}",
+                    k, pid, deadline.saturating_sub(now), period_ns, original_expired);
+            }
+        }
     }
+    // For one-shot already-expired: set pending=1 (fire immediately), deadline=0
+    // (disarmed; no future deadline needed since it already triggered).
+    let (final_deadline, init_pending) = if original_expired && period_ns == 0 {
+        (0u64, 1u64)
+    } else {
+        (deadline, 0u64)
+    };
     tbl.entry(fd as u32)
         .and_modify(|t| {
-            t.deadline_ns = deadline;
+            t.deadline_ns = final_deadline;
             t.period_ns = period_ns;
-            t.pending = 0; // re-arm resets pending
+            if original_expired && period_ns == 0 {
+                // Preserve any existing pending count, but ensure at least 1.
+                t.pending = t.pending.saturating_add(1).max(1);
+            } else {
+                t.pending = 0; // normal re-arm resets pending
+            }
         })
         .or_insert(TimerState {
-            deadline_ns: deadline,
+            deadline_ns: final_deadline,
             period_ns,
-            pending: 0,
+            pending: init_pending,
         });
     drop(tbl);
     // Wake any thread blocked in epoll_wait on an epoll that watches this timerfd,
@@ -1085,8 +1217,51 @@ unsafe fn write_user_bytes(ptr: u64, src: &[u8]) -> bool {
 // ── Syscall implementations ───────────────────────────────────────────────────
 
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
+    if fd == 5 || fd == 4 {
+        log::warn!("[write-trace] pid={} fd={} len={}", crate::process::current_pid(), fd, len);
+    }
     // Pipe write fast-path.
     let idx = fd as usize;
+
+    // ── Synth-fd fast-path ────────────────────────────────────────────────────
+    // Timerfd and eventfd handles are allocated by alloc_synth_fd() which starts
+    // at SYNTH_FD_NEXT=64, i.e. exactly equal to MAX_OPEN_FILES.  The
+    // `if idx >= 3 && idx < MAX_OPEN_FILES` block below therefore NEVER matches
+    // synth fds, so writes to them fell through to the serial-print path without
+    // updating the eventfd counter or calling epoll_wake.  That silently dropped
+    // every Flutter engine task-post (write-1-to-eventfd), leaving the Dart UI
+    // thread (pid=7) permanently blocked in epoll_wait with nothing to run.
+    if idx >= MAX_OPEN_FILES {
+        // Timerfd write
+        {
+            let mut tfd_tbl = TIMERFD_TABLE.lock();
+            if let Some(ts) = tfd_tbl.get_mut(&(fd as u32)) {
+                if len >= 8 && buf_ptr != 0 {
+                    let count = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
+                    ts.pending = ts.pending.saturating_add(count.max(1));
+                } else {
+                    ts.pending = ts.pending.saturating_add(1);
+                }
+                log::warn!("[sys_write] timerfd write fd={} pending={}", fd, ts.pending);
+                drop(tfd_tbl);
+                epoll_wake(fd as u32);
+                return len as i64;
+            }
+        }
+        // Eventfd write
+        if EVENTFD_TABLE.lock().contains_key(&(fd as u32)) {
+            if len >= 8 && buf_ptr != 0 {
+                let val = unsafe { core::ptr::read_unaligned(buf_ptr as *const u64) };
+                eventfd_write(fd as u32, val);
+            } else {
+                eventfd_write(fd as u32, 1);
+            }
+            return len as i64;
+        }
+        // Unknown synth fd — return success silently.
+        return len as i64;
+    }
+
     if idx >= 3 && idx < MAX_OPEN_FILES {
         let tbl = OPEN_FILES.lock();
         if tbl[idx].used && tbl[idx].pipe_id >= 0 {
@@ -1262,6 +1437,17 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 return 8;
             } else {
                 // Not yet fired (or not armed) — EAGAIN.
+                // Log for tfd=65 so we can trace why pending is 0 post-fix.
+                if fd == 65 {
+                    static TFD65_EAGAIN: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let k = TFD65_EAGAIN.fetch_add(1, Ordering::Relaxed);
+                    if k < 64 {
+                        let pid = crate::process::current_pid();
+                        log::warn!("[tfd65-eagain] #{} pid={} deadline={}ns",
+                            k, pid, ts.deadline_ns);
+                    }
+                }
                 return -11;
             }
         }
@@ -2048,37 +2234,112 @@ fn sys_wm_focus_mirror_set(enabled: u64) -> i64 {
     if on { 1 } else { 0 }
 }
 
-fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, _max_halts: u64) -> i64 {
-    // Fast path: events already queued.
-    let n = sys_wm_event_read(ev_ptr, ev_len);
-    if n >= 0 {
-        return n;
-    }
-
-    // Yield to another runnable thread so Dart/engine threads can progress.
-    // The embedder loops on EAGAIN, so we return -11 and let the caller retry.
+fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i64 {
     let cur = crate::process::current_pid();
-    if cur != 0 {
+    if cur == 0 { return -1; }
+
+    // Ensure timerfd deadlines are checked on every event-poll, not just on WM
+    // timeout expiry.  This keeps task-runner threads woken at ≤16ms latency
+    // instead of the ~640ms cortex-bg cycle.
+    check_timerfds_and_wake();
+
+    let is_reentrant = WM_WAITER_PID.load(Ordering::Acquire) == cur;
+
+    // On a fresh (non-reentrant) wm_event_wait: kick all task-runner threads if
+    // the APIC ISR has flagged a deferred kick (fired every ~500 ms).  This is
+    // enough to break any deadlock where a task-runner thread is stuck in
+    // epoll_wait with no timerfd armed, without spuriously waking pid=2 on every
+    // single event-loop iteration (which caused pid=2 to spin on empty timerfd
+    // reads, starving pid=1 of CPU and breaking the vsync delivery chain).
+    if !is_reentrant {
+        let kicked = KICK_REQUESTED.swap(false, Ordering::AcqRel);
+        if kicked {
+            let _ = force_wake_all_task_runners("wm-kick");
+        }
+    }
+    let deadline_ns = if is_reentrant {
+        WM_WAITER_DEADLINE.load(Ordering::Relaxed)
+    } else {
+        // Fast path: check if events are already queued.
+        let n = sys_wm_event_read(ev_ptr, ev_len);
+        if n >= 0 {
+            return n;
+        }
+
+        if timeout_ms == 0 {
+            return -11; // EAGAIN immediately if timeout is 0 and no event is ready
+        }
+
+        let dl = monotonic_ns().saturating_add(timeout_ms.saturating_mul(1_000_000));
+        WM_WAITER_PID.store(cur, Ordering::Release);
+        WM_WAITER_DEADLINE.store(dl, Ordering::Release);
+        dl
+    };
+
+    loop {
+        // Set the waiter and block before checking, to close lost-wake race window.
+        crate::wm::set_wm_waiter(cur);
+        crate::process::set_state(cur, crate::process::ProcState::Blocked);
+
+        let n = sys_wm_event_read(ev_ptr, ev_len);
+        if n >= 0 {
+            crate::wm::set_wm_waiter(0);
+            WM_WAITER_PID.store(0, Ordering::Release);
+            WM_WAITER_DEADLINE.store(0, Ordering::Release);
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+            return n;
+        }
+
+        // Check if we already exceeded the timeout before blocking.
+        let now = monotonic_ns();
+        if deadline_ns == 0 || now >= deadline_ns {
+            crate::wm::set_wm_waiter(0);
+            WM_WAITER_PID.store(0, Ordering::Release);
+            WM_WAITER_DEADLINE.store(0, Ordering::Release);
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+            return -11; // EAGAIN
+        }
+
+        // Save return context and registers so we can be resumed.
+        let urip = crate::arch::syscall::user_rip();
+        let ursp = crate::arch::syscall::user_rsp();
+        crate::process::save_return_context(cur, urip - 2, ursp);
+        crate::process::save_full_user_gprs(cur);
+        crate::process::set_rax(cur, eabi::SYS_WM_EVENT_WAIT);
+        crate::process::save_xstate(cur);
+
+        // Cooperatively switch to another runnable process.
         if let Some(next) = crate::process::next_runnable_pid(cur) {
             if next != cur {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip, ursp);
-                crate::process::save_full_user_gprs(cur);
-                crate::process::set_errno_to_deliver(cur, 11); // EAGAIN
-                crate::process::set_rax(cur, (-11i64) as u64);
-                crate::process::save_xstate(cur);
                 crate::process::enter_user_by_pid_noreturn(next);
             }
         }
-    }
 
-    // No sibling — spin briefly then return EAGAIN.
-    for _ in 0..10_000 {
-        core::hint::spin_loop();
+        // Loop-sleep (sti; hlt; cli) as long as we are Blocked.
+        while crate::process::is_blocked(cur) {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+
+            // Check if timeout has expired.
+            let now = monotonic_ns();
+            let current_dl = WM_WAITER_DEADLINE.load(Ordering::Relaxed);
+            if current_dl == 0 || now >= current_dl {
+                crate::wm::set_wm_waiter(0);
+                WM_WAITER_PID.store(0, Ordering::Release);
+                WM_WAITER_DEADLINE.store(0, Ordering::Release);
+                crate::process::set_state(cur, crate::process::ProcState::Running);
+                break;
+            }
+
+            if let Some(next) = crate::process::next_runnable_pid(cur) {
+                if next != cur {
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
     }
-    let n2 = sys_wm_event_read(ev_ptr, ev_len);
-    if n2 >= 0 { n2 } else { -11 }
 }
 
 // ── Phase 30 Slice 3: kernel dynamic linker + anonymous mmap ─────────────────
@@ -2202,9 +2463,29 @@ fn sys_munmap(_va: u64, _size: u64) -> i64 {
     0
 }
 
-fn sys_mprotect(_va: u64, _size: u64, _prot: u64) -> i64 {
-    // Stub — permissions are set at map time for now.
-    // A full implementation would update PTE flags and flush the TLB range.
+fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
+    if size == 0 { return 0; }
+    let start_va = va & !0xFFF;
+    let end_va = (va + size + 4095) & !0xFFF;
+    let pid = crate::process::current_pid();
+    if pid == 0 { return -1; } // EPERM
+    let pml4_phys = match crate::process::get_user_context(pid) {
+        Some(ctx) => ctx.pml4_phys,
+        None => return -9, // EBADF
+    };
+    let writable = (prot & 0x2) != 0;
+    let exec = (prot & 0x4) != 0;
+
+    let mut curr_va = start_va;
+    while curr_va < end_va {
+        unsafe {
+            if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+                // If the range contains unmapped areas, mprotect on POSIX returns ENOMEM (-12)
+                return -12;
+            }
+        }
+        curr_va += 4096;
+    }
     0
 }
 
@@ -2437,26 +2718,43 @@ fn sys_gpu_submit_strided(surface_id: u64, pixel_ptr: u64, row_bytes: u64) -> i6
         );
     }
     // Derive total byte length from the surface dimensions.
-    let (width, height) = {
-        let packed = crate::compositor::framebuffer_size_packed();
-        // Surface dimensions are not in the framebuffer size; use compositor.
-        // We pass row_bytes=0 to compute length inside gpu_submit_strided_for.
-        let _ = packed;
-        (0usize, 0usize) // sentinel: let compositor query its own table
+    let (width, height) = match crate::compositor::surface_geometry_get(surface_id as u32) {
+        Some((_, _, w, h)) => (w as usize, h as usize),
+        None => return -3, // ESRCH
     };
-    let _ = (width, height); // compositor will validate internally
-    // Estimate buffer length: if row_bytes == 0 we don't know, so read conservatively.
-    // The compositor validates the exact size against the surface dimensions.
     let buf_len = if row_bytes == 0 {
-        0x800000usize // 8 MiB upper bound — compositor will reject if wrong
+        width * height * 4
     } else {
-        // We need height from compositor; pass a generous estimate.
-        (row_bytes as usize).saturating_mul(4096) // up to 4096 rows
+        row_bytes as usize * height
     };
     let bytes = match unsafe { read_user_bytes(pixel_ptr, buf_len) } {
         Some(b) => b,
-        None => return -14,
+        None => {
+            log::error!(
+                "[sys_gpu_submit_strided] read_user_bytes failed: ptr={:#x} len={}",
+                pixel_ptr,
+                buf_len
+            );
+            return -14; // EFAULT
+        }
     };
+    if n < 4 {
+        let b0 = bytes.first().copied().unwrap_or(0);
+        let b1 = bytes.get(1).copied().unwrap_or(0);
+        let b2 = bytes.get(2).copied().unwrap_or(0);
+        let b3 = bytes.get(3).copied().unwrap_or(0);
+        // Center pixel
+        let mid = buf_len / 2 & !3;
+        let c0 = bytes.get(mid).copied().unwrap_or(0);
+        let c1 = bytes.get(mid + 1).copied().unwrap_or(0);
+        let c2 = bytes.get(mid + 2).copied().unwrap_or(0);
+        let c3 = bytes.get(mid + 3).copied().unwrap_or(0);
+        log::warn!(
+            "[kern-rawpix] #{} b0={:#04x} b1={:#04x} b2={:#04x} b3={:#04x} \
+             cm={:#04x} cm1={:#04x} cm2={:#04x} cm3={:#04x}",
+            n, b0, b1, b2, b3, c0, c1, c2, c3
+        );
+    }
     let pid = wm_consumer_pid();
     match crate::compositor::gpu_submit_strided_for(pid, surface_id as u32, bytes, row_bytes as usize) {
         Ok(()) => 0,
@@ -4434,9 +4732,21 @@ mod posix {
         }
         let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
         let pid = crate::process::current_pid();
+        // Targeted trace for the mutex that pid=3 holds across epoll_wait, blocking pid=2/8/9.
+        if mutex == 0x394000018 {
+            static MUTEX394_LOCK_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let ml = MUTEX394_LOCK_LOG.fetch_add(1, Ordering::Relaxed);
+            if ml < 40 {
+                let rip = crate::arch::syscall::user_rip();
+                let val = atom.load(Ordering::Relaxed);
+                log::warn!("[mutex394-lock] #{} pid={} rip={:#x} current_val={}", ml, pid, rip, val);
+            }
+        }
 
         loop {
-            if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            let res = atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire);
+            if res.is_ok() {
                 return 0;
             }
 
@@ -4490,7 +4800,27 @@ mod posix {
         if mutex < 0x1000 { return 0; }
         let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
         atom.store(0, Ordering::Release);
+        // Targeted trace for the mutex pid=3 holds across epoll_wait.
+        if mutex == 0x394000018 {
+            static MUTEX394_UNLOCK_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let ul = MUTEX394_UNLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+            if ul < 40 {
+                let pid = crate::process::current_pid();
+                let rip = crate::arch::syscall::user_rip();
+                log::warn!("[mutex394-unlock] #{} pid={} rip={:#x}", ul, pid, rip);
+            }
+        }
         let n = super::futex_wake_waiters(mutex, 1);
+        // Deferred task-runner kick: consume the KICK_REQUESTED flag set by the
+        // APIC ISR and call force_wake_all_task_runners here in syscall context
+        // (where spinlock acquisition is safe, unlike the ISR).  This fires at
+        // most every ~500 ms (30 APIC ticks) and wakes task runners stuck in
+        // infinite epoll_wait even when sys_wm_event_wait is not being called
+        // (e.g. while the embedder is inside run_task_fn).
+        if super::KICK_REQUESTED.swap(false, Ordering::AcqRel) {
+            let _ = super::force_wake_all_task_runners("deferred-kick");
+        }
         let wpid = crate::process::current_pid();
         if wpid != 0 && n > 0 {
             if let Some(next) = crate::process::next_runnable_pid(wpid) {
@@ -4806,6 +5136,11 @@ mod posix {
                 }
             }
         }
+        static COND_SIGNAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let k = COND_SIGNAL_LOG.fetch_add(1, Ordering::Relaxed);
+        if k < 64 || k % 256 == 0 {
+            log::warn!("[cond-signal] #{} pid={} cond={:#x} woke={}", k, pid, cond, n);
+        }
         log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
         let wpid = crate::process::current_pid();
         if wpid != 0 && (n > 0 || bridged > 0) {
@@ -4846,6 +5181,22 @@ mod posix {
             }
         }
 
+        // Diagnostic only — log zero-wake cond broadcasts from the engine worker thread.
+        if pid == 2 && n == 0 {
+            static COND_BROADCAST_ZERO_WAKE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let z = COND_BROADCAST_ZERO_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
+            if z < 16 || z % 4096 == 0 {
+                log::warn!(
+                    "[cond-broadcast-zero-wake] #{} pid={} cond={:#x} skip_bridge={}",
+                    z,
+                    pid,
+                    cond,
+                    skip_bridge
+                );
+            }
+        }
+
         if n == 0 && !skip_bridge {
             bridged = super::cond_miss_bridge(cond, i32::MAX as u32);
             if bridged > 0 {
@@ -4866,6 +5217,11 @@ mod posix {
         }
         cond_broadcast_loop_handoff(pid, cond, n, bridged);
 
+        static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let k = COND_BROADCAST_LOG.fetch_add(1, Ordering::Relaxed);
+        if k < 64 || k % 2048 == 0 {
+            log::warn!("[cond-broadcast] #{} pid={} cond={:#x} woke={}", k, pid, cond, n);
+        }
         log::trace!(
             "[cond-broadcast] pid={} cond={:#x} seq {}→{} woke={}",
             pid,

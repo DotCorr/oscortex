@@ -399,6 +399,22 @@ unsafe extern "C" fn apic_timer_entry() {
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     crate::syscall::check_timerfds_and_wake();
 
+    // Set a deferred-kick flag every ~500 ms (30 ticks × ~17 ms/tick).
+    // The flag is consumed in syscall context (sys_pthread_mutex_unlock or
+    // sys_wm_event_wait) where spinlock acquisition is safe.  This ISR path
+    // only does an atomic store — completely lock-free.
+    {
+        static TR_KICK_CTR: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let k = TR_KICK_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if k % 30 == 0 {
+            crate::syscall::KICK_REQUESTED.store(
+                true,
+                core::sync::atomic::Ordering::Release,
+            );
+        }
+    }
+
     static DUMP_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let count = DUMP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if count < 10 {

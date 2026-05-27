@@ -40,6 +40,23 @@ impl EventQueue {
         ev.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
+        // Coalesce baton=0 vsync events: update the existing pending entry
+        // in-place rather than adding a new one.  This prevents EV_VSYNC(0)
+        // floods from filling the queue and pushing EV_VSYNC(baton≠0) out.
+        if ev.kind == EV_VSYNC && ev.b == 0 {
+            for off in 0..self.len {
+                let idx = (self.head + off) % EVENT_CAP;
+                if self.buf[idx].kind == EV_VSYNC
+                    && self.buf[idx].b == 0
+                    && self.owner_pid[idx] == owner_pid
+                {
+                    // Update frame counter in-place; baton stays 0.
+                    self.buf[idx].a = ev.a;
+                    return;
+                }
+            }
+        }
+
         if self.len == EVENT_CAP {
             self.head = (self.head + 1) % EVENT_CAP;
             self.len -= 1;
@@ -99,6 +116,16 @@ impl EventQueue {
 }
 
 static Q: Mutex<EventQueue> = Mutex::new(EventQueue::new());
+
+static WM_WAITER: AtomicU32 = AtomicU32::new(0);
+
+pub fn set_wm_waiter(pid: u32) {
+    WM_WAITER.store(pid, Ordering::Release);
+}
+
+pub fn get_wm_waiter() -> u32 {
+    WM_WAITER.load(Ordering::Acquire)
+}
 
 struct SynthInput {
     tick: u64,
@@ -354,12 +381,24 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
         a,
         b,
     }, owner_pid);
+
+    // Wake the waiter if they are eligible for this event.
+    let waiter = WM_WAITER.load(Ordering::Acquire);
+    if waiter != 0 && (owner_pid == 0 || owner_pid == waiter) {
+        WM_WAITER.store(0, Ordering::Release);
+        crate::process::set_state(waiter, crate::process::ProcState::Running);
+    }
 }
 
 pub fn push_vsync(frame: u64) {
     // Consume the pending baton (if any) so the embedder's FlutterEngineOnVsync
     // call can use the correct baton. If no baton is posted, b = 0 (ignored).
     let baton = VSYNC_BATON.swap(0, Ordering::AcqRel);
+    static PV_SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = PV_SEQ.fetch_add(1, Ordering::Relaxed);
+    if baton != 0 || n < 30 || n % 300 == 0 {
+        log::info!("[push-vsync] #{} frame={} baton={:#x}", n, frame, baton);
+    }
     push_event(EV_VSYNC, 0, frame, baton);
 }
 

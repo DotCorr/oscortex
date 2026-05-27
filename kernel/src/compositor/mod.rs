@@ -582,6 +582,8 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                 }
             }
             let pixels = s.width as usize * s.height as usize;
+            let surf_w = s.width;
+            let surf_h = s.height;
             let expect = pixels * 4;
             if payload.len() != expect {
                 return Err("bad payload size");
@@ -600,6 +602,19 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                 let bl = payload[b + 2] as u32;
                 let a  = payload[b + 3] as u32;
                 buf[i] = r | (g << 8) | (bl << 16) | (a << 24);
+            }
+            // Log first few pixel values to diagnose pixel format / black screen.
+            {
+                static GPU_SUBMIT_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = GPU_SUBMIT_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 4 {
+                    let p0 = if pixels > 0 { buf[0] } else { 0 };
+                    let p1 = if pixels > 1 { buf[1] } else { 0 };
+                    let p_mid = if pixels > pixels/2 { buf[pixels/2] } else { 0 };
+                    log::warn!("[gpu-submit] #{} sid={} {}x{} p0={:#010x} p1={:#010x} pmid={:#010x}",
+                        n, id, surf_w, surf_h, p0, p1, p_mid);
+                }
             }
             c.back_pending[idx] = true;
             return Ok(());
@@ -759,6 +774,13 @@ pub fn render_frame() {
         let s = c.surfaces[idx];
         if c.presented[idx] {
             if let Some(buf) = c.buffers[idx].as_ref() {
+                static BLIT_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let bn = BLIT_LOG.fetch_add(1, Ordering::Relaxed);
+                if bn < 4 {
+                    log::warn!("[blit-surf] #{} id={} x={} y={} w={} h={} buflen={}",
+                        bn, s.id, s.x, s.y, s.width, s.height, buf.len());
+                }
                 crate::drivers::fb::blit_rgba32(s.x, s.y, s.width, s.height, buf);
             } else {
                 crate::drivers::fb::fill_rect(s.x, s.y, s.width, s.height, surface_color(s.id));

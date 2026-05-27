@@ -514,11 +514,72 @@ unsafe extern "C" fn present_callback(
 ) -> bool {
     unsafe {
         let count = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count < 3 {
+        if count < 16 {
             write(b"[embedder] present_callback\n");
+            // Log dimensions and allocation pointer
+            write_hex_u64(b"[embedder] present row_bytes=", row_bytes as u64);
+            write_hex_u64(b"[embedder] present height=", height as u64);
+            write_hex_u64(b"[embedder] present alloc_ptr=", allocation as u64);
+            // Sample first pixel and center pixel directly from Flutter's allocation.
+            let b0 = *allocation;
+            let b1 = *allocation.add(1);
+            let b2 = *allocation.add(2);
+            let b3 = *allocation.add(3);
+            let mid_off = (height / 2) * row_bytes + (SURFACE_W as usize / 2) * 4;
+            let c0 = *allocation.add(mid_off);
+            let c1 = *allocation.add(mid_off + 1);
+            let c2 = *allocation.add(mid_off + 2);
+            let c3 = *allocation.add(mid_off + 3);
+            let d = b"0123456789abcdef";
+            // "[embedder] rawpix#0 p0=00000000 pm=00000000\n"
+            let mut msg = *b"[embedder] rawpix#0 p0=00000000 pm=00000000\n";
+            msg[18] = b'0' + (count as u8 % 10);
+            msg[23] = d[(b0 >> 4) as usize];
+            msg[24] = d[(b0 & 0xf) as usize];
+            msg[25] = d[(b1 >> 4) as usize];
+            msg[26] = d[(b1 & 0xf) as usize];
+            msg[27] = d[(b2 >> 4) as usize];
+            msg[28] = d[(b2 & 0xf) as usize];
+            msg[29] = d[(b3 >> 4) as usize];
+            msg[30] = d[(b3 & 0xf) as usize];
+            msg[35] = d[(c0 >> 4) as usize];
+            msg[36] = d[(c0 & 0xf) as usize];
+            msg[37] = d[(c1 >> 4) as usize];
+            msg[38] = d[(c1 & 0xf) as usize];
+            msg[39] = d[(c2 >> 4) as usize];
+            msg[40] = d[(c2 & 0xf) as usize];
+            msg[41] = d[(c3 >> 4) as usize];
+            msg[42] = d[(c3 & 0xf) as usize];
+            write(&msg);
+
+            // Count non-zero bytes (sample every 64th byte) to detect if Flutter
+            // rendered anything at all.
+            let pixel_len_scan = row_bytes * height;
+            let scan = core::slice::from_raw_parts(allocation, pixel_len_scan);
+            let mut nnz: u64 = 0;
+            let mut i = 0usize;
+            while i < scan.len() {
+                if scan[i] != 0 { nnz += 1; }
+                i += 64;
+            }
+            write_hex_u64(b"[embedder] nnz_sample=", nnz);
+
+            // PIPELINE TEST: overwrite first 4 rows with opaque red (RGBA).
+            // If this red stripe appears on screen, the entire present→blit
+            // pipeline is working and the root cause is Flutter rendering blank.
+            let alloc_rw = allocation as *mut u8;
+            for row in 0..4_usize {
+                for col in 0..(row_bytes / 4) {
+                    let off = row * row_bytes + col * 4;
+                    *alloc_rw.add(off    ) = 0xFF; // R
+                    *alloc_rw.add(off + 1) = 0x00; // G
+                    *alloc_rw.add(off + 2) = 0x00; // B
+                    *alloc_rw.add(off + 3) = 0xFF; // A
+                }
+            }
+            write(b"[embedder] test-red injected into first 4 rows\n");
         }
         let surface_id = SURFACE_ID;
-        let w = SURFACE_W as usize;
         let pixel_len  = row_bytes * height;
         let pixels = core::slice::from_raw_parts(allocation, pixel_len);
         gpu_submit_strided(surface_id, pixels, row_bytes) >= 0
@@ -710,6 +771,7 @@ extern "C" fn main_embedder() {
     let mut initialize_va = 0u64;
     let mut run_initialized_va = 0u64;
     let mut notify_display_update_va = 0u64;
+    let mut is_aot = false;
 
     if get_procs_va != 0 {
         write(b"[embedder] using GetProcAddresses path\n");
@@ -735,6 +797,19 @@ extern "C" fn main_embedder() {
         run_initialized_va              = api_table.run_initialized;
         notify_display_update_va        = api_table.notify_display_update;
         RUN_TASK_FN.store(api_table.run_task, Ordering::SeqCst);
+
+        let runs_aot_fn_va = api_table.runs_aot_compiled_dart_code;
+        if runs_aot_fn_va != 0 {
+            let runs_aot: unsafe extern "C" fn() -> bool = unsafe { core::mem::transmute(runs_aot_fn_va) };
+            is_aot = unsafe { runs_aot() };
+            if is_aot {
+                write(b"[embedder] RunsAOTCompiledDartCode returns TRUE (AOT mode)\n");
+            } else {
+                write(b"[embedder] RunsAOTCompiledDartCode returns FALSE (JIT mode)\n");
+            }
+        } else {
+            write(b"[embedder] RunsAOTCompiledDartCode is NULL\n");
+        }
     } else {
         write(b"[embedder] manual symbol resolution path\n");
         // Stub path: resolve each symbol manually.
@@ -863,20 +938,45 @@ extern "C" fn main_embedder() {
         log_message_callback as *const () as u64,
     );
 
-    // JIT mode: pass snapshot asset PATHS to the legacy snapshot pointer
-    // fields. This engine build reads those fields as C strings and maps
-    // files from disk.
-    write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
+    if is_aot {
+        // AOT mode: load libapp.so via kernel syscall, parse ELF symbol table,
+        // write the 4 Dart snapshot raw pointers into FlutterProjectArgs.
+        write(b"[embedder] AOT mode: loading libapp.so via aot_loader\n");
+        static LIBAPP_PATH: &[u8] = b"/system/flutter/libapp.so\0";
+        match aot_loader::load_dart_snapshot(LIBAPP_PATH) {
+            Some(snaps) => {
+                aot_loader::log_manifest(&snaps);
+                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,              snaps.vm_data);
+                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE,         snaps.vm_data_size);
+                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS,      snaps.vm_instr);
+                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, snaps.vm_instr_size);
+                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA,             snaps.iso_data);
+                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE,        snaps.iso_data_size);
+                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS,     snaps.iso_instr);
+                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE,snaps.iso_instr_size);
+                write(b"[embedder] AOT snapshot pointers installed\n");
+            }
+            None => {
+                write(b"[embedder] ERROR: aot_loader::load_dart_snapshot FAILED\n");
+                exit(-1);
+            }
+        }
+    } else {
+        // JIT mode: pass snapshot asset PATHS to the legacy snapshot pointer
+        // fields. This engine build reads those fields as C strings and maps
+        // files from disk.
+        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
 
-    static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
-    static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
+        static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
+        static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
 
-    write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, VM_PATH.as_ptr() as u64);
-    write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
-    write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
-    write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, VM_PATH.as_ptr() as u64);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
 
-    write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
+        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
+    }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
     let mut rsp: u64;
@@ -1051,6 +1151,11 @@ extern "C" fn main_embedder() {
     // and run custom task runner platform tasks.
     let mut ev = WmEvent::default();
     let mut platform_buf = [0u8; 512];
+    let mut startup_watchdog_stage: u32 = 0;
+    let mut startup_watchdog_next_ns: u64 = rdtsc_ns() + 500_000_000;
+    // Frame pump: call FlutterEngineScheduleFrame at ~60 fps so Flutter keeps
+    // rendering even after it goes idle (static UI or before Dart init completes).
+    let mut frame_pump_next_ns: u64 = rdtsc_ns() + 16_666_666;
 
     loop {
         // Run pending platform tasks
@@ -1107,6 +1212,44 @@ extern "C" fn main_embedder() {
             diff_ms.min(16).max(1)
         };
 
+        if engine_out != 0
+            && now >= startup_watchdog_next_ns
+            && startup_watchdog_stage < 6
+        {
+            if proctable.schedule_frame != 0 {
+                let schedule_frame: ScheduleFrameFn =
+                    unsafe { core::mem::transmute(proctable.schedule_frame) };
+                let rc_sf = unsafe { schedule_frame(engine_out) };
+                if rc_sf == 0 {
+                    write_hex_u64(
+                        b"[embedder] startup watchdog schedule_frame stage=",
+                        startup_watchdog_stage as u64,
+                    );
+                }
+            }
+
+            if startup_watchdog_stage >= 2 && proctable.send_platform_message != 0 {
+                static LIFECYCLE_CH: &[u8] = b"flutter/lifecycle\0";
+                static LIFECYCLE_MSG: &[u8] = b"AppLifecycleState.resumed";
+                let msg = FlutterPlatformMessage {
+                    struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+                    channel: LIFECYCLE_CH.as_ptr() as u64,
+                    message: LIFECYCLE_MSG.as_ptr() as u64,
+                    message_size: LIFECYCLE_MSG.len(),
+                    response_handle: 0,
+                };
+                let send_platform_message: SendPlatformMessageFn =
+                    unsafe { core::mem::transmute(proctable.send_platform_message) };
+                let rc_pm = unsafe { send_platform_message(engine_out, &msg as *const _) };
+                if rc_pm == 0 {
+                    write(b"[embedder] startup watchdog resent lifecycle resumed\n");
+                }
+            }
+
+            startup_watchdog_stage += 1;
+            startup_watchdog_next_ns = now + 500_000_000;
+        }
+
         let r = wm_event_wait(&mut ev, timeout_ms);
         if r <= 0 {
             // No event or error — check for pending platform messages.
@@ -1117,16 +1260,62 @@ extern "C" fn main_embedder() {
                     platform_msg_reply(seq, b"ok");
                 }
             }
+            // Frame pump: keep Flutter rendering at ~60 fps so the Dart UI
+            // thread has time to finish init and produce a real frame.
+            let now_pump = rdtsc_ns();
+            if engine_out != 0
+                && proctable.schedule_frame != 0
+                && now_pump >= frame_pump_next_ns
+            {
+                let schedule_frame: ScheduleFrameFn =
+                    unsafe { core::mem::transmute(proctable.schedule_frame) };
+                let _ = unsafe { schedule_frame(engine_out) };
+                frame_pump_next_ns = now_pump + 16_666_666;
+            }
             continue;
         }
 
         match ev.kind {
             EV_VSYNC => {
-                let baton  = ev.b as usize;
+                let baton = ev.b as usize;
+                // Unconditional log for every non-zero baton arrival.
+                if baton != 0 {
+                    static NZ_BATON_COUNT: AtomicU32 = AtomicU32::new(0);
+                    let nzc = NZ_BATON_COUNT.fetch_add(1, Ordering::Relaxed);
+                    write_hex_u64(b"[embedder] EV_VSYNC_NZ nzc=", nzc as u64);
+                    write_hex_u64(b"  baton=", baton as u64);
+                    write_hex_u64(b"  engine_out=", engine_out as u64);
+                    write_hex_u64(b"  on_vsync=", proctable.on_vsync as u64);
+                }
+                // Log every EV_VSYNC receipt for first 80, then every 100th
+                {
+                    static EV_VSYNC_COUNT: AtomicU32 = AtomicU32::new(0);
+                    let evc = EV_VSYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+                    if evc < 80 || evc % 100 == 0 {
+                        write_hex_u64(b"[embedder] EV_VSYNC #", evc as u64);
+                        write_hex_u64(b"  baton=", baton as u64);
+                    }
+                }
+                // When no baton is pending the APIC timer still fires at 60 Hz
+                // delivering EV_VSYNC(baton=0).  Use these ticks to pump
+                // FlutterEngineScheduleFrame so Flutter posts a real baton and
+                // keeps rendering even for static (no-animation) apps.
+                if baton == 0
+                    && engine_out != 0
+                    && proctable.schedule_frame != 0
+                {
+                    let now_pump = rdtsc_ns();
+                    if now_pump >= frame_pump_next_ns {
+                        let schedule_frame: ScheduleFrameFn =
+                            unsafe { core::mem::transmute(proctable.schedule_frame) };
+                        let _ = unsafe { schedule_frame(engine_out) };
+                        frame_pump_next_ns = now_pump + 16_666_666;
+                    }
+                }
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
                     static VSYNC_SEND_LOG: AtomicU32 = AtomicU32::new(0);
                     let vsync_n = VSYNC_SEND_LOG.fetch_add(1, Ordering::Relaxed);
-                    if vsync_n < 5 || vsync_n % 60 == 0 {
+                    if vsync_n < 20 || vsync_n % 60 == 0 {
                         write(b"[embedder] vsync->engine #");
                         write_hex_u64(b"n=", vsync_n as u64);
                         write_hex_u64(b"  baton=", baton as u64);
@@ -1136,6 +1325,69 @@ extern "C" fn main_embedder() {
                     let f: OnVsyncFn =
                         unsafe { core::mem::transmute(proctable.on_vsync) };
                     unsafe { f(engine_out, baton, now_ns, target_ns) };
+                    if vsync_n < 20 || vsync_n % 60 == 0 {
+                        write_hex_u64(b"[embedder] on_vsync returned vsync_n=", vsync_n as u64);
+                    }
+
+                    // Consecutive-no-present watchdog: if 2 vsync→engine calls in a row
+                    // produced no new present, force FlutterEngineScheduleFrame to
+                    // restart the frame pump.
+                    static LAST_PRESENT_AT_VSYNC: AtomicU32 = AtomicU32::new(0);
+                    static NO_PRESENT_CONSECUTIVE: AtomicU32 = AtomicU32::new(0);
+                    let cur_presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
+                    let prev_presents = LAST_PRESENT_AT_VSYNC.swap(cur_presents, Ordering::Relaxed);
+                    if cur_presents > prev_presents {
+                        NO_PRESENT_CONSECUTIVE.store(0, Ordering::Relaxed);
+                    } else if vsync_n >= 2 {
+                        let cons = NO_PRESENT_CONSECUTIVE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if cons >= 2 && proctable.schedule_frame != 0 {
+                            let schedule_frame: ScheduleFrameFn =
+                                unsafe { core::mem::transmute(proctable.schedule_frame) };
+                            let _ = unsafe { schedule_frame(engine_out) };
+                            write_hex_u64(b"[embedder] no-present-kick cons=", cons as u64);
+                            NO_PRESENT_CONSECUTIVE.store(0, Ordering::Relaxed);
+                        }
+                    }
+
+                    let presents = cur_presents;
+                    if presents == 0 && (vsync_n == 10 || vsync_n == 30) {
+                        if proctable.schedule_frame != 0 {
+                            let schedule_frame: ScheduleFrameFn =
+                                unsafe { core::mem::transmute(proctable.schedule_frame) };
+                            let rc_sf = unsafe { schedule_frame(engine_out) };
+                            if rc_sf == 0 {
+                                write_hex_u64(b"[embedder] watchdog schedule_frame at vsync=", vsync_n as u64);
+                            } else {
+                                let mut hex = *b"[embedder] watchdog schedule_frame FAILED rc=0x________\n";
+                                let digits = b"0123456789abcdef";
+                                let r = rc_sf as u32;
+                                for i in 0..8 {
+                                    let nyb = ((r >> ((7 - i) * 4)) & 0xF) as usize;
+                                    hex[52 + i] = digits[nyb];
+                                }
+                                write(&hex);
+                            }
+                        }
+
+                        if vsync_n == 30 && proctable.send_platform_message != 0 {
+                            static LIFECYCLE_CH: &[u8] = b"flutter/lifecycle\0";
+                            static LIFECYCLE_MSG: &[u8] = b"AppLifecycleState.resumed";
+                            let msg = FlutterPlatformMessage {
+                                struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+                                channel: LIFECYCLE_CH.as_ptr() as u64,
+                                message: LIFECYCLE_MSG.as_ptr() as u64,
+                                message_size: LIFECYCLE_MSG.len(),
+                                response_handle: 0,
+                            };
+                            let send_platform_message: SendPlatformMessageFn =
+                                unsafe { core::mem::transmute(proctable.send_platform_message) };
+                            let rc_pm = unsafe { send_platform_message(engine_out, &msg as *const _) };
+                            if rc_pm == 0 {
+                                write(b"[embedder] watchdog resent lifecycle resumed\n");
+                            }
+                        }
+                    }
+
                     // After vsync, check if any platform tasks were queued
                     if vsync_n < 5 {
                         let pending = {
@@ -1148,6 +1400,11 @@ extern "C" fn main_embedder() {
                         };
                         write_hex_u64(b"  [vsync] platform_tasks_pending=", pending as u64);
                     }
+                } else if baton != 0 {
+                    // Baton is non-zero but condition failed — log why.
+                    write_hex_u64(b"[embedder] VSYNC_NZ_SKIP engine_out=", engine_out as u64);
+                    write_hex_u64(b"  on_vsync=", proctable.on_vsync as u64);
+                    write_hex_u64(b"  baton=", baton as u64);
                 }
             }
             EV_POINTER => {
@@ -1497,7 +1754,7 @@ fn rdtsc_ns() -> u64 {
             "rdtsc",
             out("eax") lo,
             out("edx") hi,
-            options(nomem, nostack, pure),
+            options(nomem, nostack),
         );
     }
     let tsc = ((hi as u64) << 32) | (lo as u64);
