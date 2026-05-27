@@ -131,9 +131,6 @@ struct SynthInput {
     tick: u64,
     x: i32,
     y: i32,
-    dx: i32,
-    dy: i32,
-    key_down: bool,
     e0_prefix: bool,
     mouse_pkt: [u8; 3],
     mouse_len: usize,
@@ -145,9 +142,6 @@ impl SynthInput {
             tick: 0,
             x: 32,
             y: 32,
-            dx: 5,
-            dy: 3,
-            key_down: false,
             e0_prefix: false,
             mouse_pkt: [0; 3],
             mouse_len: 0,
@@ -207,63 +201,19 @@ pub fn set_focus_pid(pid: u32) {
     }
 }
 
-/// Synthetic input producer tick (temporary bring-up path).
-///
-/// Generates pointer motion and periodic key press/release transitions so
-/// userspace event consumers can validate the event loop contract before real
-/// hardware input drivers land.
+/// Poll real PS/2 input and forward pointer/key events to userspace.
 pub fn tick() {
     let Some((w, h)) = crate::drivers::fb::size_px() else {
         return;
     };
 
-    let mut s = SYNTH.lock();
-    s.tick = s.tick.wrapping_add(1);
-
-    let is_ps2_ready = crate::drivers::ps2::PS2_READY.load(core::sync::atomic::Ordering::Relaxed);
-    let real_input = if is_ps2_ready {
-        false
-    } else {
-        poll_ps2_input(&mut s, w as i32, h as i32)
-    };
-
-    // If no real hardware events arrived, keep synthetic producers alive as a
-    // stable fallback for bring-up and CI validation.
-    // However, if the PS/2 controller is ready, do not generate synthetic inputs,
-    // as they would conflict with real mouse/keyboard inputs.
-    if real_input || is_ps2_ready {
+    if !crate::drivers::ps2::PS2_READY.load(core::sync::atomic::Ordering::Relaxed) {
         return;
     }
 
-    if s.tick % 2 == 0 {
-        s.x += s.dx;
-        s.y += s.dy;
-
-        if s.x <= 0 {
-            s.x = 0;
-            s.dx = s.dx.abs();
-        } else if s.x >= (w as i32 - 1).max(0) {
-            s.x = (w as i32 - 1).max(0);
-            s.dx = -s.dx.abs();
-        }
-
-        if s.y <= 0 {
-            s.y = 0;
-            s.dy = s.dy.abs();
-        } else if s.y >= (h as i32 - 1).max(0) {
-            s.y = (h as i32 - 1).max(0);
-            s.dy = -s.dy.abs();
-        }
-
-        push_pointer(s.x, s.y, 0);
-    }
-
-    // Toggle a synthetic key every 120 ticks.
-    if s.tick % 120 == 0 {
-        s.key_down = !s.key_down;
-        // Scancode 0x39 (space) as a stable synthetic key.
-        push_key(0x39, s.key_down);
-    }
+    let mut s = SYNTH.lock();
+    s.tick = s.tick.wrapping_add(1);
+    poll_ps2_input(&mut s, w as i32, h as i32);
 }
 
 #[cfg(target_arch = "x86_64")]

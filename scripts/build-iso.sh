@@ -107,7 +107,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         fi
         cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
     done
-    python3 "$ROOT/scratch/patch_kernel_blob.py" "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
 
     # Strict path contract: snapshots are only consumed from
     # /system/flutter/flutter_assets. Clear stale legacy top-level copies.
@@ -171,7 +171,7 @@ for app_path in "$ROOT"/apps/*; do
         fi
         cp "$app_assets/$f" "$dst/flutter_assets/$f"
     done
-    python3 "$ROOT/scratch/patch_kernel_blob.py" "$dst/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$dst/flutter_assets/kernel_blob.bin"
 
     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
         if [ -f "$app_assets/$f" ]; then
@@ -204,30 +204,6 @@ if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
 fi
 mkdir -p "$ROOT/initramfs/system/lib"
 cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
-
-# Phase 42: Build the real /init userspace binary and stage it to initramfs.
-INIT_DIR="$ROOT/userspace/init"
-INIT_TARGET="x86_64-unknown-none"
-
-if [ -d "$INIT_DIR" ]; then
-    echo "[0.5/4] Building userspace/init ELF..."
-    (cd "$INIT_DIR" && \
-        cargo +nightly build \
-            --release \
-            --target "$INIT_TARGET" \
-            -Z build-std=core,compiler_builtins \
-            -Z build-std-features=compiler-builtins-mem \
-            2>&1) || {
-        echo "[0.5/4] WARNING: userspace/init build failed (non-fatal)"
-    }
-
-    INIT_BIN="$INIT_DIR/target/$INIT_TARGET/release/init"
-    if [ -f "$INIT_BIN" ]; then
-        mkdir -p "$ROOT/initramfs/bin"
-        cp "$INIT_BIN" "$ROOT/initramfs/bin/init"
-        echo "[0.5/4] userspace/init staged to initramfs/bin/init ($(wc -c < "$INIT_BIN") bytes)"
-    fi
-fi
 
 # Flutter-only boot policy: flutter-embedder is always /init (PID 1)
 EMBEDDER_BIN="$ROOT/tools/flutter-embedder/target/x86_64-unknown-none/release/flutter-embedder"

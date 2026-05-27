@@ -476,6 +476,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
                 unsafe {
                     *((frame_ptr as usize + 18 * 8) as *mut u64) = next_regs.rsp;
                 }
+
                 // Deliver pending errno (e.g. EINTR from epoll_wait) for threads
                 // resumed via IRETQ rather than enter_user_by_pid_noreturn.
                 // Safe: timer ISR runs with user CR3 still loaded; SD_ERRNO is

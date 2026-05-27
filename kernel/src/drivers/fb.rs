@@ -18,7 +18,7 @@ const CHAR_H: u32 = 8;
 
 /// Foreground pixel colour (bright white).
 const FG: u32 = 0x00FF_FFFF;
-/// Background pixel colour (dark charcoal — matches early_banner).
+/// Background pixel colour (dark charcoal).
 const BG: u32 = 0x001A1A2E;
 
 /// Classic IBM VGA 8×8 bitmap font — printable ASCII 0x20–0x7F (96 glyphs).
@@ -188,124 +188,6 @@ impl Drop for InterruptGuard {
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
-
-/// Paint a single pixel for 24/32bpp framebuffers.
-#[inline(always)]
-unsafe fn poke_pixel(base: *mut u8, pitch_bytes: usize, bpp: u32, x: usize, y: usize, color: u32) {
-    let bpp_bytes = (bpp as usize) / 8;
-    if bpp_bytes < 3 { return; }
-    let p = unsafe { base.add(y * pitch_bytes + x * bpp_bytes) };
-    // Limine EFI framebuffers are typically little-endian XRGB/BGRX.
-    // We write B,G,R bytes so white/black remain visible on either layout.
-    let b = (color & 0xFF) as u8;
-    let g = ((color >> 8) & 0xFF) as u8;
-    let r = ((color >> 16) & 0xFF) as u8;
-    unsafe {
-        p.write_volatile(b);
-        p.add(1).write_volatile(g);
-        p.add(2).write_volatile(r);
-        if bpp_bytes >= 4 {
-            p.add(3).write_volatile(0);
-        }
-    }
-}
-
-/// Draw a solid horizontal bar and ASCII text using only the raw framebuffer
-/// pointer.  Safe to call before *any* kernel subsystem is initialised; uses
-/// no global mutable state.
-///
-/// # Safety
-/// `fb_addr` must be a valid, writable virtual address backed by the
-/// framebuffer memory, and `width`/`pitch_px`/`height` must describe the
-/// actual framebuffer layout.
-pub unsafe fn early_banner(fb_addr: u64, pitch_bytes: u64, bpp: u16, width: u64, _height: u64) {
-    if fb_addr == 0 { return; }
-    if bpp < 24 { return; }
-    let base = fb_addr as *mut u8;
-    let pb   = pitch_bytes as usize;
-    let w    = width as usize;
-
-    // Clear top 80px to a dark charcoal background.
-    for y in 0..80usize {
-        for x in 0..w {
-            unsafe { poke_pixel(base, pb, bpp as u32, x, y, 0x001A1A2E); }
-        }
-    }
-    // Orange accent bar (4 px).
-    for y in 80..84usize {
-        for x in 0..w {
-            unsafe { poke_pixel(base, pb, bpp as u32, x, y, 0x00FF6600); }
-        }
-    }
-
-    // Draw "OSCortex" in 2× scaled white text using the built-in 8×8 font.
-    let msg = b"OSCortex kernel starting...";
-    let start_x: usize = 16;
-    let start_y: usize = 24;
-    for (ci, &ch) in msg.iter().enumerate() {
-        if ch < 0x20 || ch > 0x7E { continue; }
-        let glyph = &FONT[(ch - 0x20) as usize];
-        for gy in 0..8usize {
-            let row_bits = glyph[gy];
-            for gx in 0..8usize {
-                let color = if (row_bits >> (7 - gx)) & 1 != 0 { 0x00FFFFFF } else { 0x001A1A2E };
-                // 2× scale
-                let px = start_x + ci * 16 + gx * 2;
-                let py = start_y + gy * 2;
-                if px + 1 < w {
-                    unsafe {
-                        poke_pixel(base, pb, bpp as u32, px,     py,     color);
-                        poke_pixel(base, pb, bpp as u32, px + 1, py,     color);
-                        poke_pixel(base, pb, bpp as u32, px,     py + 1, color);
-                        poke_pixel(base, pb, bpp as u32, px + 1, py + 1, color);
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Draw a high-contrast grayscale probe pattern very early in boot.
-///
-/// This is intentionally simple and format-tolerant so it still appears on
-/// quirky EFI framebuffers where color channel ordering may differ.
-/// If this pattern is visible, we know execution reached kernel_main and the
-/// framebuffer pointer is writable.
-pub unsafe fn early_probe_pattern(
-    fb_addr: u64,
-    pitch_bytes: u64,
-    bpp: u16,
-    width: u64,
-    height: u64,
-) {
-    if fb_addr == 0 || bpp < 24 { return; }
-    let base = fb_addr as *mut u8;
-    let pb = pitch_bytes as usize;
-    let w = width as usize;
-    let h = height as usize;
-
-    // Keep the pattern bounded for performance on large displays.
-    let draw_h = h.min(220);
-
-    // Top 128px: horizontal grayscale gradient bars.
-    let grad_h = draw_h.min(128);
-    for y in 0..grad_h {
-        for x in 0..w {
-            let v = ((x * 255) / w.max(1)) as u32;
-            let gray = (v << 16) | (v << 8) | v;
-            unsafe { poke_pixel(base, pb, bpp as u32, x, y, gray); }
-        }
-    }
-
-    // Next section: high-contrast checkerboard to make pixel writes obvious.
-    for y in grad_h..draw_h {
-        for x in 0..w {
-            let block = ((x / 16) + (y / 16)) & 1;
-            let color = if block == 0 { 0x00FF_FFFF } else { 0x0000_0000 };
-            unsafe { poke_pixel(base, pb, bpp as u32, x, y, color); }
-        }
-    }
-}
 
 /// Initialise the framebuffer console from a Limine framebuffer response.
 ///

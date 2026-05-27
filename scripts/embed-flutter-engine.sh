@@ -31,10 +31,7 @@ mkdir -p "$DEST_DIR"
 
 echo "[embed-flutter-engine] Copying $SRC → $DEST_DIR/libflutter_engine.so"
 cp "$SRC" "$DEST_DIR/libflutter_engine.so"
-echo "[embed-flutter-engine] Done. Run a full rebuild to re-pack the initramfs."
-echo ""
-echo "  cd $WORKSPACE_ROOT"
-echo "  cargo +nightly build --package oscortex-kernel --target x86_64-unknown-none \\"
-echo "      -Z build-std=core,compiler_builtins,alloc \\"
-echo "      -Z build-std-features=compiler-builtins-mem"
+echo "[embed-flutter-engine] Done. Apply OSCortex engine patches before rebuilding:"
+echo "  python3 $WORKSPACE_ROOT/tools/flutter-engine/engine_patch.py --apply-all"
+echo "  bash $WORKSPACE_ROOT/scripts/build-iso.sh"
 

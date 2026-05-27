@@ -123,34 +123,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // ── 0. Early framebuffer banner ───────────────────────────────────────
-    // Paint a visible boot banner BEFORE anything else so that physical
-    // hardware (MacBook etc.) shows life even if an early panic occurs.
-    if let Some(fb_resp) = FB_REQUEST.response() {
-        let fbs = fb_resp.framebuffers();
-        if !fbs.is_empty() {
-            let fb = fbs[0];
-            if fb.bpp >= 24 {
-                unsafe {
-                    drivers::fb::early_probe_pattern(
-                        fb.address() as u64,
-                        fb.pitch as u64,
-                        fb.bpp,
-                        fb.width as u64,
-                        fb.height as u64,
-                    );
-                    drivers::fb::early_banner(
-                        fb.address() as u64,
-                        fb.pitch as u64,
-                        fb.bpp,
-                        fb.width as u64,
-                        fb.height as u64,
-                    );
-                }
-            }
-        }
-    }
-
     // ── 1. Architecture early init ────────────────────────────────────────
     arch::early_init();
     logger::early_print("[OSCORTEX] arch::early_init done\r\n");

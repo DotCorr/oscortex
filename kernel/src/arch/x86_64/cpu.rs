@@ -125,8 +125,26 @@ pub fn enable_fpu_simd() {
             );
 
             let (xsave_feat, _, _, _) = cpuid(0xD, 1);
-            XSAVE_ENABLED.store(true, Ordering::Release);
-            XSAVE_OPT_ENABLED.store((xsave_feat & 1) != 0, Ordering::Release);
+            // Keep XSAVE_MASK / xcr0 for informational use but force
+            // fxsave64/fxrstor64 unconditionally.
+            //
+            // QEMU TCG (and many real-hardware errata) have buggy XSTATE_BV /
+            // XINUSE tracking for xsaveopt/xsave: after xrstor hands a thread
+            // the INIT state (XMM=0), user code writes to XMM registers but
+            // TCG does NOT update the XINUSE dirty bit, so the subsequent
+            // xsaveopt records XSTATE_BV[SSE]=0 and skips writing the XMM
+            // values.  The next xrstor then resets all XMM back to zero,
+            // corrupting every float argument across context switches.
+            //
+            // fxsave64/fxrstor64 bypass XSTATE_BV entirely: they
+            // unconditionally save/restore all XMM0-15 + MXCSR.  CR4.OSXSAVE
+            // can stay set (needed for VZEROUPPER).
+            //
+            // TODO: re-enable XSAVE on tested bare-metal hardware once the
+            // QEMU development phase is complete.
+            let _xsave_opt_capable = (xsave_feat & 1) != 0;
+            XSAVE_ENABLED.store(false, Ordering::Release);
+            XSAVE_OPT_ENABLED.store(false, Ordering::Release);
             XSAVE_MASK.store(xcr0, Ordering::Release);
         } else {
             // Keep OSFXSR/OSXMMEXCPT for FXSAVE/FXRSTOR fallback path.

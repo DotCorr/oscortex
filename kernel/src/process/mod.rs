@@ -85,7 +85,23 @@ struct XStateBuf([u8; XSTATE_SIZE]);
 
 impl Default for XStateBuf {
     fn default() -> Self {
-        Self([0; XSTATE_SIZE])
+        let mut buf = Self([0; XSTATE_SIZE]);
+        // fxsave64 area layout (Intel SDM Vol.1 §13.4):
+        //   offset  0: FCW  (2 bytes) — x87 FPU control word
+        //   offset 24: MXCSR (4 bytes) — SSE control/status
+        //
+        // Default FCW = 0x037F: all x87 exceptions masked, 64-bit precision,
+        // round-to-nearest. Without this, new threads start with FCW=0
+        // (24-bit precision + all exceptions unmasked).
+        buf.0[0] = 0x7F;
+        buf.0[1] = 0x03;
+        // Default MXCSR = 0x1F80: all SSE floating-point exceptions masked,
+        // round-to-nearest, no flush-to-zero. Without this, new threads start
+        // with MXCSR=0 (all FP exceptions unmasked), which can trigger #XM
+        // faults on any SSE FP operation that produces a special value.
+        buf.0[24] = 0x80;
+        buf.0[25] = 0x1F;
+        buf
     }
 }
 
@@ -461,11 +477,18 @@ pub fn save_regs(pid: u32, regs: UserRegs) {
 }
 
 /// Save current CPU xstate image into process slot.
+///
+/// NOTE: intentionally does NOT check `p.state == Running`.  A blocking
+/// syscall sets the thread's state to `Blocked` *before* calling this
+/// function (to close a lost-wake race window), so the `Running` check
+/// would silently skip the save and leave the buffer stale.  At the
+/// call sites the CPU is always executing on behalf of `pid`, so saving
+/// the live XMM/YMM/MXCSR to that slot is always correct.
 pub fn save_xstate(pid: u32) {
     let idx = idx_of(pid);
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx] };
-    if p.pid != pid || p.state != ProcState::Running {
+    if p.pid != pid {
         return;
     }
     let ptr = p.xstate.0.as_mut_ptr();

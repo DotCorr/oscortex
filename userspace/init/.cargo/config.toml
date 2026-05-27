@@ -1,9 +1,0 @@
-[build]
-target = "x86_64-unknown-none"
-
-[target.x86_64-unknown-none]
-# The linker script path and -nostdlib/-static are injected by build.rs.
-# Use the small code model (default for user-space ELFs loaded at 0x400000).
-rustflags = [
-    "-C", "panic=abort",
-]
