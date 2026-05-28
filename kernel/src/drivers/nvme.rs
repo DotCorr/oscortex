@@ -118,16 +118,18 @@ struct NvmeState {
 static NVME: Mutex<Option<NvmeState>> = Mutex::new(None);
 static NVME_READY: AtomicBool = AtomicBool::new(false);
 
+use crate::arch::mmio;
+
 // ── Register accessors ───────────────────────────────────────────────────────
 
 #[inline] unsafe fn reg32_read(bar0: u64, off: usize) -> u32 {
-    core::ptr::read_volatile((bar0 + off as u64) as *const u32)
+    mmio::read32(bar0, off)
 }
 #[inline] unsafe fn reg32_write(bar0: u64, off: usize, v: u32) {
-    core::ptr::write_volatile((bar0 + off as u64) as *mut u32, v);
+    mmio::write32(bar0, off, v);
 }
 #[inline] unsafe fn reg64_write(bar0: u64, off: usize, v: u64) {
-    core::ptr::write_volatile((bar0 + off as u64) as *mut u64, v);
+    mmio::write64(bar0, off, v);
 }
 
 fn doorbell_off(state: &NvmeState, qid: u16, tail: bool) -> usize {

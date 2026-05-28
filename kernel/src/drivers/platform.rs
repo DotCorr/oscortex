@@ -1,7 +1,9 @@
 //! Platform driver bring-up — single entry from kernel main.
 //!
-//! PCI legacy and PS/2 drivers are x86/QEMU-profile devices today. Other
-//! architectures compile stub PCI/port backends and skip probe cleanly.
+//! All PCI/port/MMIO access stays in `arch/`; drivers register here and in the
+//! CDP registry when probe succeeds.
+
+use core::sync::atomic::Ordering;
 
 use crate::arch::pci;
 
@@ -18,22 +20,50 @@ pub fn init_early(qemu_like: bool) {
     }
 
     if pci::LEGACY_IO_AVAILABLE {
-        super::usb::probe();
+        super::usb::probe_and_init();
     }
+
+    register_input_natives(qemu_like);
 }
 
 /// Storage, serial, and networking (after VFS init).
 pub fn init_block_and_net() {
     super::uart::init();
+    let _ = super::registry::register_native(b"uart");
 
     if pci::LEGACY_IO_AVAILABLE {
         super::virtio_net::init();
         super::virtio_blk::init();
         super::nvme::init();
     } else {
-        log::info!("[Drivers] PCI legacy profile unavailable on this arch — block/NVMe/net skipped");
+        log::info!(
+            "[Drivers] PCI profile unavailable on this arch — block/NVMe/net skipped"
+        );
     }
+
+    register_block_natives();
 
     crate::app_store::init();
     crate::net::init();
+}
+
+fn register_input_natives(qemu_like: bool) {
+    if qemu_like && super::ps2::PS2_READY.load(Ordering::Acquire) {
+        let _ = super::registry::register_native(b"ps2");
+    }
+    if super::usb::is_ready() {
+        let _ = super::registry::register_native(b"xhci");
+    }
+}
+
+fn register_block_natives() {
+    if super::virtio_net::is_ready() {
+        let _ = super::registry::register_native(b"virtio-net");
+    }
+    if super::virtio_blk::is_ready() {
+        let _ = super::registry::register_native(b"virtio-blk");
+    }
+    if super::nvme::is_ready() {
+        let _ = super::registry::register_native(b"nvme");
+    }
 }

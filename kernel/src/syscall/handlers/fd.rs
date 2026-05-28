@@ -346,7 +346,7 @@ pub(crate) fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 let pid = crate::process::current_pid();
                 log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
                 unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
-                cooperative_yield_for_cond_resched(pid, 0);
+                cooperative_yield_for_cond_resched(pid, 8);
                 return 8;
             } else {
                 // Not yet fired (or not armed) — EAGAIN.

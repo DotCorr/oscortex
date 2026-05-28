@@ -157,33 +157,16 @@ struct InterruptGuard {
 impl InterruptGuard {
     #[inline(always)]
     fn new() -> Self {
-        let rflags: u64;
-        unsafe {
-            #[cfg(target_arch = "x86_64")]
-            core::arch::asm!(
-                "pushfq",
-                "pop {}",
-                out(reg) rflags,
-                options(nomem, preserves_flags)
-            );
-            #[cfg(not(target_arch = "x86_64"))]
-            { rflags = 0; }
-            #[cfg(target_arch = "x86_64")]
-            core::arch::asm!("cli", options(nomem, nostack));
+        Self {
+            rflags: crate::arch::interrupts_save_and_disable(),
         }
-        Self { rflags }
     }
 }
 
 impl Drop for InterruptGuard {
     #[inline(always)]
     fn drop(&mut self) {
-        if (self.rflags & 0x200) != 0 {
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                core::arch::asm!("sti", options(nomem, nostack));
-            }
-        }
+        crate::arch::interrupts_restore(self.rflags);
     }
 }
 

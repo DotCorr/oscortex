@@ -53,6 +53,45 @@ pub fn bar0_io_base(bus: u8, dev: u8, func: u8) -> u16 {
     }
 }
 
+/// BAR0 as a memory-mapped physical base (I/O-space BARs return None).
+pub fn bar0_mmio_phys(bus: u8, dev: u8, func: u8) -> Option<u64> {
+    let bar0_lo = config_read32(bus, dev, func, 0x10);
+    if bar0_lo & 1 != 0 {
+        return None;
+    }
+    let bar0_type = (bar0_lo >> 1) & 0x3;
+    let phys_lo = (bar0_lo & !0xF) as u64;
+    if bar0_type == 0x2 {
+        let bar0_hi = config_read32(bus, dev, func, 0x14) as u64;
+        Some((bar0_hi << 32) | phys_lo)
+    } else {
+        Some(phys_lo)
+    }
+}
+
+/// Locate a PCI function by class code; returns BDF + MMIO BAR0 physical base.
+pub fn find_device_pci(class: u8, subclass: u8, prog_if: u8) -> Option<(u8, u8, u8, u64)> {
+    for bus in 0u8..=255 {
+        for dev in 0u8..32 {
+            for func in 0u8..8 {
+                let id = config_read32(bus, dev, func, 0x00);
+                if id == 0xFFFF_FFFF {
+                    continue;
+                }
+                let cc = config_read32(bus, dev, func, 0x08);
+                let dev_class = ((cc >> 24) & 0xFF) as u8;
+                let dev_subclass = ((cc >> 16) & 0xFF) as u8;
+                let dev_progif = ((cc >> 8) & 0xFF) as u8;
+                if dev_class == class && dev_subclass == subclass && dev_progif == prog_if {
+                    let bar = bar0_mmio_phys(bus, dev, func)?;
+                    return Some((bus, dev, func, bar));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Scan bus 0 for a VirtIO device with the given vendor/device ID.
 pub fn find_virtio_legacy(bus: u8, vendor: u16, device: u16) -> Option<(u8, u8)> {
     for dev in 0u8..32 {
@@ -70,35 +109,7 @@ pub fn find_virtio_legacy(bus: u8, vendor: u16, device: u16) -> Option<(u8, u8)>
 /// Scan all buses for a device matching PCI class / subclass / prog-if;
 /// return the physical address of BAR0 (memory-mapped, 64-bit aware).
 pub fn find_device_bar0(class: u8, subclass: u8, prog_if: u8) -> Option<u64> {
-    for bus in 0u8..=255 {
-        for dev in 0u8..32 {
-            for func in 0u8..8 {
-                let id = config_read32(bus, dev, func, 0x00);
-                if id == 0xFFFF_FFFF {
-                    continue;
-                }
-                let cc = config_read32(bus, dev, func, 0x08);
-                let dev_class = ((cc >> 24) & 0xFF) as u8;
-                let dev_subclass = ((cc >> 16) & 0xFF) as u8;
-                let dev_progif = ((cc >> 8) & 0xFF) as u8;
-                if dev_class == class && dev_subclass == subclass && dev_progif == prog_if {
-                    let bar0_lo = config_read32(bus, dev, func, 0x10);
-                    if bar0_lo & 0x1 != 0 {
-                        continue;
-                    }
-                    let bar0_type = (bar0_lo >> 1) & 0x3;
-                    let phys_lo = (bar0_lo & !0xF) as u64;
-                    if bar0_type == 0x2 {
-                        let bar0_hi = config_read32(bus, dev, func, 0x14) as u64;
-                        return Some((bar0_hi << 32) | phys_lo);
-                    } else {
-                        return Some(phys_lo);
-                    }
-                }
-            }
-        }
-    }
-    None
+    find_device_pci(class, subclass, prog_if).map(|(_, _, _, bar)| bar)
 }
 
 /// Count devices matching class / subclass / prog-if (up to `max` results).

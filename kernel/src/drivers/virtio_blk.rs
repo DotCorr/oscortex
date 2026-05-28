@@ -388,16 +388,16 @@ fn do_sector_op(blk: &mut BlkState, typ: u32, sector: u64) -> Result<(), &'stati
         let qmask = (blk.queue_size - 1) as u32;
         let ai = (blk.avail_idx as u32) & qmask;
         vring_write_u16(vring_virt, layout.avail_ring_off + ai * 2, 0);
-        core::arch::asm!("mfence", options(nostack, nomem));
+        crate::arch::memory_fence();
         blk.avail_idx = blk.avail_idx.wrapping_add(1);
         vring_write_u16(vring_virt, layout.avail_idx_off, blk.avail_idx);
-        core::arch::asm!("mfence", options(nostack, nomem));
+        crate::arch::memory_fence();
 
         port_io::outw(blk.io_base + VIRTIO_QUEUE_NOTIFY, 0);
 
         let mut spins = 0usize;
         loop {
-            core::arch::asm!("mfence", options(nostack, nomem));
+            crate::arch::memory_fence();
             let _ = port_io::inb(blk.io_base + VIRTIO_ISR_STATUS);
             let used_idx = vring_read_u16(vring_virt, layout.used_idx_off);
             if used_idx != blk.used_idx {
@@ -408,7 +408,7 @@ fn do_sector_op(blk: &mut BlkState, typ: u32, sector: u64) -> Result<(), &'stati
             if spins > 5_000_000 {
                 return Err("virtio-blk: timeout");
             }
-            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+            crate::arch::spin_pause();
         }
 
         if req.status != 0 {

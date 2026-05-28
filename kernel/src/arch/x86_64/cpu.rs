@@ -262,3 +262,45 @@ pub unsafe fn restore_xstate_from(ptr: *const u8) {
     restore_xstate_inner(ptr);
 }
 
+/// Full memory fence for virtio/NVMe queue publishing.
+#[inline(always)]
+pub fn memory_fence() {
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, nomem));
+    }
+}
+
+/// Hint the CPU during poll loops.
+#[inline(always)]
+pub fn spin_pause() {
+    unsafe {
+        core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Save RFLAGS and disable interrupts; returns RFLAGS for [`interrupts_restore`].
+#[inline(always)]
+pub fn interrupts_save_and_disable() -> u64 {
+    let rflags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {}",
+            out(reg) rflags,
+            options(nomem, preserves_flags)
+        );
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+    rflags
+}
+
+/// Restore interrupt enable state from [`interrupts_save_and_disable`].
+#[inline(always)]
+pub fn interrupts_restore(rflags: u64) {
+    if rflags & 0x200 != 0 {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
+}
+

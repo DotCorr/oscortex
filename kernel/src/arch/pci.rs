@@ -18,6 +18,14 @@ cfg_if::cfg_if! {
             0
         }
 
+        pub fn bar0_mmio_phys(_bus: u8, _dev: u8, _func: u8) -> Option<u64> {
+            None
+        }
+
+        pub fn find_device_pci(_class: u8, _subclass: u8, _prog_if: u8) -> Option<(u8, u8, u8, u64)> {
+            None
+        }
+
         pub fn find_virtio_legacy(_bus: u8, _vendor: u16, _device: u16) -> Option<(u8, u8)> {
             None
         }

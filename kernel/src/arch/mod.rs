@@ -22,6 +22,25 @@ cfg_if::cfg_if! {
 pub mod pci;
 /// Legacy I/O port IN/OUT (arch backend in `arch/port_io.rs`).
 pub mod port_io;
+/// MMIO load/store helpers for mapped device BARs.
+pub mod mmio;
+
+cfg_if::cfg_if! {
+    if #[cfg(target_arch = "x86_64")] {
+        pub use x86_64::cpu::{interrupts_restore, interrupts_save_and_disable, memory_fence, spin_pause};
+    } else {
+        pub fn memory_fence() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        pub fn spin_pause() {
+            core::hint::spin_loop();
+        }
+        pub fn interrupts_save_and_disable() -> u64 {
+            0
+        }
+        pub fn interrupts_restore(_rflags: u64) {}
+    }
+}
 
 /// Trigger an ACPI S5 soft-off (architecture-specific implementation).
 pub fn acpi_shutdown() -> ! {

@@ -8,33 +8,43 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Deferred task-runner kick flag (set from APIC timer ISR).
 pub static KICK_REQUESTED: AtomicBool = AtomicBool::new(false);
-/// Set when a pthread_cond waiter timed out or must finish AcquiringMutex but
-/// cooperative scheduling may be starving it (no userspace timer preemption).
-pub static COND_RESCHED_NEEDED: AtomicBool = AtomicBool::new(false);
 
-/// Yield to a sibling that needs to finish a cond-wait state machine step.
-/// Called from high-frequency syscall paths (timerfd read) where other threads
-/// may otherwise never receive a cooperative schedule point.
-pub fn cooperative_yield_for_cond_resched(cur: u32, sys_nr: u64) {
-    if cur == 0 || !COND_RESCHED_NEEDED.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    let target = {
-        let cws = COND_WAIT_STATE.lock();
-        cws.iter().find_map(|(&pid, st)| {
-            if pid != cur && matches!(st, CondWaitState::AcquiringMutex { .. }) {
-                Some(pid)
-            } else {
-                None
+/// Running thread waiting to re-lock `mutex` after a cond wait step.
+pub fn acqmutex_waiter_for(mutex: u64, exclude: u32) -> Option<u32> {
+    let cws = COND_WAIT_STATE.lock();
+    for (&pid, st) in cws.iter() {
+        if pid == exclude {
+            continue;
+        }
+        if let CondWaitState::AcquiringMutex { mutex: m, .. } = st {
+            if *m == mutex && crate::process::get_user_context(pid).is_some() {
+                return Some(pid);
             }
-        })
-    };
-    let Some(next) = target.or_else(|| crate::process::next_runnable_pid(cur)) else {
-        return;
-    };
-    if next == cur {
-        return;
+        }
     }
+    None
+}
+
+/// Pick a thread that needs to finish a cond-wait state machine step.
+fn cond_resched_target(exclude: u32) -> Option<u32> {
+    let cws = COND_WAIT_STATE.lock();
+    for (&pid, st) in cws.iter() {
+        if pid == exclude {
+            continue;
+        }
+        if let CondWaitState::AcquiringMutex { .. } = st {
+            if crate::process::is_blocked(pid) {
+                crate::process::set_state(pid, crate::process::ProcState::Running);
+            }
+            if crate::process::get_user_context(pid).is_some() {
+                return Some(pid);
+            }
+        }
+    }
+    None
+}
+
+fn perform_cooperative_yield(cur: u32, sys_nr: u64, next: u32) -> ! {
     let urip = crate::arch::syscall::user_rip();
     let ursp = crate::arch::syscall::user_rsp();
     crate::process::save_return_context(cur, urip, ursp);
@@ -42,6 +52,40 @@ pub fn cooperative_yield_for_cond_resched(cur: u32, sys_nr: u64) {
     crate::process::set_rax(cur, sys_nr);
     crate::process::save_xstate(cur);
     crate::process::enter_user_by_pid_noreturn(next);
+}
+
+/// Yield from high-frequency syscall paths so sibling threads make progress.
+/// Cooperative-only (no userspace timer preemption on x86_64 yet).
+pub fn cooperative_yield_for_cond_resched(cur: u32, sys_nr: u64) {
+    cooperative_yield_to(cur, sys_nr, None);
+}
+
+/// Like [`cooperative_yield_for_cond_resched`] but prefer a specific target pid.
+pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
+    if cur == 0 {
+        return;
+    }
+
+    static YIELD_TICK: AtomicU32 = AtomicU32::new(0);
+    let tick = YIELD_TICK.fetch_add(1, Ordering::Relaxed);
+
+    let next = prefer
+        .filter(|&p| p != cur && crate::process::get_user_context(p).is_some())
+        .or_else(|| cond_resched_target(cur))
+        .or_else(|| {
+            if (tick & 31) == 0 {
+                crate::process::next_runnable_sibling_thread(cur)
+            } else {
+                None
+            }
+        });
+    let Some(next) = next else {
+        return;
+    };
+    if next == cur || crate::process::get_user_context(next).is_none() {
+        return;
+    }
+    perform_cooperative_yield(cur, sys_nr, next);
 }
 
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
@@ -198,26 +242,25 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
     (tfds.len() + efds.len(), woken)
 }
 
-/// Complete a timed-out pthread_cond_timedwait without re-entering the full
-/// state machine (cooperative scheduling may never run the thread again).
-fn inject_cond_timedout_return(pid: u32, mutex: u64) {
+/// Complete one timed-out cond waiter stuck in AcquiringMutex with a free mutex.
+fn finish_cond_timedout_return(pid: u32, mutex: u64) {
     if pid == 0 {
         return;
     }
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
-    let _ = atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire);
+    if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_err() {
+        return;
+    }
     if let Some((rip, rsp)) = crate::process::get_saved_rip_rsp(pid) {
-        // Yield paths save RIP at the SYSCALL insn; advance past it.
         crate::process::save_return_context(pid, rip.wrapping_add(2), rsp);
     }
-    crate::process::set_rax(pid, 110); // ETIMEDOUT
+    crate::process::set_rax(pid, 110);
     COND_WAIT_STATE.lock().remove(&pid);
     crate::process::set_state(pid, crate::process::ProcState::Running);
-    COND_RESCHED_NEEDED.store(true, Ordering::Release);
-    static INJECT_LOG: AtomicU32 = AtomicU32::new(0);
-    let n = INJECT_LOG.fetch_add(1, Ordering::Relaxed);
+    static FINISH_LOG: AtomicU32 = AtomicU32::new(0);
+    let n = FINISH_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n % 64 == 0 {
-        log::warn!("[cond-timeout-inject] #{} pid={} mutex={:#x}", n, pid, mutex);
+        log::warn!("[cond-timedout-finish] #{} pid={} mutex={:#x}", n, pid, mutex);
     }
 }
 
@@ -245,51 +288,26 @@ pub fn check_timerfds_and_wake() {
         epoll_wake(fd);
     }
 
-    // Expire timed-out pthread_cond_timedwait waiters.
-    // Without this, Blocked threads whose deadline passed never get rescheduled
-    // because next_runnable_pid only considers ProcState::Running threads and
-    // the cond-wait state machine only advances when re-entered via syscall.
-    let mut expired: Vec<(u32, u64, u64)> = Vec::new(); // (pid, cond, mutex)
-    {
-        let mut cws = COND_WAIT_STATE.lock();
-        for (&pid, state) in cws.iter_mut() {
-            if let CondWaitState::Waiting { cond, mutex, timeout_ns, .. } = *state {
-                if timeout_ns != 0 && now >= timeout_ns {
-                    *state = CondWaitState::AcquiringMutex { mutex, timed_out: true };
-                    expired.push((pid, cond, mutex));
-                }
-            }
-        }
-    }
-    for (pid, cond, mutex) in expired {
-        futex_waiter_remove(cond, pid);
-        inject_cond_timedout_return(pid, mutex);
-        static TIMEOUT_EXPIRE_LOG: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        let n = TIMEOUT_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 64 == 0 {
-            log::warn!("[cond-timeout-expire] #{} pid={} cond={:#x}", n, pid, cond);
-        }
-    }
+    // Timed pthread_cond wait expiry is handled inside
+    // sys_pthread_cond_wait_timeout when the thread is scheduled (matches the
+    // working run-visible.log profile — no kernel-side inject/expire).
 
-    // Finish any timed-out cond waiters stuck in AcquiringMutex (mutex free
-    // but thread never got a cooperative schedule point).
+    // Finish at most one timed-out AcquiringMutex waiter per tick (mutex free).
     {
-        let stuck: alloc::vec::Vec<(u32, u64)> = {
+        let stuck = {
             let cws = COND_WAIT_STATE.lock();
             cws.iter()
-                .filter_map(|(&pid, st)| {
+                .find_map(|(&pid, st)| {
                     if let CondWaitState::AcquiringMutex {
                         mutex,
                         timed_out: true,
-                    } = st
+                    } = *st
                     {
-                        let mutex_addr = *mutex;
                         let atom = unsafe {
-                            &*(mutex_addr as *const core::sync::atomic::AtomicU32)
+                            &*(mutex as *const core::sync::atomic::AtomicU32)
                         };
                         if atom.load(Ordering::Acquire) == 0 {
-                            Some((pid, mutex_addr))
+                            Some((pid, mutex))
                         } else {
                             None
                         }
@@ -297,10 +315,9 @@ pub fn check_timerfds_and_wake() {
                         None
                     }
                 })
-                .collect()
         };
-        for (pid, mutex) in stuck {
-            inject_cond_timedout_return(pid, mutex);
+        if let Some((pid, mutex)) = stuck {
+            finish_cond_timedout_return(pid, mutex);
         }
     }
 
@@ -765,6 +782,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if n < 32 {
             log::warn!("[epoll_fire] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
         }
+        cooperative_yield_for_cond_resched(cur, ready as u64);
         return ready as i64;
     }
     if epfd == 70 {
@@ -804,6 +822,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             if n < 32 {
                 log::warn!("[epoll_fire_loop] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
             }
+            cooperative_yield_for_cond_resched(cur, ready as u64);
             return ready as i64;
         }
         if !infinite {

@@ -53,7 +53,7 @@ Flutter  →  syscalls (abi.rs)  →  compositor/WM/policy  →  drivers/  →  
 ## Adding hardware (short checklist)
 
 1. Driver in `kernel/src/drivers/` (native) or CDP WASM via `driver_gen.rs`.
-2. MMIO/PCI only through `kernel/src/arch/`.
+2. MMIO/PCI only through `kernel/src/arch/` (`pci`, `port_io`, `mmio`, `cpu`).
 3. Expose via **syscalls** or WM events — not userspace MMIO.
 4. Update status in `docs/hardware.txt`.
 5. Flutter via platform channel or existing WM — no parallel render path.
@@ -67,7 +67,9 @@ Flutter  →  syscalls (abi.rs)  →  compositor/WM/policy  →  drivers/  →  
 | `docs/hardware.txt` | Canonical hardware document + compliance table |
 | `kernel/src/arch/pci.rs` | PCI facade (all driver probing) |
 | `kernel/src/arch/port_io.rs` | Legacy I/O port facade |
+| `kernel/src/arch/mmio.rs` | MMIO load/store facade |
 | `kernel/src/drivers/platform.rs` | Single driver init entry from main |
+| `kernel/src/drivers/registry.rs` | Native + WASM driver registry |
 | `kernel/src/embedder/abi.rs` | Stable syscall numbers |
 | `kernel/src/drivers/` | Native drivers |
 | `kernel/src/compositor/` | Surfaces, gpu_submit, vsync |
@@ -80,11 +82,12 @@ Flutter  →  syscalls (abi.rs)  →  compositor/WM/policy  →  drivers/  →  
 | Rule | Status |
 |------|--------|
 | Syscalls-only userspace | ✅ |
-| PCI/port via `arch/` | ✅ |
+| PCI/port/MMIO via `arch/` | ✅ |
 | `drivers/platform.rs` init | ✅ |
+| Native drivers in registry at boot | ✅ |
 | Compositor canonical render | ✅ (`fb_map` no longer bypasses) |
-| CDP runtime drivers | ⏳ scaffold |
-| All device classes on all CPUs | ⏳ x86 full; other arches stub |
+| CDP WASM runtime load/heal | ✅ sandbox + quarantine; AI gen TBD |
+| All device classes on all CPUs | x86 full profile; other arches skip PCI cleanly |
 
 ---
 

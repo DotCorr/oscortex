@@ -630,6 +630,10 @@ pub fn sys_pthread_mutex_unlock(mutex: u64) -> i64 {
             }
         }
     }
+    let prefer = super::poll::acqmutex_waiter_for(mutex, wpid);
+    if prefer.is_some() {
+        super::poll::cooperative_yield_to(wpid, 0, prefer);
+    }
     0
 }
 
@@ -973,7 +977,9 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
     log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
     let wpid = crate::process::current_pid();
     if wpid != 0 && (n > 0 || bridged > 0) {
-        if let Some(next) = crate::process::next_runnable_pid(wpid) {
+        if let Some(next) = crate::process::next_runnable_sibling_thread(wpid)
+            .or_else(|| crate::process::next_runnable_pid(wpid))
+        {
             if next != wpid {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
@@ -1072,7 +1078,9 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     
     let wpid = crate::process::current_pid();
     if wpid != 0 && (n > 0 || bridged > 0) {
-        if let Some(next) = crate::process::next_runnable_pid(wpid) {
+        if let Some(next) = crate::process::next_runnable_sibling_thread(wpid)
+            .or_else(|| crate::process::next_runnable_pid(wpid))
+        {
             if next != wpid {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();

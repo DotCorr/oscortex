@@ -72,7 +72,7 @@
   NVMe           drivers/nvme.rs               block catalog            ✅
   Network        drivers/virtio_net.rs         SYS_NET_*                ✅ basic
   Serial         drivers/uart.rs               —                        ✅
-  USB host       drivers/usb.rs                SYS_USB_CONTROLLER_COUNT   ⏳ query only
+  USB host       drivers/usb.rs                SYS_USB_CONTROLLER_COUNT   ✅ MMIO+reset
   PTY            drivers/pty.rs                POSIX tty                  ✅
   Audio out/in   —                             platform channel (TBD)   ·
   Touchpad       —                             WM pointer (TBD)         ·
@@ -114,8 +114,8 @@
 
   Phase A — Native Rust (now)
     • Location: kernel/src/drivers/<name>.rs
-    • Registration: drivers/platform.rs + drivers/mod.rs
-    • Arch-specific MMIO/PCI/port I/O: crate::arch::pci and crate::arch::port_io ONLY
+    • Registration: drivers/platform.rs → drivers/registry.rs (register_native)
+    • Arch-specific MMIO/PCI/port I/O: arch/pci · arch/port_io · arch/mmio · arch/cpu
     • Export capability via syscalls or WM/compositor — not raw registers
 
   Phase B — CDP WASM (target)
@@ -163,7 +163,7 @@
 
   • Second render path (kernel demo UI, bypass compositor for “speed”)
   • Userspace driver talking to MMIO/PCI config space
-  • Inline PCI/port I/O asm inside driver modules (use arch/pci + arch/port_io)
+  • Inline PCI/port I/O asm inside driver modules (use arch/pci + arch/port_io + arch/mmio)
   • “Temporary” driver fork — pivot = delete old path (see arch.txt)
   • Assuming virtio-blk driver implies audio/touchpad works
   • Blocking shell milestone on GPU vendor drivers
@@ -177,17 +177,33 @@
   ───────────────────────────────────────  ─────────────────────────────
   Hardware access only in kernel           ✅
   Flutter via syscalls only                ✅ (embedder uses gpu_submit path)
-  PCI/port I/O via arch/ shims             ✅ (arch/pci.rs, arch/port_io.rs)
+  PCI/port/MMIO via arch/ shims            ✅ pci · port_io · mmio · cpu
   Single platform init entry               ✅ drivers/platform.rs
   One canonical render path (compositor)   ✅ fb_map no longer sets FB_BYPASS
-  CDP WASM registry (runtime drivers)      ⏳ scaffold — Cortex healing TBD
-  Multi-arch native drivers                ⏳ stubs compile; x86_64 = full profile
+  Native drivers in CDP registry at boot   ✅ register_native from platform.rs
+  CDP WASM runtime load/heal               ✅ null-driver sandbox; AI gen TBD
+  Multi-arch compile                       ✅ non-x86 PCI returns None (no probe)
   Audio / touchpad / USB HID               · not started (documented)
 
+  Verdict by driver (framework layering):
+
+  Driver          Role                         Userspace API           Compliant?
+  ──────────────  ───────────────────────────  ──────────────────────  ──────────
+  compositor      Surface blit + vsync         gpu_submit_*, surface_*  ✅
+  fb              Limine text + blit target    kernel logger only      ✅
+  ps2             Keyboard/mouse               WM EV_KEY / EV_POINTER  ✅
+  virtio_blk      Disk                         VFS / app_store         ✅
+  virtio_net      NIC                          SYS_NET_*               ✅
+  nvme            NVMe disk                    block syscalls          ✅
+  uart            Serial                       kernel log / debug      ✅
+  usb             XHCI probe + MMIO reset      SYS_USB_CONTROLLER_COUNT ✅
+  pty             Terminals                    POSIX via syscalls      ✅
+  registry        Native + WASM driver table   Cortex CDP              ✅
+
   Machine profiles:
-    x86_64 QEMU (run-qemu.sh)  — PS/2, virtio-blk/net, NVMe, compositor ✅
+    x86_64 QEMU (run-qemu.sh)  — PS/2, virtio-blk/net, NVMe, XHCI, compositor ✅
     x86_64 bare metal          — PS/2 skipped by default (safe mode)
-    aarch64 / riscv64          — PCI stubs; drivers skip probe cleanly
+    aarch64 / riscv64          — arch PCI unavailable; drivers skip probe cleanly
 
   Runtime AI-generated drivers (post-UI): CDP WASM modules loaded via
   drivers/registry.rs + cortex/driver_gen.rs — same ABI on every CPU.
@@ -200,6 +216,7 @@
   kernel/src/arch/                  CPU abstraction
   kernel/src/arch/pci.rs            PCI facade (x86 backend + arch stubs)
   kernel/src/arch/port_io.rs        Legacy I/O port facade
+  kernel/src/arch/mmio.rs           MMIO load/store facade
   kernel/src/drivers/platform.rs    Single driver init entry
   kernel/src/drivers/               native drivers
   kernel/src/compositor/            surfaces, gpu_submit, vsync flip

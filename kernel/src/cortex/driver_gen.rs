@@ -165,6 +165,39 @@ impl DriverRegistry {
         Ok(id)
     }
 
+    /// Register a built-in native driver already linked into the kernel.
+    pub fn register_native(&mut self, name: &[u8]) -> Result<u32, LoadError> {
+        if self.count >= MAX_DRIVERS {
+            return Err(LoadError::RegistryFull);
+        }
+
+        let id = self.count as u32;
+        let mut driver_name = [0u8; 64];
+        let copy_len = name.len().min(63);
+        driver_name[..copy_len].copy_from_slice(&name[..copy_len]);
+
+        self.drivers[self.count] = Some(DriverInstance {
+            id,
+            name: driver_name,
+            wasm_hash: [0u8; 32],
+            state: DriverState::Active,
+            loaded_at: crate::arch::rdtsc(),
+            error_count: 0,
+            vtable: DriverVtable::null(),
+            sandbox: None,
+        });
+        self.count += 1;
+
+        let name_str = core::str::from_utf8(&driver_name[..copy_len]).unwrap_or("?");
+        log::info!("[Cortex::DriverGen] Native driver '{}' registered (id={})", name_str, id);
+
+        Ok(id)
+    }
+
+    pub fn count(&self) -> usize {
+        self.count
+    }
+
     /// Quarantine a driver — route all calls to null stubs.
     pub fn quarantine(&mut self, id: u32) {
         if let Some(Some(d)) = self.drivers.get_mut(id as usize) {
@@ -282,15 +315,17 @@ pub enum LoadError {
 
 // ── Subsystem interface ───────────────────────────────────────────────────────
 
-static REGISTRY: spin::Mutex<DriverRegistry> = spin::Mutex::new(DriverRegistry::new());
-
 pub fn init() {
-    log::info!("[Cortex::DriverGen] CDP driver registry ready (capacity: {})", MAX_DRIVERS);
+    log::info!(
+        "[Cortex::DriverGen] CDP driver registry ready (capacity: {})",
+        MAX_DRIVERS
+    );
 
-    // Load the built-in null driver to prove the WASM sandbox is working.
-    let result = REGISTRY.lock().load(b"null-driver", NULL_DRIVER_WASM);
-    match result {
-        Ok(id) => log::info!("[Cortex::DriverGen] Built-in null driver loaded (id={}) — WASM sandbox OK", id),
+    match crate::drivers::registry::load(b"null-driver", NULL_DRIVER_WASM) {
+        Ok(id) => log::info!(
+            "[Cortex::DriverGen] Built-in null driver loaded (id={}) — WASM sandbox OK",
+            id
+        ),
         Err(e) => log::error!("[Cortex::DriverGen] Built-in driver load failed: {:?}", e),
     }
 }
