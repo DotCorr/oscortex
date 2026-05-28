@@ -45,14 +45,12 @@ const STATUS_MOUSE: u8 = 0x20;
 
 #[inline(always)]
 unsafe fn in8(port: u16) -> u8 {
-    let v: u8;
-    core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack));
-    v
+    crate::arch::port_io::inb(port)
 }
 
 #[inline(always)]
 unsafe fn out8(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    crate::arch::port_io::outb(port, val);
 }
 
 /// Wait until the 8042 input buffer is empty (ready for a new command).

@@ -818,6 +818,16 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     && (timeout_ns == 0 || monotonic_ns() < timeout_ns)
                     && super::futex_waiter_present(cond, pid) 
                 {
+                    // Timer expiry in check_timerfds_and_wake() can transition this
+                    // thread to AcquiringMutex without bumping the cond seq.  Break
+                    // out so the state machine can finish (fixes pid 8/9 stuck in
+                    // AcquiringMutex { timed_out: true } forever).
+                    if let Some(st) = super::COND_WAIT_STATE.lock().get(&pid).copied() {
+                        if !matches!(st, super::CondWaitState::Waiting { .. }) {
+                            state = Some(st);
+                            break;
+                        }
+                    }
                     if super::KICK_REQUESTED.swap(false, Ordering::AcqRel) {
                         let _ = super::force_wake_all_task_runners("cond-wait-kick");
                     }
@@ -836,6 +846,13 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                             crate::process::set_state(pid, crate::process::ProcState::Blocked);
                             crate::process::enter_user_by_pid_noreturn(next);
                         }
+                    }
+                }
+
+                if let Some(st) = super::COND_WAIT_STATE.lock().get(&pid).copied() {
+                    if !matches!(st, super::CondWaitState::Waiting { .. }) {
+                        state = Some(st);
+                        continue;
                     }
                 }
 
@@ -859,7 +876,13 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
             }
 
             super::CondWaitState::AcquiringMutex { mutex, timed_out } => {
-                // Try to acquire the mutex (using the new sys_pthread_mutex_lock logic, retrying sys_nr on yield)
+                // Fast path: mutex already free — avoid yield loop when timer
+                // expiry or bridge already decided this thread should proceed.
+                let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
+                if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+                    super::COND_WAIT_STATE.lock().remove(&pid);
+                    return if timed_out { 110 } else { 0 };
+                }
                 let rc = sys_pthread_mutex_lock(mutex, sys_nr);
                 if rc == 0 {
                     // Successfully acquired the mutex! Clear wait state and return

@@ -10,66 +10,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-// ── PCI helpers (same as virtio_net) ─────────────────────────────────────────
-
-#[inline]
-fn pci_cfg_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let addr: u32 = (1 << 31)
-        | ((bus  as u32) << 16)
-        | ((dev  as u32) << 11)
-        | ((func as u32) <<  8)
-        | ((offset & 0xFC) as u32);
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nostack, nomem));
-        let v: u32;
-        core::arch::asm!("in eax, dx",  in("dx") 0xCFCu16, out("eax") v,   options(nostack, nomem));
-        v
-    }
-}
-
-#[inline]
-fn pci_cfg_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-    let addr: u32 = (1 << 31)
-        | ((bus  as u32) << 16)
-        | ((dev  as u32) << 11)
-        | ((func as u32) <<  8)
-        | ((offset & 0xFC) as u32);
-    unsafe {
-        core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr, options(nostack, nomem));
-        core::arch::asm!("out dx, eax", in("dx") 0xCFCu16, in("eax") val,  options(nostack, nomem));
-    }
-}
-
-#[inline]
-unsafe fn inb(port: u16) -> u8 {
-    let v: u8;
-    core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack));
-    v
-}
-#[inline]
-unsafe fn inw(port: u16) -> u16 {
-    let v: u16;
-    core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack));
-    v
-}
-#[inline]
-unsafe fn inl(port: u16) -> u32 {
-    let v: u32;
-    core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack));
-    v
-}
-#[inline]
-unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
-}
-#[inline]
-unsafe fn outl(port: u16, val: u32) {
-    core::arch::asm!("out dx, eax", in("dx") port, in("eax") val, options(nomem, nostack));
-}
-#[inline]
-unsafe fn outw_ext(port: u16, val: u16) {
-    core::arch::asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack));
-}
+use crate::arch::{pci, port_io};
 
 // ── virtio legacy I/O register offsets ───────────────────────────────────────
 const VIRTIO_DEVICE_FEATURES:      u16 = 0x00;
@@ -232,51 +173,48 @@ fn alloc_dma(qsize: u16) -> Option<BlkDma> {
 // ── PCI probe ─────────────────────────────────────────────────────────────────
 
 pub fn init() {
-    'outer: for dev in 0u8..32 {
-        let id = pci_cfg_read32(0, dev, 0, 0x00);
-        if id == 0xFFFF_FFFF { continue; }
-        let vendor = (id & 0xFFFF) as u16;
-        let device = (id >> 16) as u16;
-        if vendor != 0x1AF4 { continue; }
-        if device != 0x1001 { continue; }
+    if !pci::LEGACY_IO_AVAILABLE {
+        log::info!("[virtio-blk] skipped — no legacy PCI on this arch");
+        return;
+    }
+    let Some((bus, dev)) = pci::find_virtio_legacy(0, 0x1AF4, 0x1001) else {
+        log::info!("[virtio-blk] no device on PCI bus 0");
+        return;
+    };
 
-        let bar0_raw = pci_cfg_read32(0, dev, 0, 0x10);
-        if bar0_raw & 1 == 0 {
-            log::warn!("[virtio-blk] BAR0 is MMIO — only I/O BARs supported");
-            continue;
-        }
-        let io_base = (bar0_raw & !0x3) as u16;
+    let io_base = pci::bar0_io_base(bus, dev, 0);
+    if io_base == 0 {
+        log::warn!("[virtio-blk] BAR0 is MMIO — only I/O BARs supported");
+        return;
+    }
 
-        let cmd = pci_cfg_read32(0, dev, 0, 0x04);
-        pci_cfg_write32(0, dev, 0, 0x04, cmd | 0x5);
+    pci::enable_io_and_busmaster(bus, dev, 0);
+    log::info!("[virtio-blk] found PCI {:02x}.{} I/O base={:#x}", bus, dev, io_base);
 
-        log::info!("[virtio-blk] found PCI {:02x}.{} I/O base={:#x}", dev, 0, io_base);
-
-        if setup_device(io_base) {
-            break 'outer;
-        }
+    if setup_device(io_base) {
+        return;
     }
 }
 
 fn setup_device(io_base: u16) -> bool {
     unsafe {
-        outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_RESET);
-        outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
-        outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        port_io::outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_RESET);
+        port_io::outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        port_io::outb(io_base + VIRTIO_DEVICE_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
 
-        let features = inl(io_base + VIRTIO_DEVICE_FEATURES);
+        let features = port_io::inl(io_base + VIRTIO_DEVICE_FEATURES);
         let read_only = (features & VIRTIO_BLK_F_RO) != 0;
-        outl(io_base + VIRTIO_GUEST_FEATURES, 0);
+        port_io::outl(io_base + VIRTIO_GUEST_FEATURES, 0);
 
-        outb(io_base + VIRTIO_DEVICE_STATUS,
+        port_io::outb(io_base + VIRTIO_DEVICE_STATUS,
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
 
-        let cap_lo = inl(io_base + VIRTIO_BLK_CONFIG_CAP_LO) as u64;
-        let cap_hi = inl(io_base + VIRTIO_BLK_CONFIG_CAP_HI) as u64;
+        let cap_lo = port_io::inl(io_base + VIRTIO_BLK_CONFIG_CAP_LO) as u64;
+        let cap_hi = port_io::inl(io_base + VIRTIO_BLK_CONFIG_CAP_HI) as u64;
         let capacity = (cap_hi << 32) | cap_lo;
 
-        outw_ext(io_base + VIRTIO_QUEUE_SELECT, 0);
-        let qsize = inw(io_base + VIRTIO_QUEUE_SIZE);
+        port_io::outw(io_base + VIRTIO_QUEUE_SELECT, 0);
+        let qsize = port_io::inw(io_base + VIRTIO_QUEUE_SIZE);
         if VringLayout::for_qsize(qsize).is_none() {
             log::warn!("[virtio-blk] invalid queue size {}", qsize);
             return false;
@@ -290,9 +228,9 @@ fn setup_device(io_base: u16) -> bool {
             }
         };
 
-        outl(io_base + VIRTIO_QUEUE_ADDRESS, (dma.vring_phys >> 12) as u32);
+        port_io::outl(io_base + VIRTIO_QUEUE_ADDRESS, (dma.vring_phys >> 12) as u32);
 
-        outb(io_base + VIRTIO_DEVICE_STATUS,
+        port_io::outb(io_base + VIRTIO_DEVICE_STATUS,
             VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
 
         let vring_phys = dma.vring_phys;
@@ -455,12 +393,12 @@ fn do_sector_op(blk: &mut BlkState, typ: u32, sector: u64) -> Result<(), &'stati
         vring_write_u16(vring_virt, layout.avail_idx_off, blk.avail_idx);
         core::arch::asm!("mfence", options(nostack, nomem));
 
-        outw_ext(blk.io_base + VIRTIO_QUEUE_NOTIFY, 0);
+        port_io::outw(blk.io_base + VIRTIO_QUEUE_NOTIFY, 0);
 
         let mut spins = 0usize;
         loop {
             core::arch::asm!("mfence", options(nostack, nomem));
-            let _ = inb(blk.io_base + VIRTIO_ISR_STATUS);
+            let _ = port_io::inb(blk.io_base + VIRTIO_ISR_STATUS);
             let used_idx = vring_read_u16(vring_virt, layout.used_idx_off);
             if used_idx != blk.used_idx {
                 blk.used_idx = used_idx;

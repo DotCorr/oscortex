@@ -7,55 +7,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
-// ── PCI helpers ───────────────────────────────────────────────────────────────
-
-#[inline]
-fn pci_cfg_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
-    let addr: u32 = (1 << 31)
-        | ((bus  as u32) << 16)
-        | ((dev  as u32) << 11)
-        | ((func as u32) <<  8)
-        | ((offset & 0xFC) as u32);
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx")  0xCF8u16,
-            in("eax") addr,
-            options(nostack, nomem)
-        );
-        let val: u32;
-        core::arch::asm!(
-            "in eax, dx",
-            in("dx")  0xCFCu16,
-            out("eax") val,
-            options(nostack, nomem)
-        );
-        val
-    }
-}
-
-#[inline]
-fn pci_cfg_write32(bus: u8, dev: u8, func: u8, offset: u8, val: u32) {
-    let addr: u32 = (1 << 31)
-        | ((bus  as u32) << 16)
-        | ((dev  as u32) << 11)
-        | ((func as u32) <<  8)
-        | ((offset & 0xFC) as u32);
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx")  0xCF8u16,
-            in("eax") addr,
-            options(nostack, nomem)
-        );
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx")  0xCFCu16,
-            in("eax") val,
-            options(nostack, nomem)
-        );
-    }
-}
+use crate::arch::{pci, port_io};
 
 // ── virtio-net packet buffer ──────────────────────────────────────────────────
 
@@ -99,23 +51,19 @@ static NET: Mutex<VirtioNetState> = Mutex::new(VirtioNetState {
 
 #[inline]
 unsafe fn vio_read32(base: u16, offset: u16) -> u32 {
-    let mut v: u32;
-    core::arch::asm!("in eax, dx", in("dx") base + offset, out("eax") v, options(nostack, nomem));
-    v
+    port_io::inl(base + offset)
 }
 #[inline]
 unsafe fn vio_write32(base: u16, offset: u16, v: u32) {
-    core::arch::asm!("out dx, eax", in("dx") base + offset, in("eax") v, options(nostack, nomem));
+    port_io::outl(base + offset, v);
 }
 #[inline]
 unsafe fn vio_read8(base: u16, offset: u16) -> u8 {
-    let mut v: u8;
-    core::arch::asm!("in al, dx", in("dx") base + offset, out("al") v, options(nostack, nomem));
-    v
+    port_io::inb(base + offset)
 }
 #[inline]
 unsafe fn vio_write8(base: u16, offset: u16, v: u8) {
-    core::arch::asm!("out dx, al", in("dx") base + offset, in("al") v, options(nostack, nomem));
+    port_io::outb(base + offset, v);
 }
 
 // virtio legacy registers (relative to I/O BAR)
@@ -136,49 +84,22 @@ const VIRTIO_F_CSUM_OFFLOAD:     u32 = 1 << 0;
 
 // ── Probe + init ──────────────────────────────────────────────────────────────
 
-/// Scan PCI bus 0 for a virtio-net device.  Returns `(bus, dev)` if found.
-fn pci_find_virtio_net() -> Option<(u8, u8)> {
-    for dev in 0u8..32 {
-        let id = pci_cfg_read32(0, dev, 0, 0);
-        let vendor = (id & 0xFFFF) as u16;
-        let device = (id >> 16) as u16;
-        if vendor == 0x1AF4 && (device == 0x1000 || device == 0x1041) {
-            return Some((0, dev));
-        }
-    }
-    None
-}
-
-/// Read the I/O BAR (BAR0) for a PCI device.
-fn pci_io_bar(bus: u8, dev: u8) -> u16 {
-    let bar0 = pci_cfg_read32(bus, dev, 0, 0x10);
-    // BAR0 is I/O if bit 0 is set; mask the flag bits.
-    if bar0 & 1 == 1 {
-        (bar0 & 0xFFFC) as u16
-    } else {
-        0
-    }
-}
-
-/// Enable PCI bus-mastering + I/O space for the device.
-fn pci_enable_device(bus: u8, dev: u8) {
-    let cmd = pci_cfg_read32(bus, dev, 0, 0x04);
-    // bit 0 = I/O space, bit 2 = bus master
-    pci_cfg_write32(bus, dev, 0, 0x04, cmd | 0x05);
-}
-
 /// Initialise the virtio-net device.  Fills `NET` on success.
 pub fn init() {
-    let (bus, dev) = match pci_find_virtio_net() {
-        Some(d) => d,
-        None => {
-            log::info!("[virtio-net] no device found on PCI bus 0");
-            return;
-        }
+    if !pci::LEGACY_IO_AVAILABLE {
+        log::info!("[virtio-net] skipped — no legacy PCI on this arch");
+        return;
+    }
+
+    let Some((bus, dev)) = pci::find_virtio_legacy(0, 0x1AF4, 0x1000)
+        .or_else(|| pci::find_virtio_legacy(0, 0x1AF4, 0x1041))
+    else {
+        log::info!("[virtio-net] no device found on PCI bus 0");
+        return;
     };
 
-    pci_enable_device(bus, dev);
-    let io_base = pci_io_bar(bus, dev);
+    pci::enable_io_and_busmaster(bus, dev, 0);
+    let io_base = pci::bar0_io_base(bus, dev, 0);
     if io_base == 0 {
         log::warn!("[virtio-net] BAR0 is not an I/O BAR — skipping");
         return;

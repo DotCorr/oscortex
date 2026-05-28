@@ -5,9 +5,10 @@ alwaysApply: true
 
 # OSCortex
 
-Read **docs/arch.txt** and project skills before structural work:
+Read **docs/arch.txt**, **docs/hardware.txt**, and project skills before structural work:
 
 - `.cursor/skills/oscortex-architecture/SKILL.md`
+- `.cursor/skills/oscortex-hardware/SKILL.md` (drivers, display, input, device classes)
 - `.cursor/skills/codebase-audit-cleanup/SKILL.md`
 
 ## Architecture
@@ -16,6 +17,7 @@ Read **docs/arch.txt** and project skills before structural work:
 - Flutter: shell, WM chrome, apps — **one process per app**, own engine instance.
 - PID 1: thin init/supervisor — not widgets, not all apps in one address space.
 - Apps: runtime install (`.osx`), not ISO reflash from `apps/*`.
+- Hardware: see **docs/hardware.txt** — syscalls only to userspace; one render path; drivers per device class.
 
 ## Code rules
 

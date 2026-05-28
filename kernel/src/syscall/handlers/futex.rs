@@ -107,7 +107,7 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                 let cond_states = COND_WAIT_STATE.lock();
                 t.iter()
                     .filter_map(|(addr, waiters)| {
-                        if *addr == cond {
+                        if *addr == cond || *addr == FUTEX_ADDR_HANDOFF {
                             return None;
                         }
                         // Skip mutex re-lock waiters (cond already signaled).
@@ -120,11 +120,9 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                         if only_relock {
                             return None;
                         }
-                        // Any sibling parked on this futex (cond_wait or mutex wait).
-                        // Do not require cur_seq != wseq: Flutter worker threads often
-                        // sit in cond_wait before their cond is signaled; bridging only
-                        // when the sequence already changed never fires and the engine
-                        // deadlocks with woke=0 broadcasts (see run-visible.log).
+                        // Wake sibling cond waiters parked on this futex addr.
+                        // Do not bridge to the handoff word (0x338000070): spurious
+                        // wakes there inflate seq and stall pids 5/6 without helping paint.
                         let has_sibling = waiters.iter().any(|&wpid| {
                             if !siblings.contains(&wpid) {
                                 return false;
@@ -132,7 +130,7 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                             match cond_states.get(&wpid) {
                                 Some(&CondWaitState::Waiting { cond: wcond, .. }) => wcond == *addr,
                                 Some(&CondWaitState::AcquiringMutex { .. }) => false,
-                                None => true, // mutex / futex_wait without cond state
+                                None => true,
                             }
                         });
                         if has_sibling {
@@ -144,23 +142,6 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                     .collect()
             };
             for addr in addrs {
-                // Cond waiters key off the seq word at `addr`. A bare futex wake
-                // without a seq bump sends them straight back to sleep.
-                {
-                    let cond_states = COND_WAIT_STATE.lock();
-                    let bump_seq = cond_states.values().any(|state| {
-                        matches!(
-                            state,
-                            CondWaitState::Waiting { cond: wcond, .. } if *wcond == addr
-                        )
-                    });
-                    if bump_seq {
-                        let atom = unsafe {
-                            &*(addr as *const core::sync::atomic::AtomicU32)
-                        };
-                        atom.fetch_add(1, Ordering::Release);
-                    }
-                }
                 let bridged = futex_wake_waiters(addr, bridge_wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);

@@ -1,0 +1,213 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                     O S C O R T E X   H A R D W A R E                          ║
+║           Drivers, display, input, audio — canonical model · 2026-05-27          ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+  Read with: docs/arch.txt (product architecture)
+  Agent skill: .cursor/skills/oscortex-hardware/SKILL.md
+
+  DECISION (one sentence)
+  ───────────────────────
+  Hardware lives below stable kernel syscalls. Flutter never touches devices
+  directly. Each device *class* gets its own driver work; the *API* to userspace
+  is shared across machines and CPU architectures.
+
+
+  LAYER MODEL
+  ───────────
+
+    Flutter userspace (oscortex-host, apps)
+         │  syscalls only — surfaces, WM events, platform channels, VFS, net
+         ▼
+    Kernel policy (compositor, WM, scheduler, process model, app registry)
+         │  arch-agnostic contracts
+         ▼
+    Kernel drivers (native Rust today · CDP WASM long-term)
+         │  per device / bus (PCI, USB, ACPI, virtio MMIO)
+         ▼
+    arch/ (x86_64 · aarch64 · riscv64) — traps, paging, timers, context switch
+
+  Supporting one NVMe disk does NOT enable sound or touchpad. Supporting one CPU
+  arch does NOT auto-enable every driver. What *does* transfer:
+    • compositor + embedder syscall numbers (kernel/src/embedder/abi.rs)
+    • Flutter render / input contract (present_callback → gpu_submit_strided)
+    • CDP WASM bytecode (same module on all CPUs, once written)
+
+
+  DISPLAY / “GPU” (critical — read before adding drivers)
+  ─────────────────────────────────────────────────────────
+
+  OSCortex does NOT require a traditional GPU stack (DRM/KMS, Mesa, virtio-gpu)
+  for first paint or the product shell.
+
+  Current render path (bring-up + product baseline):
+
+    Flutter engine (Skia CPU raster in userspace)
+         → embedder present_callback
+         → SYS_GPU_SUBMIT / SYS_GPU_SUBMIT_STRIDED  (pixel copy into surface back buffer)
+         → compositor::gpu_submit_strided_for (kernel CPU blit)
+         → vsync flip → Limine framebuffer (or FB bypass for full-screen owner)
+
+  “gpu_submit” means “submit pixels to the compositor surface,” not “program
+  the graphics card.” Real GPU acceleration is a *future backend* under the
+  same surface syscalls — not a parallel UI stack.
+
+  Rules:
+    • One render path — no kernel boot demos, grid splashes, or second shells.
+    • No Flutter bypass of compositor except documented FB_BYPASS full-screen path.
+    • Do not block shell bring-up on virtio-gpu / OpenGL / Vulkan drivers.
+
+
+  DEVICE CLASSES
+  ──────────────
+
+  Status key: ✅ implemented (bring-up)  ⏳ planned  · not started
+
+  Class          Kernel module(s)              Userspace API              Status
+  ─────────────  ────────────────────────────  ─────────────────────────  ──────
+  Boot console   drivers/fb.rs                 serial log only          ✅ text FB
+  Display out    compositor/mod.rs             surface_*, gpu_submit_*  ✅ CPU blit
+  Pointer/key    drivers/ps2.rs, wm/mod.rs     WM EV_POINTER/EV_KEY     ✅ PS/2 + WM
+  Block storage  drivers/virtio_blk.rs         VFS / app_store          ✅
+  NVMe           drivers/nvme.rs               block catalog            ✅
+  Network        drivers/virtio_net.rs         SYS_NET_*                ✅ basic
+  Serial         drivers/uart.rs               —                        ✅
+  USB host       drivers/usb.rs                SYS_USB_CONTROLLER_COUNT   ⏳ query only
+  PTY            drivers/pty.rs                POSIX tty                  ✅
+  Audio out/in   —                             platform channel (TBD)   ·
+  Touchpad       —                             WM pointer (TBD)         ·
+  Camera         —                             —                        ·
+  WiFi/BT        —                             —                        ·
+  Hardware GPU   —                             (future compositor BE)   ·
+
+  QEMU bring-up profile (scripts/run-qemu.sh): virtio-net, virtio-blk, NVMe,
+  PS/2, Limine framebuffer. Drivers not in this profile are not required for
+  visual shell milestone.
+
+
+  STABLE USERSPACE CONTRACTS (do not break without ABI bump)
+  ──────────────────────────────────────────────────────────
+
+  Canonical numbers: kernel/src/embedder/abi.rs (EMBEDDER_ABI_VERSION)
+
+  Display / compositor:
+    SYS_SURFACE_* · SYS_GPU_SUBMIT · SYS_GPU_SUBMIT_STRIDED
+    SYS_VSYNC_* · SYS_FB_SIZE_PACKED · SYS_FB_MAP · SYS_FB_RELEASE
+
+  Window manager / input:
+    SYS_WM_* · EV_POINTER · EV_KEY · EV_VSYNC · EV_FOCUS
+    SYS_INPUT_DEV_COUNT · SYS_INPUT_DEV_INFO
+
+  Engine bridge:
+    SYS_ENGINE_* · FlutterEngineProcTable · SYS_THREAD_*
+
+  Apps / IPC:
+    SYS_APP_* · SYS_PLATFORM_MSG_* · SYS_VFS_* · SYS_NET_*
+
+  Flutter embedder binds ONLY through these + POSIX syscalls in dispatch.rs.
+  New hardware exposes capability through existing or *new* syscalls — never
+  by mapping MMIO into userspace.
+
+
+  DRIVER IMPLEMENTATION MODEL
+  ───────────────────────────
+
+  Phase A — Native Rust (now)
+    • Location: kernel/src/drivers/<name>.rs
+    • Registration: drivers/platform.rs + drivers/mod.rs
+    • Arch-specific MMIO/PCI/port I/O: crate::arch::pci and crate::arch::port_io ONLY
+    • Export capability via syscalls or WM/compositor — not raw registers
+
+  Phase B — CDP WASM (target)
+    • Protocol: kernel/src/cortex/driver_gen.rs (Cortex Driver Protocol)
+    • Registry: kernel/src/drivers/registry.rs
+    • Required WASM exports: cdp_init, cdp_probe, cdp_open, cdp_read,
+      cdp_write, cdp_ioctl, cdp_irq, cdp_deinit, cdp_version
+    • One WASM module portable across x86_64 / aarch64 / riscv64
+    • Hot-load / quarantine / replace without reboot (Cortex healing flow)
+
+  Do NOT duplicate driver logic in userspace, embedder, or second kernel modules.
+
+
+  MULTI-ARCHITECTURE RULES
+  ────────────────────────
+
+  kernel/src/arch/mod.rs selects x86_64 | aarch64 | riscv64 at compile time.
+
+  Per ISA (once each):
+    • syscall entry/exit, page tables, timers, IPI/APIC or equivalent
+    • context switch, FS/TLS MSRs or equivalent
+
+  Per machine / QEMU profile (subset):
+    • enable only drivers probed on that platform
+    • cargo features: arch-x86_64 (default), arch-aarch64, arch-riscv64
+
+  Drivers must not embed inline asm except via arch/ shims.
+
+
+  ADDING A NEW DEVICE CLASS (checklist)
+  ─────────────────────────────────────
+
+  1. Read docs/arch.txt + this file — confirm no parallel userspace path.
+  2. Add kernel/src/drivers/<class>.rs (or CDP WASM module + registry load).
+  3. Probe from PCI/USB/ACPI/virtio — never hard-code userspace VAs.
+  4. Define or extend syscalls in embedder/abi.rs + dispatch.rs handlers.
+  5. Route events through WM (input) or platform channels (audio, sensors).
+  6. Flutter: platform channel or existing WM API — not new mmap-of-hardware.
+  7. Document class in this file (status column).
+  8. Harness / QEMU note if needed for CI — do not require real hardware.
+
+
+  ANTI-PATTERNS (reject in review)
+  ────────────────────────────────
+
+  • Second render path (kernel demo UI, bypass compositor for “speed”)
+  • Userspace driver talking to MMIO/PCI config space
+  • Inline PCI/port I/O asm inside driver modules (use arch/pci + arch/port_io)
+  • “Temporary” driver fork — pivot = delete old path (see arch.txt)
+  • Assuming virtio-blk driver implies audio/touchpad works
+  • Blocking shell milestone on GPU vendor drivers
+  • Duplicating engine_patch.py or embedder ioctl paths for one device
+
+
+  COMPLIANCE STATUS (2026-05-27)
+  ──────────────────────────────
+
+  Framework rules                          Status
+  ───────────────────────────────────────  ─────────────────────────────
+  Hardware access only in kernel           ✅
+  Flutter via syscalls only                ✅ (embedder uses gpu_submit path)
+  PCI/port I/O via arch/ shims             ✅ (arch/pci.rs, arch/port_io.rs)
+  Single platform init entry               ✅ drivers/platform.rs
+  One canonical render path (compositor)   ✅ fb_map no longer sets FB_BYPASS
+  CDP WASM registry (runtime drivers)      ⏳ scaffold — Cortex healing TBD
+  Multi-arch native drivers                ⏳ stubs compile; x86_64 = full profile
+  Audio / touchpad / USB HID               · not started (documented)
+
+  Machine profiles:
+    x86_64 QEMU (run-qemu.sh)  — PS/2, virtio-blk/net, NVMe, compositor ✅
+    x86_64 bare metal          — PS/2 skipped by default (safe mode)
+    aarch64 / riscv64          — PCI stubs; drivers skip probe cleanly
+
+  Runtime AI-generated drivers (post-UI): CDP WASM modules loaded via
+  drivers/registry.rs + cortex/driver_gen.rs — same ABI on every CPU.
+
+
+  KEY PATHS
+  ─────────
+  docs/arch.txt                     product architecture
+  docs/hardware.txt                 this file
+  kernel/src/arch/                  CPU abstraction
+  kernel/src/arch/pci.rs            PCI facade (x86 backend + arch stubs)
+  kernel/src/arch/port_io.rs        Legacy I/O port facade
+  kernel/src/drivers/platform.rs    Single driver init entry
+  kernel/src/drivers/               native drivers
+  kernel/src/compositor/            surfaces, gpu_submit, vsync flip
+  kernel/src/wm/                    focus, input routing, events
+  kernel/src/embedder/abi.rs        syscall numbers + WM event layout
+  kernel/src/cortex/driver_gen.rs   CDP WASM driver protocol
+  kernel/src/syscall/dispatch.rs    syscall entry
+  tools/flutter-embedder/           present_callback, engine glue
+
+  Skills: oscortex-architecture · oscortex-hardware · codebase-audit-cleanup
+  Rule:   .cursor/rules/oscortex-core.mdc

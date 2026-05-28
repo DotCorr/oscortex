@@ -10,7 +10,7 @@ description: >
 
 Systematically find duplicate logic, orphaned scripts, dual code paths, and boot/render junk — then delete or consolidate. **An OS cannot carry parallel implementations.**
 
-**Also read:** [oscortex-architecture](../oscortex-architecture/SKILL.md) · [docs/arch.txt](../../../docs/arch.txt)
+**Also read:** [oscortex-architecture](../oscortex-architecture/SKILL.md) · [oscortex-hardware](../oscortex-hardware/SKILL.md) · [docs/arch.txt](../../../docs/arch.txt) · [docs/hardware.txt](../../../docs/hardware.txt)
 
 **Exclude from all scans and edits:** `landing/`
 
@@ -39,6 +39,14 @@ AI generates code in isolation. On OSCortex this becomes:
 | ISO build | `scripts/build-iso.sh` |
 | Embedder | `tools/flutter-embedder/` |
 | Architecture | `docs/arch.txt` |
+| Hardware / drivers | `docs/hardware.txt` |
+| Driver init | `kernel/src/drivers/platform.rs` |
+| PCI / port I/O | `kernel/src/arch/pci.rs`, `kernel/src/arch/port_io.rs` |
+| Syscall ABI | `kernel/src/embedder/abi.rs` |
+| Native drivers | `kernel/src/drivers/` |
+| Compositor / display | `kernel/src/compositor/` |
+| CDP WASM drivers | `kernel/src/cortex/driver_gen.rs` |
+| CPU porting | `kernel/src/arch/` |
 | System shell app | `apps/oscortex_app/` |
 
 If you find logic elsewhere that belongs here → **move or merge**, then **delete** the duplicate.
@@ -82,6 +90,8 @@ grep -rn "va_to_file\|0x196e300\|patch_engine" --include="*.py" . | grep -v engi
 
 ### Single path
 - [ ] Only one boot userspace stack documented in `docs/arch.txt`?
+- [ ] Only one render path (Flutter → compositor) per `docs/hardware.txt`?
+- [ ] No duplicate driver or MMIO paths in embedder/userspace?
 - [ ] Only one engine patch script?
 - [ ] No kernel boot splash/demo surfaces before Flutter presents?
 - [ ] No second Dart entry (`main_minimal`, `.bak`) for the same app?

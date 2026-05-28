@@ -26,14 +26,12 @@ const LSR_THR_EMPTY:  u8 = 1 << 5; // Bit 5: transmit holding register empty
 
 #[inline(always)]
 unsafe fn inb(port: u16) -> u8 {
-    let v: u8;
-    core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack));
-    v
+    crate::arch::port_io::inb(port)
 }
 
 #[inline(always)]
 unsafe fn outb(port: u16, val: u8) {
-    core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack));
+    crate::arch::port_io::outb(port, val);
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────

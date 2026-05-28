@@ -2,6 +2,7 @@
 
 pub mod fb;
 pub mod nvme;
+pub mod platform;
 pub mod ps2;
 pub mod pty;
 pub mod registry;

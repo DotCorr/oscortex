@@ -1292,6 +1292,17 @@ pub fn get_saved_rax(pid: u32) -> u64 {
     if p.pid == pid { p.regs.rax } else { 0 }
 }
 
+/// Saved user RIP/RSP for a blocked/yielded thread (from `save_return_context`).
+pub fn get_saved_rip_rsp(pid: u32) -> Option<(u64, u64)> {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid {
+        Some((p.regs.rip, p.regs.rsp))
+    } else {
+        None
+    }
+}
+
 /// Force a process into the `Blocked` or `Running` state.
 pub fn set_state(pid: u32, state: ProcState) {
     let _g = PTABLE_LOCK.lock();

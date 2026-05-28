@@ -56,6 +56,16 @@
   kernel/src/app_registry/     .osx install/launch
   tools/flutter-engine/engine_patch.py
   scripts/build-iso.sh
+  docs/hardware.txt            drivers, display/GPU, device classes, CDP
+
+
+  HARDWARE (summary — full spec in docs/hardware.txt)
+  ───────────────────────────────────────────────────
+  Kernel owns devices. Flutter sees only syscalls (surfaces, WM, VFS, net).
+  Display today: CPU raster → gpu_submit_strided → compositor → framebuffer.
+  No traditional GPU driver required for shell. Each device class (audio,
+  touchpad, …) is its own driver; CDP WASM drivers are portable across CPUs.
+  Do not map hardware into userspace. Do not add parallel render paths.
 
 
   MIGRATION STATUS
@@ -68,5 +78,6 @@
   ⏳ tools/oscortex-pack
   ⏳ Shell launcher UI + platform channels
 
-  Skills: .cursor/skills/oscortex-architecture · codebase-audit-cleanup
+  Skills: .cursor/skills/oscortex-architecture · oscortex-hardware · codebase-audit-cleanup
   Rule:   .cursor/rules/oscortex-core.mdc
+  Docs:   docs/arch.txt · docs/hardware.txt

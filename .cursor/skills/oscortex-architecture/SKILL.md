@@ -8,7 +8,7 @@ description: >
 
 # OSCortex Architecture
 
-**Read first:** [docs/arch.txt](../../../docs/arch.txt)
+**Read first:** [docs/arch.txt](../../../docs/arch.txt) · [docs/hardware.txt](../../../docs/hardware.txt)
 
 **Out of scope:** `landing/` — never modify unless explicitly requested.
 
@@ -62,6 +62,18 @@ KERNEL                  — scheduler, memory, IPC, drivers, compositor, focus, 
 | Focus, hit-testing, input routing | Pointer/key handling inside engine |
 | `surface_create` / `present` / flip | `present_callback` → pixels |
 | Process spawn, mmap, capabilities | App logic, platform channels |
+| Drivers, compositor blit, input HW | Never maps MMIO / PCI from userspace |
+
+**Hardware detail:** [docs/hardware.txt](../../../docs/hardware.txt) · skill `oscortex-hardware`
+
+---
+
+## Hardware (summary)
+
+- **One render path:** Flutter → `gpu_submit_strided` → compositor → framebuffer (CPU blit today).
+- **`gpu_submit` ≠ GPU vendor driver** — pixel copy into surfaces; real GPU is a future compositor backend.
+- **Each device class** (audio, touchpad, storage, …) needs its own kernel driver; APIs are shared via syscalls.
+- **Multi-arch:** port CPU in `kernel/src/arch/`; drivers per platform; CDP WASM portable across ISAs.
 
 ---
 
@@ -75,6 +87,8 @@ KERNEL                  — scheduler, memory, IPC, drivers, compositor, focus, 
 | `apps/oscortex_app/` | System shell source (not an app manager holding all apps) |
 | `scripts/build-iso.sh` | ISO build — ships kernel, init, engine, shell; not user app catalog |
 | `docs/arch.txt` | Canonical architecture document |
+| `docs/hardware.txt` | Drivers, display, device classes, CDP |
+| `.cursor/skills/oscortex-hardware/SKILL.md` | Agent guide for driver/hardware work |
 
 ---
 

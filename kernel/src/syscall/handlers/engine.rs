@@ -706,10 +706,10 @@ pub(crate) fn sys_fb_map(info_out_ptr: u64) -> i64 {
         dst.add(16).cast::<[u8;4]>().write_unaligned(pitch_bytes.to_le_bytes());
         dst.add(20).cast::<[u8;4]>().write_unaligned(32u32.to_le_bytes());
     }
-    // Disable early boot framebuffer logging during userspace display ownership
+    // Canonical shell render path uses gpu_submit → compositor (see docs/hardware.txt).
+    // fb_map only exposes a read/write mapping for bring-up tools — it does not
+    // bypass the compositor; use SYS_SURFACE_* + gpu_submit_strided for UI.
     crate::drivers::fb::disable_fb_logging();
-    // Signal compositor that a process now owns the FB directly.
-    crate::compositor::set_fb_bypass(true);
     0
 }
 

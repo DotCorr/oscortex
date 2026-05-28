@@ -8,6 +8,41 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// Deferred task-runner kick flag (set from APIC timer ISR).
 pub static KICK_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Set when a pthread_cond waiter timed out or must finish AcquiringMutex but
+/// cooperative scheduling may be starving it (no userspace timer preemption).
+pub static COND_RESCHED_NEEDED: AtomicBool = AtomicBool::new(false);
+
+/// Yield to a sibling that needs to finish a cond-wait state machine step.
+/// Called from high-frequency syscall paths (timerfd read) where other threads
+/// may otherwise never receive a cooperative schedule point.
+pub fn cooperative_yield_for_cond_resched(cur: u32, sys_nr: u64) {
+    if cur == 0 || !COND_RESCHED_NEEDED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let target = {
+        let cws = COND_WAIT_STATE.lock();
+        cws.iter().find_map(|(&pid, st)| {
+            if pid != cur && matches!(st, CondWaitState::AcquiringMutex { .. }) {
+                Some(pid)
+            } else {
+                None
+            }
+        })
+    };
+    let Some(next) = target.or_else(|| crate::process::next_runnable_pid(cur)) else {
+        return;
+    };
+    if next == cur {
+        return;
+    }
+    let urip = crate::arch::syscall::user_rip();
+    let ursp = crate::arch::syscall::user_rsp();
+    crate::process::save_return_context(cur, urip, ursp);
+    crate::process::save_full_user_gprs(cur);
+    crate::process::set_rax(cur, sys_nr);
+    crate::process::save_xstate(cur);
+    crate::process::enter_user_by_pid_noreturn(next);
+}
 
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
 // epoll_create / inotify_init1 / timerfd_create return integer fds that
@@ -163,6 +198,29 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
     (tfds.len() + efds.len(), woken)
 }
 
+/// Complete a timed-out pthread_cond_timedwait without re-entering the full
+/// state machine (cooperative scheduling may never run the thread again).
+fn inject_cond_timedout_return(pid: u32, mutex: u64) {
+    if pid == 0 {
+        return;
+    }
+    let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
+    let _ = atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire);
+    if let Some((rip, rsp)) = crate::process::get_saved_rip_rsp(pid) {
+        // Yield paths save RIP at the SYSCALL insn; advance past it.
+        crate::process::save_return_context(pid, rip.wrapping_add(2), rsp);
+    }
+    crate::process::set_rax(pid, 110); // ETIMEDOUT
+    COND_WAIT_STATE.lock().remove(&pid);
+    crate::process::set_state(pid, crate::process::ProcState::Running);
+    COND_RESCHED_NEEDED.store(true, Ordering::Release);
+    static INJECT_LOG: AtomicU32 = AtomicU32::new(0);
+    let n = INJECT_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 64 == 0 {
+        log::warn!("[cond-timeout-inject] #{} pid={} mutex={:#x}", n, pid, mutex);
+    }
+}
+
 pub fn check_timerfds_and_wake() {
     let now = monotonic_ns();
     let mut to_wake = Vec::new();
@@ -203,16 +261,46 @@ pub fn check_timerfds_and_wake() {
             }
         }
     }
-    for (pid, cond, _mutex) in expired {
+    for (pid, cond, mutex) in expired {
         futex_waiter_remove(cond, pid);
-        // Mark Running so next_runnable_pid picks it up; the re-entered
-        // sys_pthread_cond_wait_timeout will see AcquiringMutex and proceed.
-        crate::process::set_state(pid, crate::process::ProcState::Running);
+        inject_cond_timedout_return(pid, mutex);
         static TIMEOUT_EXPIRE_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = TIMEOUT_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
         if n < 16 || n % 64 == 0 {
             log::warn!("[cond-timeout-expire] #{} pid={} cond={:#x}", n, pid, cond);
+        }
+    }
+
+    // Finish any timed-out cond waiters stuck in AcquiringMutex (mutex free
+    // but thread never got a cooperative schedule point).
+    {
+        let stuck: alloc::vec::Vec<(u32, u64)> = {
+            let cws = COND_WAIT_STATE.lock();
+            cws.iter()
+                .filter_map(|(&pid, st)| {
+                    if let CondWaitState::AcquiringMutex {
+                        mutex,
+                        timed_out: true,
+                    } = st
+                    {
+                        let mutex_addr = *mutex;
+                        let atom = unsafe {
+                            &*(mutex_addr as *const core::sync::atomic::AtomicU32)
+                        };
+                        if atom.load(Ordering::Acquire) == 0 {
+                            Some((pid, mutex_addr))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for (pid, mutex) in stuck {
+            inject_cond_timedout_return(pid, mutex);
         }
     }
 

@@ -180,27 +180,9 @@ pub extern "C" fn kernel_main() -> ! {
         log::warn!("[BOOT] No Limine modules response — libflutter_engine.so unavailable");
     }
 
-    // ── 4. Driver registry ────────────────────────────────────────────────
-    drivers::registry::init();
-
-    // ── 4a. PS/2 keyboard + mouse (IRQ-driven, Phase 37) ─────────────────
-    // On some physical Macs, legacy 8042/PIC init can stall early boot.
-    // Keep PS/2 enabled on QEMU/KVM (known-good path), but skip it by default
-    // on bare metal so the system continues into userspace.
+    // ── 4. Platform drivers (input probe) ───────────────────────────────
     let qemu_like = arch::cpu::is_qemu_like_hypervisor();
-    if qemu_like {
-        // `ps2::init()` resets the 8042 controller and enables mouse reporting.
-        // `enable_pic_irqs()` unmasks IRQ1/IRQ12 on the 8259 PIC and configures
-        // the local APIC LINT0 pin for ExtINT delivery. Must run after IDT.
-        drivers::ps2::init();
-        unsafe { drivers::ps2::enable_pic_irqs(); }
-        log::info!("[Input] PS/2 enabled (QEMU/KVM path)");
-    } else {
-        log::warn!("[Input] PS/2 init skipped (hardware-safe mode on bare metal)");
-    }
-
-    // ── 4b. USB XHCI probe (Phase 41) ────────────────────────────────────
-    drivers::usb::probe();
+    drivers::platform::init_early(qemu_like);
 
     // ── 4b. Compositor scaffold (M13) ────────────────────────────────────
     compositor::init();
@@ -220,13 +202,8 @@ pub extern "C" fn kernel_main() -> ! {
     // ── 7b. Virtual filesystem (initramfs) ───────────────────────────────
     fs::init();
 
-    // ── 7c. Networking (virtio-net + UDP + TCP/smoltcp) ───────────────────────
-    crate::drivers::uart::init();
-    crate::drivers::virtio_net::init();
-    crate::drivers::virtio_blk::init();
-    crate::app_store::init();
-    crate::drivers::nvme::init();
-    crate::net::init();
+    // ── 7c. Block, serial, and networking ─────────────────────────────────
+    drivers::platform::init_block_and_net();
 
     // ── 8. AI Cortex ─────────────────────────────────────────────────────
     // The Cortex boots last so every kernel subsystem is available to it.

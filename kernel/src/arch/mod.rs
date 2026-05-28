@@ -18,6 +18,11 @@ cfg_if::cfg_if! {
     }
 }
 
+/// PCI configuration-space access (arch backend in `arch/pci.rs`).
+pub mod pci;
+/// Legacy I/O port IN/OUT (arch backend in `arch/port_io.rs`).
+pub mod port_io;
+
 /// Trigger an ACPI S5 soft-off (architecture-specific implementation).
 pub fn acpi_shutdown() -> ! {
     #[cfg(target_arch = "x86_64")]
