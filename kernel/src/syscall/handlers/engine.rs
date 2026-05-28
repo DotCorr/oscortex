@@ -557,9 +557,9 @@ pub(crate) fn sys_input_dev_info(n: u64) -> i64 {
     crate::drivers::ps2::device_info_packed(n as u32) as i64
 }
 
-// ── Phase 38 — .oscapp app registry ──────────────────────────────────────────
+// ── Phase 38 — .osx app registry ─────────────────────────────────────────────
 
-/// Install a `.oscapp` bundle provided by the caller.
+/// Install a `.osx` bundle provided by the caller.
 /// `arg0` = bundle_ptr, `arg1` = bundle_len, `arg2` = id_out_ptr (u32le).
 pub(crate) fn sys_app_install(bundle_ptr: u64, bundle_len: u64, id_out_ptr: u64) -> i64 {
     let bytes = match unsafe { read_user_bytes(bundle_ptr, bundle_len as usize) } {
@@ -591,9 +591,8 @@ pub(crate) fn sys_app_list(buf_ptr: u64, buf_len: u64) -> i64 {
     crate::app_registry::list(buf) as i64
 }
 
-/// Launch an installed app.
-/// `arg0` = app_id, `arg1` = flags (reserved, pass 0).
-/// Returns the new isolate_id, or -ERRNO.
+/// Launch an installed app in a new host process.
+/// Returns the new host PID, or -ERRNO.
 pub(crate) fn sys_app_launch(app_id: u64, flags: u64) -> i64 {
     crate::app_registry::launch(app_id as u32, flags as u32)
 }
@@ -1043,11 +1042,23 @@ pub(crate) fn sys_ext2_read(path_ptr: u64, path_len: u64, out_ptr: u64, out_len:
 
 pub(crate) fn sys_sched_yield() -> i64 {
     let cur = crate::process::current_pid();
+    if cur == 0 {
+        return 0;
+    }
     if let Some(next) = crate::process::next_runnable_pid(cur) {
         if next != cur {
+            let urip = crate::arch::syscall::user_rip();
+            let ursp = crate::arch::syscall::user_rsp();
+            crate::process::save_cooperative_yield_context(cur, urip, ursp);
+            crate::process::set_rax(cur, 0);
+            crate::process::save_xstate(cur);
             crate::process::set_state(cur, crate::process::ProcState::Running);
-            crate::process::set_current_pid(next);
-            // Context switch will happen on next APIC timer or we do it inline.
+            crate::process::enter_user_by_pid_noreturn(next);
+        } else {
+            // No other runnable process — sleep until the next IRQ (timerfd, vsync…).
+            unsafe {
+                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
         }
     }
     0

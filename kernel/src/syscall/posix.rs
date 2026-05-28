@@ -3,6 +3,7 @@
 
 use super::{read_user_bytes, write_user_bytes, monotonic_ns};
 use crate::process::{self, dl::mmap_anon};
+use crate::syscall::state::ENGINE_HOST_PID;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 use alloc::vec::Vec;
@@ -817,6 +818,9 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     && (timeout_ns == 0 || monotonic_ns() < timeout_ns)
                     && super::futex_waiter_present(cond, pid) 
                 {
+                    if super::KICK_REQUESTED.swap(false, Ordering::AcqRel) {
+                        let _ = super::force_wake_all_task_runners("cond-wait-kick");
+                    }
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
@@ -905,6 +909,14 @@ pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, timeout: u64, sys_nr: u
 #[inline]
 fn cond_broadcast_loop_handoff(_pid: u32, _cond: u64, _n: i64, _bridged: u32) {}
 
+#[inline]
+fn engine_host_broadcast_group(pid: u32, engine_host: u32) -> bool {
+    if pid == engine_host {
+        return true;
+    }
+    crate::process::sibling_pids(pid).contains(&engine_host)
+}
+
 pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
     if cond == 0 { return 22; }
     let pid = crate::process::current_pid();
@@ -960,8 +972,9 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     let old_seq = atom.fetch_add(1, Ordering::Release);
     let n = super::futex_wake_waiters(cond, i32::MAX as u32);
     let mut bridged = 0u32;
+    let engine_host = ENGINE_HOST_PID.load(Ordering::Acquire);
     let mut skip_bridge = false;
-    if n == 0 && pid == 2 {
+    if n == 0 && engine_host != 0 && pid == engine_host {
         let ursp = crate::arch::syscall::user_rsp();
         let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
         if ursp != 0 && crate::mm::paging::translate_user_page(cur_cr3, ursp & !0xfff).is_some() {
@@ -975,8 +988,8 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
 
-    // Diagnostic only — log zero-wake cond broadcasts from the engine worker thread.
-    if pid == 2 && n == 0 {
+    // Diagnostic only — log zero-wake cond broadcasts from the engine host.
+    if engine_host != 0 && pid == engine_host && n == 0 {
         static COND_BROADCAST_ZERO_WAKE_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let z = COND_BROADCAST_ZERO_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
@@ -988,6 +1001,15 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
                 cond,
                 skip_bridge
             );
+        }
+    }
+
+    if engine_host != 0 && engine_host_broadcast_group(pid, engine_host) && n == 0 {
+        static COND_ZERO_WAKE_KICK: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let zkick = COND_ZERO_WAKE_KICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if zkick < 64 || zkick % 16 == 0 {
+            let _ = super::force_wake_all_task_runners("cond-zero-wake");
         }
     }
 

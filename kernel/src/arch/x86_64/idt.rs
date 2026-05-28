@@ -440,59 +440,9 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     }
 
     if preempted_user {
-        let cur_pid = crate::process::current_pid();
-        if cur_pid != 0 {
-            // The hardware-pushed user RSP lives just above the TimerTrapFrame
-            // struct (18 fields × 8 bytes = 0x90 bytes past frame_ptr).
-            let user_rsp = unsafe {
-                *((frame_ptr as usize + 18 * 8) as *const u64)
-            };
-            let cur_regs = crate::process::UserRegs {
-                rip:    frame.rip,
-                rsp:    user_rsp,
-                rflags: frame.rflags,
-                rax: frame.rax, rbx: frame.rbx, rcx: frame.rcx, rdx: frame.rdx,
-                rdi: frame.rdi, rsi: frame.rsi, rbp: frame.rbp,
-                r8:  frame.r8,  r9:  frame.r9,  r10: frame.r10, r11: frame.r11,
-                r12: frame.r12, r13: frame.r13, r14: frame.r14, r15: frame.r15,
-            };
-            if let Some((next_pid, next_regs)) =
-                crate::process::timer_preempt_switch(cur_pid, &cur_regs)
-            {
-                // Rewrite the interrupt frame so the iretq in the asm epilog
-                // resumes the next thread rather than the preempted one.
-                // CS and SS stay as-is (both are ring-3 user segments 0x2B/0x23).
-                frame.rip    = next_regs.rip;
-                frame.rflags = next_regs.rflags | 0x200; // ensure IF=1
-                frame.rax = next_regs.rax; frame.rbx = next_regs.rbx;
-                frame.rcx = next_regs.rcx; frame.rdx = next_regs.rdx;
-                frame.rdi = next_regs.rdi; frame.rsi = next_regs.rsi;
-                frame.rbp = next_regs.rbp; frame.r8  = next_regs.r8;
-                frame.r9  = next_regs.r9;  frame.r10 = next_regs.r10;
-                frame.r11 = next_regs.r11; frame.r12 = next_regs.r12;
-                frame.r13 = next_regs.r13; frame.r14 = next_regs.r14;
-                frame.r15 = next_regs.r15;
-                // Update the hardware-pushed user RSP slot for the new thread.
-                unsafe {
-                    *((frame_ptr as usize + 18 * 8) as *mut u64) = next_regs.rsp;
-                }
-
-                // Deliver pending errno (e.g. EINTR from epoll_wait) for threads
-                // resumed via IRETQ rather than enter_user_by_pid_noreturn.
-                // Safe: timer ISR runs with user CR3 still loaded; SD_ERRNO is
-                // in the user VA space already mapped.
-                let pending_errno = crate::process::take_errno_to_deliver(next_pid);
-                if pending_errno != 0 {
-                    unsafe {
-                        core::ptr::write_volatile(
-                            crate::process::posix_trampolines::SD_ERRNO as *mut u32,
-                            pending_errno,
-                        );
-                    }
-                }
-            }
-        }
-        // iretq in the asm epilog returns to (possibly new) ring-3 thread.
+        // Cooperative `sched_yield` / futex paths handle userspace scheduling.
+        // Timer preemption back into a thread that yielded via SYSRET corrupts
+        // register state during bring-up (see init supervisor + Flutter host).
         return;
     }
 

@@ -8,6 +8,6 @@ description = "OSCortex Flutter engine host — Phase 32-B userspace embedder bi
 [workspace]
 
 [[bin]]
-name = "flutter-embedder"
+name = "oscortex-host"
 path = "src/main.rs"
 

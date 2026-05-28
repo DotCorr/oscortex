@@ -1,0 +1,11 @@
+[package]
+name        = "oscortex-init"
+version     = "0.1.0"
+edition     = "2021"
+description = "OSCortex PID 1 supervisor — spawns shell host, reaps children"
+
+[workspace]
+
+[[bin]]
+name = "init"
+path = "src/main.rs"

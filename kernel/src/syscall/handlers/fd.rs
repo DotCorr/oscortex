@@ -647,6 +647,15 @@ pub(crate) fn sys_waitpid(pid: u64, _status_ptr: u64, _options: u64) -> i64 {
     }
 }
 
+/// Reap all zombie children of the calling process (PID 1 uses this for app hosts).
+pub(crate) fn sys_reap_children() -> i64 {
+    let parent = crate::process::current_pid();
+    if parent == 0 {
+        return -1;
+    }
+    crate::process::reap_zombie_children(parent) as i64
+}
+
 pub(crate) fn sys_kill(pid: u64, sig: u64) -> i64 {
     if sig != 9 {
         return -22; // EINVAL (only SIGKILL wired today)

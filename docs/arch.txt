@@ -1,283 +1,72 @@
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                           O S C O R T E X   A R C H                            ║
+║                     Canonical target — updated 2026-05-27                        ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
-  CANONICAL UI RUNTIME
-  ────────────────────
-  Flutter is the PERMANENT OS UI runtime. Every pixel on screen is rendered by
-  the Flutter engine. Other engines (Rive, Unity, Unreal, custom C++/Skia) are
-  integrated EXCLUSIVELY as Flutter-hosted views/textures via platform-channel
-  FFI — never as parallel render paths, never as alternative shells.
-  The OS owns the asset/loader ABI; engines plug into it.
+  DECISION (one sentence)
+  ───────────────────────
+  Kernel owns hardware and policy. Flutter owns everything above the kernel —
+  window management, shell, and applications — with one hard rule: each runnable
+  unit that can crash is its own process.
+
+  Flutter is the PERMANENT userspace UI runtime. Every pixel on screen is rendered
+  by the Flutter engine through kernel surfaces. Other engines plug in as Flutter-
+  hosted views via platform-channel FFI — never as parallel shells or render paths.
+
+  Out of scope for agents: landing/
 
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  FIRMWARE / BOOTLOADER  (Limine protocol)                                    │
-  │  SeaBIOS VBE → Limine → loads /boot/kernel  +  /boot/libflutter_engine.so   │
-  │  Sets up: framebuffer 1280×800 @ 0xFD000000, HHDM, ACPI tables, SMP IPI     │
-  └─────────────────────────────┬────────────────────────────────────────────────┘
-                                │  ELF load + SYSRET to 0xffffffff80000000
-                                ▼
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  RING 0 — KERNEL CORE  (no_std Rust, x86_64-unknown-none)                   │
-  │                                                                              │
-  │  ┌─────────────────────────────────────────────────────────────────────────┐ │
-  │  │  ARCH LAYER  (kernel/src/arch/x86_64/)                                  │ │
-  │  │  GDT · IDT (255 vectors) · APIC xAPIC · SYSCALL/SYSRET MSRs            │ │
-  │  │  SMP: BSP + 1 AP  ·  FPU/SSE/AVX  ·  CR3 paging                       │ │
-  │  └───────────────────────────────┬─────────────────────────────────────────┘ │
-  │                                  │                                            │
-  │  ┌───────────────────────────────▼─────────────────────────────────────────┐ │
-  │  │  MEMORY MANAGER  (kernel/src/mm/)                                       │ │
-  │  │  Physical frame allocator · 4-level paging (PML4)                       │ │
-  │  │  HHDM at 0xffff800000000000  · kernel heap (linked-list alloc)          │ │
-  │  │  Per-process PML4 (user: 0x400000+, kernel: top half only)              │ │
-  │  └───────────────────────────────┬─────────────────────────────────────────┘ │
-  │                                  │                                            │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  DRIVER LAYER  (kernel/src/drivers/)                                 │    │
-  │  │  PS/2 kbd+mouse · UART COM1 (115200) · Framebuffer (fb.rs)          │    │
-  │  │  NVMe (stub) · virtio-blk · virtio-net (smoltcp UDP/TCP)            │    │
-  │  │  USB (XHCI stub) · WASM sandbox driver host                         │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  AI CORTEX RUNTIME  (kernel/src/cortex/)  ← the brain               │    │
-  │  │                                                                      │    │
-  │  │  inference.rs   — 4→8→1 i8-quantised NN, interrupt pattern model    │    │
-  │  │  context.rs     — 4096-node / 16384-edge knowledge graph             │    │
-  │  │  healing.rs     — self-healing watchdog, hot-patch on anomaly        │    │
-  │  │  driver_gen.rs  — CDP registry (256 slots), WASM sandbox driver load │    │
-  │  │  observer.rs    — every interrupt passes through interrupt_hook()    │    │
-  │  │  pid0.rs        — privileged Cortex API on syscall 0x1000–0x100F    │    │
-  │  │  ipc.rs         — inter-core Cortex IPC via IPI vectors 128–191     │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  PROCESS MODEL  (kernel/src/process/)                                │    │
-  │  │  ELF loader (PT_LOAD → new PML4) · max 256 procs · PID table        │    │
-  │  │  UserRegs save/restore on SYSCALL · fork · exit · kill · waitpid    │    │
-  │  │  Kernel dynamic linker: dlopen/dlsym/dlclose (serves Limine modules) │    │
-  │  │  AOT snapshot loader (sys 0x366) · mmap / mprotect                  │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  SCHEDULER  (kernel/src/sched/)                                      │    │
-  │  │  Preemptive round-robin, APIC-timer driven (5-tick slice ~50 ms)    │    │
-  │  │  64 kernel tasks · 32 KiB stacks · Cortex-guided priority hints     │    │
-  │  │  Tasks: cortex-idle, cortex-bg, user-init (→ SYSRET to PID 1)      │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  IPC + PORT NAMESPACE  (kernel/src/ipc/ + port_ns/)                 │    │
-  │  │  Per-proc ring inbox (16 × 64-byte msgs) · send/recv · port_bind    │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  DART ISOLATE MANAGER  (kernel/src/isolate/)                         │    │
-  │  │  64 isolate slots · Running/Paused/Dead state machine                │    │
-  │  │  isolate_msg send/recv/pending (syscalls 0x36A–0x36C)               │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  FILESYSTEM  (kernel/src/fs/)                                        │    │
-  │  │  initramfs (CPIO/tar, mounted at /) · ext2 (stub) · ramdisk         │    │
-  │  │  /init  /bin/{flutter-embedder,hello,files,settings,editor}         │    │
-  │  │  /system/lib/{libflutter_engine.so,liboscortex.so,                  │    │
-  │  │              liboscortex_embedder.so}                                │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  SECURITY  (kernel/src/security/)                                    │    │
-  │  │  Capability bitfield (u64): CORTEX·DRIVER·NET·FS·PROC·MEM·IRQ·AUDIT │    │
-  │  │  /init gets ALL_CAPS; spawned procs get NO_CAPS by default          │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  SYSCALL DISPATCH  (kernel/src/syscall/mod.rs)                       │    │
-  │  │  SYSCALL/SYSRET fast path via LSTAR MSR (RAX = syscall nr)          │    │
-  │  │  Legacy int 0x80 path for compat                                     │    │
-  │  │  0x000–0x0FF  Linux-compat (read/write/open/fork/exec/exit/kill…)   │    │
-  │  │  0x100–0x1FF  Cortex PID-0 privileged API                           │    │
-  │  │  0x200–0x2FF  IPC (ipc_send / ipc_recv)                             │    │
-  │  │  0x300–0x31F  Compositor surface API (create/move/upload/flip…)     │    │
-  │  │  0x320–0x33F  WM event API (poll/read/inject/wait/focus)            │    │
-  │  │  0x340–0x34F  App registry (notify/launch/install)                  │    │
-  │  │  0x350–0x35F  Dynamic linking (dlopen/dlsym/dlclose/mmap)           │    │
-  │  │  0x360–0x36F  Flutter engine bridge (proc-table/vsync/isolate)      │    │
-  │  │  0x370–0x37F  App store, port ns, USB, fb_map, WM next_event, VFS  │    │
-  │  │  0x380–0x38F  fb_release, surface_fullscreen, exec_wait             │    │
-  │  │  0xC0         sys_poweroff (ACPI S5)                                │    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  └──────────────────────────────────────────────────────────────────────────────┘
+  TARGET USERSPACE MODEL
+  ──────────────────────
+  USER APPS (Flutter)     one process each · /bin/oscortex-host · .osx bundles
+  SYSTEM SHELL (Flutter)  one process · same host binary · shell bootstrap mode
+  INIT (PID 1)            userspace/init — spawns shell, reaps children
+  KERNEL                  compositor, WM, syscalls, app registry
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  RING 0' — HOT-LOADED DRIVER WASM SANDBOX  (software-isolated, Ring 0 mem)  │
-  │  WASM modules loaded by Cortex driver_gen at runtime, SFI-verified          │
-  │  Cannot touch raw hardware; communicate through CKI (Cortex Kernel Iface)   │
-  └──────────────────────────────────────────────────────────────────────────────┘
 
-                        SYSCALL / SYSRET boundary
-  ════════════════════════════════════════════════════════════════════════════════
+  ARTIFACT NAMING
+  ───────────────
+  *.osx              installable Flutter app bundle (magic OSCP in header)
+  /init              PID 1 supervisor ELF
+  /bin/oscortex-host Flutter engine host ELF (shell + user apps)
+  libflutter_engine.so   shared engine (mapped per host process)
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  RING 3 — USERSPACE  (ELF @ 0x400000, stack @ 0x7FFFFFFFEFFF8)              │
-  │                                                                              │
-  │  ┌──────────────────────────────────────────────────────────────────────┐    │
-  │  │  /init  =  flutter-embedder  (PID 1)                                 │    │
-  │  │  tools/flutter-embedder/  — no_std Rust, x86_64-unknown-none        │    │
-  │  │                                                                      │    │
-  │  │  _start (naked asm, rsp 16-aligned, RBP=0, breadcrumb syscall)       │    │
-  │  │    └─► main_embedder()                                               │    │
-  │  │          ├─ engine_host_register()              → sys 0x345         │    │
-  │  │          ├─ dlopen("libflutter_engine.so")      → sys 0x350         │    │
-  │  │          ├─ DT_INIT + DT_INIT_ARRAY (C++ ctors) → sys 0x382         │    │
-  │  │          ├─ dlsym(FlutterEngineGetProcAddresses)→ sys 0x351         │    │
-  │  │          ├─ proctable_set(...)                  → sys 0x356         │    │
-  │  │          ├─ surface_create(640×360 bootstrap)   → sys 0x300         │    │
-  │  │          ├─ aot_loader::load_dart_snapshot("/system/flutter/app.aot")│   │
-  │  │          │     • sys_aot_snapshot_load          → sys 0x366         │    │
-  │  │          │     • OWN ELF64 parser walks PT_LOAD + SHT_DYNSYM/SYMTAB │    │
-  │  │          │     • resolves _kDartVm/IsolateSnapshot{Data,Instructions}│   │
-  │  │          │     • writes 8 ptrs into FlutterProjectArgs              │    │
-  │  │          ├─ FlutterEngineRun(args)              ← engine VALIDATES   │    │
-  │  │          │     • no app.aot present → kInvalidArguments=0x2 (clean) │    │
-  │  │          │     • app.aot present    → Dart VM starts (next boundary)│    │
-  │  │          └─► event loop:                                            │    │
-  │  │                ├─ wm_event_wait()    → sys 0x323                    │    │
-  │  │                ├─ EV_VSYNC  → vsync_baton_post + on_vsync           │    │
-  │  │                ├─ EV_POINTER→ send_pointer_event (engine proctable) │    │
-  │  │                ├─ EV_KEY    → send_key_event                        │    │
-  │  │                └─ platform_msg_recv() → engine.send_platform_message│    │
-  │  └──────────────────────────────────────────────────────────────────────┘    │
-  └──────────────────────────────────────────────────────────────────────────────┘
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  WINDOW MANAGER PIPELINE  (current implementation)                           │
-  │                                                                              │
-  │  Framebuffer (phys 0xFD000000)                                               │
-  │       ▲                                                                      │
-  │       │ fb_map → userspace direct-write (FB_BYPASS mode)                    │
-  │       │                                                                      │
-  │  Compositor (kernel/src/compositor/)  ← M13 scaffold                        │
-  │    Surface table: 32 slots, per-pid ownership                                │
-  │    z-order, clip, damage rects, double-buffer (back/front)                  │
-  │    surface_flip → blit back→front → render_frame → write to fb              │
-  │    FB_BYPASS flag: when set, compositor skips render (userspace owns fb)    │
-  │                                                                              │
-  │  WM Event Ring (kernel/src/wm/)                                              │
-  │    256-slot ring buffer: EV_VSYNC · EV_POINTER · EV_KEY · EV_APP · EV_FOCUS │
-  │    Per-event owner_pid targeting or broadcast (pid=0)                       │
-  │    PS/2 driver → wm::push_event() → userspace polls via sys 0x378          │
-  │                                                                              │
-  │  Platform Channel (kernel/src/platform_channel/)                             │
-  │    Flutter↔native bridge: POST(0x360) / RECV(0x361) / REPLY(0x362) /ACK    │
-  └──────────────────────────────────────────────────────────────────────────────┘
+  APP LIFECYCLE
+  ─────────────
+  Dev:     flutter project → tools/oscortex-pack → app.osx
+  Install: app_install syscall (runtime, persistent storage — Phase 2)
+  Launch:  app_launch → spawn /bin/oscortex-host (new PID) + map app AOT
+  ISO:     kernel + init + engine + shell only — no apps/* bake loop
 
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  FLUTTER ENGINE INTEGRATION  (Phase 65 — Path 2 LIVE)                        │
-  │                                                                              │
-  │  libflutter_engine.so (91 MB)  ← Limine module @ 0x1000000, served via     │
-  │                                   in-kernel dlopen (no host libc, no glibc) │
-  │                                                                              │
-  │  ┌─ OSCortex-OWNED ASSET ABI (the moat) ──────────────────────────────────┐ │
-  │  │  sys_aot_snapshot_load(path) → (va, size)        [sys 0x366]           │ │
-  │  │     kernel reads file from VFS, maps PROT_R|X anon pages, returns VA   │ │
-  │  │  aot_loader (userspace, embedder-side):                                 │ │
-  │  │     pure-Rust ELF64 parser, no libc, no allocator                       │ │
-  │  │     resolves the 4 _kDart*Snapshot{Data,Instructions} symbols          │ │
-  │  │     translates VA → file-offset via PT_LOAD walk                       │ │
-  │  │     ★ Bypasses FlutterEngineCreateAOTData (which needs libc fopen)     │ │
-  │  │     ★ Uses the documented legacy snapshot-pointer escape hatch         │ │
-  │  │     ★ Same pattern hosts any Dart-AOT-shaped runtime (zero shims)      │ │
-  │  └────────────────────────────────────────────────────────────────────────┘ │
-  │                                                                              │
-  │  FlutterEngineGetProcAddresses → fills FlutterEngineProcTable (sys 0x356)   │
-  │  FlutterEngineRun(FlutterProjectArgs)                                        │
-  │     • populated with: assets_path, icu_data_path, platform/vsync/log cbs,   │
-  │       AND vm/isolate snapshot {data,instructions}+sizes (Path 2)            │
-  │  Software renderer → RGBA32 frames → present_callback                       │
-  │  Vsync baton (sys 0x358) → FlutterEngineOnVsync                             │
-  │  Platform messages → sys_platform_msg_post (sys 0x360)                      │
-  │                                                                              │
-  │  APP LAYER  (apps/oscortex_app — Flutter/Dart)                               │
-  │    lib/main.dart → flutter build aot-elf → app.aot                          │
-  │       drop at: initramfs/system/flutter/app.aot                             │
-  │       (kernel build.rs auto-embeds anything under initramfs/ into the kernel)│
-  │    Widgets render → engine rasterises → surface_upload_rgba32               │
-  │       → surface_flip → compositor blit → framebuffer                        │
-  └──────────────────────────────────────────────────────────────────────────────┘
 
-  ╔══════════════════════════════════════════════════════════════════════════════╗
-  ║  END-TO-END BOOT PROCESS  (firmware → first pixel)                          ║
-  ╠══════════════════════════════════════════════════════════════════════════════╣
-  ║                                                                              ║
-  ║  [1] FIRMWARE        SeaBIOS POSTs, picks El Torito boot record on ISO       ║
-  ║                                                                              ║
-  ║  [2] BOOTLOADER      Limine (iso_root/boot/limine/) reads limine.conf,       ║
-  ║                      loads:                                                  ║
-  ║                        • /boot/kernel                  (ELF64, our kernel)   ║
-  ║                        • /boot/libflutter_engine.so    (Flutter 3.29, 91 MB) ║
-  ║                      Negotiates: framebuffer (1280×800 RGBA32 @ 0xFD000000), ║
-  ║                      HHDM, memory map, RSDP, SMP wake vector.                ║
-  ║                                                                              ║
-  ║  [3] KERNEL ENTRY    Limine SYSRETs into kernel_main @ 0xffffffff80000000:   ║
-  ║                        a. arch::x86_64::init() → GDT, IDT, APIC, SYSCALL MSR ║
-  ║                        b. mm::init() → frame allocator, paging, heap         ║
-  ║                        c. drivers::init() → PS/2, UART, fb, NVMe, virtio    ║
-  ║                        d. cortex::init() → NN, context graph, healing, CDP  ║
-  ║                        e. sched::init() → round-robin, APIC timer           ║
-  ║                        f. fs::init() → mount initramfs.tar at /              ║
-  ║                        g. SMP: bring up AP (BSP + 1 AP online)              ║
-  ║                                                                              ║
-  ║  [4] PID 1 SPAWN     ELF loader reads /init (= flutter-embedder binary),     ║
-  ║                      maps PT_LOAD segments at 0x400000 in fresh PML4,        ║
-  ║                      builds user stack at 0x7FFFFFFFEFFF8, SYSRETs to       ║
-  ║                      _start with RBP=0 and 16-byte aligned RSP.              ║
-  ║                                                                              ║
-  ║  [5] EMBEDDER INIT   _start → main_embedder():                              ║
-  ║                        breadcrumb '!' → host_register → dlopen engine →     ║
-  ║                        DT_INIT_ARRAY (C++ ctors) → resolve proctable →      ║
-  ║                        surface_create(640×360) → register proctable.         ║
-  ║                                                                              ║
-  ║  [6] AOT LOAD        aot_loader::load_dart_snapshot("/system/flutter/app.aot")║
-  ║                        if present: ELF parse → 4 symbols resolved →         ║
-  ║                          FlutterProjectArgs.vm/isolate_snapshot_* populated ║
-  ║                        if absent : kInvalidArguments returned cleanly       ║
-  ║                                                                              ║
-  ║  [7] ENGINE START    FlutterEngineRun(args)                                  ║
-  ║                        Dart VM boot → isolate spawn → root widget mount →   ║
-  ║                        first paint → present_callback → surface_upload_rgba32║
-  ║                                                                              ║
-  ║  [8] COMPOSITE       Compositor blits surface back-buffer → front → fb.     ║
-  ║                      WM event ring delivers EV_VSYNC/POINTER/KEY/PLATFORM   ║
-  ║                      to embedder, which forwards via proctable to engine.   ║
-  ║                                                                              ║
-  ║  [9] STEADY STATE    Event loop at vsync rate:                              ║
-  ║                        wait → dispatch → engine renders → present → flip    ║
-  ║                      Cortex observes every interrupt, hot-loads drivers,    ║
-  ║                      healing watchdog patches anomalies in flight.          ║
-  ╚══════════════════════════════════════════════════════════════════════════════╝
+  BOOT (steady state)
+  ───────────────────
+  Limine → kernel → /init (supervisor)
+       → spawn /bin/oscortex-host (shell mode)
+       → Flutter shell renders
+  User launch → app_launch → new oscortex-host process (app mode)
 
-  LIVE STATUS (last verified serial trace)
-  ────────────────────────────────────────
-  ✅ Boot:        Limine → kernel_main → all subsystems init
-  ✅ Cortex:      NN inference + context graph + healing + driver-gen ACTIVE
-  ✅ SMP:         2 CPUs online (BSP + AP)
-  ✅ PID 1:       flutter-embedder SYSRET'd cleanly, RSP-aligned, no faults
-  ✅ dlopen:      libflutter_engine.so mapped, DT_INIT_ARRAY ran (C++ ctors)
-  ✅ Proctable:   FlutterEngineGetProcAddresses resolved, registered
-  ✅ AOT loader:  OSCortex-owned ELF parser plumbed (Path 2)
-  ⚠  AOT blob:   no app.aot present → engine returns kInvalidArguments=0x2
-                  (controlled rejection; identical to glibc embedder behavior)
-  ✅ Event loop: entered cleanly, dispatching vsync/pointer/key/platform
-  ✅ WM:         compositor surface created, fb_map fast-path available
 
-  NEXT BOUNDARY (when app.aot is dropped)
-  ────────────────────────────────────────
-  • Drop a Flutter AOT build at initramfs/system/flutter/app.aot
-  • Rebuild → embedder will parse it, inject snapshot pointers,
-    FlutterEngineRun should validate args and proceed to Dart VM boot
-  • Next likely boundary: software renderer surface_present_callback
-    (already wired) — first pixels from real Dart code
-  ⏳ Next:        Wire real FlutterEngineRun path (C++ ctors need TLS/libc stub)
+  KEY PATHS
+  ─────────
+  userspace/init/              PID 1 supervisor
+  tools/flutter-embedder/      builds oscortex-host
+  apps/oscortex_app/           system shell Dart source
+  kernel/src/app_registry/     .osx install/launch
+  tools/flutter-engine/engine_patch.py
+  scripts/build-iso.sh
+
+
+  MIGRATION STATUS
+  ────────────────
+  ✅ PID 1 = init supervisor (not Flutter embedder)
+  ✅ Shell = separate oscortex-host process
+  ✅ app_launch spawns host process (not isolate-in-caller)
+  ✅ ISO: no apps/* registry loop
+  ⏳ Persistent .osx storage on disk (ext2 write)
+  ⏳ tools/oscortex-pack
+  ⏳ Shell launcher UI + platform channels
+
+  Skills: .cursor/skills/oscortex-architecture · codebase-audit-cleanup
+  Rule:   .cursor/rules/oscortex-core.mdc

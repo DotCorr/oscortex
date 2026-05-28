@@ -145,10 +145,10 @@ pub const SYS_ISOLATE_MSG_PENDING: u64 = 0x36C; // msg_pending(isolate_id) → c
 pub const SYS_INPUT_DEV_COUNT: u64 = 0x36D; // input_dev_count() → n
 pub const SYS_INPUT_DEV_INFO:  u64 = 0x36E; // input_dev_info(n) → packed_u32
 
-// Phase 38 — .oscapp app registry.
+// Phase 38 — .osx app registry.
 pub const SYS_APP_INSTALL:   u64 = 0x36F; // app_install(bundle_ptr, bundle_len, id_out_ptr) → 0
 pub const SYS_APP_LIST:      u64 = 0x370; // app_list(buf_ptr, buf_len) → count
-pub const SYS_APP_LAUNCH:    u64 = 0x371; // app_launch(app_id, flags) → isolate_id
+pub const SYS_APP_LAUNCH:    u64 = 0x371; // app_launch(app_id, flags) → host_pid
 pub const SYS_APP_UNINSTALL: u64 = 0x372; // app_uninstall(app_id) → 0
 
 // Phase 39 — Named port IPC namespace.

@@ -229,7 +229,7 @@ pub(crate) fn sys_proc_surface_count(pid: u64) -> i64 {
     crate::compositor::surface_count_for(pid as u32) as i64
 }
 
-pub(crate) fn sys_app_launch_path(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
+pub(crate) fn sys_app_launch_path(path_ptr: u64, path_len: u64, flags: u64) -> i64 {
     let bytes = match unsafe { read_user_bytes(path_ptr, path_len as usize) } {
         Some(b) => b,
         None => return -14,
@@ -242,12 +242,42 @@ pub(crate) fn sys_app_launch_path(path_ptr: u64, path_len: u64, _flags: u64) -> 
         Some(data) => data,
         None => return -2,
     };
-    match crate::process::spawn(elf, path) {
+
+    let mode = flags & 0xFF;
+    let app_id = flags >> 32;
+    let rdi = if mode == 0 {
+        crate::app_registry::HOST_MODE_SHELL
+    } else {
+        mode
+    };
+    let rsi = if rdi == crate::app_registry::HOST_MODE_APP {
+        app_id
+    } else {
+        0
+    };
+
+    let bootstrap = crate::process::SpawnBootstrap {
+        rdi,
+        rsi,
+        rdx: 0,
+        parent_pid: crate::process::current_pid().max(1),
+    };
+
+    match crate::process::spawn_with_bootstrap(elf, path, bootstrap) {
         Ok(pid) => {
+            if rdi == crate::app_registry::HOST_MODE_APP && app_id != 0 {
+                let (aot_va, _) = match crate::app_registry::map_aot_into_process(app_id as u32, pid) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = crate::process::kill(pid);
+                        return e;
+                    }
+                };
+                crate::process::set_bootstrap_regs(pid, rdi, rsi, aot_va);
+            }
             crate::wm::push_app_event(pid, eabi::APP_LAUNCH, 0);
             let host_pid = ENGINE_HOST_PID.load(Ordering::Acquire);
             if host_pid != 0 {
-                // Notify the runtime host about the launched app PID.
                 crate::wm::push_event_for(host_pid, eabi::EV_APP, eabi::APP_LAUNCH, pid as u64, 0);
             }
             pid as i64
@@ -275,6 +305,7 @@ pub(crate) fn sys_engine_host_register(_flags: u64) -> i64 {
         return -1; // EPERM (kernel context cannot be engine host)
     }
     ENGINE_HOST_PID.store(pid, Ordering::Release);
+    crate::wm::set_focus_pid(pid);
     pid as i64
 }
 
@@ -406,12 +437,8 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
 
     let is_reentrant = WM_WAITER_PID.load(Ordering::Acquire) == cur;
 
-    // On a fresh (non-reentrant) wm_event_wait: kick all task-runner threads if
-    // the APIC ISR has flagged a deferred kick (fired every ~500 ms).  This is
-    // enough to break any deadlock where a task-runner thread is stuck in
-    // epoll_wait with no timerfd armed, without spuriously waking pid=2 on every
-    // single event-loop iteration (which caused pid=2 to spin on empty timerfd
-    // reads, starving pid=1 of CPU and breaking the vsync delivery chain).
+    // On a fresh (non-reentrant) wm_event_wait: kick task runners when the APIC
+    // ISR has flagged a deferred kick (~500 ms).
     if !is_reentrant {
         let kicked = KICK_REQUESTED.swap(false, Ordering::AcqRel);
         if kicked {

@@ -6,9 +6,26 @@ use super::poll::{monotonic_ns, EPOLL_TABLE, TIMERFD_TABLE};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 pub fn debug_dump_sync_states() {
-    let safe_read_u32 = |ptr: u64| -> Option<u32> {
-        if ptr < 0x1000 || ptr > 0x7fff_ffff_ffff { return None; }
-        unsafe { Some(*(ptr as *const u32)) }
+    let safe_read_u32 = |pid: u32, ptr: u64| -> Option<u32> {
+        if ptr < 0x1000 {
+            return None;
+        }
+        let pml4 = {
+            let _g = crate::process::PTABLE_LOCK.lock();
+            let p = unsafe { &crate::process::PTABLE[crate::process::idx_of(pid)] };
+            if p.pid != pid {
+                return None;
+            }
+            p.pml4_phys
+        };
+        let page = ptr & !0xfff;
+        let off = (ptr & 0xfff) as usize;
+        if off + 4 > 4096 {
+            return None;
+        }
+        let phys = crate::mm::paging::translate_user_page(pml4, page)?;
+        let hhdm = crate::mm::frame_allocator::hhdm_offset();
+        unsafe { Some(core::ptr::read_volatile((phys + hhdm + off as u64) as *const u32)) }
     };
 
     if let Some(cws) = COND_WAIT_STATE.try_lock() {
@@ -17,13 +34,13 @@ pub fn debug_dump_sync_states() {
             for (&pid, state) in cws.iter() {
                 match state {
                     CondWaitState::Waiting { cond, mutex, seq, timeout_ns } => {
-                        let c_val = safe_read_u32(*cond).map_or(-1, |v| v as i32);
-                        let m_val = safe_read_u32(*mutex).map_or(-1, |v| v as i32);
+                        let c_val = safe_read_u32(pid, *cond).map_or(-1, |v| v as i32);
+                        let m_val = safe_read_u32(pid, *mutex).map_or(-1, |v| v as i32);
                         log::info!("  pid={}: Waiting {{ cond: {:#x} (val={}), mutex: {:#x} (val={}), seq: {}, timeout_ns: {} }}",
                             pid, cond, c_val, mutex, m_val, seq, timeout_ns);
                     }
                     CondWaitState::AcquiringMutex { mutex, timed_out } => {
-                        let m_val = safe_read_u32(*mutex).map_or(-1, |v| v as i32);
+                        let m_val = safe_read_u32(pid, *mutex).map_or(-1, |v| v as i32);
                         log::info!("  pid={}: AcquiringMutex {{ mutex: {:#x} (val={}), timed_out: {} }}",
                             pid, mutex, m_val, timed_out);
                     }
@@ -35,7 +52,12 @@ pub fn debug_dump_sync_states() {
         if !fw.is_empty() {
             log::info!("=== Futex Waiters ===");
             for (&addr, pids) in fw.iter() {
-                let val = safe_read_u32(addr).map_or(-1, |v| v as i32);
+                let owner = pids.first().copied().unwrap_or(0);
+                let val = if owner != 0 {
+                    safe_read_u32(owner, addr).map_or(-1, |v| v as i32)
+                } else {
+                    -1
+                };
                 log::info!("  addr={:#x} (val={}): {:?}", addr, val, pids);
             }
         }

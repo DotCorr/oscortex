@@ -1,6 +1,6 @@
-//! .oscapp application registry — Phase 38.
+//! `.osx` application registry.
 //!
-//! ## Bundle format (`*.oscapp`)
+//! ## Bundle format (`*.osx`)
 //!
 //! A simple binary layout recognised by the magic `"OSCP"`:
 //!
@@ -37,6 +37,12 @@ use alloc::vec::Vec;
 
 const MAGIC: &[u8; 4] = b"OSCP";
 const HEADER_SIZE: usize = 112;
+
+/// Host bootstrap: shell mode (rdi) — see `tools/flutter-embedder`.
+pub const HOST_MODE_SHELL: u64 = 1;
+/// Host bootstrap: user app mode (rdi) with app_id in rsi.
+pub const HOST_MODE_APP: u64 = 2;
+const HOST_ELF_PATH: &str = "/bin/oscortex-host";
 
 pub struct BundleHeader {
     pub name:         [u8; 64],
@@ -145,7 +151,32 @@ static APP_TABLE: Mutex<AppTable> = Mutex::new(AppTable::empty());
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Install an `.oscapp` bundle from a byte slice.
+/// Install with a fixed id (used when hydrating from block store).
+pub fn install_from_store(bundle: &[u8], id: u32) -> Option<u32> {
+    let hdr = parse_header(bundle)?;
+    let aot_data: Vec<u8> = bundle[HEADER_SIZE..HEADER_SIZE + hdr.aot_len as usize].to_vec();
+    let mut table = APP_TABLE.lock();
+    if table.find(id).is_some() {
+        return None;
+    }
+    let record = AppRecord {
+        id,
+        name: hdr.name,
+        version: hdr.version,
+        entry_offset: hdr.entry_offset,
+        stack_size: if hdr.stack_size == 0 { 512 * 1024 } else { hdr.stack_size },
+        aot_data,
+    };
+    if !table.insert(record) {
+        return None;
+    }
+    if table.next_id <= id {
+        table.next_id = id.saturating_add(1).max(1);
+    }
+    Some(id)
+}
+
+/// Install a `.osx` bundle from a byte slice.
 ///
 /// Returns the new `app_id` on success, or `None` on parse error / table full.
 pub fn install(bundle: &[u8]) -> Option<u32> {
@@ -173,6 +204,8 @@ pub fn install(bundle: &[u8]) -> Option<u32> {
     };
     if !table.insert(record) { return None; }
 
+    let _ = crate::app_store::persist_bundle(id, bundle);
+
     log::info!("[APP] Installed '{}' id={}", {
         let end = hdr.name.iter().position(|&b| b == 0).unwrap_or(64);
         core::str::from_utf8(&hdr.name[..end]).unwrap_or("?")
@@ -185,6 +218,7 @@ pub fn uninstall(app_id: u32) -> bool {
     let mut table = APP_TABLE.lock();
     let found = table.remove(app_id);
     if found {
+        let _ = crate::app_store::remove_bundle(app_id);
         log::info!("[APP] Uninstalled app_id={}", app_id);
     }
     found
@@ -212,45 +246,25 @@ pub fn list(buf: &mut [u8]) -> u32 {
     count
 }
 
-/// Launch an installed app.
-///
-/// Internally:
-///   1. Copies the stored AOT snapshot into the current process's address space
-///      (via `process::dl::mmap_anon`) so the Dart runtime can find it.
-///   2. Spawns a new isolate with `crate::isolate::spawn`.
-///   3. Registers the app as an active process.
-///
-/// Returns the new isolate ID, or -ERRNO on failure.
-pub fn launch(app_id: u32, _flags: u32) -> i64 {
-    // Lock only to clone the needed data, then release before calling into
-    // process/isolate subsystems (which take their own locks).
-    let (aot_data, entry_offset, stack_size, name) = {
+/// Map an installed app's AOT payload into `pid`'s address space.
+/// Returns `(va, byte_len)` on success.
+pub fn map_aot_into_process(app_id: u32, pid: u32) -> Result<(u64, u64), i64> {
+    let aot_data = {
         let table = APP_TABLE.lock();
-        let record = match table.find(app_id) {
-            Some(r) => r,
-            None    => return -2, // ENOENT
-        };
-        (
-            record.aot_data.clone(),
-            record.entry_offset,
-            record.stack_size,
-            record.name,
-        )
+        let record = table.find(app_id).ok_or(-2i64)?;
+        record.aot_data.clone()
     };
-
-    let pid = crate::process::current_pid();
-    if pid == 0 { return -1; } // EPERM — must be called from userspace
 
     let pml4_phys = match crate::process::get_user_context(pid) {
         Some(ctx) => ctx.pml4_phys,
-        None      => return -9, // EBADF
+        None => return Err(-3),
     };
 
-    // Map AOT snapshot into the calling process's address space
-    // (PROT_READ | PROT_EXEC = flags 5).
     let pages = (aot_data.len() + 4095) / 4096;
     let va = crate::process::dl::mmap_anon(pid, pml4_phys, 0, pages, 5);
-    if va == u64::MAX { return -12; } // ENOMEM
+    if va == u64::MAX {
+        return Err(-12);
+    }
 
     unsafe {
         let hhdm = crate::mm::frame_allocator::hhdm_offset();
@@ -258,21 +272,65 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
         core::ptr::copy_nonoverlapping(aot_data.as_ptr(), dst, aot_data.len());
     }
 
-    // Spawn a Dart isolate pointing at the mapped AOT snapshot.
-    let aot_size = aot_data.len() as u64;
-    let stack_sz = stack_size as usize;
-    match crate::isolate::spawn(pid, va, aot_size, entry_offset, stack_sz) {
-        Ok(iso_id) => {
-            let name_end = name.iter().position(|&b| b == 0).unwrap_or(64);
-            let name_str = core::str::from_utf8(&name[..name_end]).unwrap_or("?");
-            log::info!("[APP] Launched '{}' app_id={} isolate={}", name_str, app_id, iso_id);
-            iso_id as i64
+    Ok((va, aot_data.len() as u64))
+}
+
+/// Launch an installed app in a **new** Flutter host process.
+///
+/// Spawns `/bin/oscortex-host` with bootstrap `(HOST_MODE_APP, app_id)`, maps
+/// the stored AOT ELF into that process, and returns the new PID.
+pub fn launch(app_id: u32, _flags: u32) -> i64 {
+    let name = {
+        let table = APP_TABLE.lock();
+        let record = match table.find(app_id) {
+            Some(r) => r,
+            None => return -2,
+        };
+        record.name
+    };
+
+    let elf = match crate::fs::lookup(HOST_ELF_PATH) {
+        Some(data) => data,
+        None => {
+            log::error!("[APP] host binary missing: {}", HOST_ELF_PATH);
+            return -2;
         }
+    };
+
+    let bootstrap = crate::process::SpawnBootstrap {
+        rdi: HOST_MODE_APP,
+        rsi: app_id as u64,
+        rdx: 0,
+        parent_pid: 1,
+    };
+
+    let child_pid = match crate::process::spawn_with_bootstrap(elf, "oscortex-host", bootstrap) {
+        Ok(p) => p,
         Err(e) => {
-            log::warn!("[APP] launch failed: {}", e);
-            -12 // ENOMEM / table full
+            log::warn!("[APP] host spawn failed: {}", e);
+            return -12;
         }
-    }
+    };
+
+    let (aot_va, _aot_size) = match map_aot_into_process(app_id, child_pid) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = crate::process::kill(child_pid);
+            return e;
+        }
+    };
+
+    crate::process::set_bootstrap_regs(child_pid, HOST_MODE_APP, app_id as u64, aot_va);
+
+    crate::wm::push_app_event(child_pid, crate::embedder::abi::APP_LAUNCH, 0);
+
+    let name_end = name.iter().position(|&b| b == 0).unwrap_or(64);
+    let name_str = core::str::from_utf8(&name[..name_end]).unwrap_or("?");
+    log::info!(
+        "[APP] Launched '{}' app_id={} host_pid={}",
+        name_str, app_id, child_pid
+    );
+    child_pid as i64
 }
 
 /// Return the number of currently installed apps.

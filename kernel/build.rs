@@ -209,7 +209,7 @@ fn generate_liboscortex_shim() -> Vec<u8> {
         // Phase 37: PS/2 input device query
         ("oscortex_input_dev_count",         0x36D),
         ("oscortex_input_dev_info",          0x36E),
-        // Phase 38: .oscapp app registry
+        // Phase 38: .osx app registry
         ("oscortex_app_install",             0x36F),
         ("oscortex_app_list",                0x370),
         ("oscortex_app_launch",              0x371),

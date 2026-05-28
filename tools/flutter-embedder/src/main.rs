@@ -440,13 +440,11 @@ static PLATFORM_TASKS_LOCK: Spinlock = Spinlock::new();
 static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
 static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_FN: AtomicU64 = AtomicU64::new(0);
+static SEND_PLATFORM_MESSAGE_RESPONSE_FN: AtomicU64 = AtomicU64::new(0);
+
+const SHELL_CHANNEL: &[u8] = b"oscortex/shell";
 
 const APPS_REQUEST_CHANNEL: &[u8] = b"oscortex/apps/request";
-const APPS_CATALOG_CHANNEL_Z: &[u8] = b"oscortex/apps/catalog\0";
-const APPS_REGISTRY_PATH_Z: &[u8] = b"/system/apps/registry.json\0";
-const AT_FDCWD: i64 = -100;
-const O_RDONLY: u64 = 0;
-const EMPTY_APPS_JSON: &[u8] = b"{\"apps\":[]}";
 
 unsafe extern "C" fn runs_task_on_current_thread_callback(_user_data: *mut ()) -> bool {
     let tid = unsafe { syscall0(186) };
@@ -538,7 +536,11 @@ unsafe extern "C" fn platform_message_callback(
     };
 
     if channel_slice == APPS_REQUEST_CHANNEL {
-        publish_subsystem_apps_catalog();
+        return;
+    }
+
+    if channel_slice == SHELL_CHANNEL {
+        handle_shell_platform_message(msg);
         return;
     }
 
@@ -549,47 +551,163 @@ unsafe extern "C" fn platform_message_callback(
     platform_msg_post(channel_slice, payload);
 }
 
-fn publish_subsystem_apps_catalog() {
-    let mut buf = [0u8; 8192];
-    let len = read_small_file(APPS_REGISTRY_PATH_Z, &mut buf);
-    let payload = if len > 0 { &buf[..len] } else { EMPTY_APPS_JSON };
-    let _ = send_platform_message_direct(APPS_CATALOG_CHANNEL_Z, payload);
+fn handle_shell_platform_message(msg: &FlutterPlatformMessage) {
+    if msg.message == 0 || msg.message_size == 0 {
+        return;
+    }
+    let payload = unsafe {
+        core::slice::from_raw_parts(msg.message as *const u8, msg.message_size)
+    };
+    let reply = dispatch_shell_command(payload);
+    if msg.response_handle == 0 {
+        return;
+    }
+    let engine = ENGINE.load(Ordering::SeqCst);
+    let resp_fn_va = SEND_PLATFORM_MESSAGE_RESPONSE_FN.load(Ordering::SeqCst);
+    if engine == 0 || resp_fn_va == 0 {
+        return;
+    }
+    type SendResponseFn = unsafe extern "C" fn(u64, u64, *const u8, usize) -> i32;
+    let send_response: SendResponseFn = unsafe { core::mem::transmute(resp_fn_va) };
+    let _ = unsafe { send_response(engine, msg.response_handle, reply.as_ptr(), reply.len()) };
 }
 
-fn read_small_file(path_z: &[u8], dst: &mut [u8]) -> usize {
-    let fd = openat(AT_FDCWD, path_z, O_RDONLY, 0);
-    if fd < 0 {
-        return 0;
+fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
+    if payload.starts_with(b"list") {
+        return format_app_list_json();
     }
+    if payload.starts_with(b"launch:") {
+        let id = parse_u32_after_colon(payload);
+        if id == 0 {
+            return b"{\"ok\":false}";
+        }
+        let pid = sys::app_launch(id);
+        if pid > 0 {
+            return b"{\"ok\":true}";
+        }
+        return b"{\"ok\":false}";
+    }
+    if payload.starts_with(b"uninstall:") {
+        let id = parse_u32_after_colon(payload);
+        if id == 0 {
+            return b"{\"ok\":false}";
+        }
+        if sys::app_uninstall(id) == 0 {
+            return b"{\"ok\":true}";
+        }
+        return b"{\"ok\":false}";
+    }
+    if payload.starts_with(b"install:") {
+        let path = &payload[8..];
+        let path = trim_line(path);
+        return install_osx_from_path(path);
+    }
+    b"{\"ok\":false}"
+}
 
-    let mut used = 0usize;
-    while used < dst.len() {
-        let n = read(fd, &mut dst[used..]);
-        if n <= 0 {
+fn parse_u32_after_colon(payload: &[u8]) -> u32 {
+    let mut n = 0u32;
+    let mut started = false;
+    for &b in payload {
+        if b == b':' {
+            started = true;
+            continue;
+        }
+        if !started {
+            continue;
+        }
+        if b < b'0' || b > b'9' {
             break;
         }
-        used = used.saturating_add(n as usize);
+        n = n.saturating_mul(10).saturating_add((b - b'0') as u32);
     }
-    let _ = close(fd);
-    used
+    n
 }
 
-fn send_platform_message_direct(channel_z: &[u8], payload: &[u8]) -> bool {
-    let engine = ENGINE.load(Ordering::SeqCst);
-    let send_fn_va = SEND_PLATFORM_MESSAGE_FN.load(Ordering::SeqCst);
-    if engine == 0 || send_fn_va == 0 {
-        return false;
-    }
+fn trim_line(s: &[u8]) -> &[u8] {
+    let end = s.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(s.len());
+    &s[..end]
+}
 
-    let msg = FlutterPlatformMessage {
-        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
-        channel: channel_z.as_ptr() as u64,
-        message: payload.as_ptr() as u64,
-        message_size: payload.len(),
-        response_handle: 0,
-    };
-    let send_platform_message: SendPlatformMessageFn = unsafe { core::mem::transmute(send_fn_va) };
-    unsafe { send_platform_message(engine, &msg as *const _) == 0 }
+static mut APP_LIST_JSON: [u8; 4096] = [0; 4096];
+static APP_LIST_JSON_LEN: AtomicU32 = AtomicU32::new(0);
+
+fn format_app_list_json() -> &'static [u8] {
+    let mut records = [0u8; 4096];
+    let count = sys::app_list(&mut records) as usize;
+    let mut out = unsafe { &mut APP_LIST_JSON };
+    let mut pos = 0usize;
+    out[pos..pos + 9].copy_from_slice(b"{\"apps\":[");
+    pos += 9;
+    let mut i = 0usize;
+    while i < count {
+        let off = i * 88;
+        if off + 88 > records.len() {
+            break;
+        }
+        let id = u32::from_le_bytes(records[off..off + 4].try_into().unwrap_or([0; 4]));
+        let name_end = records[off + 4..off + 68]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(64);
+        let name = &records[off + 4..off + 4 + name_end];
+        if i > 0 {
+            out[pos] = b',';
+            pos += 1;
+        }
+        out[pos] = b'{';
+        pos += 1;
+        out[pos..pos + 5].copy_from_slice(b"\"id\":");
+        pos += 5;
+        pos += write_json_u32(&mut out[pos..], id);
+        out[pos..pos + 9].copy_from_slice(b",\"name\":\"");
+        pos += 9;
+        let copy = name.len().min(out.len().saturating_sub(pos).saturating_sub(12));
+        out[pos..pos + copy].copy_from_slice(&name[..copy]);
+        pos += copy;
+        out[pos..pos + 3].copy_from_slice(b"\"}");
+        pos += 3;
+        i += 1;
+    }
+    out[pos..pos + 2].copy_from_slice(b"]}");
+    pos += 2;
+    APP_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
+    unsafe { core::slice::from_raw_parts(APP_LIST_JSON.as_ptr(), pos) }
+}
+
+fn write_json_u32(out: &mut [u8], mut v: u32) -> usize {
+    if out.is_empty() {
+        return 0;
+    }
+    if v == 0 {
+        out[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 10];
+    let mut n = 0usize;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        out[i] = tmp[n - 1 - i];
+    }
+    n
+}
+
+fn install_osx_from_path(path: &[u8]) -> &'static [u8] {
+    let mut buf = [0u8; 65536];
+    let n = sys::vfs_read(path, &mut buf);
+    if n <= 0 {
+        return b"{\"ok\":false,\"err\":\"read\"}";
+    }
+    let bundle = &buf[..n as usize];
+    let mut id = 0u32;
+    if sys::app_install(bundle, &mut id) != 0 {
+        return b"{\"ok\":false,\"err\":\"install\"}";
+    }
+    b"{\"ok\":true}"
 }
 
 /// Log callback — writes to the kernel's serial debug output.
@@ -623,10 +741,32 @@ unsafe fn cstr_to_slice<'a>(ptr: *const u8) -> &'a [u8] {
 
 const ENGINE_LIB_PATH: &[u8] = b"/system/lib/libflutter_engine.so";
 
+const HOST_MODE_SHELL: u64 = 1;
+const HOST_MODE_APP: u64 = 2;
+
+fn read_host_bootstrap() -> (u64, u64, u64) {
+    let rdi: u64;
+    let rsi: u64;
+    let rdx: u64;
+    unsafe {
+        asm!(
+            "mov {0}, rdi",
+            "mov {1}, rsi",
+            "mov {2}, rdx",
+            out(reg) rdi,
+            out(reg) rsi,
+            out(reg) rdx,
+        );
+    }
+    (rdi, rsi, rdx)
+}
+
 // ── Main embedder logic ───────────────────────────────────────────────────────
 
 extern "C" fn main_embedder() {
-    write(b"[embedder] starting\n");
+    let (host_mode, app_id, aot_va) = read_host_bootstrap();
+    let _ = app_id;
+    write(b"[host] starting\n");
 
     // 1. Register as the engine host.
     let host_pid = engine_host_register();
@@ -677,7 +817,6 @@ extern "C" fn main_embedder() {
     let mut initialize_va = 0u64;
     let mut run_initialized_va = 0u64;
     let mut notify_display_update_va = 0u64;
-    let mut is_aot = false;
 
     if get_procs_va != 0 {
         let mut api_table = FlutterEngineProcTableApi::default();
@@ -697,21 +836,12 @@ extern "C" fn main_embedder() {
         proctable.schedule_frame        = api_table.schedule_frame;
         proctable.send_platform_message = api_table.send_platform_message;
         SEND_PLATFORM_MESSAGE_FN.store(api_table.send_platform_message, Ordering::SeqCst);
+        SEND_PLATFORM_MESSAGE_RESPONSE_FN.store(api_table.send_platform_message_response, Ordering::SeqCst);
 
         initialize_va                   = api_table.initialize;
         run_initialized_va              = api_table.run_initialized;
         notify_display_update_va        = api_table.notify_display_update;
         RUN_TASK_FN.store(api_table.run_task, Ordering::SeqCst);
-
-        let runs_aot_fn_va = api_table.runs_aot_compiled_dart_code;
-        if runs_aot_fn_va != 0 {
-            let runs_aot: unsafe extern "C" fn() -> bool = unsafe { core::mem::transmute(runs_aot_fn_va) };
-            is_aot = unsafe { runs_aot() };
-            if is_aot {
-            } else {
-            }
-        } else {
-        }
     } else {
         // Stub path: resolve each symbol manually.
         proctable.run                   = dlsym(handle, b"FlutterEngineRun");
@@ -723,6 +853,10 @@ extern "C" fn main_embedder() {
         proctable.schedule_frame        = dlsym(handle, b"FlutterEngineScheduleFrame");
         proctable.send_platform_message = dlsym(handle, b"FlutterEngineSendPlatformMessage");
         SEND_PLATFORM_MESSAGE_FN.store(proctable.send_platform_message, Ordering::SeqCst);
+        SEND_PLATFORM_MESSAGE_RESPONSE_FN.store(
+            dlsym(handle, b"FlutterEngineSendPlatformMessageResponse"),
+            Ordering::SeqCst,
+        );
 
         initialize_va                   = dlsym(handle, b"FlutterEngineInitialize");
         run_initialized_va              = dlsym(handle, b"FlutterEngineRunInitialized");
@@ -821,11 +955,11 @@ extern "C" fn main_embedder() {
         log_message_callback as *const () as u64,
     );
 
-    if is_aot {
-        // AOT mode: load libapp.so via kernel syscall, parse ELF symbol table,
-        // write the 4 Dart snapshot raw pointers into FlutterProjectArgs.
-        static LIBAPP_PATH: &[u8] = b"/system/flutter/libapp.so\0";
-        match aot_loader::load_dart_snapshot(LIBAPP_PATH) {
+    if host_mode == HOST_MODE_APP {
+        // Per-app .osx bundles ship gen_snapshot libapp.so; only valid when the
+        // engine build matches (AOT engine). With the JIT shell engine, app
+        // hosts must bundle JIT snapshot assets instead (future work).
+        match aot_loader::load_dart_snapshot_from_mapping(aot_va) {
             Some(snaps) => {
                 aot_loader::log_manifest(&snaps);
                 write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,              snaps.vm_data);
@@ -838,15 +972,13 @@ extern "C" fn main_embedder() {
                 write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE,snaps.iso_instr_size);
             }
             None => {
-                write(b"[embedder] ERROR: aot_loader::load_dart_snapshot FAILED\n");
+                write(b"[host] ERROR: app AOT load failed\n");
                 exit(-1);
             }
         }
     } else {
-        // JIT mode: pass snapshot asset PATHS to the legacy snapshot pointer
-        // fields. This engine build reads those fields as C strings and maps
-        // files from disk.
-
+        // Shell: JIT engine reads vm/isolate snapshot files from initramfs.
+        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
         static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
         static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
 
@@ -854,7 +986,7 @@ extern "C" fn main_embedder() {
         write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
         write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
         write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
-
+        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
     }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
@@ -872,13 +1004,18 @@ extern "C" fn main_embedder() {
         &CUSTOM_TASK_RUNNERS as *const _ as u64,
     );
 
-    // Initialize the MessageLoop for the main thread so that task observers can query it without assertions.
-    // NOTE: ensure_initialized_va call removed — hardcoded offset into
-    // libflutter_engine.so for fml::MessageLoop::EnsureInitializedForCurrentThread().
-    // With render_task_runner=null Flutter manages its own threads' MessageLoops.
-    // Calling a stale/wrong offset would silently corrupt engine state.
+    // Initialize the MessageLoop for the main thread before FlutterEngineInitialize.
+    // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
+    write(b"[embedder] initializing main thread message loop...\n");
+    const ENSURE_INITIALIZED_NM: u64 = 0x19bbd40;
+    let ensure_initialized_va = 0x1000000u64 + ENSURE_INITIALIZED_NM;
+    let ensure_initialized: unsafe extern "C" fn() =
+        unsafe { core::mem::transmute(ensure_initialized_va) };
+    unsafe { ensure_initialized(); }
+    write(b"[embedder] message loop initialized!\n");
 
     // 8. Initialize the engine synchronously on the main thread
+    write(b"[embedder] calling FlutterEngineInitialize...\n");
     let mut engine_out: u64 = 0;
     let rc_init = unsafe {
         let initialize_fn: InitializeFn = unsafe { core::mem::transmute(initialize_va) };
@@ -899,9 +1036,11 @@ extern "C" fn main_embedder() {
         write(&hex);
         exit(-1);
     }
+    write(b"[embedder] FlutterEngineInitialize OK\n");
     ENGINE.store(engine_out, Ordering::SeqCst);
 
     // 9. Run the engine on the main thread (starts the shell)
+    write(b"[embedder] calling FlutterEngineRunInitialized...\n");
     let rc_run = unsafe {
         let run_initialized_fn: RunInitializedFn = unsafe { core::mem::transmute(run_initialized_va) };
         run_initialized_fn(engine_out)
@@ -914,6 +1053,7 @@ extern "C" fn main_embedder() {
         write(&hex);
         exit(-1);
     }
+    write(b"[embedder] FlutterEngineRunInitialized OK\n");
 
     // 10. Immediately notify display topology (now that shell exists)
     {
@@ -1000,8 +1140,6 @@ extern "C" fn main_embedder() {
                 }
             }
 
-            // Push the subsystem app registry to Flutter shell once at startup.
-            publish_subsystem_apps_catalog();
         } else {
             let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
             let digits = b"0123456789abcdef";
@@ -1025,6 +1163,7 @@ extern "C" fn main_embedder() {
     // rendering even after it goes idle (static UI or before Dart init completes).
     let mut frame_pump_next_ns: u64 = rdtsc_ns() + 16_666_666;
 
+    write(b"[embedder] entering event loop\n");
     loop {
         // Run pending platform tasks
         let now = rdtsc_ns();

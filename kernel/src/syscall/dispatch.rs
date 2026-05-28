@@ -374,7 +374,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         eabi::SYS_INPUT_DEV_COUNT => sys_input_dev_count(),
         eabi::SYS_INPUT_DEV_INFO  => sys_input_dev_info(arg0),
 
-        // Phase 38 — .oscapp app registry
+        // Phase 38 — .osx app registry
         eabi::SYS_APP_INSTALL   => sys_app_install(arg0, arg1, arg2),
         eabi::SYS_APP_LIST      => sys_app_list(arg0, arg1),
         eabi::SYS_APP_LAUNCH    => sys_app_launch(arg0, arg1),
@@ -411,6 +411,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
 
         // Phase 47 — exec + blocking wait (cooperative exec round-trip)
         0x39E => sys_exec_wait(arg0, arg1),
+        0x39F => sys_reap_children(),
 
         // Phase 48 — UART 16550 serial console
         0x383 => sys_serial_read(arg0, arg1),

@@ -80,10 +80,50 @@ pub fn load_dart_snapshot(path: &[u8]) -> Option<DartSnapshotPointers> {
         return None;
     }
 
-    let base = aot_va as *const u8;
-    let size = aot_size as usize;
+    parse_dart_snapshot_elf(aot_va, aot_size as usize)
+}
 
-    // SAFETY: kernel guarantees the mapping covers [aot_va, aot_va+aot_size).
+/// Parse an AOT ELF already mapped at `aot_va` (used by per-app host processes).
+pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<DartSnapshotPointers> {
+    if aot_va == 0 {
+        return None;
+    }
+    let span = infer_elf_file_span(aot_va)?;
+    parse_dart_snapshot_elf(aot_va, span)
+}
+
+fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
+    let base = aot_va as *const u8;
+    // SAFETY: reading ELF header and program headers from a kernel-mapped RX region.
+    unsafe {
+        let hdr = core::slice::from_raw_parts(base, 64);
+        if hdr.len() < 64 || &hdr[..4] != b"\x7fELF" {
+            return None;
+        }
+        let e_phoff = read_u64(hdr, 0x20)?;
+        let e_phentsize = read_u16(hdr, 0x36)? as usize;
+        let e_phnum = read_u16(hdr, 0x38)? as usize;
+        let mut end = 64usize;
+        for i in 0..e_phnum {
+            let off = e_phoff as usize + i * e_phentsize;
+            let ph = core::slice::from_raw_parts(base.add(off), 56);
+            if ph.len() < 56 {
+                return None;
+            }
+            let p_type = read_u32(ph, 0)?;
+            if p_type != PT_LOAD {
+                continue;
+            }
+            let p_offset = read_u64(ph, 8)? as usize;
+            let p_filesz = read_u64(ph, 32)? as usize;
+            end = end.max(p_offset.saturating_add(p_filesz));
+        }
+        Some(end)
+    }
+}
+
+fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<DartSnapshotPointers> {
+    let base = aot_va as *const u8;
     let buf = unsafe { core::slice::from_raw_parts(base, size) };
 
     // ── ELF64 header validation ──────────────────────────────────────────

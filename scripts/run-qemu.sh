@@ -18,11 +18,8 @@ VBLK="$ROOT/vdisk.img"
 if [ ! -f "$VBLK" ]; then
     echo "[QEMU] Creating 8 MiB virtio-blk image: $VBLK"
     dd if=/dev/zero of="$VBLK" bs=1M count=8 2>/dev/null
-    # mkfs.ext2 is needed to use the ext2 driver.  Skip silently if not present.
-    if command -v mkfs.ext2 &>/dev/null; then
-        mkfs.ext2 -b 1024 "$VBLK" &>/dev/null
-        echo "[QEMU] Formatted $VBLK as ext2"
-    fi
+    # Raw block image for kernel app_store (OSSTORE1 layout). Do not mkfs.ext2 —
+    # that puts a filesystem at sector 0 and is unrelated to our block catalog.
 fi
 
 # Create a small NVMe disk image (16 MiB).
@@ -45,7 +42,7 @@ done
 echo "[QEMU] Booting $ISO ..."
 exec qemu-system-x86_64 \
     -cdrom "$ISO" \
-    -m 512M \
+    -m 2048M \
     -smp 2 \
     -cpu qemu64,+x2apic \
     -machine q35 \

@@ -321,10 +321,28 @@ fn free_syscall_stack(ptr: *mut u8) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Bootstrap values passed to a new process entry (SysV ABI: rdi, rsi, rdx).
+#[derive(Clone, Copy, Default)]
+pub struct SpawnBootstrap {
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub parent_pid: u32,
+}
+
 /// Spawn a new process from an ELF image in memory.
 ///
 /// Returns the new PID, or an error string.
 pub fn spawn(elf_bytes: &[u8], name: &str) -> Result<u32, &'static str> {
+    spawn_with_bootstrap(elf_bytes, name, SpawnBootstrap::default())
+}
+
+/// Spawn a new process with optional bootstrap registers and parent linkage.
+pub fn spawn_with_bootstrap(
+    elf_bytes: &[u8],
+    name: &str,
+    bootstrap: SpawnBootstrap,
+) -> Result<u32, &'static str> {
     let pid = alloc_pid().ok_or("process table full")?;
     let (sys_stack_base, sys_stack_top) = alloc_syscall_stack().ok_or("OOM: syscall stack")?;
 
@@ -360,6 +378,9 @@ pub fn spawn(elf_bytes: &[u8], name: &str) -> Result<u32, &'static str> {
     let mut regs = UserRegs::default();
     regs.rip    = entry;
     regs.rsp    = USER_STACK_TOP - 8; // leave one guard word
+    regs.rdi    = bootstrap.rdi;
+    regs.rsi    = bootstrap.rsi;
+    regs.rdx    = bootstrap.rdx;
     regs.rflags = 0x0202;             // IF=1, reserved=1
 
     {
@@ -375,15 +396,68 @@ pub fn spawn(elf_bytes: &[u8], name: &str) -> Result<u32, &'static str> {
         p.syscall_stack_top = sys_stack_top;
         p.xstate = XStateBuf::default();
         p.is_thread  = false;
-        p.parent_pid = 0;
+        p.parent_pid = bootstrap.parent_pid;
         p.fs_base    = 0;
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
         p.user_stack_size = USER_STACK_SIZE as u64;
     }
 
-    log::info!("[Process] Spawned '{}' pid={} entry={:#x}", name, pid, entry);
+    log::info!(
+        "[Process] Spawned '{}' pid={} entry={:#x} rdi={:#x} rsi={:#x} rdx={:#x} parent={}",
+        name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid
+    );
     Ok(pid)
+}
+
+/// Patch bootstrap registers before the process's first userspace run.
+pub fn set_bootstrap_regs(pid: u32, rdi: u64, rsi: u64, rdx: u64) {
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx] };
+    if p.pid == pid {
+        p.regs.rdi = rdi;
+        p.regs.rsi = rsi;
+        p.regs.rdx = rdx;
+    }
+}
+
+/// Reap one zombie child of `parent`. Returns `(pid, exit_code)` or None.
+pub fn reap_one_zombie(parent: u32) -> Option<(u32, i32)> {
+    let _g = PTABLE_LOCK.lock();
+    unsafe {
+        for slot in PTABLE.iter_mut() {
+            if slot.pid != 0
+                && slot.parent_pid == parent
+                && matches!(slot.state, ProcState::Zombie(_))
+            {
+                let pid = slot.pid;
+                let code = slot.exit_code;
+                *slot = Process::empty();
+                return Some((pid, code));
+            }
+        }
+    }
+    None
+}
+
+/// Reap every zombie whose `parent_pid` matches `parent`. Returns count reaped.
+pub fn reap_zombie_children(parent: u32) -> u32 {
+    let mut reaped = 0u32;
+    let _g = PTABLE_LOCK.lock();
+    unsafe {
+        for slot in PTABLE.iter_mut() {
+            if slot.pid != 0
+                && slot.parent_pid == parent
+                && matches!(slot.state, ProcState::Zombie(_))
+            {
+                log::info!("[Process] init reaped pid={} code={}", slot.pid, slot.exit_code);
+                *slot = Process::empty();
+                reaped += 1;
+            }
+        }
+    }
+    reaped
 }
 
 /// Terminate a process.  May be called from the process itself (`sys_exit`)
@@ -1122,6 +1196,23 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
     Some((next_pid, next_regs))
 }
 
+/// Save full user context at a SYSCALL boundary before cooperatively yielding
+/// to another process. Marks the thread so timer preemption resumes via IRETQ.
+pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
+    save_full_user_gprs(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid != pid {
+        return;
+    }
+    p.regs.rip = rip;
+    p.regs.rsp = rsp;
+    p.regs.rflags = 0x202;
+    p.regs.rcx = rip;
+    p.regs.r11 = 0x202;
+    p.preempted_by_timer = true;
+}
+
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
@@ -1488,20 +1579,23 @@ pub fn get_fs_base(pid: u32) -> u64 {
 
 /// Dump a list of all active user threads/processes.
 pub fn debug_dump_processes() {
-    if let Some(_g) = PTABLE_LOCK.try_lock() {
-        log::info!("=== Process Table Dump ===");
-        for p in unsafe { PTABLE.iter() } {
-            if p.state != ProcState::Dead {
-                let state_str = match p.state {
-                    ProcState::Dead => "Dead",
-                    ProcState::Running => "Running",
-                    ProcState::Blocked => "Blocked",
-                    ProcState::Zombie(_code) => "Zombie",
-                };
-                log::info!(
-                    "  pid={} state={} is_thread={} parent_pid={} rip={:#x} rsp={:#x} rax={:#x} rdi={:#x} rsi={:#x} fs_base={:#x} ticks={}",
-                    p.pid, state_str, p.is_thread, p.parent_pid, p.regs.rip, p.regs.rsp, p.regs.rax, p.regs.rdi, p.regs.rsi, p.fs_base, p.cpu_ticks
-                );
+    if PTABLE_LOCK.try_lock().is_some() {
+        {
+            let _g = PTABLE_LOCK.lock();
+            log::info!("=== Process Table Dump ===");
+            for p in unsafe { PTABLE.iter() } {
+                if p.state != ProcState::Dead {
+                    let state_str = match p.state {
+                        ProcState::Dead => "Dead",
+                        ProcState::Running => "Running",
+                        ProcState::Blocked => "Blocked",
+                        ProcState::Zombie(_code) => "Zombie",
+                    };
+                    log::info!(
+                        "  pid={} state={} is_thread={} parent_pid={} rip={:#x} rsp={:#x} rax={:#x} rdi={:#x} rsi={:#x} fs_base={:#x} ticks={}",
+                        p.pid, state_str, p.is_thread, p.parent_pid, p.regs.rip, p.regs.rsp, p.regs.rax, p.regs.rdi, p.regs.rsi, p.fs_base, p.cpu_ticks
+                    );
+                }
             }
         }
         crate::syscall::debug_dump_sync_states();

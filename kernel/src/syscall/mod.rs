@@ -67,7 +67,7 @@
 //!   0x36E          input_dev_info(n) → packed_u32
 //!   0x36F          app_install(bundle_ptr, bundle_len, id_out_ptr) → 0
 //!   0x370          app_list(buf_ptr, buf_len) → count
-//!   0x371          app_launch(app_id, flags) → isolate_id
+//!   0x371          app_launch(app_id, flags) → host_pid
 //!   0x372          app_uninstall(app_id) → 0
 //!   0x373          port_bind(name_ptr, name_len, isolate_id) → 0
 //!   0x374          port_lookup(name_ptr, name_len, iso_out, pid_out) → 0

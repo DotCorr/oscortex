@@ -657,6 +657,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
             }
         }
 
+
         // Patch 3: fml::TaskRunner::RunNowOrPostTask (nm 0x19bfd00)
         //   Find the `84 C0  74 16` pair (test al,al ; je +0x16) after the
         //   RunsTasksOnCurrentThread vtable call. Replace ALL FOUR bytes

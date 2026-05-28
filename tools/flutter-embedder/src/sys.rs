@@ -483,6 +483,56 @@ pub fn isolate_ctrl(id: u32, op: u32) -> i64 {
     unsafe { syscall2(SYS_ISOLATE_CTRL, id as u64, op as u64) }
 }
 
+// ── App registry + VFS (shell) ───────────────────────────────────────────────
+
+pub const SYS_APP_INSTALL:   u64 = 0x36F;
+pub const SYS_APP_LIST:      u64 = 0x370;
+pub const SYS_APP_LAUNCH:    u64 = 0x371;
+pub const SYS_APP_UNINSTALL: u64 = 0x372;
+pub const SYS_VFS_READ:      u64 = 0x37A;
+
+pub fn app_install(bundle: &[u8], id_out: &mut u32) -> i64 {
+    unsafe {
+        syscall3(
+            SYS_APP_INSTALL,
+            bundle.as_ptr() as u64,
+            bundle.len() as u64,
+            id_out as *mut u32 as u64,
+        )
+    }
+}
+
+pub fn app_list(buf: &mut [u8]) -> i64 {
+    unsafe {
+        syscall2(SYS_APP_LIST, buf.as_mut_ptr() as u64, buf.len() as u64)
+    }
+}
+
+pub fn app_launch(app_id: u32) -> i64 {
+    unsafe { syscall2(SYS_APP_LAUNCH, app_id as u64, 0) }
+}
+
+pub fn app_uninstall(app_id: u32) -> i64 {
+    unsafe { syscall1(SYS_APP_UNINSTALL, app_id as u64) }
+}
+
+pub fn vfs_read(path: &[u8], buf: &mut [u8]) -> i64 {
+    let len = if !path.is_empty() && *path.last().unwrap() == 0 {
+        path.len() - 1
+    } else {
+        path.len()
+    };
+    unsafe {
+        syscall4(
+            SYS_VFS_READ,
+            path.as_ptr() as u64,
+            len as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
 /// Phase 36 — Send a message to a destination isolate's inbox.
 ///
 /// `dst_id` is the isolate ID returned by `isolate_spawn`.  `data` is an

@@ -1,0 +1,29 @@
+---
+description: OSCortex core rules — target architecture, one path, no duplicate tooling, exclude landing/
+alwaysApply: true
+---
+
+# OSCortex
+
+Read **docs/arch.txt** and project skills before structural work:
+
+- `.cursor/skills/oscortex-architecture/SKILL.md`
+- `.cursor/skills/codebase-audit-cleanup/SKILL.md`
+
+## Architecture
+
+- Kernel: hardware, compositor, focus, syscalls.
+- Flutter: shell, WM chrome, apps — **one process per app**, own engine instance.
+- PID 1: thin init/supervisor — not widgets, not all apps in one address space.
+- Apps: runtime install (`.osx`), not ISO reflash from `apps/*`.
+
+## Code rules
+
+- **One canonical path** — on pivot, delete old code/files; no dual boot or render stacks.
+- **Reuse** — extend existing modules; do not duplicate patch/embedder/syscall logic.
+- **Engine patches** — only `tools/flutter-engine/engine_patch.py`.
+- **Exclude** `landing/` unless the user explicitly asks.
+
+## Cleanup triggers
+
+Before large features or when the user mentions bloat/redundancy/pivot: run the codebase-audit-cleanup skill (Phase 1 scan → delete/consolidate → verify harness + build).

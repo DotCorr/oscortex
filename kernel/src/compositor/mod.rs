@@ -106,6 +106,9 @@ pub fn init() {
     log::info!("[Compositor] online (max_surfaces={})", MAX_SURFACES);
 
     if crate::drivers::fb::is_ready() {
+        // Boot text stops here on the QEMU window — serial continues. Leave a
+        // visible hint so this is not mistaken for a hang.
+        crate::drivers::fb::write_str("\n  OSCortex: loading Flutter shell...\n  (boot logs continue on serial)\n\n");
         crate::drivers::fb::set_double_buffer(true);
         crate::drivers::fb::disable_fb_logging();
     }

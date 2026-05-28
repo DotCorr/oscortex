@@ -27,6 +27,7 @@ extern crate alloc;
 // ── Module declarations ──────────────────────────────────────────────────────
 mod arch;
 mod app_registry;
+mod app_store;
 mod compositor;
 mod cortex;
 mod drivers;
@@ -223,6 +224,7 @@ pub extern "C" fn kernel_main() -> ! {
     crate::drivers::uart::init();
     crate::drivers::virtio_net::init();
     crate::drivers::virtio_blk::init();
+    crate::app_store::init();
     crate::drivers::nvme::init();
     crate::net::init();
 
@@ -237,12 +239,18 @@ pub extern "C" fn kernel_main() -> ! {
     // ── 9b. Spawn init process from initramfs ────────────────────────────
     match fs::lookup("/init") {
         Some(elf_bytes) => {
-            match process::spawn(elf_bytes, "init") {
+            let bootstrap = process::SpawnBootstrap {
+                rdi: crate::app_registry::HOST_MODE_SHELL,
+                rsi: 0,
+                rdx: 0,
+                parent_pid: 0,
+            };
+            match process::spawn_with_bootstrap(elf_bytes, "init", bootstrap) {
                 Ok(pid) => {
                     process::set_current_pid(pid);
                     process::schedule_user_launch(pid);
-                    crate::wm::set_focus_pid(pid); // route keyboard/mouse to init
-                    log::info!("[INIT] Spawned /init as PID {}", pid);
+                    crate::wm::set_focus_pid(pid);
+                    log::info!("[INIT] Spawned shell host as PID {}", pid);
                 }
                 Err(e)  => log::warn!("[INIT] Failed to spawn /init: {}", e),
             }
