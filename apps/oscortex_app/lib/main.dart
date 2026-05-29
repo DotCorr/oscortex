@@ -1,242 +1,94 @@
-import 'dart:convert';
+// Minimal dart:ui-only app — avoids Flutter framework JIT overhead on QEMU TCG.
+// The entire kernel_blob.bin drops from ~41 MB to ~3 MB, making JIT startup
+// fast enough to render within the QEMU timeout.
+import 'dart:ui' as ui;
 
-import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-
-const _shell = BasicMessageChannel<String>('oscortex/shell', StringCodec());
-
-const _bg = Color(0xFF0C1C26);
-const _accent = Color(0xFF2DD4BF);
+// One-shot flag so toImage test only runs on frame 1.
+bool _toImageDone = false;
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const OscortexShellApp());
+  ui.PlatformDispatcher.instance.onDrawFrame = _drawFrame;
+  ui.PlatformDispatcher.instance.scheduleFrame();
 }
 
-class OscortexShellApp extends StatelessWidget {
-  const OscortexShellApp({super.key});
+void _drawFrame() {
+  // Always schedule the next frame first so the vsync loop never stops,
+  // even if drawing throws an exception on this frame.
+  ui.PlatformDispatcher.instance.scheduleFrame();
 
-  @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        scaffoldBackgroundColor: _bg,
-        colorScheme: const ColorScheme.dark(
-          primary: _accent,
-          surface: _bg,
-        ),
-        useMaterial3: true,
-      ),
-      home: const ShellDesktop(),
-    );
-  }
-}
-
-class ShellDesktop extends StatefulWidget {
-  const ShellDesktop({super.key});
-
-  @override
-  State<ShellDesktop> createState() => _ShellDesktopState();
-}
-
-class _ShellDesktopState extends State<ShellDesktop> {
-  List<_AppTile> _apps = const [];
-  String? _error;
-  bool _loading = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _refreshApps();
+  final view = ui.PlatformDispatcher.instance.implicitView;
+  if (view == null) {
+    // ignore: avoid_print
+    print('[dart] _drawFrame: implicitView is null');
+    return;
   }
 
-  Future<void> _refreshApps() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final raw = await _shell.send('list');
-      final decoded = jsonDecode(raw ?? '{"apps":[]}') as Map<String, dynamic>;
-      final items = (decoded['apps'] as List<dynamic>? ?? [])
-          .map((e) => _AppTile.fromJson(e as Map<String, dynamic>))
-          .toList();
-      setState(() {
-        _apps = items;
-        _loading = false;
-      });
-    } catch (e) {
-      setState(() {
-        _error = '$e';
-        _loading = false;
+  try {
+    // ignore: avoid_print
+    print('[dart] _drawFrame: view ok size=${view.physicalSize}');
+
+    // ── Diagnostic: toImage test on first frame ───────────────────────────
+    // Build a tiny 4×4 picture, rasterize it offline, and dump the first pixel.
+    // If b0==255 Skia is functioning; if 0 the JIT/Skia binding is broken.
+    if (!_toImageDone) {
+      _toImageDone = true;
+      final trec = ui.PictureRecorder();
+      final tc = ui.Canvas(trec, const ui.Rect.fromLTWH(0, 0, 4, 4));
+      tc.drawColor(const ui.Color(0xFFFF0000), ui.BlendMode.src); // pure red
+      final tpic = trec.endRecording();
+      tpic.toImage(4, 4).then((img) {
+        img.toByteData(format: ui.ImageByteFormat.rawRgba).then((bd) {
+          if (bd != null && bd.lengthInBytes >= 4) {
+            final b0 = bd.getUint8(0);
+            final b1 = bd.getUint8(1);
+            final b2 = bd.getUint8(2);
+            final b3 = bd.getUint8(3);
+            // ignore: avoid_print
+            print('[dart] toImage b0=$b0 b1=$b1 b2=$b2 b3=$b3 (expect R=255 G=0 B=0 A=255 for red RGBA)');
+          } else {
+            // ignore: avoid_print
+            print('[dart] toImage: toByteData null or empty');
+          }
+          img.dispose();
+          tpic.dispose();
+        });
+      }).catchError((Object e) {
+        // ignore: avoid_print
+        print('[dart] toImage error: $e');
+        tpic.dispose();
       });
     }
-  }
 
-  Future<void> _launchApp(int id) async {
-    final raw = await _shell.send('launch:$id');
-    if (raw == null || !raw.contains('"ok":true')) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Launch failed for app $id')),
-        );
-      }
-    }
-  }
-
-  Future<void> _installSeed() async {
-    final raw = await _shell.send('install:/system/seed/demo.osx');
-    if (raw != null && raw.contains('"ok":true')) {
-      await _refreshApps();
-    } else if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Install failed (seed missing?)')),
-      );
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-              child: Row(
-                children: [
-                  const Text(
-                    'OSCortex',
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: -0.5,
-                    ),
-                  ),
-                  const Spacer(),
-                  TextButton.icon(
-                    onPressed: _installSeed,
-                    icon: const Icon(Icons.download_outlined),
-                    label: const Text('Install demo'),
-                  ),
-                  IconButton(
-                    onPressed: _refreshApps,
-                    icon: const Icon(Icons.refresh),
-                    tooltip: 'Refresh',
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Text(
-                'Installed apps',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.7),
-                  fontSize: 14,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _error != null
-                      ? Center(child: Text(_error!))
-                      : _apps.isEmpty
-                          ? Center(
-                              child: Text(
-                                'No apps installed.\nUse Install demo or drop a .osx bundle.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.6),
-                                ),
-                              ),
-                            )
-                          : GridView.builder(
-                              padding: const EdgeInsets.all(24),
-                              gridDelegate:
-                                  const SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 4,
-                                mainAxisSpacing: 16,
-                                crossAxisSpacing: 16,
-                                childAspectRatio: 0.9,
-                              ),
-                              itemCount: _apps.length,
-                              itemBuilder: (context, index) {
-                                final app = _apps[index];
-                                return _AppCard(
-                                  app: app,
-                                  onLaunch: () => _launchApp(app.id),
-                                );
-                              },
-                            ),
-            ),
-          ],
-        ),
-      ),
+    // ── Main frame rendering ──────────────────────────────────────────────
+    final rec = ui.PictureRecorder();
+    // Use Rect.largest so no cull-rect mismatch can discard drawing commands.
+    final canvas = ui.Canvas(rec, ui.Rect.largest);
+    // White fill — every pixel should become 0xFF after present_callback sees it.
+    canvas.drawColor(const ui.Color(0xFFFFFFFF), ui.BlendMode.src);
+    // Red rectangle centred in 1280×800
+    canvas.drawRect(
+      const ui.Rect.fromLTWH(440, 300, 400, 200),
+      ui.Paint()..color = const ui.Color(0xFFFF0000),
     );
+    final pic = rec.endRecording();
+    // ignore: avoid_print
+    print('[dart] picture.approximateBytesUsed=${pic.approximateBytesUsed}');
+    final builder = ui.SceneBuilder();
+    // pushOffset is required by some engine versions to activate compositing.
+    builder.pushOffset(0, 0);
+    builder.addPicture(ui.Offset.zero, pic);
+    builder.pop();
+    final scene = builder.build();
+    // ignore: avoid_print
+    print('[dart] calling view.render');
+    view.render(scene);
+    scene.dispose();
+    pic.dispose();
+    // ignore: avoid_print
+    print('[dart] view.render done');
+  } catch (e, st) {
+    // ignore: avoid_print
+    print('[dart] _drawFrame exception: $e\n$st');
   }
 }
 
-class _AppTile {
-  const _AppTile({required this.id, required this.name});
-
-  final int id;
-  final String name;
-
-  factory _AppTile.fromJson(Map<String, dynamic> json) {
-    return _AppTile(
-      id: json['id'] as int? ?? 0,
-      name: json['name'] as String? ?? 'app',
-    );
-  }
-}
-
-class _AppCard extends StatelessWidget {
-  const _AppCard({required this.app, required this.onLaunch});
-
-  final _AppTile app;
-  final VoidCallback onLaunch;
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.white.withValues(alpha: 0.06),
-      borderRadius: BorderRadius.circular(16),
-      child: InkWell(
-        borderRadius: BorderRadius.circular(16),
-        onTap: onLaunch,
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Icon(Icons.widgets_outlined, color: _accent, size: 36),
-              const Spacer(),
-              Text(
-                app.name,
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(
-                  fontSize: 15,
-                  fontWeight: FontWeight.w600,
-                ),
-              ),
-              Text(
-                'id ${app.id}',
-                style: TextStyle(
-                  fontSize: 12,
-                  color: Colors.white.withValues(alpha: 0.45),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
