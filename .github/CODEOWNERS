@@ -1,0 +1,14 @@
+# OSCortex code ownership — drives required reviews on protected branches.
+# Replace @DotCorr/maintainers with your team/usernames once the org team exists.
+
+*                               @DotCorr/maintainers
+
+# Boot, build, and release tooling are sensitive — guard them explicitly.
+/.github/                       @DotCorr/maintainers
+/scripts/                       @DotCorr/maintainers
+/tools/xtask/                   @DotCorr/maintainers
+/tools/flutter-engine/          @DotCorr/maintainers
+
+# Architecture + hardware contracts.
+/docs/                          @DotCorr/maintainers
+/kernel/src/embedder/           @DotCorr/maintainers

@@ -1,0 +1,114 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                        O S C O R T E X   C I / C D                             ║
+║              Branching, compliance gates, and release flow · 2026-05-29          ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+  Read with: docs/arch.txt (product architecture), docs/hardware.txt
+
+  DECISION (one sentence)
+  ───────────────────────
+  Day-to-day work lands on `develop` behind CI; `main` is production and every
+  merge into it auto-cuts a versioned GitHub Release with a bootable ISO.
+
+
+  BRANCH MODEL
+  ────────────
+
+    feature/* , fix/*        short-lived, branch off develop, PR back into develop
+         │  PR + CI (.github/workflows/ci.yml)
+         ▼
+    develop                  integration branch — default branch, always green
+         │  release PR (reviewed)
+         ▼
+    main                     PRODUCTION — protected, release-only
+         │  push/merge triggers .github/workflows/release.yml
+         ▼
+    GitHub Release           tag vX.Y.Z + oscortex-vX.Y.Z.iso + .sha256
+
+  Rules:
+    • Never push directly to main or develop — PR only.
+    • main contains exactly what has shipped. develop is the next release.
+    • Hotfix: branch off main as fix/*, PR into main (releases), then back-merge
+      into develop so the fix is not lost.
+
+
+  WORKFLOWS
+  ─────────
+
+  ci.yml      Trigger: PR into develop/main, push to develop/main.
+              Jobs:
+                kernel   bash tests/run_all.sh  (host unit tests + x86_64-unknown-none cross-build)  [required]
+                lint     cargo fmt --check + clippy (kernel, -D warnings)  [ADVISORY — see below]
+                flutter  flutter pub get / analyze / test  (apps/oscortex_app)  [required]
+
+              The tree is not yet rustfmt/clippy clean, so `lint` runs with
+              continue-on-error (reports, never blocks) and is NOT a required
+              check. After a formatting/clippy cleanup pass: drop continue-on-error
+              in ci.yml and add the job to CHECKS in scripts/setup-github.sh.
+
+  release.yml Trigger: push to main (or manual workflow_dispatch).
+              Steps:
+                1. Compute next version from latest v*.*.* tag (patch bump),
+                   starting at v0.0.1 when no tag exists.
+                2. cargo xtask iso  →  oscortex.iso  (canonical kernel-ISO path).
+                3. Publish GitHub Release: tag vX.Y.Z, ISO + sha256 attached.
+
+
+  VERSIONING
+  ──────────
+  Semantic, derived from git tags — no manual version file to bump.
+    no tags        → v0.0.1
+    v0.0.1 exists  → v0.0.2
+    ...            → patch bump per merge to main
+  Minor/major bumps: push a higher tag manually (e.g. `git tag v0.1.0`); the
+  next auto-release continues from there.
+
+
+  ISO SCOPE (current)
+  ───────────────────
+  The released asset is the bootable KERNEL ISO (Limine BIOS + UEFI) built by
+  `cargo xtask iso`. It is reproducible on any Linux/macOS runner: it needs only
+  the kernel ELF, xorriso, and a Limine install (LIMINE_DIR; CI checks out the
+  Limine binary branch).
+
+  The full Flutter-shell ISO (engine module + AOT app) is staged by
+  scripts/build-iso.sh and depends on a prebuilt, patched libflutter_engine.so
+  plus the local Flutter SDK — not yet wired into CI. When that engine artifact
+  is published for CI to consume, fold it into release.yml; do NOT add a second
+  ISO recipe (one canonical path).
+
+
+  COMPLIANCE GATES
+  ────────────────
+  Enforced by branch protection (scripts/setup-github.sh):
+    • PR required into develop and main (no direct pushes).
+    • CI checks (kernel, lint, flutter) must pass before merge.
+    • CODEOWNERS review required (.github/CODEOWNERS).
+    • Linear history / up-to-date branch before merge.
+  Author intent gate: .github/pull_request_template.md checklist mirrors the
+  arch.txt code rules (one path, kernel-only hardware, reuse, engine_patch only).
+
+
+  FIRST-TIME SETUP
+  ────────────────
+    gh auth login                 # authenticate once (needs repo admin)
+    bash scripts/setup-github.sh  # create develop + apply branch protection
+
+  Required permissions/secrets:
+    • A GitHub token / login with admin on DotCorr/oscortex (branch protection).
+    • No extra repo secrets needed for releases — GITHUB_TOKEN (auto-provided to
+      Actions) has contents:write, which release.yml uses to publish.
+
+
+  KEY PATHS
+  ─────────
+  .github/workflows/ci.yml          integration gate
+  .github/workflows/release.yml     production release + ISO
+  .github/pull_request_template.md  PR compliance checklist
+  .github/CODEOWNERS                required reviewers
+  scripts/setup-github.sh           branch + protection bootstrap
+  tools/xtask/src/main.rs           cargo xtask iso (canonical ISO)
+  tests/run_all.sh                  CI test entrypoint
+
+  Rule: .cursor/rules/oscortex-core.mdc
+  Docs: docs/arch.txt · docs/hardware.txt · docs/ci-cd.txt

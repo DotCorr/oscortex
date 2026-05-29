@@ -1,0 +1,112 @@
+name: CI
+
+# Integration gate. Runs on every PR into the protected branches and on every
+# push to develop. main is reserved for releases (see release.yml) but still
+# gets a build sanity check so a bad merge never ships an ISO.
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kernel:
+    name: Kernel build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins nightly + components (rust-src, clippy, rustfmt,
+      # llvm-tools) and the bare-metal targets. Honor it instead of re-declaring.
+      - name: Install Rust (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install nightly
+          rustup component add rust-src rustfmt clippy llvm-tools
+          rustup target add x86_64-unknown-none
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            tests/kernel/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # tests/run_all.sh = host unit tests + kernel cross-build (x86_64-unknown-none).
+      # No --qemu here; QEMU integration is a separate, slower job.
+      - name: Unit tests + kernel cross-build
+        run: bash tests/run_all.sh
+
+  # Advisory only — the existing tree is not yet rustfmt/clippy clean, so these
+  # report problems without blocking merges. Flip continue-on-error to false (and
+  # add them to required checks in scripts/setup-github.sh) after a cleanup pass.
+  lint:
+    name: rustfmt + clippy (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (from rust-toolchain.toml)
+        run: |
+          rustup show active-toolchain || rustup toolchain install nightly
+          rustup component add rust-src rustfmt clippy
+          rustup target add x86_64-unknown-none
+
+      - name: Cache cargo + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: lint-${{ runner.os }}-
+
+      - name: rustfmt
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: clippy (kernel)
+        continue-on-error: true
+        run: |
+          cargo clippy \
+            --package oscortex-kernel \
+            --target x86_64-unknown-none \
+            -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem \
+            -- -D warnings
+
+  flutter:
+    name: Flutter shell analyze + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/oscortex_app
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
