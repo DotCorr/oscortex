@@ -80,7 +80,19 @@ P9_EPILOGUE_ORIG = bytes([
 
 
 def build_p9_cave() -> bytes:
-    """Copy device.fPixels/fRowBytes into Draw.fPixels, then call skcpu::Draw::drawPaint."""
+    """Copy device.fPixels/fRowBytes into Draw.fDst, then call skcpu::Draw::drawPaint.
+
+    The destination pixel pointer and row-bytes live at the SAME device offsets
+    that SkBitmapDevice::onAccessPixels reads in this engine build:
+        fPixels   = *(void**)(device + 0x140)
+        fRowBytes = *(size_t*)(device + 0x148)
+    (Verified by disassembling onAccessPixels: it calls
+     SkPixmap::reset(info, [device+0x140], [device+0x148]).)
+
+    The older cave used [device+0x180]+[..+0x18], which in this build is a
+    clip/matrix pointer (SkDraw.fRC at [rsp+0x48]) — NOT the pixels — so the
+    blitter wrote to the wrong address and every fill came out zero.
+    """
     cave: list[bytes] = []
     va = P9_CAVE_VA
 
@@ -89,12 +101,10 @@ def build_p9_cave() -> bytes:
         cave.append(data)
         va += len(data)
 
-    emit(b"\x49\x8b\x86\x80\x01\x00\x00")  # mov rax, [r14+0x180]
-    emit(b"\x48\x63\x48\x18")               # movsxd rcx, [rax+0x18]
-    emit(b"\x48\x01\xc1")                   # add rcx, rax
-    emit(b"\x48\x89\x4c\x24\x10")           # mov [rsp+0x10], rcx  ; Draw.fPixels
-    emit(b"\x41\x8b\x86\x48\x01\x00\x00")  # mov eax, [r14+0x148]
-    emit(b"\x48\x89\x44\x24\x18")           # mov [rsp+0x18], rax  ; Draw.fRowBytes
+    emit(b"\x49\x8b\x86\x40\x01\x00\x00")  # mov rax, [r14+0x140]  ; fPixels
+    emit(b"\x48\x89\x44\x24\x10")           # mov [rsp+0x10], rax  ; Draw.fDst.fPixels
+    emit(b"\x49\x8b\x86\x48\x01\x00\x00")  # mov rax, [r14+0x148]  ; fRowBytes (64-bit)
+    emit(b"\x48\x89\x44\x24\x18")           # mov [rsp+0x18], rax  ; Draw.fDst.fRowBytes
     emit(b"\x48\x8d\x7c\x24\x08")           # lea rdi, [rsp+8]
     emit(b"\x48\x89\xde")                   # mov rsi, rbx
     call_at = va
