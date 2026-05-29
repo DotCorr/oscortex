@@ -18,3 +18,9 @@ pub fn init(
     heap::init();
     log::info!("[MM] Memory management online");
 }
+
+/// Report reclaimable headroom (free heap bytes) for the self-healer.
+pub fn reclaim_best_effort() -> usize {
+    let (_used, free, _total) = heap::stats();
+    free
+}

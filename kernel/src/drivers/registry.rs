@@ -29,6 +29,16 @@ pub fn replace(id: u32, name: &[u8], wasm: &[u8]) -> Result<(), LoadError> {
     REGISTRY.lock().replace(id, name, wasm)
 }
 
+/// Reload a driver (re-run cdp_init or reactivate native entry).
+pub fn reload(id: u32) -> Result<(), LoadError> {
+    REGISTRY.lock().reload(id)
+}
+
+/// Reset hardware backing a native driver slot.
+pub fn reset_device(id: u32) {
+    REGISTRY.lock().reset_device(id);
+}
+
 /// Number of registered drivers (native + WASM).
 pub fn count() -> usize {
     REGISTRY.lock().count()

@@ -268,3 +268,14 @@ pub fn schedule() {
     unsafe { crate::arch::context_switch(old_sp_ptr, new_sp_val); }
 }
 
+/// Record a migration request (UP kernel — wakes blocked process, no CPU move).
+pub fn note_migration_request(pid: u32) {
+    log::info!(
+        "[Sched] migration request for pid {} (single-CPU — no cross-core move)",
+        pid
+    );
+    if crate::process::is_blocked(pid) {
+        crate::process::set_state(pid, crate::process::ProcState::Running);
+    }
+}
+

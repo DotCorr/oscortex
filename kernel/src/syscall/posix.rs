@@ -1110,7 +1110,7 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
                 }
             }
         }
-        if (spin & 63) == 0 {
+        if (spin & 15) == 0 {
             let _ = super::force_wake_all_task_runners("notifyall-spin");
         }
     } else if wpid != 0 && (n > 0 || bridged > 0) {

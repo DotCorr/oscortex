@@ -647,11 +647,13 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
 
     // The embedder event loop must run whenever vsync batons or other WM events
     // are queued — otherwise Flutter never reaches OnVsync / present_callback.
-    if crate::wm::embedder_baton_due() {
+    if crate::wm::baton_vsync_queued_for(1) {
         if current == 1 {
-            // Do not yield away while a baton is posted or queued for pid=1.
+            // Baton event is in the WM queue — embedder must pop it, not yield to pid=2.
             return None;
         }
+    }
+    if crate::wm::embedder_baton_due() {
         let embedder = unsafe { &PTABLE[idx_of(1)] };
         if embedder.pid == 1 {
             if embedder.state == ProcState::Blocked {

@@ -177,7 +177,7 @@ pub(crate) fn engine_broadcast_storm_wake(broadcaster: u32, cond: u64) -> u32 {
         return 0;
     }
     let c = STORM_COUNT.fetch_add(1, Ordering::Relaxed);
-    if c < 8 {
+    if c < 3 {
         return 0;
     }
     STORM_COUNT.store(0, Ordering::Relaxed);

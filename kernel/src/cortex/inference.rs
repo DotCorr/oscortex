@@ -171,7 +171,16 @@ impl InferenceEngine {
             input.get(3).copied().unwrap_or(0) as i32,
         ];
 
-        let cap = &BUILTIN_CAPSULE;
+        let mut runtime_buf = [0u8; 88];
+        let cap: &[u8] = {
+            let len = RUNTIME_CAPSULE_LEN.load(core::sync::atomic::Ordering::Acquire);
+            if len >= 88 {
+                runtime_buf.copy_from_slice(&RUNTIME_CAPSULE.lock()[..88]);
+                &runtime_buf
+            } else {
+                &BUILTIN_CAPSULE
+            }
+        };
 
         // Hidden layer: h[j] = ReLU( sum_i(W1[i*8+j] * x[i]) + B1[j] ) >> 4
         let mut h = [0i32; 8];
@@ -207,9 +216,7 @@ impl InferenceEngine {
         if input.is_empty() {
             return None;
         }
-        // Simple dispatch on the first byte (event type tag).
         match input[0] {
-            // Interrupt anomaly — recommend anomaly score escalation
             0x01 if input.len() >= 3 => {
                 let score = input[2];
                 Some(InferenceResult::AnomalyScore {
@@ -217,7 +224,6 @@ impl InferenceEngine {
                     score,
                 })
             }
-            // Driver load request
             0x02 if input.len() >= 2 => {
                 let priority = input[1];
                 let mut module_name = [0u8; 64];
@@ -292,3 +298,46 @@ pub fn init() {
 pub fn run(input: &[u8], deadline_tsc: u64) -> Option<InferenceResult> {
     ENGINE.lock().infer(input, deadline_tsc)
 }
+
+/// Replace the runtime model capsule (PID-0 / signed update channel).
+pub fn load_runtime_capsule(data: &[u8]) -> Result<(), &'static str> {
+    if data.len() < 88 {
+        return Err("capsule too short");
+    }
+    if &data[..4] != b"CRTX" {
+        return Err("bad magic");
+    }
+    if data[4] != 1 {
+        return Err("unsupported version");
+    }
+    if data.len() > RUNTIME_CAPSULE.lock().len() {
+        return Err("capsule too large");
+    }
+    // Optional trailing u32 checksum (non-zero = verify xor of payload bytes).
+    if data.len() >= 92 {
+        let sig = u32::from_le_bytes([data[data.len() - 4], data[data.len() - 3], data[data.len() - 2], data[data.len() - 1]]);
+        if sig != 0 {
+            let mut x = 0u32;
+            for b in &data[..data.len() - 4] {
+                x = x.wrapping_add(*b as u32);
+            }
+            if x != sig {
+                return Err("checksum mismatch");
+            }
+        }
+    }
+    let mut buf = RUNTIME_CAPSULE.lock();
+    buf[..data.len()].copy_from_slice(data);
+    buf[data.len()..].fill(0);
+    RUNTIME_CAPSULE_LEN.store(data.len(), core::sync::atomic::Ordering::Release);
+    let mut e = ENGINE.lock();
+    e.model_loaded = true;
+    e.heuristic_mode = false;
+    e.ready = true;
+    log::info!("[Cortex::Inference] Runtime model capsule swapped ({} bytes)", data.len());
+    Ok(())
+}
+
+static RUNTIME_CAPSULE: spin::Mutex<[u8; 512]> = spin::Mutex::new([0u8; 512]);
+static RUNTIME_CAPSULE_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);

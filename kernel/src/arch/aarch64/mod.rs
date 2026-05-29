@@ -17,8 +17,12 @@ pub unsafe extern "C" fn context_switch(_old_sp: *mut u64, _new_sp: u64) {}
 /// No-op stub — task entry trampoline not yet implemented on aarch64.
 pub unsafe extern "C" fn task_entry() { loop { core::hint::spin_loop() } }
 
-pub fn early_init() { todo!("aarch64 early_init") }
-pub fn ap_init() { todo!("aarch64 ap_init") }
+pub fn early_init() {
+    crate::logger::early_print("[arch::aarch64] early_init stub (Milestone 4b)\r\n");
+}
+pub fn ap_init() {
+    crate::logger::early_print("[arch::aarch64] ap_init stub\r\n");
+}
 pub fn smp_init(_resp: Option<&'static limine::request::MpResponse>) { /* stub */ }
 pub fn halt() { loop { core::hint::spin_loop() } }
 pub fn halt_forever() -> ! { loop { core::hint::spin_loop() } }

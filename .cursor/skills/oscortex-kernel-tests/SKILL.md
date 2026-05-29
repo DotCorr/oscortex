@@ -10,7 +10,7 @@ description: >
 
 **Read first:** [tests/README.md](../../../tests/README.md) · [docs/hardware.txt](../../../docs/hardware.txt)
 
-**Related skills:** [oscortex-hardware](../oscortex-hardware/SKILL.md) · [oscortex-architecture](../oscortex-architecture/SKILL.md) · [codebase-audit-cleanup](../codebase-audit-cleanup/SKILL.md)
+**Related skills:** [oscortex-hardware](../oscortex-hardware/SKILL.md) · [oscortex-architecture](../oscortex-architecture/SKILL.md) · [oscortex-ci-cd](../oscortex-ci-cd/SKILL.md) · [codebase-audit-cleanup](../codebase-audit-cleanup/SKILL.md)
 
 ---
 

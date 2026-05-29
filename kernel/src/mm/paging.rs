@@ -337,11 +337,11 @@ mod stub_impl {
     use super::PageFlags;
 
     pub unsafe fn map_page(_virt: u64, _phys: u64, _flags: PageFlags) {
-        // TODO: implement aarch64/riscv64 page table walker (Milestone 4b).
+        // Milestone 4b: aarch64/riscv64 page table walker (TTBR0/TTBR1, SATP).
     }
 
     pub unsafe fn map_mmio(_phys: u64, _virt: u64, _size: usize) {
-        // TODO: aarch64 uses TTBR0/TTBR1; riscv64 uses SATP.
+        // Milestone 4b: identity/MMIO map via arch-specific page tables.
     }
 
     pub fn init(_hhdm_offset: u64) {
