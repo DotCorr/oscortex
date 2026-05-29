@@ -436,6 +436,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     if vsync {
         crate::wm::tick();
         crate::compositor::tick();
+        crate::drivers::usb::poll();
         crate::arch::apic::reset_vsync_last_tsc();
     }
 

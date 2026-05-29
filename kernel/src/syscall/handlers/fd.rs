@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use crate::syscall::poll::{
-    alloc_synth_fd, cooperative_yield_for_cond_resched, epoll_wake, eventfd_write,
+    alloc_synth_fd, epoll_wake, eventfd_write,
     sys_epoll_create_real, sys_epoll_ctl_real, sys_epoll_wait_real, sys_eventfd2,
     sys_timerfd_create_real, sys_timerfd_settime_real, EVENTFD_TABLE, TimerState,
     TIMERFD_TABLE,
@@ -346,7 +346,6 @@ pub(crate) fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 let pid = crate::process::current_pid();
                 log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
                 unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
-                cooperative_yield_for_cond_resched(pid, 8);
                 return 8;
             } else {
                 // Not yet fired (or not armed) — EAGAIN.

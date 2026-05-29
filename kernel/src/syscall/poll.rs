@@ -88,6 +88,88 @@ pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
     perform_cooperative_yield(cur, sys_nr, next);
 }
 
+/// Pick the next thread for cooperative scheduling.
+///
+/// Prefer the embedder when it is blocked in `wm_event_wait`, then core Flutter
+/// runner threads (typically pid 2–7), avoiding Dart worker isolates (8+) that
+/// starve init when given equal round-robin weight.
+pub fn coop_target_ready(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if crate::process::is_blocked(pid) {
+        let wm = WM_WAITER_PID.load(Ordering::Acquire);
+        if wm == pid {
+            crate::process::set_state(pid, crate::process::ProcState::Running);
+        }
+    }
+    crate::process::get_user_context(pid).is_some()
+}
+
+/// When a vsync baton is waiting, always prefer the embedder over engine spins.
+pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
+    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready(1) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
+    static COOP_TICK: AtomicU32 = AtomicU32::new(0);
+    let tick = COOP_TICK.fetch_add(1, Ordering::Relaxed);
+
+    let wm = WM_WAITER_PID.load(Ordering::Acquire);
+    // Embedder must drain WM events (especially vsync batons) promptly.
+    if wm != 0 && wm != cur && crate::wm::embedder_baton_due() {
+        if crate::process::is_blocked(wm) {
+            crate::process::set_state(wm, crate::process::ProcState::Running);
+        }
+        if coop_target_ready(wm) {
+            return Some(wm);
+        }
+    }
+    // When a vsync baton is queued, always prefer the embedder — even over
+    // Flutter runner threads that would otherwise monopolise the CPU.
+    if wm != 0 && wm != cur && crate::wm::vsync_baton_pending() {
+        if crate::process::is_blocked(wm) {
+            crate::process::set_state(wm, crate::process::ProcState::Running);
+        }
+        if coop_target_ready(wm) {
+            return Some(wm);
+        }
+    }
+    // Do not preempt Flutter runner threads (2–7) for baton=0 vsync ticks only.
+    if wm != 0 && wm != cur && !(2..=7).contains(&cur) && !crate::wm::vsync_baton_pending() {
+        let pending = crate::wm::pending_count_for(wm);
+        let wm_due = pending > 0 || (tick & 3) == 0;
+        if wm_due {
+            if crate::process::is_blocked(wm) {
+                crate::process::set_state(wm, crate::process::ProcState::Running);
+            }
+            if coop_target_ready(wm) {
+                return Some(wm);
+            }
+        }
+    }
+
+    for prefer in [2u32, 3, 4, 7, 1] {
+        if prefer != cur && coop_target_ready(prefer) {
+            return Some(prefer);
+        }
+    }
+
+    if (tick & 31) == 0 {
+        if let Some(sib) = crate::process::next_runnable_sibling_thread(cur) {
+            if sib <= 7 && coop_target_ready(sib) {
+                return Some(sib);
+            }
+        }
+    }
+
+    crate::process::next_runnable_pid(cur)
+}
+
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
 // epoll_create / inotify_init1 / timerfd_create return integer fds that
 // user space then stores in std::map<fd, T> keyed event loops. Returning the
@@ -321,20 +403,14 @@ pub fn check_timerfds_and_wake() {
         }
     }
 
-    // Expire timed-out WM event waiters.
+    // Nudge blocked WM waiters when their deadline has passed.  Do not clear
+    // WM_WAITER_DEADLINE here — the embedder's wm_event_wait loop uses it to
+    // return EAGAIN; zeroing it early caused spurious eagain-top returns.
     let wm_deadline = WM_WAITER_DEADLINE.load(Ordering::Acquire);
     if wm_deadline != 0 && now >= wm_deadline {
-        WM_WAITER_DEADLINE.store(0, Ordering::Release);
         let wm_waiter = WM_WAITER_PID.load(Ordering::Acquire);
-        if wm_waiter != 0 {
-            crate::wm::set_wm_waiter(0);
+        if wm_waiter != 0 && crate::process::is_blocked(wm_waiter) {
             crate::process::set_state(wm_waiter, crate::process::ProcState::Running);
-            static WM_TIMEOUT_EXPIRE_LOG: core::sync::atomic::AtomicU32 =
-                core::sync::atomic::AtomicU32::new(0);
-            let n = WM_TIMEOUT_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
-            if n < 16 || n % 64 == 0 {
-                log::warn!("[wm-timeout-expire] #{} pid={}", n, wm_waiter);
-            }
         }
     }
 }
@@ -432,10 +508,8 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
         .saturating_add(int_ns.max(0) as u64);
     let value_ns = (val_s.max(0) as u64).saturating_mul(1_000_000_000)
         .saturating_add(val_ns.max(0) as u64);
-    if (flags & 1 != 0) && value_ns > 0 && period_ns == value_ns {
-        // Treat as a one-shot timer if it was set via TFD_TIMER_ABSTIME and it_interval == it_value
-        period_ns = 0;
-    }
+    // Flutter MessageLoopLinux arms periodic absolute timers with
+    // it_interval == it_value — keep period_ns intact (run-visible.log profile).
     let now = monotonic_ns();
     let mut deadline = if value_ns == 0 {
         0 // POSIX: if it_value is zero, the timer is disarmed.
@@ -445,29 +519,22 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
         now.saturating_add(value_ns)
     };
     let original_expired = deadline != 0 && deadline <= now;
-    // When a one-shot timer's deadline is already in the past, POSIX semantics
-    // are that it fires immediately (pending becomes 1 on the next read).
-    // Previously we forced a 1ms artificial delay AND reset pending=0, which
-    // meant every WakeUp() call from Flutter's message loop (all of which have
-    // orig_exp=true because the task is always already due) would reset the
-    // timer to "not ready" and prevent pid=2 from ever reading tfd=65 post-vsync.
-    //
-    // Fix: for one-shot (period=0) already-expired timers, disarm the deadline
-    // and set pending=1 so the very next epoll_collect_ready sees it as ready.
-    // For periodic timers, keep the 1ms delay to avoid CPU starvation.
+    // Periodic already-expired: 1ms delay (matches working run-visible.log).
+    // True one-shot (period=0): fire immediately via pending below.
+    let fire_now_oneshot = original_expired && period_ns == 0;
     if original_expired && period_ns != 0 {
-        // Periodic timer already past first fire: force 1ms delay to avoid hotloop.
         deadline = now.saturating_add(1_000_000);
     }
-    // For one-shot already-expired (original_expired && period_ns==0): deadline
-    // stays at the original (past) value; the and_modify below will set pending=1.
     let mut tbl = TIMERFD_TABLE.lock();
     {
         let n = TFD_SETTIME_LOG.fetch_add(1, Ordering::Relaxed);
         let pid = crate::process::current_pid();
         if n < 32 {
-            if original_expired {
+            if fire_now_oneshot {
                 log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → fire-now (now={}ns)",
+                    n, pid, fd, flags, value_ns, period_ns, now);
+            } else if original_expired {
+                log::warn!("[tfd-settime] #{} pid={} fd={} flags={} val={}ns period={}ns → forced-delay-1ms (now={}ns)",
                     n, pid, fd, flags, value_ns, period_ns, now);
             } else {
                 log::warn!("[tfd-settime] #{} pid={} fd={} flags={} deadline={}ns now={}ns delta={}ns period={}ns",
@@ -492,9 +559,7 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
             }
         }
     }
-    // For one-shot already-expired: set pending=1 (fire immediately), deadline=0
-    // (disarmed; no future deadline needed since it already triggered).
-    let (final_deadline, init_pending) = if original_expired && period_ns == 0 {
+    let (final_deadline, init_pending) = if fire_now_oneshot {
         (0u64, 1u64)
     } else {
         (deadline, 0u64)
@@ -503,11 +568,10 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
         .and_modify(|t| {
             t.deadline_ns = final_deadline;
             t.period_ns = period_ns;
-            if original_expired && period_ns == 0 {
-                // Preserve any existing pending count, but ensure at least 1.
+            if fire_now_oneshot {
                 t.pending = t.pending.saturating_add(1).max(1);
             } else {
-                t.pending = 0; // normal re-arm resets pending
+                t.pending = 0;
             }
         })
         .or_insert(TimerState {
@@ -782,7 +846,6 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if n < 32 {
             log::warn!("[epoll_fire] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
         }
-        cooperative_yield_for_cond_resched(cur, ready as u64);
         return ready as i64;
     }
     if epfd == 70 {
@@ -822,7 +885,6 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             if n < 32 {
                 log::warn!("[epoll_fire_loop] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
             }
-            cooperative_yield_for_cond_resched(cur, ready as u64);
             return ready as i64;
         }
         if !infinite {
@@ -833,7 +895,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
 
         if cur != 0 {
-            if let Some(next) = crate::process::next_runnable_pid(cur) {
+            if let Some(next) = cooperative_sched_target(cur) {
                 if next != cur {
                     // Block ourselves on epoll
                     {

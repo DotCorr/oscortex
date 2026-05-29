@@ -11,7 +11,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-// ── NVMe register offsets (BAR0) ─────────────────────────────────────────────
+use crate::arch::mmio;
+use crate::drivers::common::nvme_regs::{doorbell_offset, doorbell_stride_from_cap};
 
 const OFF_CAP:    usize = 0x00;   // Controller Capabilities (64-bit)
 const OFF_VS:     usize = 0x08;   // Version
@@ -118,8 +119,6 @@ struct NvmeState {
 static NVME: Mutex<Option<NvmeState>> = Mutex::new(None);
 static NVME_READY: AtomicBool = AtomicBool::new(false);
 
-use crate::arch::mmio;
-
 // ── Register accessors ───────────────────────────────────────────────────────
 
 #[inline] unsafe fn reg32_read(bar0: u64, off: usize) -> u32 {
@@ -133,10 +132,7 @@ use crate::arch::mmio;
 }
 
 fn doorbell_off(state: &NvmeState, qid: u16, tail: bool) -> usize {
-    // Doorbell base = BAR0 + 0x1000.  Each queue has a pair of 32-bit
-    // doorbells at stride bytes apart.
-    let s = state.doorbell_stride as usize;
-    0x1000 + (qid as usize * 2 + if tail { 0 } else { 1 }) * s
+    doorbell_offset(qid, tail, state.doorbell_stride)
 }
 
 unsafe fn ring_adm_sq(state: &mut NvmeState) {
@@ -216,9 +212,10 @@ pub fn init() {
 
     unsafe {
         // Read capability register for doorbell stride and minimum page size.
-        let cap_lo = reg32_read(bar0, OFF_CAP);
-        let dstrd = (reg32_read(bar0, OFF_CAP + 4) >> 0) & 0xF;
-        let doorbell_stride = 4u32 << dstrd;
+        let cap_lo = reg32_read(bar0, OFF_CAP) as u64;
+        let cap_hi = reg32_read(bar0, OFF_CAP + 4) as u64;
+        let cap = cap_lo | (cap_hi << 32);
+        let doorbell_stride = doorbell_stride_from_cap(cap);
 
         // Disable controller.
         reg32_write(bar0, OFF_CC, 0);

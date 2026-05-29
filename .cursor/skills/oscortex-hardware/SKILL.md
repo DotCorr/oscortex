@@ -57,6 +57,18 @@ Flutter  →  syscalls (abi.rs)  →  compositor/WM/policy  →  drivers/  →  
 3. Expose via **syscalls** or WM events — not userspace MMIO.
 4. Update status in `docs/hardware.txt`.
 5. Flutter via platform channel or existing WM — no parallel render path.
+6. **Run tests** — `tests/run_all.sh` (see oscortex-kernel-tests skill).
+
+---
+
+## Testing (2026-05-27)
+
+| Layer | Command | Covers |
+|-------|---------|--------|
+| Unit | `tests/run_all.sh` | vring, PCI BAR, xHCI caps, NVMe doorbells, net frames, manifest |
+| Integration | `tests/run_all.sh --qemu` | virtio-blk/net, NVMe, PS/2 serial markers |
+
+Skill: `.cursor/skills/oscortex-kernel-tests/SKILL.md`
 
 ---
 

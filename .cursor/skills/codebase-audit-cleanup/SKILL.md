@@ -41,6 +41,8 @@ AI generates code in isolation. On OSCortex this becomes:
 | Architecture | `docs/arch.txt` |
 | Hardware / drivers | `docs/hardware.txt` |
 | Driver init | `kernel/src/drivers/platform.rs` |
+| Driver unit tests | `tests/kernel/` · `kernel/src/drivers/common/` |
+| Driver QEMU integration | `tests/integration/qemu_drivers.sh` |
 | PCI / port I/O | `kernel/src/arch/pci.rs`, `kernel/src/arch/port_io.rs` |
 | Syscall ABI | `kernel/src/embedder/abi.rs` |
 | Native drivers | `kernel/src/drivers/` |

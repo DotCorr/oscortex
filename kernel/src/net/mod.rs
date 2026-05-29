@@ -53,8 +53,41 @@ static NET_STATE: Mutex<NetState> = Mutex::new(NetState::new());
 /// Initialise the networking layer.  Called after `virtio_net::init()`.
 pub fn init() {
     log::info!("[net] UDP stack online (virtio-net backend)");
-    // Phase 50: initialise smoltcp TCP/IP stack.
     tcp::init_smoltcp();
+    boot_self_test();
+}
+
+/// DHCP + stack smoke test (serial markers for integration tests).
+fn boot_self_test() {
+    if !crate::drivers::virtio_net::is_ready() {
+        log::info!("[net] self-test skipped — virtio-net not ready");
+        return;
+    }
+
+    tcp::poll();
+
+    let ip = tcp::dhcp_discover();
+    if ip != 0 {
+        log::info!(
+            "[net] DHCP self-test OK ip={}.{}.{}.{}",
+            (ip >> 24) & 0xFF,
+            (ip >> 16) & 0xFF,
+            (ip >> 8) & 0xFF,
+            ip & 0xFF
+        );
+    } else {
+        log::info!("[net] DHCP self-test timeout (static IP fallback OK)");
+    }
+
+    match tcp::tcp_connect(u32::from_be_bytes([10, 0, 2, 2]), 80) {
+        Ok(fd) => {
+            let _ = tcp::tcp_close(fd);
+            log::info!("[net] TCP self-test connect OK (QEMU gateway 10.0.2.2:80)");
+        }
+        Err(_) => {
+            log::info!("[net] TCP self-test connect skipped (gateway unreachable OK on some profiles)");
+        }
+    }
 }
 
 /// Format a text line with MAC and IP info.

@@ -69,19 +69,51 @@ impl EventQueue {
         self.len += 1;
     }
 
+    fn push_front(&mut self, mut ev: WmEvent, owner_pid: u32) {
+        ev.seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+
+        if self.len == EVENT_CAP {
+            self.tail = (self.tail + EVENT_CAP - 1) % EVENT_CAP;
+            self.len -= 1;
+            self.dropped = self.dropped.wrapping_add(1);
+        }
+
+        self.head = (self.head + EVENT_CAP - 1) % EVENT_CAP;
+        self.buf[self.head] = ev;
+        self.owner_pid[self.head] = owner_pid;
+        self.len += 1;
+    }
+
     fn pop_for(&mut self, pid: u32) -> Option<WmEvent> {
         if self.len == 0 {
             return None;
         }
 
-        // Find first event visible to this consumer.
+        // Baton vsync events must not sit behind baton=0 ticks — the embedder
+        // needs FlutterEngineOnVsync promptly or the engine stalls rendering.
         let mut found_off = None;
         for off in 0..self.len {
             let idx = (self.head + off) % EVENT_CAP;
             let owner = self.owner_pid[idx];
-            if owner == 0 || owner == pid {
+            if (owner == 0 || owner == pid)
+                && self.buf[idx].kind == EV_VSYNC
+                && self.buf[idx].b != 0
+            {
                 found_off = Some(off);
                 break;
+            }
+        }
+
+        // Find first event visible to this consumer.
+        if found_off.is_none() {
+            for off in 0..self.len {
+                let idx = (self.head + off) % EVENT_CAP;
+                let owner = self.owner_pid[idx];
+                if owner == 0 || owner == pid {
+                    found_off = Some(off);
+                    break;
+                }
             }
         }
         let off = found_off?;
@@ -112,6 +144,20 @@ impl EventQueue {
             }
         }
         n
+    }
+
+    fn has_baton_vsync_for(&self, pid: u32) -> bool {
+        for off in 0..self.len {
+            let idx = (self.head + off) % EVENT_CAP;
+            let owner = self.owner_pid[idx];
+            if (owner == 0 || owner == pid)
+                && self.buf[idx].kind == EV_VSYNC
+                && self.buf[idx].b != 0
+            {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -156,6 +202,7 @@ static FOCUS_MIRROR: AtomicBool = AtomicBool::new(false);
 /// Included in the next EV_VSYNC event's `b` field so the embedder can call
 /// `FlutterEngineOnVsync` with the correct baton value.
 static VSYNC_BATON: AtomicU64 = AtomicU64::new(0);
+static BATON_VSYNC_QUEUED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
     log::info!("[WM] Event queue online (cap={})", EVENT_CAP);
@@ -315,8 +362,17 @@ pub fn dropped_count() -> u64 {
     Q.lock().dropped
 }
 
+/// True when the embedder must run FlutterEngineOnVsync (baton queued or posted).
+pub fn embedder_baton_due() -> bool {
+    vsync_baton_pending() || Q.lock().has_baton_vsync_for(1)
+}
+
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
-    Q.lock().pop_for(pid)
+    let ev = Q.lock().pop_for(pid)?;
+    if ev.kind == EV_VSYNC && ev.b != 0 {
+        BATON_VSYNC_QUEUED.store(false, Ordering::Release);
+    }
+    Some(ev)
 }
 
 pub fn push_event(kind: u32, flags: u32, a: u64, b: u64) {
@@ -340,6 +396,11 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
     }
 }
 
+/// Returns true when the engine has posted a vsync baton not yet delivered.
+pub fn vsync_baton_pending() -> bool {
+    VSYNC_BATON.load(Ordering::Acquire) != 0 || BATON_VSYNC_QUEUED.load(Ordering::Acquire)
+}
+
 pub fn push_vsync(frame: u64) {
     // Consume the pending baton (if any) so the embedder's FlutterEngineOnVsync
     // call can use the correct baton. If no baton is posted, b = 0 (ignored).
@@ -349,7 +410,22 @@ pub fn push_vsync(frame: u64) {
     if baton != 0 || n < 30 || n % 300 == 0 {
         log::info!("[push-vsync] #{} frame={} baton={:#x}", n, frame, baton);
     }
-    push_event(EV_VSYNC, 0, frame, baton);
+    if baton != 0 {
+        let mut ev = WmEvent::empty();
+        ev.kind = EV_VSYNC;
+        ev.a = frame;
+        ev.b = baton;
+        Q.lock().push_front(ev, 0);
+        BATON_VSYNC_QUEUED.store(true, Ordering::Release);
+        crate::process::set_state(1, crate::process::ProcState::Running);
+        let waiter = WM_WAITER.load(Ordering::Acquire);
+        if waiter != 0 {
+            WM_WAITER.store(0, Ordering::Release);
+            crate::process::set_state(waiter, crate::process::ProcState::Running);
+        }
+    } else {
+        push_event(EV_VSYNC, 0, frame, baton);
+    }
 }
 
 /// Set the vsync baton that will be included in the next EV_VSYNC event.

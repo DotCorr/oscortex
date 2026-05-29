@@ -96,12 +96,12 @@ mod trace;
 mod wait;
 
 pub use dispatch::{dispatch_fast, dispatch_legacy};
-pub use poll::{check_timerfds_and_wake, cooperative_yield_for_cond_resched, cooperative_yield_to, force_wake_all_task_runners, monotonic_ns, KICK_REQUESTED, acqmutex_waiter_for};
+pub use poll::{check_timerfds_and_wake, coop_target_ready, cooperative_sched_target, cooperative_yield_for_cond_resched, cooperative_yield_to, force_wake_all_task_runners, monotonic_ns, prefer_embedder_if_baton_due, KICK_REQUESTED, acqmutex_waiter_for};
 pub use trace::{debug_dump_sync_states, dump_event_state, dump_recent_syscalls, dump_user_backtrace, init};
 
 // Flat re-exports for `posix` and legacy `super::` call sites.
 pub(crate) use handlers::{
-    cond_miss_bridge, futex_wake_waiters, read_user_bytes, sys_exit, write_user_bytes, wm_consumer_pid,
+    cond_miss_bridge, engine_broadcast_storm_wake, futex_wake_waiters, read_user_bytes, sys_exit, write_user_bytes, wm_consumer_pid,
 };
 pub(crate) use tables::{MAX_OPEN_FILES, OPEN_FILES, PIPES};
 pub(crate) use state::{

@@ -29,6 +29,13 @@ if [ ! -f "$NVME" ]; then
     dd if=/dev/zero of="$NVME" bs=1M count=16 2>/dev/null
 fi
 
+# Stale QEMU from a prior run holds an exclusive lock on vdisk.img.
+if command -v lsof >/dev/null 2>&1 && lsof "$VBLK" >/dev/null 2>&1; then
+    echo "[QEMU] vdisk.img is locked — stopping stale qemu-system-x86..."
+    pkill -9 qemu-system-x86 2>/dev/null || true
+    sleep 1
+fi
+
 DISPLAY_FLAGS="-display cocoa"
 EXTRA=""
 
@@ -52,6 +59,7 @@ exec qemu-system-x86_64 \
     -drive "file=$VBLK,format=raw,id=vblk,if=none" \
     -device nvme,drive=nvmedrive,serial=oscortex0 \
     -drive "file=$NVME,format=raw,id=nvmedrive,if=none" \
+    -device qemu-xhci,id=xhci \
     -serial stdio \
     -no-reboot \
     $DISPLAY_FLAGS \

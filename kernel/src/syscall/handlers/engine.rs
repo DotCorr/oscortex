@@ -189,6 +189,11 @@ pub(crate) fn sys_engine_vsync_baton_post(baton: u64) -> i64 {
         );
     }
     crate::wm::set_vsync_baton(baton);
+    // Embedder must run FlutterEngineOnVsync before the next push_vsync consumes
+    // this baton — keep pid=1 runnable even when engine threads are spinning.
+    if baton != 0 {
+        crate::process::set_state(1, crate::process::ProcState::Running);
+    }
     0
 }
 
@@ -367,13 +372,46 @@ pub(crate) fn sys_gpu_submit_strided(surface_id: u64, pixel_ptr: u64, row_bytes:
         Some(b) => b,
         None => return -14, // EFAULT
     };
-    let pid = wm_consumer_pid();
+    let pid = crate::process::current_pid();
     match crate::compositor::gpu_submit_strided_for(pid, surface_id as u32, bytes, row_bytes as usize) {
-        Ok(()) => 0,
+        Ok(()) => {
+            static GPU_SUBMIT_LOG: AtomicU32 = AtomicU32::new(0);
+            let n = GPU_SUBMIT_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 60 == 0 {
+                let sample = if bytes.len() >= 4 {
+                    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                } else {
+                    0
+                };
+                log::warn!(
+                    "[frame-boundary] gpu_submit_strided #{} pid={} sid={} ptr={:#x} row_bytes={} sample={:#x}",
+                    n,
+                    pid,
+                    surface_id,
+                    pixel_ptr,
+                    row_bytes,
+                    sample
+                );
+            }
+            0
+        }
         Err("bad payload size") => -22,
         Err("permission denied") => -1,
         Err("no such surface") => -3,
-        Err(_) => -12,
+        Err(e) => {
+            static GPU_SUBMIT_ERR: AtomicU32 = AtomicU32::new(0);
+            let n = GPU_SUBMIT_ERR.fetch_add(1, Ordering::Relaxed);
+            if n < 8 {
+                log::warn!(
+                    "[gpu_submit_strided-err] #{} pid={} sid={} err={}",
+                    n,
+                    pid,
+                    surface_id,
+                    e
+                );
+            }
+            -12
+        }
     }
 }
 

@@ -43,6 +43,11 @@ pub fn init_block_and_net() {
 
     register_block_natives();
 
+    // HID→WM path self-test (software route; independent of xHCI ring bring-up).
+    if cfg!(target_arch = "x86_64") {
+        super::usb_hid::wm_route_self_test();
+    }
+
     crate::app_store::init();
     crate::net::init();
 }

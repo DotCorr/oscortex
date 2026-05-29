@@ -503,7 +503,10 @@ unsafe extern "C" fn present_callback(
         let pixels = core::slice::from_raw_parts(allocation, pixel_len);
         let ok = gpu_submit_strided(surface_id, pixels, row_bytes) >= 0;
         if ok {
-            PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            let n = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+            if n < 8 || n % 60 == 0 {
+                write(b"[embedder] present_callback\n");
+            }
         }
         ok
     }
@@ -1158,10 +1161,10 @@ extern "C" fn main_embedder() {
     let mut ev = WmEvent::default();
     let mut platform_buf = [0u8; 512];
     let mut startup_watchdog_stage: u32 = 0;
-    let mut startup_watchdog_next_ns: u64 = rdtsc_ns() + 500_000_000;
+    let mut startup_watchdog_next_ns: u64 = rdtsc_ns() + 100_000_000;
     // Frame pump: call FlutterEngineScheduleFrame at ~60 fps so Flutter keeps
     // rendering even after it goes idle (static UI or before Dart init completes).
-    let mut frame_pump_next_ns: u64 = rdtsc_ns() + 16_666_666;
+    let mut frame_pump_next_ns: u64 = rdtsc_ns() + 1_000_000;
 
     write(b"[embedder] entering event loop\n");
     loop {
@@ -1241,19 +1244,20 @@ extern "C" fn main_embedder() {
             }
 
             startup_watchdog_stage += 1;
-            startup_watchdog_next_ns = now + 500_000_000;
+            startup_watchdog_next_ns = now + 100_000_000;
         }
 
         let r = wm_event_wait(&mut ev, timeout_ms);
-        if r <= 0 {
-            // No event or error — check for pending platform messages.
-            let n = platform_msg_recv(&mut platform_buf);
-            if n > 0 {
-                if (n as usize) >= 8 + 2 + 4 {
-                    let seq = u64::from_le_bytes(platform_buf[0..8].try_into().unwrap_or([0; 8]));
-                    platform_msg_reply(seq, b"ok");
-                }
+        // Always drain the platform-channel queue (run-visible.log had 16 early
+        // platform-recv calls; waiting for wm_event_wait EAGAIN starves init).
+        let n = platform_msg_recv(&mut platform_buf);
+        if n > 0 {
+            if (n as usize) >= 8 + 2 + 4 {
+                let seq = u64::from_le_bytes(platform_buf[0..8].try_into().unwrap_or([0; 8]));
+                platform_msg_reply(seq, b"ok");
             }
+        }
+        if r <= 0 {
             // Frame pump: keep Flutter rendering at ~60 fps so the Dart UI
             // thread has time to finish init and produce a real frame.
             let now_pump = rdtsc_ns();
@@ -1264,7 +1268,9 @@ extern "C" fn main_embedder() {
                 let schedule_frame: ScheduleFrameFn =
                     unsafe { core::mem::transmute(proctable.schedule_frame) };
                 let _ = unsafe { schedule_frame(engine_out) };
-                frame_pump_next_ns = now_pump + 16_666_666;
+                let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
+                let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
+                frame_pump_next_ns = now_pump + interval;
             }
             continue;
         }
@@ -1285,7 +1291,9 @@ extern "C" fn main_embedder() {
                         let schedule_frame: ScheduleFrameFn =
                             unsafe { core::mem::transmute(proctable.schedule_frame) };
                         let _ = unsafe { schedule_frame(engine_out) };
-                        frame_pump_next_ns = now_pump + 16_666_666;
+                        let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
+                        let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
+                        frame_pump_next_ns = now_pump + interval;
                     }
                 }
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {

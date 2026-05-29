@@ -46,27 +46,14 @@ pub fn enable_io_and_busmaster(bus: u8, dev: u8, func: u8) {
 /// BAR0 as a legacy I/O port base (bit 0 set). Returns 0 if MMIO or absent.
 pub fn bar0_io_base(bus: u8, dev: u8, func: u8) -> u16 {
     let bar0 = config_read32(bus, dev, func, 0x10);
-    if bar0 & 1 == 1 {
-        (bar0 & 0xFFFC) as u16
-    } else {
-        0
-    }
+    crate::drivers::common::pci_bar::decode_bar0_io(bar0).unwrap_or(0)
 }
 
 /// BAR0 as a memory-mapped physical base (I/O-space BARs return None).
 pub fn bar0_mmio_phys(bus: u8, dev: u8, func: u8) -> Option<u64> {
     let bar0_lo = config_read32(bus, dev, func, 0x10);
-    if bar0_lo & 1 != 0 {
-        return None;
-    }
-    let bar0_type = (bar0_lo >> 1) & 0x3;
-    let phys_lo = (bar0_lo & !0xF) as u64;
-    if bar0_type == 0x2 {
-        let bar0_hi = config_read32(bus, dev, func, 0x14) as u64;
-        Some((bar0_hi << 32) | phys_lo)
-    } else {
-        Some(phys_lo)
-    }
+    let bar0_hi = config_read32(bus, dev, func, 0x14);
+    crate::drivers::common::pci_bar::decode_bar0_mmio(bar0_lo, bar0_hi)
 }
 
 /// Locate a PCI function by class code; returns BDF + MMIO BAR0 physical base.

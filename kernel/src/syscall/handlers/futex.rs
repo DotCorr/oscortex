@@ -166,6 +166,66 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
     total
 }
 
+/// When an engine runner (pid 2–7) spins on zero-wake `NotifyAll`, wake sibling
+/// threads parked on *other* cond addresses so init can proceed.
+pub(crate) fn engine_broadcast_storm_wake(broadcaster: u32, cond: u64) -> u32 {
+    static LAST_COND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static STORM_COUNT: AtomicU32 = AtomicU32::new(0);
+    if cond != LAST_COND.load(Ordering::Relaxed) {
+        LAST_COND.store(cond, Ordering::Relaxed);
+        STORM_COUNT.store(0, Ordering::Relaxed);
+        return 0;
+    }
+    let c = STORM_COUNT.fetch_add(1, Ordering::Relaxed);
+    if c < 8 {
+        return 0;
+    }
+    STORM_COUNT.store(0, Ordering::Relaxed);
+
+    let siblings = crate::process::sibling_pids(broadcaster);
+    if siblings.len() <= 1 {
+        return 0;
+    }
+    let targets: Vec<(u32, u64)> = {
+        let t = COND_WAIT_STATE.lock();
+        t.iter()
+            .filter_map(|(&pid, st)| {
+                if !siblings.contains(&pid) || pid == broadcaster {
+                    return None;
+                }
+                match st {
+                    CondWaitState::Waiting { cond: wcond, .. } if *wcond != cond => {
+                        Some((pid, *wcond))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    };
+    let mut total = 0u32;
+    for (pid, wcond) in targets {
+        let n = futex_wake_waiters(wcond, i32::MAX as u32);
+        if n > 0 {
+            total = total.saturating_add(n as u32);
+            crate::process::set_state(pid, crate::process::ProcState::Running);
+        }
+    }
+    if total > 0 {
+        static STORM_WAKE_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = STORM_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 16 || n % 64 == 0 {
+            log::warn!(
+                "[engine-bcast-storm] #{} pid={} cond={:#x} storm_wakes={}",
+                n,
+                broadcaster,
+                cond,
+                total
+            );
+        }
+    }
+    total
+}
+
 #[inline]
 fn futex_pid1_postrun_bypass(uaddr: u64, val: u32) -> bool {
     if uaddr != FUTEX_ADDR_PID1_WAIT || val != 0 {

@@ -9,6 +9,7 @@ Read **docs/arch.txt**, **docs/hardware.txt**, and project skills before structu
 
 - `.cursor/skills/oscortex-architecture/SKILL.md`
 - `.cursor/skills/oscortex-hardware/SKILL.md` (drivers, display, input, device classes)
+- `.cursor/skills/oscortex-kernel-tests/SKILL.md` (driver unit + QEMU integration tests)
 - `.cursor/skills/codebase-audit-cleanup/SKILL.md`
 
 ## Architecture

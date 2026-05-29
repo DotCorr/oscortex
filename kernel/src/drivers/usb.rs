@@ -6,6 +6,10 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::arch::{mmio, pci};
+use crate::drivers::common::pci_bar;
+use crate::drivers::common::xhci_caps::{
+    halted_after_reset, parse_capability, reset_complete, USBCMD_HCRST, USBSTS_HCH,
+};
 
 const MAX_CONTROLLERS: usize = 4;
 const XHCI_MMIO_SIZE: usize = 0x10000;
@@ -15,16 +19,16 @@ pub static USB_XHCI_COUNT: AtomicU32 = AtomicU32::new(0);
 
 static USB_XHCI_READY: AtomicBool = AtomicBool::new(false);
 
-struct XhciController {
+pub(crate) struct XhciController {
     bus: u8,
     dev: u8,
     func: u8,
     bar_phys: u64,
-    bar_virt: u64,
+    pub(crate) bar_virt: u64,
     cap_length: u8,
     hci_version: u16,
-    max_slots: u8,
-    max_ports: u8,
+    pub(crate) max_slots: u8,
+    pub(crate) max_ports: u8,
 }
 
 static mut CONTROLLERS: [Option<XhciController>; MAX_CONTROLLERS] =
@@ -50,6 +54,11 @@ pub fn is_ready() -> bool {
     USB_XHCI_READY.load(Ordering::Acquire)
 }
 
+/// Poll xHCI event rings and route live HID keyboard reports to WM.
+pub fn poll() {
+    super::xhci_runtime::poll();
+}
+
 /// Scan PCI, map BAR0, and reset each XHCI controller (class 0x0C / 0x03 / 0x30).
 pub fn probe_and_init() {
     if USB_XHCI_COUNT.load(Ordering::Relaxed) != 0 {
@@ -71,10 +80,7 @@ pub fn probe_and_init() {
                     continue;
                 }
                 let class_reg = pci::config_read32(bus, dev, func, 0x08);
-                let class = (class_reg >> 24) as u8;
-                let subclass = (class_reg >> 16) as u8;
-                let progif = (class_reg >> 8) as u8;
-                if class != 0x0C || subclass != 0x03 || progif != 0x30 {
+                if !pci_bar::is_xhci(class_reg) {
                     continue;
                 }
 
@@ -101,6 +107,9 @@ pub fn probe_and_init() {
                 match init_controller(bus, dev, func, bar_phys, bar_virt, vendor, device) {
                     Ok(ctrl) => {
                         if (found as usize) < MAX_CONTROLLERS {
+                            if let Err(e) = super::xhci_runtime::start(&ctrl) {
+                                log::warn!("[USB] XHCI runtime start failed: {}", e);
+                            }
                             unsafe {
                                 CONTROLLERS[found as usize] = Some(ctrl);
                             }
@@ -149,21 +158,11 @@ fn init_controller(
 ) -> Result<XhciController, &'static str> {
     unsafe {
         let cap = mmio::read32(bar_virt, 0);
-        let cap_length = (cap & 0xFF) as u8;
-        if cap_length == 0 {
-            return Err("invalid CAPLENGTH");
-        }
+        let hcsparams1 = mmio::read32(bar_virt, (cap & 0xFF) as usize);
+        let caps = parse_capability(cap, hcsparams1)?;
 
-        let hci_version = ((cap >> 16) & 0xFFFF) as u16;
-        let hcsparams1 = mmio::read32(bar_virt, cap_length as usize);
-        let max_slots = (hcsparams1 & 0xFF) as u8;
-        let max_ports = ((hcsparams1 >> 24) & 0xFF) as u8;
-
-        let usbcmd_off = cap_length as usize;
-        let usbsts_off = usbcmd_off + 4;
-
-        const USBCMD_HCRST: u32 = 1 << 1;
-        const USBSTS_HCH: u32 = 1 << 12;
+        let usbcmd_off = caps.usbcmd_off;
+        let usbsts_off = caps.usbsts_off;
 
         let mut usbcmd = mmio::read32(bar_virt, usbcmd_off);
         usbcmd |= USBCMD_HCRST;
@@ -171,18 +170,21 @@ fn init_controller(
 
         for _ in 0..1_000_000 {
             usbcmd = mmio::read32(bar_virt, usbcmd_off);
-            if usbcmd & USBCMD_HCRST == 0 {
+            if reset_complete(usbcmd) {
                 break;
             }
             crate::arch::spin_pause();
         }
-        if usbcmd & USBCMD_HCRST != 0 {
+        if !reset_complete(usbcmd) {
             return Err("controller reset timeout");
         }
 
         let usbsts = mmio::read32(bar_virt, usbsts_off);
-        if usbsts & USBSTS_HCH == 0 {
-            return Err("controller not halted after reset");
+        if !halted_after_reset(usbsts) {
+            log::warn!(
+                "[USB] XHCI {:02X}:{:02X}.{} not halted after reset (USBSTS={:#x}) — continuing",
+                bus, dev, func, usbsts
+            );
         }
 
         log::info!(
@@ -193,9 +195,9 @@ fn init_controller(
             vendor,
             device,
             bar_phys,
-            hci_version,
-            max_slots,
-            max_ports
+            caps.hci_version,
+            caps.max_slots,
+            caps.max_ports
         );
 
         Ok(XhciController {
@@ -204,10 +206,10 @@ fn init_controller(
             func,
             bar_phys,
             bar_virt,
-            cap_length,
-            hci_version,
-            max_slots,
-            max_ports,
+            cap_length: caps.cap_length,
+            hci_version: caps.hci_version,
+            max_slots: caps.max_slots,
+            max_ports: caps.max_ports,
         })
     }
 }

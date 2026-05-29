@@ -617,19 +617,6 @@ pub fn sys_pthread_mutex_unlock(mutex: u64) -> i64 {
         let _ = super::force_wake_all_task_runners("deferred-kick");
     }
     let wpid = crate::process::current_pid();
-    if wpid != 0 && n > 0 {
-        if let Some(next) = crate::process::next_runnable_pid(wpid) {
-            if next != wpid {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(wpid, urip, ursp);
-                crate::process::save_full_user_gprs(wpid);
-                crate::process::set_rax(wpid, 0);
-                crate::process::save_xstate(wpid);
-                crate::process::enter_user_by_pid_noreturn(next);
-            }
-        }
-    }
     let prefer = super::poll::acqmutex_waiter_for(mutex, wpid);
     if prefer.is_some() {
         super::poll::cooperative_yield_to(wpid, 0, prefer);
@@ -803,7 +790,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                 // Otherwise, we must wait (yield or hlt)
                 if pid != 0 {
                     super::futex_waiter_add(cond, pid);
-                    if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if let Some(next) = super::cooperative_sched_target(pid) {
                         if next != pid {
                             let urip = crate::arch::syscall::user_rip();
                             let ursp = crate::arch::syscall::user_rsp();
@@ -839,7 +826,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     unsafe {
                         core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
                     }
-                    if let Some(next) = crate::process::next_runnable_pid(pid) {
+                    if let Some(next) = super::cooperative_sched_target(pid) {
                         if next != pid {
                             let urip = crate::arch::syscall::user_rip();
                             let ursp = crate::arch::syscall::user_rsp();
@@ -976,7 +963,7 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
     }
     log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
     let wpid = crate::process::current_pid();
-    if wpid != 0 && (n > 0 || bridged > 0) {
+    if wpid != 0 && n > 0 {
         if let Some(next) = crate::process::next_runnable_sibling_thread(wpid)
             .or_else(|| crate::process::next_runnable_pid(wpid))
         {
@@ -1010,7 +997,8 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
             let caller = unsafe { core::ptr::read_unaligned(ursp as *const u64) };
             // Flutter engine Dart VM `ConditionVariable::NotifyAll` callsite
             // after `pthread_cond_broadcast@plt` (see mapped addr 0x326d61e).
-            // Bridging this path causes a synthetic wake storm.
+            // Bridging this path causes a synthetic wake storm.  Also skip when
+            // the caller is in the engine text mapping (ASLR-safe).
             if caller == 0x326d61e {
                 skip_bridge = true;
             }
@@ -1060,6 +1048,16 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
             }
         }
     }
+
+    if n == 0 && bridged == 0 && crate::process::get_group_leader(pid) == 1 && pid >= 2 {
+        bridged = super::engine_broadcast_storm_wake(pid, cond);
+        static ENGINE_ZERO_WAKE_KICK: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let zkick = ENGINE_ZERO_WAKE_KICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if zkick < 64 || zkick % 64 == 0 {
+            let _ = super::force_wake_all_task_runners("engine-bcast-zero");
+        }
+    }
     cond_broadcast_loop_handoff(pid, cond, n, bridged);
 
     static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1077,18 +1075,62 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     );
     
     let wpid = crate::process::current_pid();
-    if wpid != 0 && (n > 0 || bridged > 0) {
-        if let Some(next) = crate::process::next_runnable_sibling_thread(wpid)
-            .or_else(|| crate::process::next_runnable_pid(wpid))
-        {
-            if next != wpid {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(wpid, urip, ursp);
-                crate::process::save_full_user_gprs(wpid);
-                crate::process::set_rax(wpid, 0);
-                crate::process::save_xstate(wpid);
-                crate::process::enter_user_by_pid_noreturn(next);
+    if wpid != 0
+        && wpid != 1
+        && crate::process::get_group_leader(wpid) == 1
+    {
+        if let Some(next) = super::prefer_embedder_if_baton_due(wpid) {
+            let urip = crate::arch::syscall::user_rip();
+            let ursp = crate::arch::syscall::user_rsp();
+            crate::process::save_return_context(wpid, urip, ursp);
+            crate::process::save_full_user_gprs(wpid);
+            crate::process::set_rax(wpid, 0);
+            crate::process::save_xstate(wpid);
+            crate::process::enter_user_by_pid_noreturn(next);
+        }
+    } else if wpid != 0 && n == 0 && bridged == 0 && crate::process::get_group_leader(wpid) == 1 && wpid >= 2 {
+        // Engine NotifyAll hot loops must not monopolize the CPU — yield so
+        // task runners and the embedder can make init progress.
+        static NOTIFYALL_SPIN: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let spin = NOTIFYALL_SPIN.fetch_add(1, Ordering::Relaxed);
+        if (spin & 1) == 0 {
+            if let Some(next) = super::prefer_embedder_if_baton_due(wpid)
+                .or_else(|| crate::process::next_runnable_sibling_thread(wpid))
+                .or_else(|| super::cooperative_sched_target(wpid))
+            {
+                if next != wpid && super::coop_target_ready(next) {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(wpid, urip, ursp);
+                    crate::process::save_full_user_gprs(wpid);
+                    crate::process::set_rax(wpid, 0);
+                    crate::process::save_xstate(wpid);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+            }
+        }
+        if (spin & 63) == 0 {
+            let _ = super::force_wake_all_task_runners("notifyall-spin");
+        }
+    } else if wpid != 0 && (n > 0 || bridged > 0) {
+        static BCAST_YIELD_TICK: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let ty = BCAST_YIELD_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n > 0 || (ty & 3) == 0 {
+            if let Some(next) = super::prefer_embedder_if_baton_due(wpid)
+                .or_else(|| crate::process::next_runnable_sibling_thread(wpid))
+                .or_else(|| crate::process::next_runnable_pid(wpid))
+            {
+                if next != wpid {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(wpid, urip, ursp);
+                    crate::process::save_full_user_gprs(wpid);
+                    crate::process::set_rax(wpid, 0);
+                    crate::process::save_xstate(wpid);
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
             }
         }
     }
@@ -1889,6 +1931,14 @@ pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
         } else { 0 };
         if dbg_n < 8 {
             log::warn!("[vsnprintf-debug] arg={:#x}", val);
+        }
+        let pid = crate::process::current_pid();
+        if pid == 2 && val >= 0x400_000_000 && val < 0x500_000_000 {
+            static VSnprintf_MILESTONE: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !VSnprintf_MILESTONE.swap(true, core::sync::atomic::Ordering::Relaxed) {
+                log::warn!("[vsnprintf-milestone] pid=2 arg={:#x}", val);
+            }
         }
         val
     };

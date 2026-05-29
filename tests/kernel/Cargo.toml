@@ -1,0 +1,11 @@
+[package]
+name = "oscortex-kernel-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Host unit tests for OSCortex kernel driver logic"
+
+[[test]]
+name = "unit"
+path = "unit/main.rs"
+harness = true

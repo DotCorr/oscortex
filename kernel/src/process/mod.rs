@@ -645,6 +645,24 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let _g = PTABLE_LOCK.lock();
 
+    // The embedder event loop must run whenever vsync batons or other WM events
+    // are queued — otherwise Flutter never reaches OnVsync / present_callback.
+    if crate::wm::embedder_baton_due() {
+        if current == 1 {
+            // Do not yield away while a baton is posted or queued for pid=1.
+            return None;
+        }
+        let embedder = unsafe { &PTABLE[idx_of(1)] };
+        if embedder.pid == 1 {
+            if embedder.state == ProcState::Blocked {
+                crate::process::set_state(1, ProcState::Running);
+            }
+            if embedder.state == ProcState::Running {
+                return Some(1);
+            }
+        }
+    }
+
     let mut start = idx_of(current.wrapping_add(1));
     if current == 0 {
         start = 0;

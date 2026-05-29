@@ -7,11 +7,15 @@ fn main() {
         Some("build") => build(),
         Some("run") => run(),
         Some("iso") => iso(),
+        Some("test") => test(false),
+        Some("test-qemu") => test(true),
         _ => {
-            eprintln!("Usage: cargo xtask <build|run|iso>");
-            eprintln!("  build  — build the kernel ELF");
-            eprintln!("  run    — build and launch in QEMU");
-            eprintln!("  iso    — build bootable ISO image");
+            eprintln!("Usage: cargo xtask <build|run|iso|test|test-qemu>");
+            eprintln!("  build      — build the kernel ELF");
+            eprintln!("  run        — build and launch in QEMU");
+            eprintln!("  iso        — build bootable ISO image");
+            eprintln!("  test       — host kernel driver unit tests");
+            eprintln!("  test-qemu  — unit tests + QEMU driver integration");
         }
     }
 }
@@ -23,13 +27,13 @@ fn workspace_root() -> PathBuf {
 
 fn build() {
     let root = workspace_root();
-    let target = root.join("targets/x86_64-oscortex.json");
     let status = Command::new("cargo")
         .args([
             "+nightly",
             "build",
+            "--release",
             "--package", "oscortex-kernel",
-            "--target", target.to_str().unwrap(),
+            "--target", "x86_64-unknown-none",
             "-Z", "build-std=core,compiler_builtins,alloc",
             "-Z", "build-std-features=compiler-builtins-mem",
         ])
@@ -50,7 +54,7 @@ fn iso() {
     std::fs::create_dir_all(iso_dir.join("EFI/BOOT")).unwrap();
 
     // Copy kernel ELF
-    let kernel_elf = root.join("target/x86_64-oscortex/debug/kernel");
+    let kernel_elf = root.join("target/x86_64-unknown-none/release/kernel");
     std::fs::copy(&kernel_elf, iso_dir.join("boot/kernel")).unwrap();
 
     // Write limine config
@@ -93,6 +97,20 @@ fn run() {
         ])
         .status()
         .expect("qemu-system-x86_64 not found — run: brew install qemu");
+    if !status.success() {
+        std::process::exit(1);
+    }
+}
+
+fn test(qemu: bool) {
+    let root = workspace_root();
+    let script = root.join("tests/run_all.sh");
+    let mut cmd = Command::new("bash");
+    cmd.arg(script);
+    if qemu {
+        cmd.arg("--qemu");
+    }
+    let status = cmd.status().expect("tests/run_all.sh failed");
     if !status.success() {
         std::process::exit(1);
     }

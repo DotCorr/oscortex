@@ -336,6 +336,24 @@ pub(crate) fn sys_wm_event_poll() -> i64 {
 }
 
 pub(crate) fn sys_wm_event_read(ev_ptr: u64, ev_len: u64) -> i64 {
+    wm_event_copy_to_user(ev_ptr, ev_len, false)
+}
+
+fn wm_wait_drain_event(ev_ptr: u64, ev_len: u64) -> i64 {
+    wm_event_copy_to_user(ev_ptr, ev_len, true)
+}
+
+static WM_LAST_DRAIN_SLACK: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+fn wm_drain_requested_platform_poll() -> bool {
+    WM_LAST_DRAIN_SLACK.swap(false, Ordering::AcqRel)
+}
+
+fn wm_event_copy_to_user(ev_ptr: u64, ev_len: u64, platform_poll_slack: bool) -> i64 {
+    WM_LAST_DRAIN_SLACK.store(false, Ordering::Release);
+
     let need = crate::wm::event_size();
     if (ev_len as usize) < need {
         return -22; // EINVAL
@@ -345,6 +363,17 @@ pub(crate) fn sys_wm_event_read(ev_ptr: u64, ev_len: u64) -> i64 {
         Some(e) => e,
         None => return -11, // EAGAIN
     };
+
+    if platform_poll_slack && ev.kind == crate::wm::EV_VSYNC && ev.b == 0 {
+        static VSYNC_POLL_SLACK: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let t = VSYNC_POLL_SLACK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if (t & 1) == 0 {
+            crate::wm::push_event(ev.kind, ev.flags, ev.a, ev.b);
+            WM_LAST_DRAIN_SLACK.store(true, Ordering::Release);
+            return -11;
+        }
+    }
 
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -430,10 +459,45 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
     let cur = crate::process::current_pid();
     if cur == 0 { return -1; }
 
+    static WM_WAIT_RET_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let mut wm_log_ret = |tag: &str, val: i64| {
+        let n = WM_WAIT_RET_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 24 {
+            log::warn!("[wm-event-wait-ret] #{} pid={} {}={}", n, cur, tag, val);
+        }
+        val
+    };
+
     // Ensure timerfd deadlines are checked on every event-poll, not just on WM
     // timeout expiry.  This keeps task-runner threads woken at ≤16ms latency
     // instead of the ~640ms cortex-bg cycle.
     check_timerfds_and_wake();
+
+    // Cooperative yield via enter_user resumes userspace at the syscall site
+    // without completing the prior in-kernel wait loop — always drain the queue
+    // and honor a deferred timeout before re-blocking.
+    let n = wm_wait_drain_event(ev_ptr, ev_len);
+    if n >= 0 {
+        crate::wm::set_wm_waiter(0);
+        WM_WAITER_PID.store(0, Ordering::Release);
+        WM_WAITER_DEADLINE.store(0, Ordering::Release);
+        crate::process::set_state(cur, crate::process::ProcState::Running);
+        return wm_log_ret("event", n);
+    }
+    if n == -11 && wm_drain_requested_platform_poll() {
+        return wm_log_ret("eagain-platform", -11);
+    }
+    if WM_WAITER_PID.load(Ordering::Acquire) == cur {
+        let dl = WM_WAITER_DEADLINE.load(Ordering::Relaxed);
+        if dl != 0 && monotonic_ns() >= dl {
+            crate::wm::set_wm_waiter(0);
+            WM_WAITER_PID.store(0, Ordering::Release);
+            WM_WAITER_DEADLINE.store(0, Ordering::Release);
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+            return wm_log_ret("eagain-top", -11);
+        }
+    }
 
     let is_reentrant = WM_WAITER_PID.load(Ordering::Acquire) == cur;
 
@@ -448,12 +512,6 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
     let deadline_ns = if is_reentrant {
         WM_WAITER_DEADLINE.load(Ordering::Relaxed)
     } else {
-        // Fast path: check if events are already queued.
-        let n = sys_wm_event_read(ev_ptr, ev_len);
-        if n >= 0 {
-            return n;
-        }
-
         if timeout_ms == 0 {
             return -11; // EAGAIN immediately if timeout is 0 and no event is ready
         }
@@ -469,13 +527,20 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         crate::wm::set_wm_waiter(cur);
         crate::process::set_state(cur, crate::process::ProcState::Blocked);
 
-        let n = sys_wm_event_read(ev_ptr, ev_len);
+        let n = wm_wait_drain_event(ev_ptr, ev_len);
         if n >= 0 {
             crate::wm::set_wm_waiter(0);
             WM_WAITER_PID.store(0, Ordering::Release);
             WM_WAITER_DEADLINE.store(0, Ordering::Release);
             crate::process::set_state(cur, crate::process::ProcState::Running);
-            return n;
+            return wm_log_ret("event-loop", n);
+        }
+        if n == -11 && wm_drain_requested_platform_poll() {
+            crate::wm::set_wm_waiter(0);
+            WM_WAITER_PID.store(0, Ordering::Release);
+            WM_WAITER_DEADLINE.store(0, Ordering::Release);
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+            return wm_log_ret("eagain-platform-loop", -11);
         }
 
         // Check if we already exceeded the timeout before blocking.
@@ -485,7 +550,7 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
             WM_WAITER_PID.store(0, Ordering::Release);
             WM_WAITER_DEADLINE.store(0, Ordering::Release);
             crate::process::set_state(cur, crate::process::ProcState::Running);
-            return -11; // EAGAIN
+            return wm_log_ret("eagain-loop", -11); // EAGAIN
         }
 
         // Save return context and registers so we can be resumed.
@@ -497,17 +562,28 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         crate::process::save_xstate(cur);
 
         // Cooperatively switch to another runnable process.
-        if let Some(next) = crate::process::next_runnable_pid(cur) {
-            if next != cur {
-                crate::process::enter_user_by_pid_noreturn(next);
+        if !crate::wm::embedder_baton_due() {
+            if let Some(next) = crate::process::next_runnable_pid(cur) {
+                if next != cur {
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
             }
         }
 
         // Loop-sleep (sti; hlt; cli) as long as we are Blocked.
+        // Cooperative yield already happened once above.  Re-yield only every
+        // 16th hlt wake so reentrant wm_event_wait can hit eagain-top for
+        // platform-recv without the sched ping-pong that starved pid=2 init.
+        static HLT_YIELD_TICK: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
         while crate::process::is_blocked(cur) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
                 core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            }
+
+            if !crate::process::is_blocked(cur) {
+                break;
             }
 
             // Check if timeout has expired.
@@ -521,9 +597,11 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
                 break;
             }
 
-            if let Some(next) = crate::process::next_runnable_pid(cur) {
-                if next != cur {
-                    crate::process::enter_user_by_pid_noreturn(next);
+            if (HLT_YIELD_TICK.fetch_add(1, Ordering::Relaxed) & 15) == 0 {
+                if let Some(next) = crate::process::next_runnable_pid(cur) {
+                    if next != cur {
+                        crate::process::enter_user_by_pid_noreturn(next);
+                    }
                 }
             }
         }

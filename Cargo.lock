@@ -136,6 +136,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "oscortex-kernel-tests"
+version = "0.1.0"
+
+[[package]]
 name = "proc-macro-error-attr2"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

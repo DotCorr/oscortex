@@ -578,6 +578,8 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                 buf[i] = r | (g << 8) | (bl << 16) | (a << 24);
             }
             c.back_pending[idx] = true;
+            drop(c);
+            render_frame();
             return Ok(());
         }
     }
