@@ -501,6 +501,27 @@ unsafe extern "C" fn present_callback(
         let surface_id = SURFACE_ID;
         let pixel_len  = row_bytes * height;
         let pixels = core::slice::from_raw_parts(allocation, pixel_len);
+        let n = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
+        if n < 4 {
+            // Diagnostic: find first non-zero byte to confirm the engine
+            // actually rasterized into this present buffer.
+            let mut first_nz: i64 = -1;
+            let mut nz_count: u64 = 0;
+            let scan = if pixel_len > 1_000_000 { 1_000_000 } else { pixel_len };
+            let mut i = 0usize;
+            while i < scan {
+                if pixels[i] != 0 {
+                    if first_nz < 0 { first_nz = i as i64; }
+                    nz_count += 1;
+                }
+                i += 1;
+            }
+            write_hex_u64(b"[present-scan] alloc_addr=", allocation as u64);
+            write_hex_u64(b"[present-scan] row_bytes=", row_bytes as u64);
+            write_hex_u64(b"[present-scan] pixel_len=", pixel_len as u64);
+            write_hex_u64(b"[present-scan] first_nz_off=", first_nz as u64);
+            write_hex_u64(b"[present-scan] nz_count=", nz_count);
+        }
         let ok = gpu_submit_strided(surface_id, pixels, row_bytes) >= 0;
         if ok {
             let n = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);

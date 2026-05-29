@@ -69,6 +69,92 @@ P9_HOOK_VA = 0x1A8BEB8
 P9_RESUME_VA = 0x1A8BEC5
 P9_CAVE_FILE = 0x1F4438C
 P9_CAVE_VA = file_to_va(P9_CAVE_FILE)
+
+# Diagnostic log stub: prints "FP" + 16 hex digits of device[0x140] (fPixels)
+# via the SYS_WRITE(fd=1) syscall, then returns. Placed further into the
+# (unused-in-software-engine) ChaCha20 region. Set DIAG_LOG=False to disable.
+DIAG_LOG = True
+# When set, the P9 cave manually memsets the whole device buffer to a sentinel
+# colour before calling drawPaint. Used to prove the present/framebuffer path
+# works independently of Skia's (broken) software blitter.
+DIAG_FILL = True
+DIAG_FILL_COLOR = 0xFFFF00FF
+# When set, skip the real skcpu::Draw::drawPaint call (only the sentinel fill
+# runs). Used to prove drawPaint is actively zero-filling the surface.
+DIAG_SKIP_DRAWPAINT = False
+LOG_CAVE_FILE = 0x1F44400
+LOG_CAVE_VA = file_to_va(LOG_CAVE_FILE)
+
+
+def build_log_stub() -> bytes:
+    """Print three labelled 64-bit device fields via SYS_WRITE(fd=1):
+        FP = device[0x140]  (fPixels)
+        CT = device[0x158]  (SkColorInfo.fColorType|fAlphaType)
+        WH = device[0x160]  (fWidth | fHeight<<32)
+    """
+    def fmt_rax(label: bytes) -> list[int]:
+        """Format the 64-bit value in rax as 'XX<16 hex>\\n' and SYS_WRITE it."""
+        l0, l1 = label[0], label[1]
+        return [
+            0x48, 0x83, 0xec, 0x20,            # sub rsp, 0x20
+            0xc6, 0x04, 0x24, l0,              # mov byte [rsp], label[0]
+            0xc6, 0x44, 0x24, 0x01, l1,        # mov byte [rsp+1], label[1]
+            0x48, 0x8d, 0x7c, 0x24, 0x02,      # lea rdi, [rsp+2]
+            0xb9, 0x10, 0x00, 0x00, 0x00,      # mov ecx, 16
+            # .loop:
+            0x48, 0xc1, 0xc0, 0x04,            # rol rax, 4
+            0x48, 0x89, 0xc3,                  # mov rbx, rax
+            0x83, 0xe3, 0x0f,                  # and ebx, 0xf
+            0x80, 0xc3, 0x30,                  # add bl, 0x30
+            0x80, 0xfb, 0x3a,                  # cmp bl, 0x3a
+            0x72, 0x03,                        # jb +3
+            0x80, 0xc3, 0x27,                  # add bl, 0x27
+            0x88, 0x1f,                        # mov [rdi], bl
+            0x48, 0xff, 0xc7,                  # inc rdi
+            0xff, 0xc9,                        # dec ecx
+            0x75, 0xe2,                        # jnz .loop
+            0xc6, 0x07, 0x0a,                  # mov byte [rdi], 0x0a
+            0x48, 0xff, 0xc7,                  # inc rdi
+            0x48, 0x89, 0xfa,                  # mov rdx, rdi
+            0x48, 0x29, 0xe2,                  # sub rdx, rsp
+            0x48, 0x89, 0xe6,                  # mov rsi, rsp
+            0xbf, 0x01, 0x00, 0x00, 0x00,      # mov edi, 1
+            0xb8, 0x01, 0x00, 0x00, 0x00,      # mov eax, 1 (SYS_WRITE)
+            0x0f, 0x05,                        # syscall
+            0x48, 0x83, 0xc4, 0x20,            # add rsp, 0x20
+        ]
+
+    def load_field(off: int) -> list[int]:
+        return [0x49, 0x8b, 0x86, off & 0xff, (off >> 8) & 0xff, 0x00, 0x00]  # mov rax,[r14+off]
+
+    body: list[int] = []
+    body += [0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x53]  # push regs
+    # Paint SkColor4f: PA=[rbx+0x10] (R|G floats), PB=[rbx+0x18] (B|A floats).
+    body += [0x49, 0x89, 0xd8]                       # mov r8, rbx  (save paint ptr)
+    body += [0x49, 0x8b, 0x00] + fmt_rax(b"PA")        # mov rax,[r8]      R|G floats
+    body += [0x49, 0x8b, 0x40, 0x08] + fmt_rax(b"PB")  # mov rax,[r8+0x8]  B|A floats
+    body += load_field(0x140) + fmt_rax(b"FP")
+    body += load_field(0x158) + fmt_rax(b"CT")
+    body += load_field(0x160) + fmt_rax(b"WH")
+    # DC = device[0x180]
+    body += load_field(0x180) + fmt_rax(b"DC")
+    # clip = device[0x180] + (int)device[0x180][0x18];  CB = [clip+0x8] (right|bottom)
+    body += [
+        0x49, 0x8b, 0x86, 0x80, 0x01, 0x00, 0x00,  # mov rax,[r14+0x180]
+        0x48, 0x63, 0x48, 0x18,                    # movsxd rcx,[rax+0x18]
+        0x48, 0x01, 0xc8,                          # add rax,rcx       (rax = clip)
+        0x48, 0x8b, 0x40, 0x08,                    # mov rax,[rax+0x8] (right|bottom)
+    ]
+    body += fmt_rax(b"CB")
+    # RB = *(u32*)device[0x140]  (read back first pixel of the surface buffer)
+    body += [
+        0x49, 0x8b, 0x86, 0x40, 0x01, 0x00, 0x00,  # mov rax,[r14+0x140]
+        0x8b, 0x00,                                # mov eax,[rax]
+    ]
+    body += fmt_rax(b"RB")
+    body += [0x41, 0x5b, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58]  # pop regs
+    body += [0xc3]                                                         # ret
+    return bytes(body)
 P9_PROLOGUE_FILE = va_to_file(0x1A8BE5F)
 P9_PROLOGUE_ORIG = bytes([0x48, 0x8D, 0x7C, 0x24, 0x08, 0xE8, 0xA7, 0x8C, 0x02, 0x00])
 P9_EPILOGUE_FILE = va_to_file(0x1A8BEC5)
@@ -80,7 +166,19 @@ P9_EPILOGUE_ORIG = bytes([
 
 
 def build_p9_cave() -> bytes:
-    """Copy device.fPixels/fRowBytes into Draw.fPixels, then call skcpu::Draw::drawPaint."""
+    """Copy device.fPixels/fRowBytes into Draw.fDst, then call skcpu::Draw::drawPaint.
+
+    The destination pixel pointer and row-bytes live at the SAME device offsets
+    that SkBitmapDevice::onAccessPixels reads in this engine build:
+        fPixels   = *(void**)(device + 0x140)
+        fRowBytes = *(size_t*)(device + 0x148)
+    (Verified by disassembling onAccessPixels: it calls
+     SkPixmap::reset(info, [device+0x140], [device+0x148]).)
+
+    The older cave used [device+0x180]+[..+0x18], which in this build is a
+    clip/matrix pointer (SkDraw.fRC at [rsp+0x48]) — NOT the pixels — so the
+    blitter wrote to the wrong address and every fill came out zero.
+    """
     cave: list[bytes] = []
     va = P9_CAVE_VA
 
@@ -89,20 +187,34 @@ def build_p9_cave() -> bytes:
         cave.append(data)
         va += len(data)
 
-    emit(b"\x49\x8b\x86\x80\x01\x00\x00")  # mov rax, [r14+0x180]
-    emit(b"\x48\x63\x48\x18")               # movsxd rcx, [rax+0x18]
-    emit(b"\x48\x01\xc1")                   # add rcx, rax
-    emit(b"\x48\x89\x4c\x24\x10")           # mov [rsp+0x10], rcx  ; Draw.fPixels
-    emit(b"\x41\x8b\x86\x48\x01\x00\x00")  # mov eax, [r14+0x148]
-    emit(b"\x48\x89\x44\x24\x18")           # mov [rsp+0x18], rax  ; Draw.fRowBytes
-    emit(b"\x48\x8d\x7c\x24\x08")           # lea rdi, [rsp+8]
-    emit(b"\x48\x89\xde")                   # mov rsi, rbx
-    call_at = va
-    emit(call_rel32(call_at, 0x1AB74B0))
+    emit(b"\x49\x8b\x86\x40\x01\x00\x00")  # mov rax, [r14+0x140]  ; fPixels
+    emit(b"\x48\x89\x44\x24\x10")           # mov [rsp+0x10], rax  ; Draw.fDst.fPixels
+    emit(b"\x49\x8b\x96\x48\x01\x00\x00")  # mov rdx, [r14+0x148]  ; fRowBytes (64-bit)
+    emit(b"\x48\x89\x54\x24\x18")           # mov [rsp+0x18], rdx  ; Draw.fDst.fRowBytes
+    if DIAG_FILL:
+        # rcx = height ([r14+0x164]) * rowBytes ([r14+0x148]); /4 => dword count
+        emit(b"\x45\x8b\x96\x64\x01\x00\x00")      # mov r10d, [r14+0x164]  ; height
+        emit(b"\x4d\x0f\xaf\x96\x48\x01\x00\x00")  # imul r10, [r14+0x148]  ; *rowBytes
+        emit(b"\x49\xc1\xea\x02")                   # shr r10, 2             ; dword count
+        emit(b"\x49\x89\xc1")                       # mov r9, rax           ; cursor
+        emit(b"\xba" + struct.pack("<I", DIAG_FILL_COLOR))  # mov edx, color
+        # .fill:
+        emit(b"\x41\x89\x11")                       # mov [r9], edx
+        emit(b"\x49\x83\xc1\x04")                   # add r9, 4
+        emit(b"\x49\xff\xca")                       # dec r10
+        emit(b"\x75\xf4")                           # jnz .fill
+    if DIAG_LOG:
+        emit(call_rel32(va, LOG_CAVE_VA))  # log stub (FP/CT/WH/DC/CB/RB)
+    if not DIAG_SKIP_DRAWPAINT:
+        emit(b"\x48\x8d\x7c\x24\x08")           # lea rdi, [rsp+8]
+        emit(b"\x48\x89\xde")                   # mov rsi, rbx
+        call_at = va
+        emit(call_rel32(call_at, 0x1AB74B0))
     emit(jmp_rel32(va, P9_RESUME_VA))
     blob = b"".join(cave)
-    if len(blob) > 52:
-        raise RuntimeError(f"P9 cave too large: {len(blob)} bytes")
+    cave_budget = P9_CAVE_VA  # cave region runs up to LOG_CAVE_VA
+    if P9_CAVE_VA + len(blob) > LOG_CAVE_VA:
+        raise RuntimeError(f"P9 cave overruns log stub: {len(blob)} bytes")
     return blob
 
 
@@ -114,6 +226,8 @@ def p9_hook_bytes() -> bytes:
 
 PATCHES["P9"] = (va_to_file(P9_HOOK_VA), p9_hook_bytes())
 PATCHES["P9_CAVE"] = (P9_CAVE_FILE, build_p9_cave())
+if DIAG_LOG:
+    PATCHES["LOG_CAVE"] = (LOG_CAVE_FILE, build_log_stub())
 PATCHES["P9_PROLOGUE"] = (P9_PROLOGUE_FILE, P9_PROLOGUE_ORIG)
 PATCHES["P9_EPILOGUE"] = (P9_EPILOGUE_FILE, P9_EPILOGUE_ORIG)
 
@@ -215,6 +329,8 @@ def main() -> int:
     )
     if "P9" in to_apply and "P9_CAVE" not in to_apply:
         to_apply.extend(["P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"])
+    if DIAG_LOG and "LOG_CAVE" in PATCHES and "LOG_CAVE" not in to_apply:
+        to_apply.append("LOG_CAVE")
     if "P7" in to_apply:
         to_apply.extend(["P7_CAVE", "P7_PROLOGUE", "P7_EPILOGUE"])
     # Preserve order, drop duplicates.
