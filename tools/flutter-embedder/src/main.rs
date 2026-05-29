@@ -1303,7 +1303,15 @@ extern "C" fn main_embedder() {
                     let target_ns = now_ns + 16_666_666;
                     let f: OnVsyncFn =
                         unsafe { core::mem::transmute(proctable.on_vsync) };
+                    // A baton is a one-shot token: call OnVsync EXACTLY once.
+                    // Calling it twice corrupts the engine's vsync accounting
+                    // and stops it from scheduling further frames.
                     unsafe { f(engine_out, baton, now_ns, target_ns) };
+
+                    // OnVsync posts raster/UI work — yield so runner threads can execute.
+                    for _ in 0..12 {
+                        sched_yield();
+                    }
 
                     // Consecutive-no-present watchdog: if 2 vsync→engine calls in a row
                     // produced no new present, force FlutterEngineScheduleFrame to

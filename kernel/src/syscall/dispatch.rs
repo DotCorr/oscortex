@@ -720,8 +720,8 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     }
 }
 
-/// Legacy INT 0x80 syscall path.
+/// Legacy INT 0x80 syscall path (handled by `arch::x86_64::syscall::legacy_syscall_entry`).
 pub fn dispatch_legacy() {
-    // TODO: read registers from saved context and dispatch.
+    log::warn!("[syscall] dispatch_legacy called without saved register frame");
 }
 

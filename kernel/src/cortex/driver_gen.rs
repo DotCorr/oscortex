@@ -126,9 +126,7 @@ impl DriverRegistry {
             return Err(LoadError::InvalidWasm);
         }
 
-        // 2. Verify CDP ABI version export (simplified — real version uses
-        //    a full WASM parser).
-        // TODO: parse WASM export section and call cdp_version().
+        // CDP ABI version is validated in `load_wasm_driver` via `cdp_version()`.
 
         // 3. Compute content hash (simplified — real version: SHA-256).
         let mut hash = [0u8; 32];
@@ -204,6 +202,58 @@ impl DriverRegistry {
             d.state = DriverState::Quarantined;
             d.vtable = DriverVtable::null();
             log::warn!("[Cortex::DriverGen] Driver {} quarantined", id);
+        }
+    }
+
+    pub fn driver_name(&self, id: u32) -> Option<&[u8]> {
+        let d = self.drivers.get(id as usize)?.as_ref()?;
+        let end = d.name.iter().position(|&b| b == 0).unwrap_or(d.name.len());
+        Some(&d.name[..end])
+    }
+
+    /// Re-run `cdp_init` for a WASM driver, or reactivate a native entry.
+    pub fn reload(&mut self, id: u32) -> Result<(), LoadError> {
+        let d = self
+            .drivers
+            .get_mut(id as usize)
+            .and_then(|slot| slot.as_mut())
+            .ok_or(LoadError::NotFound)?;
+        if let Some(sb) = d.sandbox.as_mut() {
+            use crate::drivers::wasm_sandbox::WasmError;
+            let _ = sb.call(b"cdp_deinit", &[]);
+            match sb.call(b"cdp_init", &[]) {
+                Ok(0) | Err(WasmError::FunctionNotFound) => {}
+                Ok(rc) => {
+                    log::error!("[Cortex::DriverGen] reload cdp_init returned {}", rc);
+                    return Err(LoadError::InitFailed);
+                }
+                Err(e) => {
+                    log::error!("[Cortex::DriverGen] reload cdp_init error: {:?}", e);
+                    return Err(LoadError::InitFailed);
+                }
+            }
+        }
+        d.state = DriverState::Active;
+        d.error_count = 0;
+        log::info!("[Cortex::DriverGen] Driver {} reloaded", id);
+        Ok(())
+    }
+
+    /// Best-effort hardware reset for a registered native driver.
+    pub fn reset_device(&self, id: u32) {
+        let Some(name) = self.driver_name(id) else {
+            return;
+        };
+        if name == b"ps2" || name == b"input" {
+            crate::drivers::ps2::init();
+        } else if name == b"xhci" || name == b"usb" {
+            crate::drivers::usb::poll();
+        } else {
+            log::info!(
+                "[Cortex::DriverGen] reset_device id={} ({}) — no hardware hook",
+                id,
+                core::str::from_utf8(name).unwrap_or("?")
+            );
         }
     }
 
@@ -349,12 +399,38 @@ pub fn request_driver_for_device(device_desc: &[u8]) -> Option<u32> {
         module_name,
         content_hash: _,
         priority: _,
-    } = result {
-        // Look up the module in the embedded module store.
-        // TODO: implement module store (embedded WASM blobs + signed update channel).
-        let _ = module_name;
-        log::info!("[Cortex::DriverGen] Driver requested for device — module store lookup TBD");
+    } = result
+    {
+        let end = module_name.iter().position(|&b| b == 0).unwrap_or(module_name.len());
+        let name = &module_name[..end];
+        if let Some(wasm) = lookup_embedded_module(name) {
+            match crate::drivers::registry::load(name, wasm) {
+                Ok(id) => {
+                    log::info!(
+                        "[Cortex::DriverGen] Loaded embedded module '{}' (id={})",
+                        core::str::from_utf8(name).unwrap_or("?"),
+                        id
+                    );
+                    return Some(id);
+                }
+                Err(e) => {
+                    log::warn!("[Cortex::DriverGen] Embedded module load failed: {:?}", e);
+                }
+            }
+        } else {
+            log::info!(
+                "[Cortex::DriverGen] No embedded module for {:?}",
+                core::str::from_utf8(name).ok()
+            );
+        }
     }
 
     None
+}
+
+fn lookup_embedded_module(name: &[u8]) -> Option<&'static [u8]> {
+    match name {
+        b"null-driver" | b"null" => Some(NULL_DRIVER_WASM),
+        _ => None,
+    }
 }

@@ -109,6 +109,8 @@ pub fn init() {
     pid0::init();
     log::info!("[Cortex] PID-0 OK");
 
+    ipc::init();
+
     let mut c = CORTEX.lock();
     c.initialised = true;
 
@@ -205,5 +207,13 @@ pub fn interrupt_hook(vector: u8, frame: &InterruptFrame, error: Option<u64>) {
 /// the fault (demand paging, CoW, guard page expansion, etc.).
 pub fn handle_page_fault(cr2: u64, error: u64) -> bool {
     crate::mm::paging::demand_page(cr2, error)
+}
+
+/// Borrow Cortex state for PID-0 syscalls and maintenance.
+pub fn with_state<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut CortexState) -> R,
+{
+    f(&mut *CORTEX.lock())
 }
 

@@ -562,7 +562,7 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         crate::process::save_xstate(cur);
 
         // Cooperatively switch to another runnable process.
-        if !crate::wm::embedder_baton_due() {
+        if !crate::wm::baton_vsync_queued_for(1) {
             if let Some(next) = crate::process::next_runnable_pid(cur) {
                 if next != cur {
                     crate::process::enter_user_by_pid_noreturn(next);

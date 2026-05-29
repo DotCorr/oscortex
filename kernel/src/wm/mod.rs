@@ -203,6 +203,15 @@ static FOCUS_MIRROR: AtomicBool = AtomicBool::new(false);
 /// `FlutterEngineOnVsync` with the correct baton value.
 static VSYNC_BATON: AtomicU64 = AtomicU64::new(0);
 static BATON_VSYNC_QUEUED: AtomicBool = AtomicBool::new(false);
+static FLUTTER_INIT_READY: AtomicBool = AtomicBool::new(false);
+
+pub fn flutter_init_ready() -> bool {
+    FLUTTER_INIT_READY.load(Ordering::Acquire)
+}
+
+pub fn set_flutter_init_ready() {
+    FLUTTER_INIT_READY.store(true, Ordering::Release);
+}
 
 pub fn init() {
     log::info!("[WM] Event queue online (cap={})", EVENT_CAP);
@@ -362,9 +371,14 @@ pub fn dropped_count() -> u64 {
     Q.lock().dropped
 }
 
+/// True when a baton≠0 EV_VSYNC is already in the queue for `pid`.
+pub fn baton_vsync_queued_for(pid: u32) -> bool {
+    Q.lock().has_baton_vsync_for(pid)
+}
+
 /// True when the embedder must run FlutterEngineOnVsync (baton queued or posted).
 pub fn embedder_baton_due() -> bool {
-    vsync_baton_pending() || Q.lock().has_baton_vsync_for(1)
+    vsync_baton_pending() || baton_vsync_queued_for(1)
 }
 
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
@@ -428,11 +442,39 @@ pub fn push_vsync(frame: u64) {
     }
 }
 
-/// Set the vsync baton that will be included in the next EV_VSYNC event.
+/// Deliver a vsync baton to the embedder (pid=1) immediately.
+///
 /// Called via `sys_engine_vsync_baton_post` when the engine invokes the
-/// embedder's `vsync_callback`.
+/// embedder's `vsync_callback`. The baton is a "call `FlutterEngineOnVsync`
+/// now" signal: it must NOT be parked in `VSYNC_BATON` waiting for the next
+/// `compositor::tick()` -> `push_vsync`, because that path is gated on
+/// `COMP.try_lock()` and stalls permanently if any thread holds the compositor
+/// lock. We push the EV_VSYNC event straight to the front of pid=1's queue and
+/// wake it, independent of compositor state.
 pub fn set_vsync_baton(baton: u64) {
-    VSYNC_BATON.store(baton, Ordering::Release);
+    if baton == 0 {
+        VSYNC_BATON.store(0, Ordering::Release);
+        return;
+    }
+    // Don't strand the baton; deliver it now.
+    VSYNC_BATON.store(0, Ordering::Release);
+    let mut ev = WmEvent::empty();
+    ev.kind = EV_VSYNC;
+    ev.a = 0;
+    ev.b = baton;
+    Q.lock().push_front(ev, 0);
+    BATON_VSYNC_QUEUED.store(true, Ordering::Release);
+    crate::process::set_state(1, crate::process::ProcState::Running);
+    let waiter = WM_WAITER.load(Ordering::Acquire);
+    if waiter != 0 {
+        WM_WAITER.store(0, Ordering::Release);
+        crate::process::set_state(waiter, crate::process::ProcState::Running);
+    }
+    static DELIVER_SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = DELIVER_SEQ.fetch_add(1, Ordering::Relaxed);
+    if n < 30 || n % 300 == 0 {
+        log::info!("[deliver-baton] #{} baton={:#x}", n, baton);
+    }
 }
 
 pub fn push_pointer(x: i32, y: i32, buttons: u32) {

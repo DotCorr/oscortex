@@ -89,7 +89,7 @@ pub fn init() {
         IDT.entries[0x2C].set(ps2_mouse_irq_handler as *const () as u64, 0, 0);
 
         // Legacy syscall vector (ring 3 → ring 0 path)
-        IDT.entries[0x80].set(syscall_legacy_handler as *const () as u64, 0, 3);
+        IDT.entries[0x80].set(super::syscall::legacy_syscall_entry as *const () as u64, 0, 3);
 
         load();
     }
@@ -327,10 +327,6 @@ extern "x86-interrupt" fn ps2_kbd_irq_handler(_frame: InterruptFrame) {
 
 extern "x86-interrupt" fn ps2_mouse_irq_handler(_frame: InterruptFrame) {
     crate::drivers::ps2::mouse_irq();
-}
-
-extern "x86-interrupt" fn syscall_legacy_handler(_frame: InterruptFrame) {
-    crate::syscall::dispatch_legacy();
 }
 
 #[repr(C)]
