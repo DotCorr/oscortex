@@ -79,6 +79,9 @@ DIAG_LOG = True
 # works independently of Skia's (broken) software blitter.
 DIAG_FILL = True
 DIAG_FILL_COLOR = 0xFFFF00FF
+# When set, skip the real skcpu::Draw::drawPaint call (only the sentinel fill
+# runs). Used to prove drawPaint is actively zero-filling the surface.
+DIAG_SKIP_DRAWPAINT = False
 LOG_CAVE_FILE = 0x1F44400
 LOG_CAVE_VA = file_to_va(LOG_CAVE_FILE)
 
@@ -126,6 +129,10 @@ def build_log_stub() -> bytes:
 
     body: list[int] = []
     body += [0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x53]  # push regs
+    # Paint SkColor4f: PA=[rbx+0x10] (R|G floats), PB=[rbx+0x18] (B|A floats).
+    body += [0x49, 0x89, 0xd8]                       # mov r8, rbx  (save paint ptr)
+    body += [0x49, 0x8b, 0x00] + fmt_rax(b"PA")        # mov rax,[r8]      R|G floats
+    body += [0x49, 0x8b, 0x40, 0x08] + fmt_rax(b"PB")  # mov rax,[r8+0x8]  B|A floats
     body += load_field(0x140) + fmt_rax(b"FP")
     body += load_field(0x158) + fmt_rax(b"CT")
     body += load_field(0x160) + fmt_rax(b"WH")
@@ -198,10 +205,11 @@ def build_p9_cave() -> bytes:
         emit(b"\x75\xf4")                           # jnz .fill
     if DIAG_LOG:
         emit(call_rel32(va, LOG_CAVE_VA))  # log stub (FP/CT/WH/DC/CB/RB)
-    emit(b"\x48\x8d\x7c\x24\x08")           # lea rdi, [rsp+8]
-    emit(b"\x48\x89\xde")                   # mov rsi, rbx
-    call_at = va
-    emit(call_rel32(call_at, 0x1AB74B0))
+    if not DIAG_SKIP_DRAWPAINT:
+        emit(b"\x48\x8d\x7c\x24\x08")           # lea rdi, [rsp+8]
+        emit(b"\x48\x89\xde")                   # mov rsi, rbx
+        call_at = va
+        emit(call_rel32(call_at, 0x1AB74B0))
     emit(jmp_rel32(va, P9_RESUME_VA))
     blob = b"".join(cave)
     cave_budget = P9_CAVE_VA  # cave region runs up to LOG_CAVE_VA
