@@ -110,5 +110,6 @@
   tools/xtask/src/main.rs           cargo xtask iso (canonical ISO)
   tests/run_all.sh                  CI test entrypoint
 
-  Rule: .cursor/rules/oscortex-core.mdc
-  Docs: docs/arch.txt · docs/hardware.txt · docs/ci-cd.txt
+  Rule:   .cursor/rules/oscortex-core.mdc
+  Skill:  .cursor/skills/oscortex-ci-cd/SKILL.md
+  Docs:   docs/arch.txt · docs/hardware.txt · docs/ci-cd.txt
