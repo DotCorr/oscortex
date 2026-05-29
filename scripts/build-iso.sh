@@ -154,9 +154,13 @@ if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
 fi
 mkdir -p "$ROOT/initramfs/system/lib"
 cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
-python3 "$ROOT/tools/flutter-engine/engine_patch.py" \
-    --engine "$ROOT/initramfs/system/lib/libflutter_engine.so" \
-    --apply-all
+if [ "${OSC_SKIP_ENGINE_PATCH:-0}" = "1" ]; then
+    echo "[0.5/5] OSC_SKIP_ENGINE_PATCH=1 — staging PRISTINE engine (no P1-P10 patches)"
+else
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" \
+        --engine "$ROOT/initramfs/system/lib/libflutter_engine.so" \
+        --apply-all
+fi
 
 REQUIRED_FILES=(
     "$ROOT/initramfs/init"

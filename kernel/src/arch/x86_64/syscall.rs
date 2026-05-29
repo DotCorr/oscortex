@@ -270,6 +270,64 @@ unsafe extern "C" fn syscall_entry() {
     )
 }
 
+// ── Legacy INT 0x80 path ─────────────────────────────────────────────────────
+
+/// INT 0x80 entry — saves GPRs, dispatches via `dispatch_fast`, returns in RAX.
+#[unsafe(naked)]
+pub unsafe extern "C" fn legacy_syscall_entry() {
+    core::arch::naked_asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "call {wrapper}",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        wrapper = sym legacy_dispatch_wrapper,
+    )
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn legacy_dispatch_wrapper(reg_stack: *mut u64) {
+    unsafe {
+        let ret = crate::syscall::dispatch_fast(
+            *reg_stack,
+            *reg_stack.add(5),
+            *reg_stack.add(4),
+            *reg_stack.add(3),
+            *reg_stack.add(9),
+            *reg_stack.add(7),
+        );
+        *reg_stack = ret as u64;
+    }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn wrmsr(msr: u32, val: u64) {

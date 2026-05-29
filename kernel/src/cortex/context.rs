@@ -30,6 +30,7 @@ pub struct ContextNode {
 }
 
 #[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
 pub enum NodeKind {
     Empty,
     Device,
@@ -143,12 +144,65 @@ impl ContextGraph {
         self.node_count -= 1;
     }
 
+    /// Number of live nodes in the graph.
+    pub fn node_count(&self) -> usize {
+        self.node_count
+    }
+
     /// Query: count of nodes by kind.
     pub fn count_by_kind(&self, kind: NodeKind) -> usize {
         self.nodes[..self.node_count]
             .iter()
             .filter(|n| n.kind == kind)
             .count()
+    }
+
+    /// Find the most recent node matching `kind` and optional `id` (0 = any).
+    pub fn find_node(&self, kind: NodeKind, id: u64) -> Option<&ContextNode> {
+        self.nodes[..self.node_count]
+            .iter()
+            .rev()
+            .find(|n| n.kind == kind && (id == 0 || n.id == id))
+    }
+
+    /// Serialise one node into `out`. Returns bytes written or 0 if no match.
+    pub fn write_node(&self, kind: NodeKind, id: u64, out: &mut [u8]) -> usize {
+        let Some(node) = self.find_node(kind, id) else {
+            return 0;
+        };
+        if out.len() < 80 {
+            return 0;
+        }
+        out[0] = node.kind as u8;
+        out[1..9].copy_from_slice(&node.id.to_le_bytes());
+        out[9..17].copy_from_slice(&node.timestamp.to_le_bytes());
+        out[17..81].copy_from_slice(&node.data);
+        80
+    }
+
+    /// Flat binary dump: header + up to `max_nodes` nodes (81 bytes each).
+    pub fn dump_flat(&self, out: &mut [u8], max_nodes: usize) -> usize {
+        const HDR: usize = 8;
+        const NODE: usize = 81;
+        if out.len() < HDR {
+            return 0;
+        }
+        out[0..4].copy_from_slice(b"CTXG");
+        out[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let n = self.node_count.min(max_nodes);
+        out[6..8].copy_from_slice(&(n as u16).to_le_bytes());
+        let mut off = HDR;
+        for node in self.nodes[..n].iter() {
+            if off + NODE > out.len() {
+                break;
+            }
+            out[off] = node.kind as u8;
+            out[off + 1..off + 9].copy_from_slice(&node.id.to_le_bytes());
+            out[off + 9..off + 17].copy_from_slice(&node.timestamp.to_le_bytes());
+            out[off + 17..off + 81].copy_from_slice(&node.data);
+            off += NODE;
+        }
+        off
     }
 }
 

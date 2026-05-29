@@ -78,15 +78,27 @@
   ISO recipe (one canonical path).
 
 
-  COMPLIANCE GATES
-  ────────────────
-  Enforced by branch protection (scripts/setup-github.sh):
-    • PR required into develop and main (no direct pushes).
-    • CI checks (kernel, lint, flutter) must pass before merge.
-    • CODEOWNERS review required (.github/CODEOWNERS).
-    • Linear history / up-to-date branch before merge.
-  Author intent gate: .github/pull_request_template.md checklist mirrors the
-  arch.txt code rules (one path, kernel-only hardware, reuse, engine_patch only).
+  COMPLIANCE GATES (two tiers)
+  ────────────────────────────
+
+  develop — LIGHT (integration)
+    • PR required (no direct pushes — git push origin develop always fails)
+    • Required CI: kernel tests + Flutter analyze/test
+    • 1 approving review (any write-access reviewer; CODEOWNERS not required)
+    • Human merges on GitHub after green CI — agents never merge
+    • Linear history, branch up to date
+
+  main — STRICT (production)
+    • PR required (release PR develop → main only)
+    • Same required CI checks on the release PR
+    • CODEOWNERS review required (.github/CODEOWNERS)
+    • Human release sign-off before merge — agents never merge
+    • Merge triggers auto tag + ISO (release.yml)
+
+  Author intent: .github/pull_request_template.md checklist mirrors arch.txt rules.
+
+  Re-apply protection after rule changes:
+    bash scripts/setup-github.sh
 
 
   FIRST-TIME SETUP
@@ -110,5 +122,6 @@
   tools/xtask/src/main.rs           cargo xtask iso (canonical ISO)
   tests/run_all.sh                  CI test entrypoint
 
-  Rule: .cursor/rules/oscortex-core.mdc
-  Docs: docs/arch.txt · docs/hardware.txt · docs/ci-cd.txt
+  Rule:   .cursor/rules/oscortex-core.mdc
+  Skill:  .cursor/skills/oscortex-ci-cd/SKILL.md
+  Docs:   docs/arch.txt · docs/hardware.txt · docs/ci-cd.txt

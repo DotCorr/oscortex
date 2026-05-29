@@ -5,11 +5,12 @@ alwaysApply: true
 
 # OSCortex
 
-Read **docs/arch.txt**, **docs/hardware.txt**, and project skills before structural work:
+Read **docs/arch.txt**, **docs/hardware.txt**, **docs/ci-cd.txt**, and project skills before structural work:
 
 - `.cursor/skills/oscortex-architecture/SKILL.md`
 - `.cursor/skills/oscortex-hardware/SKILL.md` (drivers, display, input, device classes)
 - `.cursor/skills/oscortex-kernel-tests/SKILL.md` (driver unit + QEMU integration tests)
+- `.cursor/skills/oscortex-ci-cd/SKILL.md` (branching, PRs, CI, release to main)
 - `.cursor/skills/codebase-audit-cleanup/SKILL.md`
 
 ## Architecture

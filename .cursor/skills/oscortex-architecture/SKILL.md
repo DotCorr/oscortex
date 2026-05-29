@@ -89,6 +89,7 @@ KERNEL                  — scheduler, memory, IPC, drivers, compositor, focus, 
 | `docs/arch.txt` | Canonical architecture document |
 | `docs/hardware.txt` | Drivers, display, device classes, CDP |
 | `.cursor/skills/oscortex-hardware/SKILL.md` | Agent guide for driver/hardware work |
+| `.cursor/skills/oscortex-ci-cd/SKILL.md` | Branching, PRs, CI, release to main |
 
 ---
 

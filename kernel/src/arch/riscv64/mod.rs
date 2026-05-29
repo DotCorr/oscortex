@@ -17,7 +17,9 @@ pub unsafe extern "C" fn context_switch(_old_sp: *mut u64, _new_sp: u64) {}
 /// No-op stub — task entry trampoline not yet implemented on riscv64.
 pub unsafe extern "C" fn task_entry() { loop { core::hint::spin_loop() } }
 
-pub fn early_init() { todo!("riscv64 early_init") }
+pub fn early_init() {
+    crate::logger::early_print("[arch::riscv64] early_init stub (Milestone 4b)\r\n");
+}
 pub fn ap_init() {}
 pub fn smp_init(_resp: Option<&'static limine::request::MpResponse>) { /* stub */ }
 pub fn halt() { loop { core::hint::spin_loop() } }

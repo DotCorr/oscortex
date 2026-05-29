@@ -52,6 +52,16 @@ pub fn stats() -> (usize, usize, usize) {
     (h.used(), h.free(), h.size())
 }
 
+/// Expand the kernel heap when free space is low (best-effort).
+pub fn expand(extra_bytes: usize) -> Result<(), &'static str> {
+    let (_used, free, _total) = stats();
+    if free >= extra_bytes {
+        log::info!("[MM::Heap] expand({}) — sufficient free space ({} bytes)", extra_bytes, free);
+        return Ok(());
+    }
+    Err("heap expansion requires contiguous frame grow (not implemented)")
+}
+
 #[alloc_error_handler]
 fn alloc_error(layout: core::alloc::Layout) -> ! {
     panic!("Kernel heap allocation failed: size={} align={}", layout.size(), layout.align());

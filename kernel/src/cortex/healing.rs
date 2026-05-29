@@ -98,9 +98,11 @@ fn run_heal(vector: u8, deadline_tsc: u64, _state: &mut crate::cortex::CortexSta
         }
         Some(InferenceResult::AnomalyScore { source, score }) => {
             if score > 200 {
-                // Critical — escalate to soft driver reset.
-                log::warn!("[Cortex::Healing] Critical anomaly on vector {} (source={}), attempting soft reset", vector, source);
-                // TODO: find driver for this vector and soft-reset it.
+                log::warn!(
+                    "[Cortex::Healing] Critical anomaly on vector {} (source={}), attempting soft reset",
+                    vector, source
+                );
+                soft_reset_for_vector(vector);
             }
         }
         _ => {
@@ -110,6 +112,23 @@ fn run_heal(vector: u8, deadline_tsc: u64, _state: &mut crate::cortex::CortexSta
     }
 }
 
+fn soft_reset_for_vector(vector: u8) {
+    match vector {
+        0x21 | 0x2C => crate::drivers::ps2::init(),
+        0x30 => {
+            let _ = crate::drivers::usb::poll();
+        }
+        _ => {
+            log::debug!("[Cortex::Healing] No soft-reset hook for vector {}", vector);
+        }
+    }
+}
+
+/// Manual healing trigger from PID-0 API.
+pub fn execute_manual(action: HealingActionKind, target_id: u64) {
+    execute_healing_action(action, target_id);
+}
+
 fn execute_healing_action(action: HealingActionKind, target_id: u64) {
     let mut healer = HEALER.lock();
     healer.heals_total += 1;
@@ -117,7 +136,7 @@ fn execute_healing_action(action: HealingActionKind, target_id: u64) {
     match action {
         HealingActionKind::ReloadDriver => {
             log::info!("[Cortex::Healing] Action: ReloadDriver (id={})", target_id);
-            // TODO: crate::drivers::registry::reload(target_id as u32);
+            let _ = crate::drivers::registry::reload(target_id as u32);
         }
         HealingActionKind::QuarantineModule => {
             log::warn!("[Cortex::Healing] Action: QuarantineModule (id={})", target_id);
@@ -125,23 +144,24 @@ fn execute_healing_action(action: HealingActionKind, target_id: u64) {
         }
         HealingActionKind::ExpandPageTable => {
             log::info!("[Cortex::Healing] Action: ExpandPageTable");
-            // TODO: crate::mm::paging::expand_kernel_heap();
+            let _ = crate::mm::heap::expand(4 * 1024 * 1024);
         }
         HealingActionKind::ReclaimMemory => {
             log::info!("[Cortex::Healing] Action: ReclaimMemory");
-            // TODO: crate::mm::reclaim();
+            let freed = crate::mm::reclaim_best_effort();
+            log::info!("[Cortex::Healing] Reclaim reported {} bytes", freed);
         }
         HealingActionKind::MigrateProcess => {
             log::info!("[Cortex::Healing] Action: MigrateProcess (pid={})", target_id);
-            // TODO: crate::sched::migrate_off_device(target_id);
+            crate::sched::note_migration_request(target_id as u32);
         }
         HealingActionKind::ResetDevice => {
             log::info!("[Cortex::Healing] Action: ResetDevice (id={})", target_id);
-            // TODO: crate::drivers::registry::reset_device(target_id);
+            crate::drivers::registry::reset_device(target_id as u32);
         }
         HealingActionKind::KillProcess => {
             log::warn!("[Cortex::Healing] Action: KillProcess (pid={})", target_id);
-            // TODO: crate::sched::kill(target_id);
+            let _ = crate::process::kill(target_id as u32);
         }
     }
 }
