@@ -516,6 +516,8 @@ unsafe extern "C" fn present_callback(
                 }
                 i += 1;
             }
+            write_hex_u64(b"[present-scan] alloc_addr=", allocation as u64);
+            write_hex_u64(b"[present-scan] row_bytes=", row_bytes as u64);
             write_hex_u64(b"[present-scan] pixel_len=", pixel_len as u64);
             write_hex_u64(b"[present-scan] first_nz_off=", first_nz as u64);
             write_hex_u64(b"[present-scan] nz_count=", nz_count);
