@@ -1,6 +1,7 @@
 <!--
 OSCortex PRs target `develop`. Only release PRs (develop -> main) ship an ISO.
 Read docs/arch.txt + docs/hardware.txt before structural changes.
+Do not append tool/vendor footers (e.g. "Made with Cursor") — project content only.
 -->
 
 ## What & why

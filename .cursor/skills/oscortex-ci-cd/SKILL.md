@@ -161,6 +161,7 @@ Agents **must not** open or merge release PRs unless the user explicitly asks.
 4. **Never open `develop` → `main` release PR** unless user explicitly requests production ship.
 5. **Commit only when user asks** (repo rule); when they do, publish via `feat/*` + PR to `develop`.
 6. Fill [.github/pull_request_template.md](../../../.github/pull_request_template.md) on every PR.
+7. **Never** append tool branding to PR bodies (e.g. `Made with Cursor`) — description is project-only.
 
 ---
 
