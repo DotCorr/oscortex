@@ -57,6 +57,7 @@
   tools/flutter-engine/engine_patch.py
   scripts/build-iso.sh
   docs/hardware.txt            drivers, display/GPU, device classes, CDP
+  docs/multiarch.txt           shared vs per-CPU porting model
 
 
   HARDWARE (summary — full spec in docs/hardware.txt)

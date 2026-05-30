@@ -143,12 +143,17 @@ static KBD_E0: AtomicBool = AtomicBool::new(false);
 // ── Public IRQ entry points ───────────────────────────────────────────────────
 
 /// Return the current absolute cursor position (x, y) in screen pixels.
-/// Updated by mouse IRQ; starts at (32, 32).
 pub fn cursor_pos() -> (i32, i32) {
     (
         CURSOR_X.load(Ordering::Relaxed),
         CURSOR_Y.load(Ordering::Relaxed),
     )
+}
+
+/// Update cursor position (poll path + IRQ path share the same atomics).
+pub fn set_cursor_pos(x: i32, y: i32) {
+    CURSOR_X.store(x, Ordering::Relaxed);
+    CURSOR_Y.store(y, Ordering::Relaxed);
 }
 
 /// Called from IDT vector 0x21 (PS/2 keyboard IRQ1).
@@ -251,6 +256,7 @@ fn handle_mouse_byte(byte: u8) {
     });
 
     let buttons = (p0 & 0x07) as u32;
+    crate::compositor::invalidate();
     crate::wm::push_pointer(x, y, buttons);
 }
 

@@ -654,6 +654,76 @@ fn write_dec(mut v: u64) {
     }
 }
 
+fn write_hex(mut val: u64) {
+    if val == 0 {
+        write(b"0");
+        return;
+    }
+    let digits = b"0123456789abcdef";
+    let mut buf = [0u8; 16];
+    let mut n = 0usize;
+    while val > 0 {
+        buf[n] = digits[(val & 0xF) as usize];
+        val >>= 4;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        write(core::slice::from_ref(&buf[n]));
+    }
+}
+
+/// Pass JIT vm/isolate snapshot file paths to the engine (debug engine build).
+fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, assets_dir: &[u8]) {
+    static VM_TAIL: &[u8] = b"/vm_snapshot_data\0";
+    static ISO_TAIL: &[u8] = b"/isolate_snapshot_data\0";
+    static mut VM_PATH: [u8; 128] = [0; 128];
+    static mut ISO_PATH: [u8; 128] = [0; 128];
+
+    const PATH_CAP: usize = 128;
+    if assets_dir.len() + VM_TAIL.len() > PATH_CAP
+        || assets_dir.len() + ISO_TAIL.len() > PATH_CAP
+    {
+        write(b"[embedder] JIT asset path too long\n");
+        exit(-1);
+    }
+
+    unsafe {
+        VM_PATH[..assets_dir.len()].copy_from_slice(assets_dir);
+        VM_PATH[assets_dir.len()..assets_dir.len() + VM_TAIL.len()].copy_from_slice(VM_TAIL);
+        ISO_PATH[..assets_dir.len()].copy_from_slice(assets_dir);
+        ISO_PATH[assets_dir.len()..assets_dir.len() + ISO_TAIL.len()].copy_from_slice(ISO_TAIL);
+
+        let vm_path_len = assets_dir.len() + VM_TAIL.len() - 1;
+        let iso_path_len = assets_dir.len() + ISO_TAIL.len() - 1;
+
+        write(b"[embedder] JIT snapshots: ");
+        write(&VM_PATH[..vm_path_len]);
+        write(b"\n");
+
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_VM_SNAPSHOT_DATA,
+            VM_PATH.as_ptr() as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_VM_SNAPSHOT_DATA_SIZE,
+            vm_path_len as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_ISO_SNAPSHOT_DATA,
+            ISO_PATH.as_ptr() as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_ISO_SNAPSHOT_DATA_SIZE,
+            iso_path_len as u64,
+        );
+    }
+}
+
 fn run_due_platform_tasks(engine: u64, now: u64, max_tasks: usize) {
     if engine == 0 || max_tasks == 0 {
         return;
@@ -1096,37 +1166,18 @@ extern "C" fn main_embedder() {
     );
 
     if host_mode == HOST_MODE_APP {
-        // Per-app .osx bundles ship gen_snapshot libapp.so; only valid when the
-        // engine build matches (AOT engine). With the JIT shell engine, app
-        // hosts must bundle JIT snapshot assets instead (future work).
-        match aot_loader::load_dart_snapshot_from_mapping(aot_va) {
-            Some(snaps) => {
-                aot_loader::log_manifest(&snaps);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,              snaps.vm_data);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE,         snaps.vm_data_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS,      snaps.vm_instr);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, snaps.vm_instr_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA,             snaps.iso_data);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE,        snaps.iso_data_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS,     snaps.iso_instr);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE,snaps.iso_instr_size);
-            }
-            None => {
-                write(b"[host] ERROR: app AOT load failed\n");
-                exit(-1);
-            }
-        }
+        write(b"[host] APP mode pid bootstrap app_id=");
+        write_dec(app_id as u64);
+        write(b" aot_va=");
+        write_hex(aot_va);
+        write(b"\n");
+        // libflutter_engine.so is a debug/JIT build (see build-iso.sh). .osx bundles
+        // currently ship AOT libapp.so for persistence/metadata; app hosts load JIT
+        // snapshot files until we stage a profile engine + per-app asset dirs.
+        install_jit_snapshot_paths(&mut project_args, b"/system/flutter/flutter_assets");
     } else {
-        // Shell: JIT engine reads vm/isolate snapshot files from initramfs.
-        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
-        static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
-        static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
-
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, VM_PATH.as_ptr() as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
-        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
+        write(b"[host] SHELL mode\n");
+        install_jit_snapshot_paths(&mut project_args, b"/system/flutter/flutter_assets");
     }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
@@ -1478,9 +1529,18 @@ extern "C" fn main_embedder() {
             EV_POINTER => {
                 let buttons = ev.flags as i64;
                 if engine_out != 0 && proctable.send_pointer_event != 0 {
-                    let x       = ((ev.a >> 48) as i16) as f64;
-                    let y       = (((ev.a >> 32) & 0xFFFF) as i16) as f64;
-                    let phase = if buttons != 0 { 2i32 } else { 1i32 };
+                    // push_pointer packs: a = (x as u32 as u64) << 32 | (y as u32)
+                    let x = ((ev.a >> 32) as i32) as f64;
+                    let y = (ev.a as u32) as f64;
+                    static POINTER_ADDED: AtomicU32 = AtomicU32::new(0);
+                    let phase = if buttons != 0 {
+                        2i32 // kDown
+                    } else if POINTER_ADDED.load(Ordering::Relaxed) == 0 {
+                        POINTER_ADDED.store(1, Ordering::Relaxed);
+                        0i32 // kAdd
+                    } else {
+                        3i32 // kMove
+                    };
                     let evt = FlutterPointerEvent {
                         struct_size:    core::mem::size_of::<FlutterPointerEvent>(),
                         phase,

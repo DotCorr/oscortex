@@ -12,6 +12,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// When `true`, a userspace process owns the framebuffer directly.
 /// `render_frame()` skips the background fill and placeholder blits.
 static FB_BYPASS: AtomicBool = AtomicBool::new(false);
+/// Set when input moves the cursor so we redraw the software pointer overlay.
+static FRAME_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Request a compositor redraw (e.g. cursor moved but Flutter surface unchanged).
+pub fn invalidate() {
+    FRAME_DIRTY.store(true, Ordering::Release);
+}
 
 /// Set or clear the FB bypass flag.
 pub fn set_fb_bypass(bypass: bool) {
@@ -598,6 +605,32 @@ fn has_visible_content(c: &CompositorState) -> bool {
     false
 }
 
+/// Simple PS/2 pointer overlay (OS cursor — Flutter does not draw one in software mode).
+fn draw_software_cursor() {
+    use core::sync::atomic::Ordering;
+    if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
+        return;
+    }
+    let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
+    if let Some((w, h)) = crate::drivers::fb::size_px() {
+        x = x.clamp(0, w as i32 - 14);
+        y = y.clamp(0, h as i32 - 18);
+    }
+    const FG: u32 = 0xFFFFFFFF;
+    const BG: u32 = 0xFF000000;
+    // Classic arrow: vertical shaft + diagonal fill.
+    for i in 0..14 {
+        crate::drivers::fb::fill_rect(x, y + i, 1, 1, BG);
+        crate::drivers::fb::fill_rect(x + 1, y + i, 1, 1, FG);
+    }
+    for i in 0..9 {
+        crate::drivers::fb::fill_rect(x + i, y + i, 2, 2, BG);
+        if i < 8 {
+            crate::drivers::fb::fill_rect(x + i + 1, y + i + 1, 1, 1, FG);
+        }
+    }
+}
+
 // ── Phase 32-D: stride-aware GPU blit ─────────────────────────────────────────
 
 /// Stride-aware variant of [`gpu_submit_for`].
@@ -690,8 +723,12 @@ pub fn render_frame() {
     }
 
     if !has_visible_content(&c) {
-        c.frame_counter = c.frame_counter.wrapping_add(1);
-        crate::wm::push_vsync(c.frame_counter);
+        let frame = c.frame_counter.wrapping_add(1);
+        c.frame_counter = frame;
+        drop(c);
+        draw_software_cursor();
+        crate::drivers::fb::swap_buffers();
+        crate::wm::push_vsync(frame);
         return;
     }
 
@@ -736,6 +773,7 @@ pub fn render_frame() {
     }
 
     drop(c);
+    draw_software_cursor();
     crate::drivers::fb::swap_buffers();
     let mut c = COMP.lock();
     c.frame_counter = c.frame_counter.wrapping_add(1);
@@ -759,7 +797,7 @@ pub fn tick() {
         None => return,
     };
 
-    let mut dirty = false;
+    let mut dirty = FRAME_DIRTY.swap(false, Ordering::AcqRel);
 
     // 1. Check if any surfaces changed (creation, destruction, moving, resizing, visibility, clip, etc.)
     {

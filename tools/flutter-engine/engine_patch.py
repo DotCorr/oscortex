@@ -73,7 +73,7 @@ P9_CAVE_VA = file_to_va(P9_CAVE_FILE)
 # Diagnostic log stub: prints "FP" + 16 hex digits of device[0x140] (fPixels)
 # via the SYS_WRITE(fd=1) syscall, then returns. Placed further into the
 # (unused-in-software-engine) ChaCha20 region. Set DIAG_LOG=False to disable.
-DIAG_LOG = True
+DIAG_LOG = False
 # When set, the P9 cave manually memsets the whole device buffer to a sentinel
 # colour before calling drawPaint. Used to prove the present/framebuffer path
 # works independently of Skia's (broken) software blitter.

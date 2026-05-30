@@ -268,6 +268,11 @@ pub fn tick() {
     }
 
     let mut s = SYNTH.lock();
+    {
+        let (cx, cy) = crate::drivers::ps2::cursor_pos();
+        s.x = cx;
+        s.y = cy;
+    }
     s.tick = s.tick.wrapping_add(1);
     poll_ps2_input(&mut s, w as i32, h as i32);
 }
@@ -324,8 +329,10 @@ fn poll_ps2_input(s: &mut SynthInput, max_w: i32, max_h: i32) -> bool {
                 s.x = (s.x + dx).clamp(0, (max_w - 1).max(0));
                 // PS/2 Y is positive when moving down? In practice invert for screen space.
                 s.y = (s.y - dy).clamp(0, (max_h - 1).max(0));
+                crate::drivers::ps2::set_cursor_pos(s.x, s.y);
 
                 let buttons = (p0 & 0x07) as u32;
+                crate::compositor::invalidate();
                 push_pointer(s.x, s.y, buttons);
                 produced = true;
             }
