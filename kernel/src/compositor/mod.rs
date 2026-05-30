@@ -569,11 +569,14 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                 c.back_buffers[idx] = Some(alloc::vec![0u32; pixels]);
             }
             let buf = c.back_buffers[idx].as_mut().ok_or("no back buffer")?;
+            // Flutter's software surface is kN32 (= BGRA8888 on little-endian x86):
+            // payload bytes are [B, G, R, A]. The compositor buffer / blit_rgba32
+            // expect R in the low byte, so swap B and R while packing.
             for i in 0..pixels {
                 let b = i * 4;
-                let r  = payload[b    ] as u32;
+                let bl = payload[b    ] as u32;
                 let g  = payload[b + 1] as u32;
-                let bl = payload[b + 2] as u32;
+                let r  = payload[b + 2] as u32;
                 let a  = payload[b + 3] as u32;
                 buf[i] = r | (g << 8) | (bl << 16) | (a << 24);
             }
