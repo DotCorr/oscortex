@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # OSCortex QEMU launcher
-# Usage: ./scripts/run-qemu.sh [--no-display] [--kvm]
+# Usage: ./scripts/run-qemu.sh [--no-display] [--serial-stdio] [--kvm]
 #
+# Defaults: visible Cocoa window + serial log at /tmp/osc_serial.log
 # Creates disk images if they don't exist, then boots oscortex.iso.
 
 set -e
@@ -37,16 +38,19 @@ if command -v lsof >/dev/null 2>&1 && lsof "$VBLK" >/dev/null 2>&1; then
 fi
 
 DISPLAY_FLAGS="-display cocoa"
+SERIAL_FLAGS="-serial file:/tmp/osc_serial.log"
 EXTRA=""
 
 for arg in "$@"; do
     case "$arg" in
         --no-display) DISPLAY_FLAGS="-display none" ;;
+        --serial-stdio) SERIAL_FLAGS="-serial stdio" ;;
         --kvm)        EXTRA="$EXTRA -accel kvm" ;;
     esac
 done
 
 echo "[QEMU] Booting $ISO ..."
+echo "[QEMU] Display: $DISPLAY_FLAGS | Serial: $SERIAL_FLAGS"
 exec qemu-system-x86_64 \
     -cdrom "$ISO" \
     -m 2048M \
@@ -60,7 +64,7 @@ exec qemu-system-x86_64 \
     -device nvme,drive=nvmedrive,serial=oscortex0 \
     -drive "file=$NVME,format=raw,id=nvmedrive,if=none" \
     -device qemu-xhci,id=xhci \
-    -serial stdio \
+    $SERIAL_FLAGS \
     -no-reboot \
     $DISPLAY_FLAGS \
     $EXTRA

@@ -490,6 +490,7 @@ pub const SYS_APP_LIST:      u64 = 0x370;
 pub const SYS_APP_LAUNCH:    u64 = 0x371;
 pub const SYS_APP_UNINSTALL: u64 = 0x372;
 pub const SYS_VFS_READ:      u64 = 0x37A;
+pub const SYS_VFS_STAT:      u64 = 0x37C;
 
 pub fn app_install(bundle: &[u8], id_out: &mut u32) -> i64 {
     unsafe {
@@ -516,12 +517,16 @@ pub fn app_uninstall(app_id: u32) -> i64 {
     unsafe { syscall1(SYS_APP_UNINSTALL, app_id as u64) }
 }
 
-pub fn vfs_read(path: &[u8], buf: &mut [u8]) -> i64 {
-    let len = if !path.is_empty() && *path.last().unwrap() == 0 {
+fn path_len(path: &[u8]) -> usize {
+    if !path.is_empty() && *path.last().unwrap() == 0 {
         path.len() - 1
     } else {
         path.len()
-    };
+    }
+}
+
+pub fn vfs_read(path: &[u8], buf: &mut [u8]) -> i64 {
+    let len = path_len(path);
     unsafe {
         syscall4(
             SYS_VFS_READ,
@@ -530,6 +535,25 @@ pub fn vfs_read(path: &[u8], buf: &mut [u8]) -> i64 {
             buf.as_mut_ptr() as u64,
             buf.len() as u64,
         )
+    }
+}
+
+/// Return the byte size of a VFS file, or negative errno.
+pub fn vfs_stat(path: &[u8]) -> i64 {
+    let len = path_len(path);
+    let mut size: u64 = 0;
+    let rc = unsafe {
+        syscall3(
+            SYS_VFS_STAT,
+            path.as_ptr() as u64,
+            len as u64,
+            &mut size as *mut u64 as u64,
+        )
+    };
+    if rc == 0 {
+        size as i64
+    } else {
+        rc
     }
 }
 

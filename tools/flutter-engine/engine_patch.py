@@ -77,7 +77,7 @@ DIAG_LOG = True
 # When set, the P9 cave manually memsets the whole device buffer to a sentinel
 # colour before calling drawPaint. Used to prove the present/framebuffer path
 # works independently of Skia's (broken) software blitter.
-DIAG_FILL = True
+DIAG_FILL = False
 DIAG_FILL_COLOR = 0xFFFF00FF
 # When set, skip the real skcpu::Draw::drawPaint call (only the sentinel fill
 # runs). Used to prove drawPaint is actively zero-filling the surface.
@@ -129,10 +129,26 @@ def build_log_stub() -> bytes:
 
     body: list[int] = []
     body += [0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x53]  # push regs
-    # Paint SkColor4f: PA=[rbx+0x10] (R|G floats), PB=[rbx+0x18] (B|A floats).
-    body += [0x49, 0x89, 0xd8]                       # mov r8, rbx  (save paint ptr)
-    body += [0x49, 0x8b, 0x00] + fmt_rax(b"PA")        # mov rax,[r8]      R|G floats
-    body += [0x49, 0x8b, 0x40, 0x08] + fmt_rax(b"PB")  # mov rax,[r8+0x8]  B|A floats
+    body += [0x49, 0x89, 0xd8]                       # mov r8, rbx  (save paint ptr; fmt_rax clobbers rbx)
+    # CPU self-test: SS = bits of (float)255 via cvtsi2ss (expect 0x437F0000).
+    #                DQ = bits of (float)255 via cvtdq2ps  (expect 0x437F0000).
+    body += [
+        0xb9, 0xff, 0x00, 0x00, 0x00,        # mov ecx, 255
+        0xf3, 0x0f, 0x2a, 0xc1,              # cvtsi2ss xmm0, ecx
+        0x66, 0x0f, 0x7e, 0xc0,              # movd eax, xmm0
+    ]
+    body += fmt_rax(b"SS")
+    body += [
+        0xb9, 0xff, 0x00, 0x00, 0x00,        # mov ecx, 255
+        0x66, 0x0f, 0x6e, 0xc1,              # movd xmm0, ecx
+        0x0f, 0x5b, 0xc0,                    # cvtdq2ps xmm0, xmm0
+        0x66, 0x0f, 0x7e, 0xc0,              # movd eax, xmm0
+    ]
+    body += fmt_rax(b"DQ")
+    # Paint SkColor4f lives at SkPaint+0x30 (verified via SkPaint::setColor:
+    # 'movups [rbx+0x30], xmm0').  PA=[r8+0x30] (R|G), PB=[r8+0x38] (B|A).
+    body += [0x49, 0x8b, 0x40, 0x30] + fmt_rax(b"PA")  # mov rax,[r8+0x30]  R|G floats
+    body += [0x49, 0x8b, 0x40, 0x38] + fmt_rax(b"PB")  # mov rax,[r8+0x38]  B|A floats
     body += load_field(0x140) + fmt_rax(b"FP")
     body += load_field(0x158) + fmt_rax(b"CT")
     body += load_field(0x160) + fmt_rax(b"WH")
