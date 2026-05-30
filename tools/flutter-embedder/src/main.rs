@@ -446,6 +446,33 @@ const SHELL_CHANNEL: &[u8] = b"oscortex/shell";
 
 const APPS_REQUEST_CHANNEL: &[u8] = b"oscortex/apps/request";
 
+/// StandardMethodCodec envelope for a successful `null` response.
+const METHOD_SUCCESS_NULL: &[u8] = &[0x00, 0x00];
+
+fn send_platform_response_now(handle: u64, data: &[u8]) {
+    if handle == 0 {
+        return;
+    }
+    let engine = ENGINE.load(Ordering::SeqCst);
+    let resp_fn_va = SEND_PLATFORM_MESSAGE_RESPONSE_FN.load(Ordering::SeqCst);
+    if engine == 0 || resp_fn_va == 0 {
+        return;
+    }
+    type SendResponseFn = unsafe extern "C" fn(u64, u64, *const u8, usize) -> i32;
+    let send_response: SendResponseFn = unsafe { core::mem::transmute(resp_fn_va) };
+    let _ = unsafe { send_response(engine, handle, data.as_ptr(), data.len()) };
+}
+
+fn respond_platform_message(msg: &FlutterPlatformMessage, data: &[u8]) {
+    if msg.response_handle == 0 {
+        return;
+    }
+    // Must reply synchronously: Dart may call BasicMessageChannel.send during
+    // FlutterEngineRunInitialized before our event loop runs. Deferring to the
+    // main thread deadlocks init (spinner forever on shell list).
+    send_platform_response_now(msg.response_handle, data);
+}
+
 unsafe extern "C" fn runs_task_on_current_thread_callback(_user_data: *mut ()) -> bool {
     let tid = unsafe { syscall0(186) };
     tid == 1
@@ -545,11 +572,10 @@ unsafe extern "C" fn vsync_callback(
 }
 
 /// Platform-message callback — the engine calls this when Dart sends a
-/// platform-channel message.  We parse the `FlutterPlatformMessage` struct
-/// and post the payload to the kernel's platform-channel bridge.
+/// platform-channel message.  ABI: `(const FlutterPlatformMessage* message, void* user_data)`.
 unsafe extern "C" fn platform_message_callback(
-    _engine:  u64,
-    msg_ptr:  *const FlutterPlatformMessage,
+    msg_ptr:   *const FlutterPlatformMessage,
+    _user_data: *mut (),
 ) {
     if msg_ptr.is_null() { return; }
     let msg = unsafe { &*msg_ptr };
@@ -559,7 +585,18 @@ unsafe extern "C" fn platform_message_callback(
         b"unknown"
     };
 
+    static PFM_LOG: AtomicU32 = AtomicU32::new(0);
+    let n = PFM_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 8 {
+        write(b"[embedder/pfm] ch=");
+        write(channel_slice);
+        write(b" sz=");
+        write_dec(msg.message_size as u64);
+        write(b"\n");
+    }
+
     if channel_slice == APPS_REQUEST_CHANNEL {
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
         return;
     }
 
@@ -568,32 +605,82 @@ unsafe extern "C" fn platform_message_callback(
         return;
     }
 
-    if msg.message == 0 || msg.message_size == 0 {
-        return;
+    // Flutter framework MethodChannels (text input, mouse cursor, etc.) expect
+    // a StandardMethodCodec reply; without one BasicMessageChannel/MethodChannel
+    // `.send()` / `.invokeMethod()` calls hang forever.
+    if msg.response_handle != 0 {
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
     }
-    let payload = unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) };
-    platform_msg_post(channel_slice, payload);
 }
 
 fn handle_shell_platform_message(msg: &FlutterPlatformMessage) {
+    static SHELL_MSG_LOG: AtomicU32 = AtomicU32::new(0);
+    if SHELL_MSG_LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+        write(b"[embedder/shell] platform message\n");
+    }
     if msg.message == 0 || msg.message_size == 0 {
+        if msg.response_handle != 0 {
+            respond_platform_message(msg, b"{\"apps\":[]}");
+        }
         return;
     }
     let payload = unsafe {
         core::slice::from_raw_parts(msg.message as *const u8, msg.message_size)
     };
     let reply = dispatch_shell_command(payload);
-    if msg.response_handle == 0 {
+    if SHELL_MSG_LOG.load(Ordering::Relaxed) <= 4 {
+        write(b"[embedder/shell] dispatch reply len=");
+        write_dec(reply.len() as u64);
+        write(b"\n");
+    }
+    respond_platform_message(msg, reply);
+}
+
+fn write_dec(mut v: u64) {
+    if v == 0 {
+        write(b"0");
         return;
     }
-    let engine = ENGINE.load(Ordering::SeqCst);
-    let resp_fn_va = SEND_PLATFORM_MESSAGE_RESPONSE_FN.load(Ordering::SeqCst);
-    if engine == 0 || resp_fn_va == 0 {
+    let mut tmp = [0u8; 20];
+    let mut n = 0usize;
+    while v > 0 {
+        tmp[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    while n > 0 {
+        n -= 1;
+        write(core::slice::from_ref(&tmp[n]));
+    }
+}
+
+fn run_due_platform_tasks(engine: u64, now: u64, max_tasks: usize) {
+    if engine == 0 || max_tasks == 0 {
         return;
     }
-    type SendResponseFn = unsafe extern "C" fn(u64, u64, *const u8, usize) -> i32;
-    let send_response: SendResponseFn = unsafe { core::mem::transmute(resp_fn_va) };
-    let _ = unsafe { send_response(engine, msg.response_handle, reply.as_ptr(), reply.len()) };
+    let run_task_va = RUN_TASK_FN.load(Ordering::SeqCst);
+    if run_task_va == 0 {
+        return;
+    }
+    let run_task_fn: unsafe extern "C" fn(u64, *const FlutterTask) -> i32 =
+        unsafe { core::mem::transmute(run_task_va) };
+    for _ in 0..max_tasks {
+        let mut task_to_run = None;
+        {
+            let _guard = PLATFORM_TASKS_LOCK.lock();
+            for slot in unsafe { &mut PLATFORM_TASKS } {
+                if slot.active && now >= slot.target_time_ns {
+                    task_to_run = Some(slot.task);
+                    slot.active = false;
+                    break;
+                }
+            }
+        }
+        let Some(task) = task_to_run else { break; };
+        unsafe {
+            run_task_fn(engine, &task as *const _);
+        }
+    }
 }
 
 fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
@@ -720,18 +807,47 @@ fn write_json_u32(out: &mut [u8], mut v: u32) -> usize {
     n
 }
 
+static mut INSTALL_REPLY: [u8; 48] = [0; 48];
+static INSTALL_REPLY_LEN: AtomicU32 = AtomicU32::new(0);
+
 fn install_osx_from_path(path: &[u8]) -> &'static [u8] {
-    let mut buf = [0u8; 65536];
-    let n = sys::vfs_read(path, &mut buf);
-    if n <= 0 {
+    let file_sz = sys::vfs_stat(path);
+    if file_sz <= 0 {
+        write(b"[embedder/shell] install stat failed\n");
+        return b"{\"ok\":false,\"err\":\"stat\"}";
+    }
+    let file_sz = file_sz as usize;
+    if file_sz > 16 * 1024 * 1024 {
+        write(b"[embedder/shell] install file too large\n");
+        return b"{\"ok\":false,\"err\":\"size\"}";
+    }
+    let va = sys::mmap_anon(file_sz);
+    if va == 0 || va == u64::MAX {
+        write(b"[embedder/shell] install mmap failed\n");
+        return b"{\"ok\":false,\"err\":\"mmap\"}";
+    }
+    let bundle = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, file_sz) };
+    let n = sys::vfs_read(path, bundle);
+    if n as usize != file_sz {
+        write(b"[embedder/shell] install read short\n");
         return b"{\"ok\":false,\"err\":\"read\"}";
     }
-    let bundle = &buf[..n as usize];
     let mut id = 0u32;
     if sys::app_install(bundle, &mut id) != 0 {
+        write(b"[embedder/shell] install app_install failed\n");
         return b"{\"ok\":false,\"err\":\"install\"}";
     }
-    b"{\"ok\":true}"
+    write(b"[embedder/shell] installed id=");
+    write_dec(id as u64);
+    write(b"\n");
+    let mut out = unsafe { &mut INSTALL_REPLY };
+    out[..18].copy_from_slice(b"{\"ok\":true,\"id\":");
+    let mut pos = 18usize;
+    pos += write_json_u32(&mut out[pos..], id);
+    out[pos] = b'}';
+    pos += 1;
+    INSTALL_REPLY_LEN.store(pos as u32, Ordering::Release);
+    unsafe { core::slice::from_raw_parts(INSTALL_REPLY.as_ptr(), pos) }
 }
 
 /// Log callback — writes to the kernel's serial debug output.
@@ -1189,30 +1305,8 @@ extern "C" fn main_embedder() {
 
     write(b"[embedder] entering event loop\n");
     loop {
-        // Run pending platform tasks
         let now = rdtsc_ns();
-        loop {
-            let mut task_to_run = None;
-            {
-                let _guard = PLATFORM_TASKS_LOCK.lock();
-                for slot in unsafe { &mut PLATFORM_TASKS } {
-                    if slot.active && now >= slot.target_time_ns {
-                        task_to_run = Some(slot.task);
-                        slot.active = false;
-                        break;
-                    }
-                }
-            }
-            if let Some(task) = task_to_run {
-                let run_task_fn: unsafe extern "C" fn(u64, *const FlutterTask) -> i32 =
-                    unsafe { core::mem::transmute(RUN_TASK_FN.load(Ordering::SeqCst)) };
-                unsafe {
-                    run_task_fn(engine_out, &task as *const _);
-                }
-            } else {
-                break;
-            }
-        }
+        run_due_platform_tasks(engine_out, now, 64);
 
         // Calculate timeout for next task (wait up to 16ms)
         let now = rdtsc_ns();

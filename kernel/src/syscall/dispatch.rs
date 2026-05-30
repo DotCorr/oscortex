@@ -16,6 +16,16 @@ use core::sync::atomic::Ordering;
 /// Fast SYSCALL entry path (called from assembly stub).
 #[unsafe(no_mangle)]
 pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    // Fast path: libm math (sin/cos/floor/round/pow/...). These are pure compute
+    // routed from the POSIX math trampolines, called extremely frequently by the
+    // Flutter engine (Skia) and the Dart VM. They never switch tasks or touch IO,
+    // so skip the syscall tracing and return-context persistence below.
+    if number >= crate::process::posix_trampolines::LIBM_NR_LO
+        && number <= crate::process::posix_trampolines::LIBM_NR_HI
+    {
+        return crate::process::posix_trampolines::libm_call(number, arg0, arg1, arg2);
+    }
+
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
 

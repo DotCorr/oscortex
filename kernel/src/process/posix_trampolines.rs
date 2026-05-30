@@ -88,6 +88,13 @@ enum StubKind {
     Setjmp,
     /// Custom inline userspace longjmp implementation (48 bytes, spans 3 slots)
     Longjmp,
+    /// Unary libm call: `movq rdi,xmm0; mov eax,NR; syscall; movq xmm0,rax; ret`
+    /// (18 bytes — spans 2 slots). Routes to kernel `libm_call` via syscall NR.
+    MathSyscall1(u32),
+    /// Binary libm call: passes xmm0→rdi, xmm1→rsi (23 bytes — spans 2 slots).
+    MathSyscall2(u32),
+    /// Ternary libm call (fma): xmm0→rdi, xmm1→rsi, xmm2→rdx (28 bytes — 2 slots).
+    MathSyscall3(u32),
 }
 
 // ── Master symbol list ────────────────────────────────────────────────────────
@@ -396,57 +403,59 @@ const STUBS: &[(&str, StubKind)] = &[
     /* 271 */ ("llround",             StubKind::Syscall(0x4A0)),
     /* 272 */ ("llroundf",            StubKind::Syscall(0x4A1)),
     /* 273 */ ("remainder",           StubKind::Syscall(0x4A2)),
-    // ── Math (float/double return in xmm0) ─────────────────────────────────
-    /* 274 */ ("sin",   StubKind::FloatZero),
-    /* 275 */ ("sinf",  StubKind::FloatZero),
-    /* 276 */ ("cos",   StubKind::FloatZero),
-    /* 277 */ ("cosf",  StubKind::FloatZero),
-    /* 278 */ ("tan",   StubKind::FloatZero),
-    /* 279 */ ("tanf",  StubKind::FloatZero),
-    /* 280 */ ("asin",  StubKind::FloatZero),
-    /* 281 */ ("asinf", StubKind::FloatZero),
-    /* 282 */ ("acos",  StubKind::FloatZero),
-    /* 283 */ ("acosf", StubKind::FloatZero),
-    /* 284 */ ("atan",  StubKind::FloatZero),
-    /* 285 */ ("atan2", StubKind::FloatZero),
-    /* 286 */ ("atan2f",StubKind::FloatZero),
-    /* 287 */ ("sinh",  StubKind::FloatZero),
-    /* 288 */ ("cosh",  StubKind::FloatZero),
-    /* 289 */ ("tanh",  StubKind::FloatZero),
-    /* 290 */ ("tanhf", StubKind::FloatZero),
-    /* 291 */ ("exp",   StubKind::FloatZero),
-    /* 292 */ ("expf",  StubKind::FloatZero),
-    /* 293 */ ("exp2",  StubKind::FloatZero),
-    /* 294 */ ("exp2f", StubKind::FloatZero),
-    /* 295 */ ("log",   StubKind::FloatZero),
-    /* 296 */ ("log2",  StubKind::FloatZero),
-    /* 297 */ ("log2f", StubKind::FloatZero),
-    /* 298 */ ("log10", StubKind::FloatZero),
-    /* 299 */ ("pow",   StubKind::FloatZero),
-    /* 300 */ ("powf",  StubKind::FloatZero),
-    /* 301 */ ("sqrt",  StubKind::FloatZero),
-    /* 302 */ ("sqrtf", StubKind::FloatZero),
-    /* 303 */ ("cbrt",  StubKind::FloatZero),
-    /* 304 */ ("cbrtf", StubKind::FloatZero),
-    /* 305 */ ("fabs",  StubKind::FloatZero),
-    /* 306 */ ("floor", StubKind::FloatZero),
-    /* 307 */ ("floorf",StubKind::FloatZero),
-    /* 308 */ ("ceil",  StubKind::FloatZero),
-    /* 309 */ ("ceilf", StubKind::FloatZero),
-    /* 310 */ ("round", StubKind::FloatZero),
-    /* 311 */ ("roundf",StubKind::FloatZero),
-    /* 312 */ ("trunc", StubKind::FloatZero),
-    /* 313 */ ("truncf",StubKind::FloatZero),
-    /* 314 */ ("fmod",  StubKind::FloatZero),
-    /* 315 */ ("fmodf", StubKind::FloatZero),
-    /* 316 */ ("fma",   StubKind::FloatZero),
-    /* 317 */ ("hypot", StubKind::FloatZero),
-    /* 318 */ ("hypotf",StubKind::FloatZero),
-    /* 319 */ ("erff",  StubKind::FloatZero),
-    /* 320 */ ("acosh", StubKind::FloatZero),
-    /* 321 */ ("asinh", StubKind::FloatZero),
-    /* 322 */ ("atanh", StubKind::FloatZero),
-    /* 323 */ ("log10f",StubKind::FloatZero),  // extra
+    // ── Math (real libm via kernel syscall; result in xmm0) ─────────────────
+    // Each MathSyscall* spans 2 trampoline slots, so every entry is followed by
+    // a Padding slot. The syscall NRs MUST match the match arms in `libm_call`.
+    ("sin",    StubKind::MathSyscall1(0x4C0)), ("__m_sin",   StubKind::Padding),
+    ("sinf",   StubKind::MathSyscall1(0x4C1)), ("__m_sinf",  StubKind::Padding),
+    ("cos",    StubKind::MathSyscall1(0x4C2)), ("__m_cos",   StubKind::Padding),
+    ("cosf",   StubKind::MathSyscall1(0x4C3)), ("__m_cosf",  StubKind::Padding),
+    ("tan",    StubKind::MathSyscall1(0x4C4)), ("__m_tan",   StubKind::Padding),
+    ("tanf",   StubKind::MathSyscall1(0x4C5)), ("__m_tanf",  StubKind::Padding),
+    ("asin",   StubKind::MathSyscall1(0x4C6)), ("__m_asin",  StubKind::Padding),
+    ("asinf",  StubKind::MathSyscall1(0x4C7)), ("__m_asinf", StubKind::Padding),
+    ("acos",   StubKind::MathSyscall1(0x4C8)), ("__m_acos",  StubKind::Padding),
+    ("acosf",  StubKind::MathSyscall1(0x4C9)), ("__m_acosf", StubKind::Padding),
+    ("atan",   StubKind::MathSyscall1(0x4CA)), ("__m_atan",  StubKind::Padding),
+    ("atan2",  StubKind::MathSyscall2(0x4CB)), ("__m_atan2", StubKind::Padding),
+    ("atan2f", StubKind::MathSyscall2(0x4CC)), ("__m_atan2f",StubKind::Padding),
+    ("sinh",   StubKind::MathSyscall1(0x4CD)), ("__m_sinh",  StubKind::Padding),
+    ("cosh",   StubKind::MathSyscall1(0x4CE)), ("__m_cosh",  StubKind::Padding),
+    ("tanh",   StubKind::MathSyscall1(0x4CF)), ("__m_tanh",  StubKind::Padding),
+    ("tanhf",  StubKind::MathSyscall1(0x4D0)), ("__m_tanhf", StubKind::Padding),
+    ("exp",    StubKind::MathSyscall1(0x4D1)), ("__m_exp",   StubKind::Padding),
+    ("expf",   StubKind::MathSyscall1(0x4D2)), ("__m_expf",  StubKind::Padding),
+    ("exp2",   StubKind::MathSyscall1(0x4D3)), ("__m_exp2",  StubKind::Padding),
+    ("exp2f",  StubKind::MathSyscall1(0x4D4)), ("__m_exp2f", StubKind::Padding),
+    ("log",    StubKind::MathSyscall1(0x4D5)), ("__m_log",   StubKind::Padding),
+    ("log2",   StubKind::MathSyscall1(0x4D6)), ("__m_log2",  StubKind::Padding),
+    ("log2f",  StubKind::MathSyscall1(0x4D7)), ("__m_log2f", StubKind::Padding),
+    ("log10",  StubKind::MathSyscall1(0x4D8)), ("__m_log10", StubKind::Padding),
+    ("pow",    StubKind::MathSyscall2(0x4D9)), ("__m_pow",   StubKind::Padding),
+    ("powf",   StubKind::MathSyscall2(0x4DA)), ("__m_powf",  StubKind::Padding),
+    ("sqrt",   StubKind::MathSyscall1(0x4DB)), ("__m_sqrt",  StubKind::Padding),
+    ("sqrtf",  StubKind::MathSyscall1(0x4DC)), ("__m_sqrtf", StubKind::Padding),
+    ("cbrt",   StubKind::MathSyscall1(0x4DD)), ("__m_cbrt",  StubKind::Padding),
+    ("cbrtf",  StubKind::MathSyscall1(0x4DE)), ("__m_cbrtf", StubKind::Padding),
+    ("fabs",   StubKind::MathSyscall1(0x4DF)), ("__m_fabs",  StubKind::Padding),
+    ("floor",  StubKind::MathSyscall1(0x4E0)), ("__m_floor", StubKind::Padding),
+    ("floorf", StubKind::MathSyscall1(0x4E1)), ("__m_floorf",StubKind::Padding),
+    ("ceil",   StubKind::MathSyscall1(0x4E2)), ("__m_ceil",  StubKind::Padding),
+    ("ceilf",  StubKind::MathSyscall1(0x4E3)), ("__m_ceilf", StubKind::Padding),
+    ("round",  StubKind::MathSyscall1(0x4E4)), ("__m_round", StubKind::Padding),
+    ("roundf", StubKind::MathSyscall1(0x4E5)), ("__m_roundf",StubKind::Padding),
+    ("trunc",  StubKind::MathSyscall1(0x4E6)), ("__m_trunc", StubKind::Padding),
+    ("truncf", StubKind::MathSyscall1(0x4E7)), ("__m_truncf",StubKind::Padding),
+    ("fmod",   StubKind::MathSyscall2(0x4E8)), ("__m_fmod",  StubKind::Padding),
+    ("fmodf",  StubKind::MathSyscall2(0x4E9)), ("__m_fmodf", StubKind::Padding),
+    ("fma",    StubKind::MathSyscall3(0x4EA)), ("__m_fma",   StubKind::Padding),
+    ("hypot",  StubKind::MathSyscall2(0x4EB)), ("__m_hypot", StubKind::Padding),
+    ("hypotf", StubKind::MathSyscall2(0x4EC)), ("__m_hypotf",StubKind::Padding),
+    ("erff",   StubKind::MathSyscall1(0x4ED)), ("__m_erff",  StubKind::Padding),
+    ("acosh",  StubKind::MathSyscall1(0x4EE)), ("__m_acosh", StubKind::Padding),
+    ("asinh",  StubKind::MathSyscall1(0x4EF)), ("__m_asinh", StubKind::Padding),
+    ("atanh",  StubKind::MathSyscall1(0x4F0)), ("__m_atanh", StubKind::Padding),
+    ("log10f", StubKind::MathSyscall1(0x4F1)), ("__m_log10f",StubKind::Padding),
     // ── GNU emulated TLS (used by Flutter engine compiled without native TLS) ──
     /* 324 */ ("__emutls_get_address",       StubKind::Syscall(0x4B0)),
     /* 325 */ ("__emutls_register_common",   StubKind::Syscall(0x4B1)),
@@ -505,6 +514,80 @@ pub fn find_posix_symbol(name: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Lowest / highest libm syscall numbers (see the MathSyscall* entries above).
+pub const LIBM_NR_LO: u64 = 0x4C0;
+pub const LIBM_NR_HI: u64 = 0x4F1;
+
+/// Compute a libm function for the math trampolines.
+///
+/// `a0`/`a1`/`a2` carry the raw IEEE-754 bit patterns of the (up to three)
+/// `double` arguments — the trampoline moved `xmm0/xmm1/xmm2` into the integer
+/// arg registers. `f32` variants take the low 32 bits as the float. The result
+/// bit pattern is returned in `rax` and the trampoline moves it back to `xmm0`.
+///
+/// NRs MUST stay in sync with the `MathSyscall*` entries in `STUBS`.
+pub fn libm_call(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let x = f64::from_bits(a0);
+    let y = f64::from_bits(a1);
+    let z = f64::from_bits(a2);
+    let xf = f32::from_bits(a0 as u32);
+    let yf = f32::from_bits(a1 as u32);
+    let bits: u64 = match nr {
+        0x4C0 => libm::sin(x).to_bits(),
+        0x4C1 => libm::sinf(xf).to_bits() as u64,
+        0x4C2 => libm::cos(x).to_bits(),
+        0x4C3 => libm::cosf(xf).to_bits() as u64,
+        0x4C4 => libm::tan(x).to_bits(),
+        0x4C5 => libm::tanf(xf).to_bits() as u64,
+        0x4C6 => libm::asin(x).to_bits(),
+        0x4C7 => libm::asinf(xf).to_bits() as u64,
+        0x4C8 => libm::acos(x).to_bits(),
+        0x4C9 => libm::acosf(xf).to_bits() as u64,
+        0x4CA => libm::atan(x).to_bits(),
+        0x4CB => libm::atan2(x, y).to_bits(),
+        0x4CC => libm::atan2f(xf, yf).to_bits() as u64,
+        0x4CD => libm::sinh(x).to_bits(),
+        0x4CE => libm::cosh(x).to_bits(),
+        0x4CF => libm::tanh(x).to_bits(),
+        0x4D0 => libm::tanhf(xf).to_bits() as u64,
+        0x4D1 => libm::exp(x).to_bits(),
+        0x4D2 => libm::expf(xf).to_bits() as u64,
+        0x4D3 => libm::exp2(x).to_bits(),
+        0x4D4 => libm::exp2f(xf).to_bits() as u64,
+        0x4D5 => libm::log(x).to_bits(),
+        0x4D6 => libm::log2(x).to_bits(),
+        0x4D7 => libm::log2f(xf).to_bits() as u64,
+        0x4D8 => libm::log10(x).to_bits(),
+        0x4D9 => libm::pow(x, y).to_bits(),
+        0x4DA => libm::powf(xf, yf).to_bits() as u64,
+        0x4DB => libm::sqrt(x).to_bits(),
+        0x4DC => libm::sqrtf(xf).to_bits() as u64,
+        0x4DD => libm::cbrt(x).to_bits(),
+        0x4DE => libm::cbrtf(xf).to_bits() as u64,
+        0x4DF => libm::fabs(x).to_bits(),
+        0x4E0 => libm::floor(x).to_bits(),
+        0x4E1 => libm::floorf(xf).to_bits() as u64,
+        0x4E2 => libm::ceil(x).to_bits(),
+        0x4E3 => libm::ceilf(xf).to_bits() as u64,
+        0x4E4 => libm::round(x).to_bits(),
+        0x4E5 => libm::roundf(xf).to_bits() as u64,
+        0x4E6 => libm::trunc(x).to_bits(),
+        0x4E7 => libm::truncf(xf).to_bits() as u64,
+        0x4E8 => libm::fmod(x, y).to_bits(),
+        0x4E9 => libm::fmodf(xf, yf).to_bits() as u64,
+        0x4EA => libm::fma(x, y, z).to_bits(),
+        0x4EB => libm::hypot(x, y).to_bits(),
+        0x4EC => libm::hypotf(xf, yf).to_bits() as u64,
+        0x4ED => libm::erff(xf).to_bits() as u64,
+        0x4EE => libm::acosh(x).to_bits(),
+        0x4EF => libm::asinh(x).to_bits(),
+        0x4F0 => libm::atanh(x).to_bits(),
+        0x4F1 => libm::log10f(xf).to_bits() as u64,
+        _ => 0,
+    };
+    bits as i64
 }
 
 // ── Ctype table generator ─────────────────────────────────────────────────────
@@ -705,6 +788,45 @@ fn encode_stub(page: &mut [u8], off: usize, kind: StubKind) {
                 0x73, 0x11, 0x8a, 0x04, 0x0f, 0x8a, 0x14, 0x0e, 0x88, 0x04, 0x0e, 0x88, 0x14, 0x0f, 0x48, 0xff,
                 0xc1, 0xeb, 0xea, 0x48, 0xff, 0xcd, 0xeb, 0xb3, 0x48, 0xff, 0xc3, 0xeb, 0xa6, 0x41, 0x5f, 0x41,
                 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x5d, 0x5b, 0xc3
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
+        StubKind::MathSyscall1(nr) => {
+            // movq rdi, xmm0 ; mov eax, nr ; syscall ; movq xmm0, rax ; ret
+            let code: &[u8] = &[
+                0x66, 0x48, 0x0F, 0x7E, 0xC7,                 // movq rdi, xmm0
+                0xB8, (nr & 0xFF) as u8, ((nr >> 8) & 0xFF) as u8,
+                      ((nr >> 16) & 0xFF) as u8, ((nr >> 24) & 0xFF) as u8, // mov eax, nr
+                0x0F, 0x05,                                   // syscall
+                0x66, 0x48, 0x0F, 0x6E, 0xC0,                 // movq xmm0, rax
+                0xC3,                                         // ret
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
+        StubKind::MathSyscall2(nr) => {
+            // movq rdi,xmm0 ; movq rsi,xmm1 ; mov eax,nr ; syscall ; movq xmm0,rax ; ret
+            let code: &[u8] = &[
+                0x66, 0x48, 0x0F, 0x7E, 0xC7,                 // movq rdi, xmm0
+                0x66, 0x48, 0x0F, 0x7E, 0xCE,                 // movq rsi, xmm1
+                0xB8, (nr & 0xFF) as u8, ((nr >> 8) & 0xFF) as u8,
+                      ((nr >> 16) & 0xFF) as u8, ((nr >> 24) & 0xFF) as u8, // mov eax, nr
+                0x0F, 0x05,                                   // syscall
+                0x66, 0x48, 0x0F, 0x6E, 0xC0,                 // movq xmm0, rax
+                0xC3,                                         // ret
+            ];
+            page[off..off + code.len()].copy_from_slice(code);
+        }
+        StubKind::MathSyscall3(nr) => {
+            // movq rdi,xmm0 ; movq rsi,xmm1 ; movq rdx,xmm2 ; mov eax,nr ; syscall ; movq xmm0,rax ; ret
+            let code: &[u8] = &[
+                0x66, 0x48, 0x0F, 0x7E, 0xC7,                 // movq rdi, xmm0
+                0x66, 0x48, 0x0F, 0x7E, 0xCE,                 // movq rsi, xmm1
+                0x66, 0x48, 0x0F, 0x7E, 0xD2,                 // movq rdx, xmm2
+                0xB8, (nr & 0xFF) as u8, ((nr >> 8) & 0xFF) as u8,
+                      ((nr >> 16) & 0xFF) as u8, ((nr >> 24) & 0xFF) as u8, // mov eax, nr
+                0x0F, 0x05,                                   // syscall
+                0x66, 0x48, 0x0F, 0x6E, 0xC0,                 // movq xmm0, rax
+                0xC3,                                         // ret
             ];
             page[off..off + code.len()].copy_from_slice(code);
         }
