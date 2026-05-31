@@ -30,8 +30,9 @@
 //! | 0x371  | app_launch      | (app_id, flags)                       | pid / -ERR  |
 //! | 0x372  | app_uninstall   | (app_id)                              | 0 / -ERRNO  |
 
-use spin::Mutex;
+use alloc::string::String;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 // ── Bundle parsing ────────────────────────────────────────────────────────────
 
@@ -45,44 +46,59 @@ pub const HOST_MODE_APP: u64 = 2;
 const HOST_ELF_PATH: &str = "/bin/oscortex-host";
 
 pub struct BundleHeader {
-    pub name:         [u8; 64],
-    pub version:      [u8; 16],
+    pub name: [u8; 64],
+    pub version: [u8; 16],
     pub entry_offset: u64,
-    pub stack_size:   u64,
-    pub aot_len:      u32,
+    pub stack_size: u64,
+    pub aot_len: u32,
 }
 
 /// Parse the fixed-size bundle header.  Returns `None` if the bundle is too
 /// short, the magic is wrong, or the declared `aot_len` exceeds the buffer.
 pub fn parse_header(bundle: &[u8]) -> Option<BundleHeader> {
-    if bundle.len() < HEADER_SIZE { return None; }
-    if &bundle[0..4] != MAGIC { return None; }
+    if bundle.len() < HEADER_SIZE {
+        return None;
+    }
+    if &bundle[0..4] != MAGIC {
+        return None;
+    }
     // format_version at [4..8] — accept 1 only.
     let ver = u32::from_le_bytes(bundle[4..8].try_into().ok()?);
-    if ver != 1 { return None; }
+    if ver != 1 {
+        return None;
+    }
 
-    let mut name    = [0u8; 64];
+    let mut name = [0u8; 64];
     let mut version = [0u8; 16];
     name.copy_from_slice(&bundle[8..72]);
     version.copy_from_slice(&bundle[72..88]);
     let entry_offset = u64::from_le_bytes(bundle[88..96].try_into().ok()?);
-    let stack_size   = u64::from_le_bytes(bundle[96..104].try_into().ok()?);
-    let aot_len      = u32::from_le_bytes(bundle[104..108].try_into().ok()?);
+    let stack_size = u64::from_le_bytes(bundle[96..104].try_into().ok()?);
+    let aot_len = u32::from_le_bytes(bundle[104..108].try_into().ok()?);
 
-    if bundle.len() < HEADER_SIZE + aot_len as usize { return None; }
-    Some(BundleHeader { name, version, entry_offset, stack_size, aot_len })
+    if bundle.len() < HEADER_SIZE + aot_len as usize {
+        return None;
+    }
+    Some(BundleHeader {
+        name,
+        version,
+        entry_offset,
+        stack_size,
+        aot_len,
+    })
 }
 
 // ── App record ────────────────────────────────────────────────────────────────
 
 pub struct AppRecord {
-    pub id:           u32,
-    pub name:         [u8; 64],
-    pub version:      [u8; 16],
+    pub id: u32,
+    pub name: [u8; 64],
+    pub version: [u8; 16],
     pub entry_offset: u64,
-    pub stack_size:   u64,
+    pub stack_size: u64,
+    pub system: bool,
     /// Copy of the AOT snapshot, kept in kernel heap.
-    pub aot_data:     Vec<u8>,
+    pub aot_data: Vec<u8>,
 }
 
 impl AppRecord {
@@ -109,7 +125,10 @@ struct AppTable {
 
 impl AppTable {
     const fn empty() -> Self {
-        Self { slots: Vec::new(), next_id: 1 }
+        Self {
+            slots: Vec::new(),
+            next_id: 1,
+        }
     }
 
     fn find(&self, id: u32) -> Option<&AppRecord> {
@@ -124,7 +143,9 @@ impl AppTable {
     }
 
     fn insert(&mut self, record: AppRecord) -> bool {
-        if self.slots.iter().flatten().count() >= MAX_APPS { return false; }
+        if self.slots.iter().flatten().count() >= MAX_APPS {
+            return false;
+        }
         // Reuse a None slot first.
         for slot in self.slots.iter_mut() {
             if slot.is_none() {
@@ -134,6 +155,16 @@ impl AppTable {
         }
         self.slots.push(Some(record));
         true
+    }
+
+    fn allocate_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            if self.find(id).is_none() {
+                return id;
+            }
+        }
     }
 
     fn remove(&mut self, id: u32) -> bool {
@@ -151,20 +182,30 @@ static APP_TABLE: Mutex<AppTable> = Mutex::new(AppTable::empty());
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-/// Install with a fixed id (used when hydrating from block store).
-pub fn install_from_store(bundle: &[u8], id: u32) -> Option<u32> {
+fn install_record(bundle: &[u8], id: u32, system: bool) -> Option<u32> {
     let hdr = parse_header(bundle)?;
     let aot_data: Vec<u8> = bundle[HEADER_SIZE..HEADER_SIZE + hdr.aot_len as usize].to_vec();
     let mut table = APP_TABLE.lock();
     if table.find(id).is_some() {
         return None;
     }
+
+    let name_end = hdr.name.iter().position(|&b| b == 0).unwrap_or(64);
+    if table.find_by_name(&hdr.name[..name_end]).is_some() {
+        return None;
+    }
+
     let record = AppRecord {
         id,
         name: hdr.name,
         version: hdr.version,
         entry_offset: hdr.entry_offset,
-        stack_size: if hdr.stack_size == 0 { 512 * 1024 } else { hdr.stack_size },
+        stack_size: if hdr.stack_size == 0 {
+            512 * 1024
+        } else {
+            hdr.stack_size
+        },
+        system,
         aot_data,
     };
     if !table.insert(record) {
@@ -174,6 +215,111 @@ pub fn install_from_store(bundle: &[u8], id: u32) -> Option<u32> {
         table.next_id = id.saturating_add(1).max(1);
     }
     Some(id)
+}
+
+fn install_record_auto_id(bundle: &[u8], system: bool) -> Option<u32> {
+    let hdr = parse_header(bundle)?;
+    let aot_data: Vec<u8> = bundle[HEADER_SIZE..HEADER_SIZE + hdr.aot_len as usize].to_vec();
+    let mut table = APP_TABLE.lock();
+
+    let name_end = hdr.name.iter().position(|&b| b == 0).unwrap_or(64);
+    if table.find_by_name(&hdr.name[..name_end]).is_some() {
+        return None;
+    }
+
+    let id = table.allocate_id();
+    let record = AppRecord {
+        id,
+        name: hdr.name,
+        version: hdr.version,
+        entry_offset: hdr.entry_offset,
+        stack_size: if hdr.stack_size == 0 {
+            512 * 1024
+        } else {
+            hdr.stack_size
+        },
+        system,
+        aot_data,
+    };
+    if !table.insert(record) {
+        return None;
+    }
+    Some(id)
+}
+
+/// Install with a fixed id (used when hydrating from block store).
+pub fn install_from_store(bundle: &[u8], id: u32) -> Option<u32> {
+    install_record(bundle, id, false)
+}
+
+/// Install a read-only system app from the embedded filesystem.
+pub fn install_system_from_path(path: &str, id: u32) -> Option<u32> {
+    let bundle = crate::fs::lookup(path)?;
+    let installed = install_record(bundle, id, true)?;
+    log::info!("[APP] Seeded system app '{}' id={}", path, installed);
+    Some(installed)
+}
+
+/// Install a read-only system app from the embedded filesystem using the next
+/// registry id. This is used for additional `.osx` bundles found under
+/// `/Applications` after the stable core app IDs are reserved.
+pub fn install_system_from_path_auto(path: &str) -> Option<u32> {
+    let bundle = crate::fs::lookup(path)?;
+    let installed = install_record_auto_id(bundle, true)?;
+    log::info!("[APP] Discovered system app '{}' id={}", path, installed);
+    Some(installed)
+}
+
+/// Seed core system apps that live in the OS Applications directory.
+pub fn install_system_apps() {
+    const SYSTEM_APPS: &[(&str, u32)] = &[
+        ("/Applications/Canvas.app/Canvas.osx", 1),
+        ("/Applications/Files.app/Files.osx", 2),
+        ("/Applications/Web Link.app/Web Link.osx", 3),
+    ];
+
+    for (path, id) in SYSTEM_APPS {
+        if install_system_from_path(path, *id).is_none() {
+            log::warn!("[APP] System app seed skipped: {}", path);
+        }
+    }
+
+    discover_applications_dir();
+}
+
+fn discover_applications_dir() {
+    const PREFIX: &str = "/Applications";
+    const BUF_LEN: usize = 32 * 1024;
+    let mut buf = alloc::vec![0u8; BUF_LEN];
+    let written = crate::fs::list_prefix(PREFIX, buf.as_mut_ptr(), buf.len()).min(buf.len());
+    if written == 0 {
+        log::info!("[APP] No additional /Applications bundles discovered");
+        return;
+    }
+
+    let mut discovered = 0u32;
+    for line in buf[..written].split(|&b| b == b'\n') {
+        if !line.ends_with(b".osx") {
+            continue;
+        }
+        let Ok(rel) = core::str::from_utf8(line) else {
+            continue;
+        };
+        if rel.is_empty() {
+            continue;
+        }
+        let mut path = String::from(PREFIX);
+        path.push('/');
+        path.push_str(rel);
+        if install_system_from_path_auto(&path).is_some() {
+            discovered += 1;
+        }
+    }
+
+    log::info!(
+        "[APP] /Applications discovery complete: {} additional app(s)",
+        discovered
+    );
 }
 
 /// Install a `.osx` bundle from a byte slice.
@@ -196,26 +342,41 @@ pub fn install(bundle: &[u8]) -> Option<u32> {
 
     let record = AppRecord {
         id,
-        name:         hdr.name,
-        version:      hdr.version,
+        name: hdr.name,
+        version: hdr.version,
         entry_offset: hdr.entry_offset,
-        stack_size:   if hdr.stack_size == 0 { 512 * 1024 } else { hdr.stack_size },
+        stack_size: if hdr.stack_size == 0 {
+            512 * 1024
+        } else {
+            hdr.stack_size
+        },
+        system: false,
         aot_data,
     };
-    if !table.insert(record) { return None; }
+    if !table.insert(record) {
+        return None;
+    }
 
     let _ = crate::app_store::persist_bundle(id, bundle);
 
-    log::info!("[APP] Installed '{}' id={}", {
-        let end = hdr.name.iter().position(|&b| b == 0).unwrap_or(64);
-        core::str::from_utf8(&hdr.name[..end]).unwrap_or("?")
-    }, id);
+    log::info!(
+        "[APP] Installed '{}' id={}",
+        {
+            let end = hdr.name.iter().position(|&b| b == 0).unwrap_or(64);
+            core::str::from_utf8(&hdr.name[..end]).unwrap_or("?")
+        },
+        id
+    );
     Some(id)
 }
 
 /// Uninstall an app by `app_id`.  Returns `true` if found and removed.
 pub fn uninstall(app_id: u32) -> bool {
     let mut table = APP_TABLE.lock();
+    if table.find(app_id).map(|r| r.system).unwrap_or(false) {
+        log::warn!("[APP] Refusing to uninstall system app_id={}", app_id);
+        return false;
+    }
     let found = table.remove(app_id);
     if found {
         let _ = crate::app_store::remove_bundle(app_id);
@@ -225,7 +386,7 @@ pub fn uninstall(app_id: u32) -> bool {
 }
 
 /// Serialise the app list into `buf` as packed 88-byte records:
-/// `[id: u32le][name: u8×64][version: u8×16][_: u32le padding]`
+/// `[id: u32le][name: u8×64][version: u8×16][flags: u32le]`
 ///
 /// Returns the number of installed apps (even if buf was too small to hold all).
 pub fn list(buf: &mut [u8]) -> u32 {
@@ -239,7 +400,8 @@ pub fn list(buf: &mut [u8]) -> u32 {
             buf[offset..offset + 4].copy_from_slice(&record.id.to_le_bytes());
             buf[offset + 4..offset + 68].copy_from_slice(&record.name);
             buf[offset + 68..offset + 84].copy_from_slice(&record.version);
-            buf[offset + 84..offset + 88].copy_from_slice(&[0u8; 4]);
+            let flags = if record.system { 1u32 } else { 0u32 };
+            buf[offset + 84..offset + 88].copy_from_slice(&flags.to_le_bytes());
             offset += RECORD_SZ;
         }
     }
@@ -328,7 +490,9 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
     let name_str = core::str::from_utf8(&name[..name_end]).unwrap_or("?");
     log::info!(
         "[APP] Launched '{}' app_id={} host_pid={}",
-        name_str, app_id, child_pid
+        name_str,
+        app_id,
+        child_pid
     );
     child_pid as i64
 }

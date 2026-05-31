@@ -47,9 +47,23 @@ static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = [ZERO_CPU; MAX_CPUS];
 /// Total logical CPUs online (including BSP).
 pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
+/// Return this CPU's ID (by looking up the local APIC ID).
+pub fn current_cpu_id() -> u32 {
+    let lapic_id = crate::arch::x86_64::apic::local_apic_id();
+    let n = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    unsafe {
+        for i in 0..n {
+            if PER_CPU_DATA[i].lapic_id == lapic_id {
+                return i as u32;
+            }
+        }
+    }
+    0
+}
+
 /// Return this CPU's per-CPU entry.
 pub fn this_cpu() -> &'static PerCpuData {
-    let cpu_idx = crate::arch::syscall::current_cpu_id() as usize;
+    let cpu_idx = current_cpu_id() as usize;
     unsafe { &PER_CPU_DATA[cpu_idx] }
 }
 
@@ -115,6 +129,7 @@ pub fn init(smp_resp: Option<&'static MpResponse>) {
             PER_CPU_DATA[cpu_idx as usize].cpu_id   = cpu_idx;
             PER_CPU_DATA[cpu_idx as usize].lapic_id = cpu.lapic_id;
         }
+        CPU_COUNT.store(cpu_idx + 1, Ordering::Release);
         cpu.bootstrap(ap_entry as MpGotoFunction, cpu_idx as u64);
         cpu_idx += 1;
     }

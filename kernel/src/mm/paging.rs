@@ -328,6 +328,34 @@ mod x86_64_impl {
             Some(phys)
         }
     }
+
+    /// Walk a user PML4 and free a mapped user page.
+    pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
+        let present  = PageFlags::PRESENT.bits();
+
+        let pml4 = phys_to_virt(pml4_phys) as *mut u64;
+        let pml4e = pml4.add(pml4_idx).read_volatile();
+        if pml4e & present == 0 { return Err("not present"); }
+        let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read_volatile();
+        if pdpte & present == 0 { return Err("not present"); }
+        let pd = phys_to_virt(pdpte & PHYS_MASK) as *mut u64;
+        let pde = pd.add(pd_idx).read_volatile();
+        if pde & present == 0 { return Err("not present"); }
+        let pt = phys_to_virt(pde & PHYS_MASK) as *mut u64;
+        let pte_ptr = pt.add(pt_idx);
+        let pte = pte_ptr.read_volatile();
+        if pte & present == 0 { return Err("not present"); }
+
+        let phys = pte & PHYS_MASK;
+        pte_ptr.write_volatile(0);
+        invlpg(virt);
+        Ok(phys)
+    }
 }
 
 // ─── Non-x86_64 stubs ─────────────────────────────────────────────────────────
@@ -509,6 +537,36 @@ pub unsafe fn update_user_page(
     {
         let _ = (pml4_phys, virt, writable, exec);
         Ok(())
+    }
+}
+
+/// Unmap a single 4-KiB page in a specific PML4 and return its physical frame.
+///
+/// # Safety
+/// `pml4_phys` must be a valid allocated PML4.
+pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { x86_64_impl::unmap_user_page(pml4_phys, virt) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (pml4_phys, virt);
+        Err("unsupported")
+    }
+}
+
+/// Unmap a range of virtual addresses in a specific PML4 and free their physical frames.
+pub fn unmap_user_range(pml4_phys: u64, start_va: u64, size: u64) {
+    if size == 0 { return; }
+    let start = start_va & !0xFFF;
+    let end = (start_va + size + 4095) & !0xFFF;
+    for virt in (start..end).step_by(4096) {
+        unsafe {
+            if let Ok(phys) = unmap_user_page(pml4_phys, virt) {
+                crate::mm::frame_allocator::free_frame(phys);
+            }
+        }
     }
 }
 

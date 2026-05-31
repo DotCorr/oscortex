@@ -119,9 +119,15 @@ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
     if va == u64::MAX { -12 } else { va as i64 } // ENOMEM or success
 }
 
-pub(crate) fn sys_munmap(_va: u64, _size: u64) -> i64 {
-    // Stub — frames remain mapped until process exit.
-    // Full unmapping requires reverse page-table mappings (future milestone).
+pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
+    if size == 0 { return 0; }
+    let pid = crate::process::current_pid();
+    if pid == 0 { return -1; } // EPERM
+    let pml4_phys = match crate::process::get_user_context(pid) {
+        Some(ctx) => ctx.pml4_phys,
+        None => return -9, // EBADF
+    };
+    crate::mm::paging::unmap_user_range(pml4_phys, va, size);
     0
 }
 

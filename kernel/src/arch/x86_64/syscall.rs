@@ -82,11 +82,7 @@ pub static mut CPU_SCRATCHES: [CpuScratch; MAX_CPUS] = [const { CpuScratch {
 
 #[inline(always)]
 pub fn current_cpu_id() -> u32 {
-    let id: u64;
-    unsafe {
-        asm!("mov {}, gs:[120]", out(reg) id, options(nomem, nostack, preserves_flags));
-    }
-    id as u32
+    crate::arch::x86_64::smp::current_cpu_id()
 }
 
 pub fn init() {

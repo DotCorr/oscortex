@@ -36,7 +36,7 @@
 | **Flutter embedder** | `oscortex-host` — binds Flutter engine to kernel syscalls (surfaces, vsync, input) | Active |
 | **System shell** | `apps/oscortex_app` — the desktop UI (currently slim `dart:ui` for QEMU speed) | Active |
 | **Engine patches** | `tools/flutter-engine/engine_patch.py` — patches `libflutter_engine.so` for OSCortex | Active (P9 cave / diagnostics) |
-| **App model** | `.osx` bundles, install/launch via syscalls — **not** baked into ISO at dev time | Designed, partial |
+| **App model** | `.osx` bundles, install/launch via syscalls — **not** baked into ISO at dev time | Active |
 | **Cortex** | Kernel AI layer: PID-0 syscalls, healing, driver gen, anomaly context | In progress |
 | **CDP drivers** | Hot-loadable WASM drivers (portable across CPU arches) | Framework in place |
 
@@ -61,6 +61,44 @@
 | `oscortex-host` | Flutter host binary — runs shell or a user app. |
 | `libflutter_engine.so` | Patched Flutter engine (large binary, gitignored). |
 | `.osx` | Installable app bundle format. |
+
+---
+
+## Canonical Third-Party App Workflow
+
+Use this as the single public path for building and sideloading user apps on OSCortex.
+
+1. Build a Flutter app into a `.osx` bundle:
+
+```bash
+./tools/build-flutter-osx.sh \
+	/absolute/path/to/your_flutter_app \
+	"My App" \
+	/tmp/MyApp.osx \
+	/tmp/MyApp.flutter_assets
+```
+
+2. Place the bundle where OSCortex can see it at runtime:
+
+- For preloaded testing in initramfs, stage into `/Applications/...` during image build.
+- For runtime sideload, copy into a browsable path like `/tmp` and install from the Files core app.
+
+3. Install from the running OS:
+
+- Open **Files** (core app, separate PID).
+- Navigate to the bundle path.
+- Press **Install** on the `.osx` entry.
+
+4. Launch from shell:
+
+- Return to the shell (`oscortex_app`) and refresh app registry.
+- Launch the new app tile; OSCortex spawns a dedicated `oscortex-host` process for it.
+
+Notes:
+
+- Do not target Linux desktop binaries for OSCortex apps.
+- OSCortex apps are Flutter AOT packaged as `.osx` and launched through kernel app syscalls.
+- Core apps (Canvas, Files, Web Link) are pinned in the dock but still run as independent processes.
 
 ---
 
@@ -112,3 +150,4 @@ You work on **feature branches**, merge to **`develop`** after CI + review, ship
 ---
 
 **TL;DR:** You’re building a **custom OS kernel** with a **Flutter-native userspace** — one compositor, one shell process, isolated app processes, syscalls as the only hardware API, and a path toward **AI-assisted driver healing (Cortex)** on top. The repo is the kernel + embedder + shell + build/release tooling to boot and iterate in QEMU, then ship versioned ISOs from `main`.
+

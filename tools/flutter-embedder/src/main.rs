@@ -466,6 +466,8 @@ static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
 static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_RESPONSE_FN: AtomicU64 = AtomicU64::new(0);
+static CURRENT_HOST_MODE: AtomicU64 = AtomicU64::new(0);
+static CURRENT_APP_ID: AtomicU64 = AtomicU64::new(0);
 
 const SHELL_CHANNEL: &[u8] = b"oscortex/shell";
 
@@ -754,6 +756,91 @@ fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, assets_d
     }
 }
 
+fn configure_project_assets(project_args: &mut FlutterProjectArgsRaw, assets_dir: &[u8]) {
+    static mut ASSETS_PATH: [u8; 128] = [0; 128];
+
+    if assets_dir.len() + 1 > unsafe { ASSETS_PATH.len() } {
+        write(b"[embedder] asset path too long\n");
+        exit(-1);
+    }
+
+    unsafe {
+        ASSETS_PATH.fill(0);
+        ASSETS_PATH[..assets_dir.len()].copy_from_slice(assets_dir);
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PROJECT_ARGS_ASSETS_PATH,
+            ASSETS_PATH.as_ptr() as u64,
+        );
+    }
+    install_jit_snapshot_paths(project_args, assets_dir);
+}
+
+fn configure_app_assets(project_args: &mut FlutterProjectArgsRaw, app_id: u64) {
+    let mut records = [0u8; 4096];
+    let count = sys::app_list(&mut records);
+    if count <= 0 {
+        write(b"[embedder] app asset lookup failed; using shell assets\n");
+        configure_project_assets(project_args, b"/system/flutter/flutter_assets");
+        return;
+    }
+
+    let mut name_buf = [0u8; 64];
+    let mut found = false;
+    let mut i = 0usize;
+    while i < count as usize {
+        let off = i * 88;
+        if off + 88 > records.len() {
+            break;
+        }
+        let id = u32::from_le_bytes(records[off..off + 4].try_into().unwrap_or([0; 4]));
+        if id as u64 == app_id {
+            name_buf.copy_from_slice(&records[off + 4..off + 68]);
+            found = true;
+            break;
+        }
+        i += 1;
+    }
+
+    if !found {
+        write(b"[embedder] app id not in registry; using shell assets\n");
+        configure_project_assets(project_args, b"/system/flutter/flutter_assets");
+        return;
+    }
+
+    let name_end = name_buf.iter().position(|&b| b == 0).unwrap_or(64);
+    if name_end == 0 {
+        configure_project_assets(project_args, b"/system/flutter/flutter_assets");
+        return;
+    }
+
+    static mut APP_ASSETS_DIR: [u8; 128] = [0; 128];
+    const PREFIX: &[u8] = b"/Applications/";
+    const MID: &[u8] = b".app/flutter_assets";
+    let total = PREFIX.len() + name_end + MID.len();
+    if total + 1 > unsafe { APP_ASSETS_DIR.len() } {
+        write(b"[embedder] app asset dir too long; using shell assets\n");
+        configure_project_assets(project_args, b"/system/flutter/flutter_assets");
+        return;
+    }
+
+    unsafe {
+        APP_ASSETS_DIR.fill(0);
+        let mut pos = 0usize;
+        APP_ASSETS_DIR[pos..pos + PREFIX.len()].copy_from_slice(PREFIX);
+        pos += PREFIX.len();
+        APP_ASSETS_DIR[pos..pos + name_end].copy_from_slice(&name_buf[..name_end]);
+        pos += name_end;
+        APP_ASSETS_DIR[pos..pos + MID.len()].copy_from_slice(MID);
+        pos += MID.len();
+
+        write(b"[embedder] app assets: ");
+        write(&APP_ASSETS_DIR[..pos]);
+        write(b"\n");
+        configure_project_assets(project_args, &APP_ASSETS_DIR[..pos]);
+    }
+}
+
 fn run_due_platform_tasks(engine: u64, now: u64, max_tasks: usize) {
     if engine == 0 || max_tasks == 0 {
         return;
@@ -823,10 +910,28 @@ fn schedule_frame_with_log(engine: u64, schedule_frame_addr: u64, reason: &[u8])
 }
 
 fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
+    let host_mode = CURRENT_HOST_MODE.load(Ordering::Acquire);
+    let app_id = CURRENT_APP_ID.load(Ordering::Acquire);
+    let shell_capable = host_mode == HOST_MODE_SHELL;
+    let files_capable = host_mode == HOST_MODE_APP && app_id == 2;
+
     if payload.starts_with(b"list") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         return format_app_list_json();
     }
+    if payload.starts_with(b"vfs:list:") {
+        if !(shell_capable || files_capable) {
+            return b"{\"ok\":false,\"err\":\"cap\",\"entries\":[]}";
+        }
+        let path = trim_line(&payload[9..]);
+        return format_vfs_list_json(path);
+    }
     if payload.starts_with(b"launch:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let id = parse_u32_after_colon(payload);
         if id == 0 {
             return b"{\"ok\":false}";
@@ -838,6 +943,9 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         return b"{\"ok\":false}";
     }
     if payload.starts_with(b"uninstall:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let id = parse_u32_after_colon(payload);
         if id == 0 {
             return b"{\"ok\":false}";
@@ -848,6 +956,9 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         return b"{\"ok\":false}";
     }
     if payload.starts_with(b"install:") {
+        if !(shell_capable || files_capable) {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let path = &payload[8..];
         let path = trim_line(path);
         return install_osx_from_path(path);
@@ -904,6 +1015,13 @@ fn format_app_list_json() -> &'static [u8] {
             .position(|&b| b == 0)
             .unwrap_or(64);
         let name = &records[off + 4..off + 4 + name_end];
+        let version_end = records[off + 68..off + 84]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(16);
+        let version = &records[off + 68..off + 68 + version_end];
+        let flags = u32::from_le_bytes(records[off + 84..off + 88].try_into().unwrap_or([0; 4]));
+        let system = (flags & 1) != 0;
         if i > 0 {
             out[pos] = b',';
             pos += 1;
@@ -919,18 +1037,104 @@ fn format_app_list_json() -> &'static [u8] {
         pos += NAME_PREFIX.len();
         let copy = name
             .len()
-            .min(out.len().saturating_sub(pos).saturating_sub(12));
+            .min(out.len().saturating_sub(pos).saturating_sub(64));
         out[pos..pos + copy].copy_from_slice(&name[..copy]);
         pos += copy;
-        const ENTRY_SUFFIX: &[u8] = b"\"}";
-        out[pos..pos + ENTRY_SUFFIX.len()].copy_from_slice(ENTRY_SUFFIX);
-        pos += ENTRY_SUFFIX.len();
+        const VERSION_PREFIX: &[u8] = b"\",\"version\":\"";
+        out[pos..pos + VERSION_PREFIX.len()].copy_from_slice(VERSION_PREFIX);
+        pos += VERSION_PREFIX.len();
+        let copy = version
+            .len()
+            .min(out.len().saturating_sub(pos).saturating_sub(40));
+        out[pos..pos + copy].copy_from_slice(&version[..copy]);
+        pos += copy;
+        const SYSTEM_TRUE: &[u8] = b"\",\"system\":true";
+        const SYSTEM_FALSE: &[u8] = b"\",\"system\":false";
+        let system_slice = if system { SYSTEM_TRUE } else { SYSTEM_FALSE };
+        out[pos..pos + system_slice.len()].copy_from_slice(system_slice);
+        pos += system_slice.len();
+        if name == b"Canvas" {
+            const ROLE: &[u8] = b",\"coreRole\":\"canvas\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        } else if name == b"Files" {
+            const ROLE: &[u8] = b",\"coreRole\":\"files\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        } else if name == b"Web Link" {
+            const ROLE: &[u8] = b",\"coreRole\":\"web\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        }
+        out[pos] = b'}';
+        pos += 1;
         i += 1;
     }
     out[pos..pos + 2].copy_from_slice(b"]}");
     pos += 2;
     APP_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
     unsafe { core::slice::from_raw_parts(APP_LIST_JSON.as_ptr(), pos) }
+}
+
+static mut VFS_LIST_JSON: [u8; 8192] = [0; 8192];
+static VFS_LIST_JSON_LEN: AtomicU32 = AtomicU32::new(0);
+
+fn format_vfs_list_json(path: &[u8]) -> &'static [u8] {
+    let mut records = [0u8; 4096];
+    let n = sys::vfs_list(path, &mut records);
+    if n < 0 {
+        return b"{\"ok\":false,\"entries\":[]}";
+    }
+
+    let mut out = unsafe { &mut VFS_LIST_JSON };
+    let mut pos = 0usize;
+    const PREFIX: &[u8] = b"{\"ok\":true,\"entries\":[";
+    out[pos..pos + PREFIX.len()].copy_from_slice(PREFIX);
+    pos += PREFIX.len();
+
+    let mut first = true;
+    let valid = (n as usize).min(records.len());
+    for line in records[..valid].split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if !first {
+            out[pos] = b',';
+            pos += 1;
+        }
+        first = false;
+
+        const ITEM_PREFIX: &[u8] = b"{\"name\":\"";
+        out[pos..pos + ITEM_PREFIX.len()].copy_from_slice(ITEM_PREFIX);
+        pos += ITEM_PREFIX.len();
+        for &b in line {
+            if pos + 8 >= out.len() {
+                break;
+            }
+            if b == b'"' || b == b'\\' {
+                out[pos] = b'\\';
+                out[pos + 1] = b;
+                pos += 2;
+            } else {
+                out[pos] = b;
+                pos += 1;
+            }
+        }
+        let installable = line.ends_with(b".osx");
+        const MID_TRUE: &[u8] = b"\",\"installable\":true}";
+        const MID_FALSE: &[u8] = b"\",\"installable\":false}";
+        let suffix = if installable { MID_TRUE } else { MID_FALSE };
+        if pos + suffix.len() >= out.len() {
+            break;
+        }
+        out[pos..pos + suffix.len()].copy_from_slice(suffix);
+        pos += suffix.len();
+    }
+
+    out[pos..pos + 2].copy_from_slice(b"]}");
+    pos += 2;
+    VFS_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
+    unsafe { core::slice::from_raw_parts(VFS_LIST_JSON.as_ptr(), pos) }
 }
 
 fn write_json_u32(out: &mut [u8], mut v: u32) -> usize {
@@ -1051,7 +1255,8 @@ fn read_host_bootstrap() -> (u64, u64, u64) {
 
 extern "C" fn main_embedder() {
     let (host_mode, app_id, aot_va) = read_host_bootstrap();
-    let _ = app_id;
+    CURRENT_HOST_MODE.store(host_mode, Ordering::Release);
+    CURRENT_APP_ID.store(app_id, Ordering::Release);
     write(b"[host] starting\n");
 
     // 1. Register as the engine host.
@@ -1289,13 +1494,10 @@ extern "C" fn main_embedder() {
         write(b" aot_va=");
         write_hex(aot_va);
         write(b"\n");
-        // libflutter_engine.so is a debug/JIT build (see build-iso.sh). .osx bundles
-        // currently ship AOT libapp.so for persistence/metadata; app hosts load JIT
-        // snapshot files until we stage a profile engine + per-app asset dirs.
-        install_jit_snapshot_paths(&mut project_args, b"/system/flutter/flutter_assets");
+        configure_app_assets(&mut project_args, app_id);
     } else {
         write(b"[host] SHELL mode\n");
-        install_jit_snapshot_paths(&mut project_args, b"/system/flutter/flutter_assets");
+        configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
     }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
@@ -1705,8 +1907,20 @@ extern "C" fn main_embedder() {
                         let mut timestamp = engine_now_us();
                         loop {
                             let last = LAST_TIMESTAMP.load(Ordering::SeqCst);
-                            let next = if timestamp <= last { last + 1 } else { timestamp };
-                            if LAST_TIMESTAMP.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                            let next = if timestamp <= last {
+                                last + 1
+                            } else {
+                                timestamp
+                            };
+                            if LAST_TIMESTAMP
+                                .compare_exchange_weak(
+                                    last,
+                                    next,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
                                 timestamp = next;
                                 break;
                             }

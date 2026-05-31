@@ -105,12 +105,23 @@ if [ ! -f "$LIBAPP_SO_DEST" ]; then
 fi
 echo "[0.3/5] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes"
 
-echo "[0.35/5] Packing demo .osx seed bundle..."
-mkdir -p "$ROOT/initramfs/system/seed"
-python3 "$ROOT/tools/oscortex-pack.py" \
-    "$LIBAPP_SO_DEST" \
-    "$ROOT/initramfs/system/seed/demo.osx" \
-    --name "Demo"
+echo "[0.35/5] Building core system apps into /Applications..."
+mkdir -p "$ROOT/initramfs/Applications"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_canvas" \
+    "Canvas" \
+    "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx" \
+    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_files" \
+    "Files" \
+    "$ROOT/initramfs/Applications/Files.app/Files.osx" \
+    "$ROOT/initramfs/Applications/Files.app/flutter_assets"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_web_link" \
+    "Web Link" \
+    "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx" \
+    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets"
 
 if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
@@ -168,10 +179,15 @@ REQUIRED_FILES=(
     "$ROOT/initramfs/system/lib/libflutter_engine.so"
     "$ROOT/initramfs/system/flutter/icudtl.dat"
     "$ROOT/initramfs/system/flutter/libapp.so"
-    "$ROOT/initramfs/system/seed/demo.osx"
+    "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx"
+    "$ROOT/initramfs/Applications/Files.app/Files.osx"
+    "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
     "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
     "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
     "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
+    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+    "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 )
 for req in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$req" ]; then
@@ -245,7 +261,7 @@ if [[ "${1:-}" == "--run" ]]; then
         -cdrom "$OUTPUT" \
         -cpu qemu64,+x2apic \
         -m 2G \
-        -smp 2 \
+        -smp 1 \
         -serial stdio \
         -display none \
         -no-reboot \
@@ -253,4 +269,3 @@ if [[ "${1:-}" == "--run" ]]; then
         -D "$ROOT/qemu-log.txt" \
         2>&1
 fi
-

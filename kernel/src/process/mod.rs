@@ -469,9 +469,17 @@ pub fn exit(pid: u32, code: i32) {
     if p.pid != pid || p.state == ProcState::Dead { return; }
 
     // Free the user page tables only for standalone processes — threads share
-    // the parent's PML4 and must never free it.
+    // the parent's PML4 and must never free it. Instead, reclaim the thread's
+    // private user stack and TLS page.
     if !p.is_thread {
         paging::free_user_pml4(p.pml4_phys);
+    } else {
+        if p.user_stack_base != 0 && p.user_stack_size != 0 {
+            paging::unmap_user_range(p.pml4_phys, p.user_stack_base, p.user_stack_size);
+        }
+        if p.fs_base != 0 {
+            paging::unmap_user_range(p.pml4_phys, p.fs_base, 4096);
+        }
     }
     free_syscall_stack(p.syscall_stack_base);
     p.syscall_stack_base = core::ptr::null_mut();
@@ -643,6 +651,9 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
 
 /// Round-robin pick of next runnable process after `current`.
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
+    if PENDING_INIT_PID.load(Ordering::Acquire) != 0 {
+        return None;
+    }
     let _g = PTABLE_LOCK.lock();
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
 
@@ -887,6 +898,9 @@ pub fn clone_thread(
     child_rip: u64,
     child_rsp: u64,
 ) -> Result<u32, &'static str> {
+    // Save parent's registers from CPU scratch before reading them from PTABLE.
+    save_full_user_gprs(parent_pid);
+
     let (parent_pml4_phys, owning_pid) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(parent_pid)] };
@@ -975,6 +989,20 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     };
 
     crate::process::set_current_pid(pid);
+    if pid == 2 {
+        log::warn!(
+            "[enter-user-2] pid=2 rip={:#x} rsp={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x} preempted={}",
+            rip,
+            rsp,
+            rbx,
+            rbp,
+            r12,
+            r13,
+            r14,
+            r15,
+            preempted_by_timer
+        );
+    }
     if pid == 8 || pid == 9 {
         static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
         let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
@@ -1176,6 +1204,7 @@ fn user_launch_task() {
     // saving a corrupt interrupt-stack RSP into our kernel_sp on subsequent
     // preemptions, and prevents the round-robin from ever selecting it again.
     crate::sched::mark_current_zombie();
+    PENDING_INIT_PID.store(0, Ordering::Release);
     enter_user_by_pid_noreturn(pid)
 }
 
@@ -1189,7 +1218,7 @@ fn user_launch_task() {
 /// set so the ISR can rewrite the interrupt frame.
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
-pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs)> {
+pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     // Find the next runnable thread (acquires/releases PTABLE_LOCK internally).
     let next_pid = next_runnable_pid(cur_pid)?;
@@ -1197,12 +1226,14 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
 
     // Save the current thread's full context.
     {
+        let fs = crate::arch::cpu::get_fs_base();
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx_of(cur_pid)] };
         if p.pid == cur_pid && p.state == ProcState::Running {
             p.regs = *cur_regs;
             p.regs.rflags |= 0x200; // ensure IF=1 on resume
             p.preempted_by_timer = true;
+            p.fs_base = fs;
             p.current_cpu = None; // Switch away from cur_pid
         }
     }
@@ -1235,21 +1266,22 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
 
     // Point the active syscall stack at the new thread's stack so the next
     // syscall from the new thread uses the right kernel stack.
-    let (stack_top, fs_base) = {
+    let (stack_top, fs_base, pml4_phys) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(next_pid)] };
-        (p.syscall_stack_top, p.fs_base)
+        (p.syscall_stack_top, p.fs_base, p.pml4_phys)
     };
     crate::arch::syscall::set_active_stack_top(stack_top);
     crate::arch::cpu::set_fs_base(fs_base);
 
-    Some((next_pid, next_regs))
+    Some((next_pid, next_regs, pml4_phys))
 }
 
 /// Save full user context at a SYSCALL boundary before cooperatively yielding
 /// to another process. Marks the thread so timer preemption resumes via IRETQ.
 pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
     save_full_user_gprs(pid);
+    let fs = crate::arch::cpu::get_fs_base();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid {
@@ -1261,11 +1293,13 @@ pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
     p.regs.rcx = rip;
     p.regs.r11 = 0x202;
     p.preempted_by_timer = true;
+    p.fs_base = fs;
 }
 
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
+    let fs = crate::arch::cpu::get_fs_base();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid {
@@ -1274,6 +1308,7 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
         p.preempted_by_timer = false;
+        p.fs_base = fs;
     }
 }
 
@@ -1285,6 +1320,19 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
 /// `this` pointer and locals.
 pub fn save_full_user_gprs(pid: u32) {
     let snap = crate::arch::syscall::user_gprs();
+    if pid == 2 {
+        log::warn!(
+            "[save_full_user_gprs] pid=2 rdi={:#x} rsi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            snap.rdi,
+            snap.rsi,
+            snap.rbx,
+            snap.rbp,
+            snap.r12,
+            snap.r13,
+            snap.r14,
+            snap.r15
+        );
+    }
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid { return; }
@@ -1360,9 +1408,10 @@ pub fn set_state(pid: u32, state: ProcState) {
     if p.pid == pid {
         let old_state = p.state;
         p.state = state;
-        if state != ProcState::Running {
-            p.current_cpu = None;
-        }
+        // Note: CPU occupancy is kept as Some(cpu) even when blocked to prevent
+        // another CPU core from concurrently scheduling this thread while its
+        // kernel execution context is still bound/sleeping on the original CPU.
+        // It is cleared only when the CPU switches to a different userspace PID.
         if state == ProcState::Running && old_state != ProcState::Running {
             drop(_g);
             crate::arch::smp::broadcast_resched_ipi();
@@ -1524,6 +1573,9 @@ pub fn set_signal_mask(pid: u32, mask: u32) {
 pub fn fork_current() -> Result<u32, &'static str> {
     let parent_pid = current_pid();
     if parent_pid == 0 { return Err("fork from kernel"); }
+
+    // Save parent's registers from CPU scratch before reading them from PTABLE.
+    save_full_user_gprs(parent_pid);
 
     let child_pid = alloc_pid().ok_or("too many processes")?;
     let child_slot = idx_of(child_pid);

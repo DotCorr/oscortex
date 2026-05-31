@@ -3,7 +3,10 @@ import 'package:flutter/services.dart';
 import '../models/app_tile.dart';
 
 class ShellService {
-  static const _channel = BasicMessageChannel<String>('oscortex/shell', StringCodec());
+  static const _channel = BasicMessageChannel<String>(
+    'oscortex/shell',
+    StringCodec(),
+  );
 
   static void trace(String message) {
     // ignore: avoid_print
@@ -61,7 +64,10 @@ class ShellService {
   static Future<List<AppTile>> refreshApps() async {
     trace('refresh_start');
     final raw = await _safeSend('list');
-    final decoded = _parseJsonObject(raw, fallback: const <String, dynamic>{'apps': <dynamic>[]});
+    final decoded = _parseJsonObject(
+      raw,
+      fallback: const <String, dynamic>{'apps': <dynamic>[]},
+    );
     return (decoded['apps'] as List<dynamic>? ?? [])
         .map((e) => AppTile.fromJson(e as Map<String, dynamic>))
         .toList();
@@ -84,10 +90,10 @@ class ShellService {
     }
   }
 
-  static Future<bool> installSeed() async {
-    trace('install_tap');
+  static Future<bool> installFromPath(String path) async {
+    trace('install_tap path=$path');
     try {
-      final raw = await _safeSend('install:/system/seed/demo.osx');
+      final raw = await _safeSend('install:$path');
       final success = _isOkReply(raw);
       if (success) {
         trace('install_ok');

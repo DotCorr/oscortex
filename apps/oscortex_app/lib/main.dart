@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'widgets/shell_desktop.dart';
 
-const _bg = Color(0xFF0C1C26);
-const _accent = Color(0xFF2DD4BF);
+const _bg = Color(0xFF07080B);
+const _accent = Color(0xFF7C3AED);
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,7 +17,7 @@ class OscortexShellApp extends StatelessWidget {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        fontFamily: 'NotoSans',
+        fontFamily: 'Inter',
         brightness: Brightness.dark,
         scaffoldBackgroundColor: _bg,
         colorScheme: const ColorScheme.dark(primary: _accent, surface: _bg),
