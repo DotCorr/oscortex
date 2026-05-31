@@ -644,10 +644,13 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
     if events_out == 0 || maxevents <= 0 { return 0; }
     let now = monotonic_ns();
     let mut count: i32 = 0;
-    let tbl = EPOLL_TABLE.lock();
-    let Some(list) = tbl.get(&epfd) else { return 0; };
+    let entries = {
+        let tbl = EPOLL_TABLE.lock();
+        let Some(list) = tbl.get(&epfd) else { return 0; };
+        list.clone()
+    };
     let mut tfd_tbl = TIMERFD_TABLE.lock();
-    for entry in list.iter() {
+    for entry in entries.iter() {
         if count >= maxevents { break; }
         if epfd == 70 && entry.fd == 71 {
             static EPOLL_70_SCAN_LOG: core::sync::atomic::AtomicU32 =
@@ -760,6 +763,44 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             log::warn!("[epoll_wait] #{} pid={} epfd={} max={} to={}", n, cur, epfd, maxevents, timeout_signed);
         }
     }
+
+    // ── Input de-starve (single-core fairness) ───────────────────────────────
+    // The Flutter engine task-runner threads busy-loop on epoll_wait. On a
+    // single CPU they monopolize the core and never yield to the embedder host
+    // (pid 1 / focus), which is the ONLY consumer of WM pointer/key events — so
+    // queued clicks pile up and never reach Flutter. On EVERY epoll_wait entry
+    // by an engine thread, if the focus consumer has queued input and is
+    // runnable, hand the core straight to it. Gated on flutter_init_ready so it
+    // never fires during engine init (would deadlock RunInitialized). pid 1
+    // re-blocks in wm_event_wait once it has drained, then this engine thread's
+    // epoll_wait is re-executed on resume.
+    let bootstrap_spin_active = crate::wm::flutter_bootstrap_spin_active();
+    if cur != 0 && !bootstrap_spin_active {
+        let focus = crate::wm::focus_pid();
+        let target = if focus != 0 { focus } else { 1 };
+        if target != cur && crate::wm::input_pending_for(target) > 0 {
+            static DESTARVE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let ready_focus = coop_target_ready(target);
+            let d = DESTARVE_LOG.fetch_add(1, Ordering::Relaxed);
+            if d < 60 {
+                log::warn!(
+                    "[destarve-epoll] #{} cur={} focus={} target={} pend={} coop_ready={}",
+                    d, cur, focus, target, crate::wm::input_pending_for(target), ready_focus
+                );
+            }
+            if ready_focus {
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
+                crate::process::save_xstate(cur);
+                crate::process::set_state(cur, crate::process::ProcState::Blocked);
+                crate::process::enter_user_by_pid_noreturn(target);
+            }
+        }
+    }
     if epfd == 70 {
         static EPOLL_70_ENTER_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
@@ -846,6 +887,50 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if n < 32 {
             log::warn!("[epoll_fire] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
         }
+        // Fairness de-starve: on a single core the engine threads busy-loop on
+        // epoll_wait (their timerfd is perpetually ready), so the fast path
+        // returns immediately every iteration and NEVER yields. That starves the
+        // WM input consumer (focus pid / embedder host pid 1) which only drains
+        // pointer/key events when scheduled — so clicks never reach Flutter.
+        // ONLY yield when the focus consumer is genuinely runnable right now
+        // (woken by input arrival via push_event_for) — never when it is blocked
+        // on init/cond, otherwise the engine threads would ping-pong forever and
+        // stall boot. Switch straight to focus so it drains input promptly; the
+        // engine re-executes epoll_wait on resume (events still ready).
+        let focus = crate::wm::focus_pid();
+        {
+            static YIELD_GATE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let pend = crate::wm::input_pending_for(focus);
+            if pend > 0 && focus != cur {
+                let g = YIELD_GATE_LOG.fetch_add(1, Ordering::Relaxed);
+                if g < 40 {
+                    log::warn!(
+                        "[yield-gate] #{} cur={} focus={} init_ready={} pend={} coop_ready={}",
+                        g, cur, focus,
+                        crate::wm::flutter_init_ready(),
+                        pend,
+                        coop_target_ready(focus)
+                    );
+                }
+            }
+        }
+        if cur != 0
+            && focus != 0
+            && focus != cur
+            && !bootstrap_spin_active
+            && crate::wm::input_pending_for(focus) > 0
+            && coop_target_ready(focus)
+        {
+            let urip = crate::arch::syscall::user_rip();
+            let ursp = crate::arch::syscall::user_rsp();
+            crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+            crate::process::save_full_user_gprs(cur);
+            crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+            crate::process::save_xstate(cur);
+            crate::process::set_state(cur, crate::process::ProcState::Blocked);
+            crate::process::enter_user_by_pid_noreturn(focus);
+        }
         return ready as i64;
     }
     if epfd == 70 {
@@ -894,24 +979,110 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             }
         }
 
+        // Pre-init Flutter runner timers are often re-armed just a few hundred
+        // microseconds into the future. On single-core boots, dropping into the
+        // kernel hlt path here can strand the thread before the next scan. Give
+        // the embedder thread group a short spin window so freshly armed timerfd
+        // deadlines can mature and be observed without relying on IRQ wakeups.
+        if cur >= 2
+            && crate::process::get_group_leader(cur) == 1
+            && crate::wm::flutter_bootstrap_spin_active()
+        {
+            let spin_until = monotonic_ns().saturating_add(2_000_000);
+            loop {
+                check_timerfds_and_wake();
+                let ready = epoll_collect_ready(epfd as u32, events_out, max);
+                if ready > 0 {
+                    static EPOLL_SPIN_READY_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_SPIN_READY_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        log::warn!(
+                            "[epoll-spin-ready] #{} pid={} epfd={} ready={} init_ready={}",
+                            n,
+                            cur,
+                            epfd,
+                            ready,
+                            crate::wm::flutter_init_ready()
+                        );
+                    }
+                    return ready as i64;
+                }
+                if monotonic_ns() >= spin_until {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
         if cur != 0 {
             if let Some(next) = cooperative_sched_target(cur) {
                 if next != cur {
+                    if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
+                        static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+                            core::sync::atomic::AtomicU32::new(0);
+                        let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+                        if n < 48 {
+                            log::warn!(
+                                "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
+                                n,
+                                cur,
+                                epfd,
+                                next,
+                                crate::arch::syscall::user_rip()
+                            );
+                        }
+                    }
                     // Block ourselves on epoll
                     {
                         let mut blocked = EPOLL_BLOCKED.lock();
                         blocked.insert(cur as u32, epfd as u32);
                     }
+                    // Re-execute the epoll_wait syscall on resume (do NOT return
+                    // -1/EINTR to userspace). Returning EINTR here makes the
+                    // Flutter engine retry epoll_wait immediately; if it is woken
+                    // before any fd is actually ready it gets EINTR again and
+                    // busy-spins, monopolizing the single core and starving the
+                    // embedder host (pid 1) input loop. Saving the context at the
+                    // syscall instruction (urip - 2) with rax = the epoll_wait
+                    // syscall number makes the thread re-enter the kernel on wake
+                    // and re-check readiness — returning real events when ready or
+                    // blocking again — exactly like sys_wm_event_wait does.
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip, ursp);
+                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
                     crate::process::save_full_user_gprs(cur);
-                    crate::process::set_errno_to_deliver(cur, 4); // EINTR
-                    crate::process::set_rax(cur, (-1i64) as u64);
+                    crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                     crate::process::save_xstate(cur);
                     crate::process::set_state(cur, crate::process::ProcState::Blocked);
                     crate::process::enter_user_by_pid_noreturn(next);
                 }
+            } else if cur >= 2
+                && crate::process::get_group_leader(cur) == 1
+                && !crate::wm::flutter_init_ready()
+                && crate::process::current_pid() != 1
+            {
+                static EPOLL_INIT_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = EPOLL_INIT_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x}",
+                        n,
+                        cur,
+                        epfd,
+                        crate::arch::syscall::user_rip()
+                    );
+                }
+                crate::process::set_state(1, crate::process::ProcState::Running);
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B);
+                crate::process::save_xstate(cur);
+                crate::process::set_state(cur, crate::process::ProcState::Blocked);
+                crate::process::enter_user_by_pid_noreturn(1);
             }
         }
 
@@ -921,4 +1092,3 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
     }
 }
-

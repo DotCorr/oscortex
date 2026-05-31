@@ -233,8 +233,24 @@ fn handle_mouse_byte(byte: u8) {
     if (p0 & 0xC0) != 0 { return; }
 
     // Sign-extend delta bytes using the sign bits in the flags byte.
-    let dx: i32 = if p0 & 0x10 != 0 { (p1 as i8) as i32 } else { p1 as i32 };
-    let dy: i32 = if p0 & 0x20 != 0 { (p2 as i8) as i32 } else { p2 as i32 };
+    let raw_dx: i32 = if p0 & 0x10 != 0 { (p1 as i8) as i32 } else { p1 as i32 };
+    let raw_dy: i32 = if p0 & 0x20 != 0 { (p2 as i8) as i32 } else { p2 as i32 };
+
+    // Lightweight acceleration curve tuned for QEMU PS/2 packets.
+    // Small deltas stay precise; medium/large movement gets amplified.
+    let accel = |d: i32| -> i32 {
+        let a = d.abs();
+        let gain = if a >= 8 {
+            3
+        } else if a >= 4 {
+            2
+        } else {
+            1
+        };
+        d.saturating_mul(gain)
+    };
+    let dx = accel(raw_dx);
+    let dy = accel(raw_dy);
 
     // Get framebuffer bounds.
     let (max_w, max_h) = crate::drivers::fb::size_px()

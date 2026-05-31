@@ -1,13 +1,13 @@
 //! Implementations of POSIX/glibc functions dispatched via syscall stubs
 //! from the trampoline page mapped by posix_trampolines.rs.
 
-use super::{read_user_bytes, write_user_bytes, monotonic_ns};
+use super::{monotonic_ns, read_user_bytes, write_user_bytes};
 use crate::process::{self, dl::mmap_anon};
 use crate::syscall::state::ENGINE_HOST_PID;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
-use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
 
 // ── Per-process TLS area ──────────────────────────────────────────────────
 //
@@ -57,9 +57,19 @@ static NEXT_KEY: AtomicU32 = AtomicU32::new(1);
 static PTHREAD_SELF_TABLE: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
 
 // ── Per-process malloc tracking ───────────────────────────────────────────
-// (pid, user_va) → pages_allocated
-// Used so free/realloc can skip already-allocated regions.
-// Since munmap is a stub (no actual unmapping), free is a no-op here.
+// User allocations are keyed by address space (PML4), not raw pid, because
+// Flutter's engine threads share one address space and may free each other's
+// allocations. We cannot unmap yet, so freed blocks are recycled in-place.
+#[derive(Clone, Copy)]
+struct MallocBlock {
+    pml4:  u64,
+    base:  u64,
+    size:  u64,
+    pages: usize,
+}
+
+static MALLOC_ALLOCS: Mutex<BTreeMap<(u64, u64), MallocBlock>> = Mutex::new(BTreeMap::new());
+static MALLOC_FREE: Mutex<Vec<MallocBlock>> = Mutex::new(Vec::new());
 
 // ── Random state ─────────────────────────────────────────────────────────
 
@@ -79,35 +89,48 @@ fn pid_and_pml4() -> (u32, u64) {
 
 /// Read a null-terminated C string from user memory (max 4096 bytes).
 unsafe fn read_cstr(ptr: u64) -> Option<&'static [u8]> {
-    if ptr < 0x10000 || ptr >= 0x0000_8000_0000_0000 { return None; }
+    if ptr < 0x10000 || ptr >= 0x0000_8000_0000_0000 {
+        return None;
+    }
     let p = ptr as *const u8;
     let mut len = 0usize;
     unsafe {
-        while len < 4096 && *p.add(len) != 0 { len += 1; }
+        while len < 4096 && *p.add(len) != 0 {
+            len += 1;
+        }
     }
     Some(unsafe { core::slice::from_raw_parts(p, len) })
 }
 
 /// Write a value to a user pointer (8-byte atomic write).
 unsafe fn write_u64_user(ptr: u64, v: u64) {
-    if user_ptr_ok(ptr) { unsafe { *(ptr as *mut u64) = v; } }
+    if user_ptr_ok(ptr) {
+        unsafe {
+            *(ptr as *mut u64) = v;
+        }
+    }
 }
 unsafe fn write_u32_user(ptr: u64, v: u32) {
-    if user_ptr_ok(ptr) { unsafe { *(ptr as *mut u32) = v; } }
+    if user_ptr_ok(ptr) {
+        unsafe {
+            *(ptr as *mut u32) = v;
+        }
+    }
 }
 
 // ── Memory allocation ─────────────────────────────────────────────────────
 
 pub fn sys_malloc(size: u64) -> i64 {
-    if size == 0 { return 8; } // non-null sentinel
+    if size == 0 {
+        return 8;
+    } // non-null sentinel
     let (pid, pml4) = pid_and_pml4();
     if pid == 0 {
         log::error!("[malloc] pid=0 — no user context; size={:#x}", size);
         return 0;
     }
     // Progress counter — prints every 100K mallocs to show life signs
-    static MALLOC_COUNT: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0);
+    static MALLOC_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let n = MALLOC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if n % 100_000 == 99_999 {
         log::warn!("[malloc] progress: {} mallocs pid={}", n + 1, pid);
@@ -115,39 +138,95 @@ pub fn sys_malloc(size: u64) -> i64 {
     // Allocate size + 16 bytes (header stores size for realloc).
     let alloc_size = size as usize + 16;
     let pages = alloc_size.div_ceil(4096);
+
+    if let Some(block) = take_free_malloc_block(pml4, size, pages) {
+        unsafe {
+            write_u64_user(block.base, size);
+        }
+        let ptr = block.base + 16;
+        MALLOC_ALLOCS.lock().insert((pml4, ptr), MallocBlock { size, ..block });
+        return ptr as i64;
+    }
+
     let va = mmap_anon(pid, pml4, 0, pages, 3);
     if va == u64::MAX {
         let used = crate::mm::frame_allocator::frames_used();
         let total = crate::mm::frame_allocator::frames_total();
-        log::error!("[malloc] OOM: size={:#x} pages={} pid={} pml4={:#x} frames={}/{}", size, pages, pid, pml4, used, total);
+        let free_blocks = MALLOC_FREE.lock().len();
+        log::error!(
+            "[malloc] OOM: size={:#x} pages={} pid={} pml4={:#x} frames={}/{} free_blocks={}",
+            size,
+            pages,
+            pid,
+            pml4,
+            used,
+            total,
+            free_blocks
+        );
         return 0;
     }
     // Write allocation size into header (kernel can write since user VA is
     // directly accessible in our single-space model).
-    unsafe { write_u64_user(va, size); }
-    (va + 16) as i64  // return ptr past header
+    unsafe {
+        write_u64_user(va, size);
+    }
+    let ptr = va + 16;
+    MALLOC_ALLOCS.lock().insert((pml4, ptr), MallocBlock { pml4, base: va, size, pages });
+    ptr as i64 // return ptr past header
 }
 
-pub fn sys_free(_ptr: u64) -> i64 {
-    // munmap is a stub → leak is acceptable for demo.
+fn take_free_malloc_block(pml4: u64, size: u64, pages: usize) -> Option<MallocBlock> {
+    let mut free = MALLOC_FREE.lock();
+    let idx = free
+        .iter()
+        .position(|block| block.pml4 == pml4 && block.pages >= pages && block.size >= size)?;
+    Some(free.swap_remove(idx))
+}
+
+pub fn sys_free(ptr: u64) -> i64 {
+    if ptr <= 16 {
+        return 0;
+    }
+    let (_, pml4) = pid_and_pml4();
+    let block = MALLOC_ALLOCS.lock().remove(&(pml4, ptr));
+    if let Some(block) = block {
+        MALLOC_FREE.lock().push(block);
+    }
     0
 }
 
 pub fn sys_calloc(n: u64, size: u64) -> i64 {
-    // mmap_anon zeroes pages, so malloc already gives zeroed memory.
-    sys_malloc(n.saturating_mul(size))
+    let bytes = n.saturating_mul(size);
+    let ptr = sys_malloc(bytes);
+    if ptr > 0 {
+        unsafe {
+            core::ptr::write_bytes(ptr as *mut u8, 0, bytes as usize);
+        }
+    }
+    ptr
 }
 
 pub fn sys_realloc(ptr: u64, size: u64) -> i64 {
-    if ptr == 0 { return sys_malloc(size); }
-    if size == 0 { sys_free(ptr); return 0; }
-    // Get old size from header (ptr - 16).
-    let old_size = if ptr >= 16 {
-        unsafe { *((ptr - 16) as *const u64) }
-    } else { 0 };
-    if old_size >= size { return ptr as i64; } // already big enough
+    if ptr == 0 {
+        return sys_malloc(size);
+    }
+    if size == 0 {
+        sys_free(ptr);
+        return 0;
+    }
+    let (_, pml4) = pid_and_pml4();
+    let old_size = MALLOC_ALLOCS
+        .lock()
+        .get(&(pml4, ptr))
+        .map(|block| block.size)
+        .unwrap_or_else(|| if ptr >= 16 { unsafe { *((ptr - 16) as *const u64) } } else { 0 });
+    if old_size >= size {
+        return ptr as i64;
+    } // already big enough
     let new_ptr = sys_malloc(size);
-    if new_ptr == 0 || ptr == 0 { return new_ptr; }
+    if new_ptr == 0 || ptr == 0 {
+        return new_ptr;
+    }
     // Copy old data.
     let copy_len = old_size.min(size) as usize;
     unsafe {
@@ -163,12 +242,20 @@ pub fn sys_aligned_alloc(_align: u64, size: u64) -> i64 {
 
 pub fn sys_posix_memalign(pptr: u64, _align: u64, size: u64) -> i64 {
     let ptr = sys_malloc(size);
-    unsafe { write_u64_user(pptr, ptr as u64); }
-    if ptr == 0 { 12 } else { 0 } // 12 = ENOMEM
+    unsafe {
+        write_u64_user(pptr, ptr as u64);
+    }
+    if ptr == 0 {
+        12
+    } else {
+        0
+    } // 12 = ENOMEM
 }
 
 pub fn sys_malloc_usable_size(ptr: u64) -> i64 {
-    if ptr < 16 { return 0; }
+    if ptr < 16 {
+        return 0;
+    }
     let size = unsafe { *((ptr - 16) as *const u64) };
     size as i64
 }
@@ -176,7 +263,9 @@ pub fn sys_malloc_usable_size(ptr: u64) -> i64 {
 pub fn sys_strdup(s: u64) -> i64 {
     let len = sys_strlen(s) as u64;
     let new_ptr = sys_malloc(len + 1);
-    if new_ptr == 0 { return 0; }
+    if new_ptr == 0 {
+        return 0;
+    }
     sys_memcpy(new_ptr as u64, s, len + 1);
     new_ptr
 }
@@ -185,21 +274,33 @@ pub fn sys_strndup(s: u64, n: u64) -> i64 {
     let slen = sys_strlen(s) as u64;
     let len = slen.min(n);
     let new_ptr = sys_malloc(len + 1);
-    if new_ptr == 0 { return 0; }
+    if new_ptr == 0 {
+        return 0;
+    }
     sys_memcpy(new_ptr as u64, s, len);
     // null-terminate
-    unsafe { *((new_ptr as u64 + len) as *mut u8) = 0; }
+    unsafe {
+        *((new_ptr as u64 + len) as *mut u8) = 0;
+    }
     new_ptr
 }
 
 // ── String operations ─────────────────────────────────────────────────────
 
 pub fn sys_strlen(s: u64) -> i64 {
-    if s < 0x10000 || s >= 0x0000_8000_0000_0000 { return 0; }  // guard: only userspace addresses
+    if s < 0x10000 || s >= 0x0000_8000_0000_0000 {
+        return 0;
+    } // guard: only userspace addresses
     let mut len = 0i64;
     unsafe {
         let mut p = s as *const u8;
-        while *p != 0 { p = p.add(1); len += 1; if len > 1024*1024 { break; } }
+        while *p != 0 {
+            p = p.add(1);
+            len += 1;
+            if len > 1024 * 1024 {
+                break;
+            }
+        }
     }
     len
 }
@@ -210,40 +311,62 @@ fn user_ptr_ok(p: u64) -> bool {
 }
 
 pub fn sys_memcpy(dst: u64, src: u64, n: u64) -> i64 {
-    if n == 0 || !user_ptr_ok(dst) || !user_ptr_ok(src) { return dst as i64; }
-    unsafe { core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n as usize); }
+    if n == 0 || !user_ptr_ok(dst) || !user_ptr_ok(src) {
+        return dst as i64;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n as usize);
+    }
     dst as i64
 }
 
 pub fn sys_memset(dst: u64, val: u64, n: u64) -> i64 {
-    if n == 0 || !user_ptr_ok(dst) { return dst as i64; }
-    unsafe { core::ptr::write_bytes(dst as *mut u8, val as u8, n as usize); }
+    if n == 0 || !user_ptr_ok(dst) {
+        return dst as i64;
+    }
+    unsafe {
+        core::ptr::write_bytes(dst as *mut u8, val as u8, n as usize);
+    }
     dst as i64
 }
 
 pub fn sys_memmove(dst: u64, src: u64, n: u64) -> i64 {
-    if n == 0 || !user_ptr_ok(dst) || !user_ptr_ok(src) { return dst as i64; }
-    unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, n as usize); }
+    if n == 0 || !user_ptr_ok(dst) || !user_ptr_ok(src) {
+        return dst as i64;
+    }
+    unsafe {
+        core::ptr::copy(src as *const u8, dst as *mut u8, n as usize);
+    }
     dst as i64
 }
 
 pub fn sys_memcmp(a: u64, b: u64, n: u64) -> i64 {
-    if n == 0 { return 0; }
-    if !user_ptr_ok(a) || !user_ptr_ok(b) { return 0; }
+    if n == 0 {
+        return 0;
+    }
+    if !user_ptr_ok(a) || !user_ptr_ok(b) {
+        return 0;
+    }
     let sa = unsafe { core::slice::from_raw_parts(a as *const u8, n as usize) };
     let sb = unsafe { core::slice::from_raw_parts(b as *const u8, n as usize) };
     for i in 0..n as usize {
         let diff = sa[i] as i32 - sb[i] as i32;
-        if diff != 0 { return diff as i64; }
+        if diff != 0 {
+            return diff as i64;
+        }
     }
     0
 }
 
 pub fn sys_memchr(s: u64, c: u64, n: u64) -> i64 {
-    if n == 0 || !user_ptr_ok(s) { return 0; }
+    if n == 0 || !user_ptr_ok(s) {
+        return 0;
+    }
     let slice = unsafe { core::slice::from_raw_parts(s as *const u8, n as usize) };
     for (i, &b) in slice.iter().enumerate() {
-        if b == c as u8 { return (s + i as u64) as i64; }
+        if b == c as u8 {
+            return (s + i as u64) as i64;
+        }
     }
     0
 }
@@ -253,28 +376,40 @@ pub fn sys_bzero(dst: u64, n: u64) -> i64 {
 }
 
 pub fn sys_strcmp(a: u64, b: u64) -> i64 {
-    if a == 0 || b == 0 { return if a == b { 0 } else { 1 }; }
+    if a == 0 || b == 0 {
+        return if a == b { 0 } else { 1 };
+    }
     let mut pa = a as *const u8;
     let mut pb = b as *const u8;
     loop {
         let ca = unsafe { *pa };
         let cb = unsafe { *pb };
-        if ca != cb { return (ca as i64) - (cb as i64); }
-        if ca == 0 { return 0; }
+        if ca != cb {
+            return (ca as i64) - (cb as i64);
+        }
+        if ca == 0 {
+            return 0;
+        }
         pa = unsafe { pa.add(1) };
         pb = unsafe { pb.add(1) };
     }
 }
 
 pub fn sys_strncmp(a: u64, b: u64, n: u64) -> i64 {
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
     let mut pa = a as *const u8;
     let mut pb = b as *const u8;
     for _ in 0..n {
         let ca = unsafe { *pa };
         let cb = unsafe { *pb };
-        if ca != cb { return (ca as i64) - (cb as i64); }
-        if ca == 0 { return 0; }
+        if ca != cb {
+            return (ca as i64) - (cb as i64);
+        }
+        if ca == 0 {
+            return 0;
+        }
         pa = unsafe { pa.add(1) };
         pb = unsafe { pb.add(1) };
     }
@@ -282,13 +417,19 @@ pub fn sys_strncmp(a: u64, b: u64, n: u64) -> i64 {
 }
 
 pub fn sys_strcpy(dst: u64, src: u64) -> i64 {
-    if dst == 0 || src == 0 { return dst as i64; }
+    if dst == 0 || src == 0 {
+        return dst as i64;
+    }
     let mut ps = src as *const u8;
     let mut pd = dst as *mut u8;
     loop {
         let c = unsafe { *ps };
-        unsafe { *pd = c; }
-        if c == 0 { break; }
+        unsafe {
+            *pd = c;
+        }
+        if c == 0 {
+            break;
+        }
         ps = unsafe { ps.add(1) };
         pd = unsafe { pd.add(1) };
     }
@@ -296,12 +437,25 @@ pub fn sys_strcpy(dst: u64, src: u64) -> i64 {
 }
 
 pub fn sys_strncpy(dst: u64, src: u64, n: u64) -> i64 {
-    if dst == 0 { return 0; }
+    if dst == 0 {
+        return 0;
+    }
     let mut ps = src as *const u8;
     let mut pd = dst as *mut u8;
     for _ in 0..n {
-        let c = if src != 0 { unsafe { let v = *ps; ps = ps.add(1); v } } else { 0 };
-        unsafe { *pd = c; pd = pd.add(1); }
+        let c = if src != 0 {
+            unsafe {
+                let v = *ps;
+                ps = ps.add(1);
+                v
+            }
+        } else {
+            0
+        };
+        unsafe {
+            *pd = c;
+            pd = pd.add(1);
+        }
     }
     dst as i64
 }
@@ -317,54 +471,80 @@ pub fn sys_strncat(dst: u64, src: u64, n: u64) -> i64 {
     sys_strncpy(dst + dlen, src, n);
     // ensure null terminator
     let total = dlen + n;
-    unsafe { *((dst + total) as *mut u8) = 0; }
+    unsafe {
+        *((dst + total) as *mut u8) = 0;
+    }
     dst as i64
 }
 
 pub fn sys_strstr(hay: u64, needle: u64) -> i64 {
-    if hay == 0 || needle == 0 { return 0; }
+    if hay == 0 || needle == 0 {
+        return 0;
+    }
     let nlen = sys_strlen(needle) as usize;
-    if nlen == 0 { return hay as i64; }
+    if nlen == 0 {
+        return hay as i64;
+    }
     let hlen = sys_strlen(hay) as usize;
-    if nlen > hlen { return 0; }
+    if nlen > hlen {
+        return 0;
+    }
     let hs = unsafe { core::slice::from_raw_parts(hay as *const u8, hlen) };
     let ns = unsafe { core::slice::from_raw_parts(needle as *const u8, nlen) };
     for i in 0..=(hlen - nlen) {
-        if hs[i..i+nlen] == *ns { return (hay + i as u64) as i64; }
+        if hs[i..i + nlen] == *ns {
+            return (hay + i as u64) as i64;
+        }
     }
     0
 }
 
 pub fn sys_strchr(s: u64, c: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let mut p = s as *const u8;
     loop {
         let b = unsafe { *p };
-        if b == c as u8 { return p as i64; }
-        if b == 0 { return 0; }
+        if b == c as u8 {
+            return p as i64;
+        }
+        if b == 0 {
+            return 0;
+        }
         p = unsafe { p.add(1) };
     }
 }
 
 pub fn sys_strrchr(s: u64, c: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let mut p = s as *const u8;
     let mut last = 0i64;
     loop {
         let b = unsafe { *p };
-        if b == c as u8 { last = p as i64; }
-        if b == 0 { break; }
+        if b == c as u8 {
+            last = p as i64;
+        }
+        if b == 0 {
+            break;
+        }
         p = unsafe { p.add(1) };
     }
     last
 }
 
 pub fn sys_strnlen(s: u64, n: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let mut len = 0u64;
     let mut p = s as *const u8;
     while len < n {
-        if unsafe { *p } == 0 { break; }
+        if unsafe { *p } == 0 {
+            break;
+        }
         p = unsafe { p.add(1) };
         len += 1;
     }
@@ -372,15 +552,25 @@ pub fn sys_strnlen(s: u64, n: u64) -> i64 {
 }
 
 pub fn sys_strcspn(s: u64, reject: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let rlen = sys_strlen(reject) as usize;
-    let rs = if reject != 0 { unsafe { core::slice::from_raw_parts(reject as *const u8, rlen) } } else { &[] };
+    let rs = if reject != 0 {
+        unsafe { core::slice::from_raw_parts(reject as *const u8, rlen) }
+    } else {
+        &[]
+    };
     let mut len = 0i64;
     let mut p = s as *const u8;
     loop {
         let c = unsafe { *p };
-        if c == 0 { break; }
-        if rs.contains(&c) { break; }
+        if c == 0 {
+            break;
+        }
+        if rs.contains(&c) {
+            break;
+        }
         p = unsafe { p.add(1) };
         len += 1;
     }
@@ -388,14 +578,22 @@ pub fn sys_strcspn(s: u64, reject: u64) -> i64 {
 }
 
 pub fn sys_strspn(s: u64, accept: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let alen = sys_strlen(accept) as usize;
-    let acc = if accept != 0 { unsafe { core::slice::from_raw_parts(accept as *const u8, alen) } } else { &[] };
+    let acc = if accept != 0 {
+        unsafe { core::slice::from_raw_parts(accept as *const u8, alen) }
+    } else {
+        &[]
+    };
     let mut len = 0i64;
     let mut p = s as *const u8;
     loop {
         let c = unsafe { *p };
-        if c == 0 || !acc.contains(&c) { break; }
+        if c == 0 || !acc.contains(&c) {
+            break;
+        }
         p = unsafe { p.add(1) };
         len += 1;
     }
@@ -404,16 +602,22 @@ pub fn sys_strspn(s: u64, accept: u64) -> i64 {
 
 pub fn sys_strcasestr(hay: u64, needle: u64) -> i64 {
     // Simple case-insensitive substring search.
-    if hay == 0 || needle == 0 { return 0; }
+    if hay == 0 || needle == 0 {
+        return 0;
+    }
     let hlen = sys_strlen(hay) as usize;
     let nlen = sys_strlen(needle) as usize;
-    if nlen == 0 { return hay as i64; }
-    if nlen > hlen { return 0; }
+    if nlen == 0 {
+        return hay as i64;
+    }
+    if nlen > hlen {
+        return 0;
+    }
     let hs = unsafe { core::slice::from_raw_parts(hay as *const u8, hlen) };
     let ns = unsafe { core::slice::from_raw_parts(needle as *const u8, nlen) };
     'outer: for i in 0..=(hlen - nlen) {
         for j in 0..nlen {
-            if hs[i+j].to_ascii_lowercase() != ns[j].to_ascii_lowercase() {
+            if hs[i + j].to_ascii_lowercase() != ns[j].to_ascii_lowercase() {
                 continue 'outer;
             }
         }
@@ -423,10 +627,16 @@ pub fn sys_strcasestr(hay: u64, needle: u64) -> i64 {
 }
 
 pub fn sys_strtol(s: u64, endptr: u64, base: u64) -> i64 {
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let bytes = unsafe { read_cstr(s) }.unwrap_or(&[]);
     let s = core::str::from_utf8(bytes).unwrap_or("").trim_start();
-    let (neg, s) = if s.starts_with('-') { (true, &s[1..]) } else { (false, s) };
+    let (neg, s) = if s.starts_with('-') {
+        (true, &s[1..])
+    } else {
+        (false, s)
+    };
     let base = if base == 0 { 10 } else { base };
     let mut val: i64 = 0;
     let mut consumed = 0usize;
@@ -437,14 +647,22 @@ pub fn sys_strtol(s: u64, endptr: u64, base: u64) -> i64 {
             b'A'..=b'F' => (c - b'A' + 10) as i64,
             _ => break,
         };
-        if d >= base as i64 { break; }
+        if d >= base as i64 {
+            break;
+        }
         val = val * base as i64 + d;
         consumed += 1;
     }
     if endptr != 0 {
-        unsafe { *(endptr as *mut u64) = s.as_ptr() as u64 + consumed as u64 + if neg { 1 } else { 0 }; }
+        unsafe {
+            *(endptr as *mut u64) = s.as_ptr() as u64 + consumed as u64 + if neg { 1 } else { 0 };
+        }
     }
-    if neg { -val } else { val }
+    if neg {
+        -val
+    } else {
+        val
+    }
 }
 
 pub fn sys_strtoul(s: u64, endptr: u64, base: u64) -> i64 {
@@ -481,7 +699,9 @@ pub fn sys_srand(seed: u32) {
 
 pub fn sys_pthread_self() -> i64 {
     let tid = process::current_pid();
-    if tid == 0 { return 0; }
+    if tid == 0 {
+        return 0;
+    }
 
     let fs_base = crate::process::get_fs_base(tid);
     if fs_base != 0 {
@@ -505,9 +725,9 @@ pub fn sys_pthread_self() -> i64 {
         // Clear object and set a few self-referential fields expected by
         // pointer-based pthread_t implementations.
         core::ptr::write_bytes(obj as *mut u8, 0, 256);
-        *(obj as *mut u64) = obj;              // self pointer
+        *(obj as *mut u64) = obj; // self pointer
         *((obj + 8) as *mut u64) = tid as u64; // tid
-        *((obj + 0x68) as *mut u64) = obj;     // non-null guard field
+        *((obj + 0x68) as *mut u64) = obj; // non-null guard field
     }
 
     PTHREAD_SELF_TABLE.lock().insert(tid, obj);
@@ -516,17 +736,25 @@ pub fn sys_pthread_self() -> i64 {
 
 pub fn sys_pthread_mutex_init(mutex: u64) -> i64 {
     // A mutex is a 64-bit value: 0 = unlocked.
-    if mutex != 0 { unsafe { *(mutex as *mut u64) = 0; } }
+    if mutex != 0 {
+        unsafe {
+            *(mutex as *mut u64) = 0;
+        }
+    }
     0
 }
 
 pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
     if mutex < 0x1000 {
-        log::warn!("[mutex] pthread_mutex_lock bogus addr={:#x}, returning 0", mutex);
+        log::warn!(
+            "[mutex] pthread_mutex_lock bogus addr={:#x}, returning 0",
+            mutex
+        );
         return 0;
     }
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
     let pid = crate::process::current_pid();
+    let trace_startup_mutex = matches!(mutex, 0x371ef70 | 0x39b000018);
     // Targeted trace for the mutex that pid=3 holds across epoll_wait, blocking pid=2/8/9.
     if mutex == 0x394000018 {
         static MUTEX394_LOCK_LOG: core::sync::atomic::AtomicU32 =
@@ -535,13 +763,33 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
         if ml < 40 {
             let rip = crate::arch::syscall::user_rip();
             let val = atom.load(Ordering::Relaxed);
-            log::warn!("[mutex394-lock] #{} pid={} rip={:#x} current_val={}", ml, pid, rip, val);
+            log::warn!(
+                "[mutex394-lock] #{} pid={} rip={:#x} current_val={}",
+                ml,
+                pid,
+                rip,
+                val
+            );
         }
     }
 
     loop {
         let res = atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire);
         if res.is_ok() {
+            if trace_startup_mutex {
+                static STARTUP_MUTEX_ACQUIRE_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = STARTUP_MUTEX_ACQUIRE_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[startup-mutex] acquire #{} pid={} mutex={:#x} rip={:#x}",
+                        n,
+                        pid,
+                        mutex,
+                        crate::arch::syscall::user_rip()
+                    );
+                }
+            }
             return 0;
         }
 
@@ -549,11 +797,104 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
             return 0;
         }
 
+        if trace_startup_mutex {
+            static STARTUP_MUTEX_CONTEND_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = STARTUP_MUTEX_CONTEND_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                log::warn!(
+                    "[startup-mutex] contend #{} pid={} mutex={:#x} val={} rip={:#x}",
+                    n,
+                    pid,
+                    mutex,
+                    atom.load(Ordering::Relaxed),
+                    crate::arch::syscall::user_rip()
+                );
+            }
+        }
+
         // Add the process to the futex waiters list
+        if trace_startup_mutex {
+            log::warn!("[startup-mutex] before-waiter-add pid={} mutex={:#x}", pid, mutex);
+        }
         super::futex_waiter_add(mutex, pid);
+        if trace_startup_mutex {
+            log::warn!("[startup-mutex] after-waiter-add pid={} mutex={:#x}", pid, mutex);
+        }
+
+        if pid >= 2 && crate::process::get_group_leader(pid) == 1 {
+            static ENGINE_MUTEX_WAIT_KICK: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let kick = ENGINE_MUTEX_WAIT_KICK.fetch_add(1, Ordering::Relaxed);
+            crate::process::set_state(1, crate::process::ProcState::Running);
+            if kick < 32 || (kick & 15) == 0 {
+                if trace_startup_mutex {
+                    log::warn!("[startup-mutex] before-force-wake pid={} mutex={:#x}", pid, mutex);
+                }
+                let _ = super::force_wake_all_task_runners("engine-mutex-wait");
+                if trace_startup_mutex {
+                    log::warn!("[startup-mutex] after-force-wake pid={} mutex={:#x}", pid, mutex);
+                }
+            }
+        }
+
+        // During FlutterEngineRunInitialized, pid=1 holds the startup mutexes
+        // while worker threads (notably pid=8) need a prompt handoff back to
+        // the host so it can release them. Let unlock/wake semantics handle
+        // the eventual resume instead of burning the core here.
+        if trace_startup_mutex && pid >= 2 && crate::process::get_group_leader(pid) == 1 {
+            let owner_candidate = 1u32;
+            if owner_candidate != pid {
+                static STARTUP_MUTEX_PID1_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = STARTUP_MUTEX_PID1_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[startup-mutex] pid1-handoff #{} pid={} mutex={:#x}",
+                        n,
+                        pid,
+                        mutex
+                    );
+                }
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(pid, urip - 2, ursp);
+                crate::process::save_full_user_gprs(pid);
+                crate::process::set_rax(pid, sys_nr);
+                crate::process::save_xstate(pid);
+                crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                crate::process::enter_user_by_pid_noreturn(owner_candidate);
+            }
+        }
+
+        let mut mutex_handoff_target = || {
+            crate::process::next_runnable_pid(pid).or_else(|| {
+                if pid >= 2 && crate::process::get_group_leader(pid) == 1 {
+                    super::prefer_embedder_if_baton_due(pid)
+                        .or_else(|| crate::process::next_runnable_sibling_thread(pid))
+                        .or_else(|| super::cooperative_sched_target(pid))
+                } else {
+                    None
+                }
+            })
+        };
 
         // Yield if there is a sibling runnable thread
-        if let Some(next) = crate::process::next_runnable_pid(pid) {
+        if let Some(next) = mutex_handoff_target() {
+            if trace_startup_mutex {
+                static STARTUP_MUTEX_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = STARTUP_MUTEX_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[startup-mutex] handoff #{} pid={} mutex={:#x} -> next={}",
+                        n,
+                        pid,
+                        mutex,
+                        next
+                    );
+                }
+            }
             if next != pid {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
@@ -565,6 +906,19 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
                 crate::process::set_state(pid, crate::process::ProcState::Blocked);
                 crate::process::enter_user_by_pid_noreturn(next);
             }
+        } else if trace_startup_mutex {
+            static STARTUP_MUTEX_NO_TARGET_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let n = STARTUP_MUTEX_NO_TARGET_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                log::warn!(
+                    "[startup-mutex] no-target #{} pid={} mutex={:#x}",
+                    n,
+                    pid,
+                    mutex
+                );
+                crate::process::debug_dump_core_threads();
+            }
         }
 
         // No sibling thread — loop in kernel space using hlt
@@ -573,7 +927,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
             unsafe {
                 core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
             }
-            if let Some(next) = crate::process::next_runnable_pid(pid) {
+            if let Some(next) = mutex_handoff_target() {
                 if next != pid {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
@@ -592,8 +946,26 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
 }
 
 pub fn sys_pthread_mutex_unlock(mutex: u64) -> i64 {
-    if mutex < 0x1000 { return 0; }
+    if mutex < 0x1000 {
+        return 0;
+    }
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
+    let mutex_waiter = super::futex_waiter_for(mutex, crate::process::current_pid());
+    if matches!(mutex, 0x371ef70 | 0x39b000018) {
+        static STARTUP_MUTEX_UNLOCK_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = STARTUP_MUTEX_UNLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log::warn!(
+                "[startup-mutex] unlock #{} pid={} mutex={:#x} waiter={:?} rip={:#x}",
+                n,
+                crate::process::current_pid(),
+                mutex,
+                mutex_waiter,
+                crate::arch::syscall::user_rip()
+            );
+        }
+    }
     atom.store(0, Ordering::Release);
     // Targeted trace for the mutex pid=3 holds across epoll_wait.
     if mutex == 0x394000018 {
@@ -617,23 +989,43 @@ pub fn sys_pthread_mutex_unlock(mutex: u64) -> i64 {
         let _ = super::force_wake_all_task_runners("deferred-kick");
     }
     let wpid = crate::process::current_pid();
-    let prefer = super::poll::acqmutex_waiter_for(mutex, wpid);
-    if prefer.is_some() {
-        super::poll::cooperative_yield_to(wpid, 0, prefer);
+    let prefer = super::poll::acqmutex_waiter_for(mutex, wpid).or_else(|| {
+        if n > 0 {
+            mutex_waiter
+        } else {
+            None
+        }
+    });
+    if let Some(next) = prefer {
+        super::poll::cooperative_yield_to(wpid, 0, Some(next));
     }
     0
 }
 
 pub fn sys_pthread_mutex_trylock(mutex: u64) -> i64 {
-    if mutex < 0x1000 { return 0; }
+    if mutex < 0x1000 {
+        return 0;
+    }
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
-    if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() { 0 } else { 16 }
+    if atom
+        .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+        .is_ok()
+    {
+        0
+    } else {
+        16
+    }
 }
 
 pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
     if once < 0x1000 || func == 0 {
-        log::error!("[pthread-err] once EINVAL pid={} once={:#x} func={:#x} rip={:#x}",
-            crate::process::current_pid(), once, func, crate::arch::syscall::user_rip());
+        log::error!(
+            "[pthread-err] once EINVAL pid={} once={:#x} func={:#x} rip={:#x}",
+            crate::process::current_pid(),
+            once,
+            func,
+            crate::arch::syscall::user_rip()
+        );
         return 22;
     }
     let atom = unsafe { &*(once as *const core::sync::atomic::AtomicU32) };
@@ -646,7 +1038,10 @@ pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
             return 0;
         }
         if state == 0 {
-            if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+            if atom
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+            {
                 // We won the race — call func.
                 let f: extern "C" fn() = unsafe { core::mem::transmute(func) };
                 f();
@@ -718,7 +1113,9 @@ pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
 
 pub fn sys_pthread_key_create(key_ptr: u64, _dtor: u64) -> i64 {
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    unsafe { write_u32_user(key_ptr, key); }
+    unsafe {
+        write_u32_user(key_ptr, key);
+    }
     0
 }
 
@@ -732,13 +1129,22 @@ pub fn sys_pthread_setspecific(key: u64, value: u64) -> i64 {
 pub fn sys_pthread_getspecific(key: u64) -> i64 {
     let pid = process::current_pid();
     let tid = pid;
-    KEY_TABLE.lock().get(&(pid, tid, key as u32)).copied().unwrap_or(0) as i64
+    KEY_TABLE
+        .lock()
+        .get(&(pid, tid, key as u32))
+        .copied()
+        .unwrap_or(0) as i64
 }
 
 pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys_nr: u64) -> i64 {
     if cond < 0x1000 || mutex < 0x1000 {
-        log::error!("[pthread-err] cond_wait EINVAL pid={} cond={:#x} mutex={:#x} rip={:#x}",
-            crate::process::current_pid(), cond, mutex, crate::arch::syscall::user_rip());
+        log::error!(
+            "[pthread-err] cond_wait EINVAL pid={} cond={:#x} mutex={:#x} rip={:#x}",
+            crate::process::current_pid(),
+            cond,
+            mutex,
+            crate::arch::syscall::user_rip()
+        );
         return 22;
     }
 
@@ -758,7 +1164,12 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
             super::futex_waiter_add(cond, pid);
         }
         sys_pthread_mutex_unlock(mutex);
-        let next_state = super::CondWaitState::Waiting { cond, mutex, seq, timeout_ns };
+        let next_state = super::CondWaitState::Waiting {
+            cond,
+            mutex,
+            seq,
+            timeout_ns,
+        };
         super::COND_WAIT_STATE.lock().insert(pid, next_state);
         state = Some(next_state);
     }
@@ -766,12 +1177,20 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
     // Now process the state machine
     loop {
         match state.unwrap() {
-            super::CondWaitState::Waiting { cond, mutex, seq, timeout_ns } => {
+            super::CondWaitState::Waiting {
+                cond,
+                mutex,
+                seq,
+                timeout_ns,
+            } => {
                 let cur_seq = atom.load(Ordering::Acquire);
                 if cur_seq != seq {
                     // The condvar was signaled!
                     super::futex_waiter_remove(cond, pid);
-                    let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: false };
+                    let next_state = super::CondWaitState::AcquiringMutex {
+                        mutex,
+                        timed_out: false,
+                    };
                     super::COND_WAIT_STATE.lock().insert(pid, next_state);
                     state = Some(next_state);
                     // Continue to try and acquire the mutex
@@ -781,7 +1200,10 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                 // Check for timeout
                 if timeout_ns != 0 && monotonic_ns() >= timeout_ns {
                     super::futex_waiter_remove(cond, pid);
-                    let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                    let next_state = super::CondWaitState::AcquiringMutex {
+                        mutex,
+                        timed_out: true,
+                    };
                     super::COND_WAIT_STATE.lock().insert(pid, next_state);
                     state = Some(next_state);
                     continue;
@@ -805,9 +1227,9 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                 }
 
                 // No sibling runnable thread — loop using hlt in the kernel until sequence changes or timeout
-                while atom.load(Ordering::Acquire) == seq 
+                while atom.load(Ordering::Acquire) == seq
                     && (timeout_ns == 0 || monotonic_ns() < timeout_ns)
-                    && super::futex_waiter_present(cond, pid) 
+                    && super::futex_waiter_present(cond, pid)
                 {
                     // Timer expiry in check_timerfds_and_wake() can transition this
                     // thread to AcquiringMutex without bumping the cond seq.  Break
@@ -851,7 +1273,10 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                 let cur_seq = atom.load(Ordering::Acquire);
                 if cur_seq != seq {
                     super::futex_waiter_remove(cond, pid);
-                    let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: false };
+                    let next_state = super::CondWaitState::AcquiringMutex {
+                        mutex,
+                        timed_out: false,
+                    };
                     super::COND_WAIT_STATE.lock().insert(pid, next_state);
                     state = Some(next_state);
                     continue;
@@ -859,7 +1284,10 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
 
                 if timeout_ns != 0 && monotonic_ns() >= timeout_ns {
                     super::futex_waiter_remove(cond, pid);
-                    let next_state = super::CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                    let next_state = super::CondWaitState::AcquiringMutex {
+                        mutex,
+                        timed_out: true,
+                    };
                     super::COND_WAIT_STATE.lock().insert(pid, next_state);
                     state = Some(next_state);
                     continue;
@@ -870,7 +1298,10 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                 // Fast path: mutex already free — avoid yield loop when timer
                 // expiry or bridge already decided this thread should proceed.
                 let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
-                if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+                if atom
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire)
+                    .is_ok()
+                {
                     super::COND_WAIT_STATE.lock().remove(&pid);
                     return if timed_out { 110 } else { 0 };
                 }
@@ -904,7 +1335,8 @@ pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, timeout: u64, sys_nr: u
         (0, 0)
     };
     let timeout_ns = if timeout != 0 {
-        (sec.max(0) as u64).saturating_mul(1_000_000_000)
+        (sec.max(0) as u64)
+            .saturating_mul(1_000_000_000)
             .saturating_add(nsec.max(0) as u64)
     } else {
         0
@@ -913,8 +1345,15 @@ pub fn sys_pthread_cond_timedwait(cond: u64, mutex: u64, timeout: u64, sys_nr: u
     static TIMEDWAIT_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let n = TIMEDWAIT_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 32 {
-        log::warn!("[timedwait] #{} pid={} cond={:#x} mutex={:#x} timeout_ns={} now={}",
-            n, crate::process::current_pid(), cond, mutex, timeout_ns, monotonic_ns());
+        log::warn!(
+            "[timedwait] #{} pid={} cond={:#x} mutex={:#x} timeout_ns={} now={}",
+            n,
+            crate::process::current_pid(),
+            cond,
+            mutex,
+            timeout_ns,
+            monotonic_ns()
+        );
     }
 
     sys_pthread_cond_wait_timeout(cond, mutex, timeout_ns, sys_nr)
@@ -925,14 +1364,13 @@ fn cond_broadcast_loop_handoff(_pid: u32, _cond: u64, _n: i64, _bridged: u32) {}
 
 #[inline]
 fn engine_host_broadcast_group(pid: u32, engine_host: u32) -> bool {
-    if pid == engine_host {
-        return true;
-    }
-    crate::process::sibling_pids(pid).contains(&engine_host)
+    crate::process::get_group_leader(pid) == engine_host
 }
 
 pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
-    if cond == 0 { return 22; }
+    if cond == 0 {
+        return 22;
+    }
     let pid = crate::process::current_pid();
     let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
     let old_seq = atom.fetch_add(1, Ordering::Release);
@@ -959,9 +1397,22 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
     static COND_SIGNAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let k = COND_SIGNAL_LOG.fetch_add(1, Ordering::Relaxed);
     if k < 64 || k % 256 == 0 {
-        log::warn!("[cond-signal] #{} pid={} cond={:#x} woke={}", k, pid, cond, n);
+        log::warn!(
+            "[cond-signal] #{} pid={} cond={:#x} woke={}",
+            k,
+            pid,
+            cond,
+            n
+        );
     }
-    log::trace!("[cond-signal] pid={} cond={:#x} seq {}→{} woke={}", pid, cond, old_seq, old_seq+1, n);
+    log::trace!(
+        "[cond-signal] pid={} cond={:#x} seq {}→{} woke={}",
+        pid,
+        cond,
+        old_seq,
+        old_seq + 1,
+        n
+    );
     let wpid = crate::process::current_pid();
     if wpid != 0 && n > 0 {
         if let Some(next) = crate::process::next_runnable_sibling_thread(wpid)
@@ -982,7 +1433,9 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
 }
 
 pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
-    if cond == 0 { return 22; }
+    if cond == 0 {
+        return 22;
+    }
     let pid = crate::process::current_pid();
     let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
     let old_seq = atom.fetch_add(1, Ordering::Release);
@@ -990,7 +1443,8 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     let mut bridged = 0u32;
     let engine_host = ENGINE_HOST_PID.load(Ordering::Acquire);
     let mut skip_bridge = false;
-    if n == 0 && engine_host != 0 && pid == engine_host {
+    let pid_leader = crate::process::get_group_leader(pid);
+    if n == 0 && engine_host != 0 && pid_leader == engine_host {
         let ursp = crate::arch::syscall::user_rsp();
         let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
         if ursp != 0 && crate::mm::paging::translate_user_page(cur_cr3, ursp & !0xfff).is_some() {
@@ -1006,7 +1460,7 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     }
 
     // Diagnostic only — log zero-wake cond broadcasts from the engine host.
-    if engine_host != 0 && pid == engine_host && n == 0 {
+    if engine_host != 0 && pid_leader == engine_host && n == 0 {
         static COND_BROADCAST_ZERO_WAKE_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let z = COND_BROADCAST_ZERO_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
@@ -1060,10 +1514,17 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     }
     cond_broadcast_loop_handoff(pid, cond, n, bridged);
 
-    static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
     let k = COND_BROADCAST_LOG.fetch_add(1, Ordering::Relaxed);
     if k < 64 || k % 2048 == 0 {
-        log::warn!("[cond-broadcast] #{} pid={} cond={:#x} woke={}", k, pid, cond, n);
+        log::warn!(
+            "[cond-broadcast] #{} pid={} cond={:#x} woke={}",
+            k,
+            pid,
+            cond,
+            n
+        );
     }
     log::trace!(
         "[cond-broadcast] pid={} cond={:#x} seq {}→{} woke={}",
@@ -1073,12 +1534,38 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         old_seq + 1,
         n
     );
-    
+
     let wpid = crate::process::current_pid();
+
+    // Highest priority de-starve: if the WM input consumer (focus pid, normally
+    // the embedder host pid 1) has queued pointer/key events and is runnable,
+    // hand the core straight to it. Engine threads otherwise busy-spin on
+    // cond_broadcast (zero-wake NotifyAll storms) and never yield to pid 1, so
+    // queued clicks pile up (qlen grows) and never reach Flutter. Gated on
+    // flutter_init_ready so this never fires during engine init (would deadlock).
+    let bootstrap_spin_active = crate::wm::flutter_bootstrap_spin_active();
     if wpid != 0
-        && wpid != 1
+        && wpid >= 2
         && crate::process::get_group_leader(wpid) == 1
+        && !bootstrap_spin_active
     {
+        let focus = crate::wm::focus_pid();
+        if focus != 0
+            && focus != wpid
+            && crate::wm::input_pending_for(focus) > 0
+            && super::coop_target_ready(focus)
+        {
+            let urip = crate::arch::syscall::user_rip();
+            let ursp = crate::arch::syscall::user_rsp();
+            crate::process::save_return_context(wpid, urip, ursp);
+            crate::process::save_full_user_gprs(wpid);
+            crate::process::set_rax(wpid, 0);
+            crate::process::save_xstate(wpid);
+            crate::process::enter_user_by_pid_noreturn(focus);
+        }
+    }
+
+    if wpid != 0 && wpid != 1 && crate::process::get_group_leader(wpid) == 1 {
         if let Some(next) = super::prefer_embedder_if_baton_due(wpid) {
             let urip = crate::arch::syscall::user_rip();
             let ursp = crate::arch::syscall::user_rsp();
@@ -1088,7 +1575,12 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
             crate::process::save_xstate(wpid);
             crate::process::enter_user_by_pid_noreturn(next);
         }
-    } else if wpid != 0 && n == 0 && bridged == 0 && crate::process::get_group_leader(wpid) == 1 && wpid >= 2 {
+    } else if wpid != 0
+        && n == 0
+        && bridged == 0
+        && crate::process::get_group_leader(wpid) == 1
+        && wpid >= 2
+    {
         // Engine NotifyAll hot loops must not monopolize the CPU — yield so
         // task runners and the embedder can make init progress.
         static NOTIFYALL_SPIN: core::sync::atomic::AtomicU32 =
@@ -1140,7 +1632,11 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
 pub fn sys_pthread_attr_init(attr: u64) -> i64 {
     log::trace!("[trace] sys_pthread_attr_init attr={:#x}", attr);
     // pthread_attr_t is typically 56 bytes; zero it out.
-    if attr != 0 { unsafe { core::ptr::write_bytes(attr as *mut u8, 0, 56); } }
+    if attr != 0 {
+        unsafe {
+            core::ptr::write_bytes(attr as *mut u8, 0, 56);
+        }
+    }
     0
 }
 
@@ -1150,16 +1646,32 @@ pub fn sys_pthread_attr_destroy(attr: u64) -> i64 {
 }
 
 pub fn sys_pthread_attr_setstacksize(attr: u64, stacksize: u64) -> i64 {
-    log::trace!("[trace] sys_pthread_attr_setstacksize attr={:#x} size={:#x}", attr, stacksize);
+    log::trace!(
+        "[trace] sys_pthread_attr_setstacksize attr={:#x} size={:#x}",
+        attr,
+        stacksize
+    );
     // Store stacksize at offset 8 of the attr struct (glibc layout).
-    if attr != 0 { unsafe { *((attr + 8) as *mut u64) = stacksize; } }
+    if attr != 0 {
+        unsafe {
+            *((attr + 8) as *mut u64) = stacksize;
+        }
+    }
     0
 }
 
 pub fn sys_pthread_attr_setdetachstate(attr: u64, state: u64) -> i64 {
-    log::trace!("[trace] sys_pthread_attr_setdetachstate attr={:#x} state={}", attr, state);
+    log::trace!(
+        "[trace] sys_pthread_attr_setdetachstate attr={:#x} state={}",
+        attr,
+        state
+    );
     // Store detach state at offset 0.
-    if attr != 0 { unsafe { *(attr as *mut u64) = state; } }
+    if attr != 0 {
+        unsafe {
+            *(attr as *mut u64) = state;
+        }
+    }
     0
 }
 
@@ -1179,15 +1691,28 @@ pub fn sys_pthread_attr_getstack(attr: u64, base_out: u64, size_out: u64) -> i64
         // Try reading what pthread_getattr_np may have written into attr.
         let a_base = unsafe { *(attr.wrapping_add(0x10) as *const u64) };
         let a_size = unsafe { *(attr.wrapping_add(0x18) as *const u64) };
-        if a_base != 0 && a_size != 0 { (a_base, a_size) } else { (0, 0) }
+        if a_base != 0 && a_size != 0 {
+            (a_base, a_size)
+        } else {
+            (0, 0)
+        }
     } else {
         (0, 0)
     };
 
-    log::debug!("[pthread_attr_getstack] tid={} base={:#x} size={:#x}", tid, eff_base, eff_size);
+    log::debug!(
+        "[pthread_attr_getstack] tid={} base={:#x} size={:#x}",
+        tid,
+        eff_base,
+        eff_size
+    );
     unsafe {
-        if base_out != 0 { *(base_out as *mut u64) = eff_base; }
-        if size_out != 0 { *(size_out as *mut u64) = eff_size; }
+        if base_out != 0 {
+            *(base_out as *mut u64) = eff_base;
+        }
+        if size_out != 0 {
+            *(size_out as *mut u64) = eff_size;
+        }
     }
     0
 }
@@ -1202,17 +1727,32 @@ pub fn sys_pthread_setname_np(thread: u64, name: u64) -> i64 {
         let bytes = unsafe {
             let p = name as *const u8;
             let mut end = 0usize;
-            while end < 64 && *p.add(end) != 0 { end += 1; }
+            while end < 64 && *p.add(end) != 0 {
+                end += 1;
+            }
             core::slice::from_raw_parts(p, end)
         };
         core::str::from_utf8(bytes).unwrap_or("?")
-    } else { "?" };
-    log::trace!("[trace] sys_pthread_setname_np thread={:#x} (tid={}) name=\"{}\"", thread, tid, name_str);
+    } else {
+        "?"
+    };
+    log::trace!(
+        "[trace] sys_pthread_setname_np thread={:#x} (tid={}) name=\"{}\"",
+        thread,
+        tid,
+        name_str
+    );
     0
 }
 
 pub fn sys_pthread_attr_getter_noop(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
-    log::trace!("[trace] pthread_attr/sched noop nr={:#x} a0={:#x} a1={:#x} a2={:#x}", nr, a0, a1, a2);
+    log::trace!(
+        "[trace] pthread_attr/sched noop nr={:#x} a0={:#x} a1={:#x} a2={:#x}",
+        nr,
+        a0,
+        a1,
+        a2
+    );
     0
 }
 
@@ -1220,43 +1760,72 @@ pub fn sys_pthread_attr_getter_noop(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 
 pub fn sys_sem_init(sem: u64, _pshared: u64, value: u64) -> i64 {
     if sem == 0 {
-        log::error!("[pthread-err] sem_init EINVAL pid={} rip={:#x}",
-            crate::process::current_pid(), crate::arch::syscall::user_rip());
+        log::error!(
+            "[pthread-err] sem_init EINVAL pid={} rip={:#x}",
+            crate::process::current_pid(),
+            crate::arch::syscall::user_rip()
+        );
         return 22;
     }
-    unsafe { *(sem as *mut u32) = value as u32; }
+    unsafe {
+        *(sem as *mut u32) = value as u32;
+    }
     0
 }
 
 pub fn sys_sem_wait(sem: u64) -> i64 {
     if sem < 0x1000 {
-        log::error!("[pthread-err] sem_wait EINVAL pid={} sem={:#x} rip={:#x}",
-            crate::process::current_pid(), sem, crate::arch::syscall::user_rip());
+        log::error!(
+            "[pthread-err] sem_wait EINVAL pid={} sem={:#x} rip={:#x}",
+            crate::process::current_pid(),
+            sem,
+            crate::arch::syscall::user_rip()
+        );
         return 22;
     }
     let atom = unsafe { &*(sem as *const core::sync::atomic::AtomicU32) };
     loop {
         let v = atom.load(Ordering::Acquire);
-        if v > 0 && atom.compare_exchange(v, v - 1, Ordering::Acquire, Ordering::Acquire).is_ok() {
+        if v > 0
+            && atom
+                .compare_exchange(v, v - 1, Ordering::Acquire, Ordering::Acquire)
+                .is_ok()
+        {
             break;
         }
-        unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+        }
     }
     0
 }
 
 pub fn sys_sem_trywait(sem: u64) -> i64 {
-    if sem < 0x1000 { return -11; }
+    if sem < 0x1000 {
+        return -11;
+    }
     let atom = unsafe { &*(sem as *const core::sync::atomic::AtomicU32) };
     let v = atom.load(Ordering::Acquire);
-    if v == 0 { return -11; }
-    if atom.compare_exchange(v, v - 1, Ordering::Acquire, Ordering::Acquire).is_ok() { 0 } else { -11 }
+    if v == 0 {
+        return -11;
+    }
+    if atom
+        .compare_exchange(v, v - 1, Ordering::Acquire, Ordering::Acquire)
+        .is_ok()
+    {
+        0
+    } else {
+        -11
+    }
 }
 
 pub fn sys_sem_post(sem: u64) -> i64 {
     if sem == 0 {
-        log::error!("[pthread-err] sem_post EINVAL pid={} rip={:#x}",
-            crate::process::current_pid(), crate::arch::syscall::user_rip());
+        log::error!(
+            "[pthread-err] sem_post EINVAL pid={} rip={:#x}",
+            crate::process::current_pid(),
+            crate::arch::syscall::user_rip()
+        );
         return 22;
     }
     let atom = unsafe { &*(sem as *const core::sync::atomic::AtomicU32) };
@@ -1270,10 +1839,14 @@ pub fn sys_tls_get_addr(ti_ptr: u64) -> i64 {
     // `ti_ptr` points to a TLS descriptor: [module_id: u64, offset: u64].
     let offset = if ti_ptr != 0 {
         unsafe { *((ti_ptr + 8) as *const u64) }
-    } else { 0 };
+    } else {
+        0
+    };
     let (pid, pml4) = pid_and_pml4();
     let tls_base = get_or_alloc_tls(pid, pml4);
-    if tls_base == u64::MAX { return 0; }
+    if tls_base == u64::MAX {
+        return 0;
+    }
     // Return base + (offset & 0x1FFFF) — keep within 128 KiB.
     (tls_base + (offset & 0x1_FFFF)) as i64
 }
@@ -1291,7 +1864,9 @@ pub fn sys_tls_get_addr(ti_ptr: u64) -> i64 {
 //  +24  templ  – pointer to initializer template (NULL → zero-init)
 
 pub fn sys_emutls_get_address(obj: u64) -> i64 {
-    if obj == 0 { return 0; }
+    if obj == 0 {
+        return 0;
+    }
     let (pid, _pml4) = pid_and_pml4();
 
     // Per-thread cache lookup. DO NOT consult obj+16 — that cell is in the
@@ -1308,19 +1883,19 @@ pub fn sys_emutls_get_address(obj: u64) -> i64 {
     let size = unsafe { *(obj as *const u64) };
     let sz = size.max(8);
     let ptr_va = sys_malloc(sz) as u64;
-    if ptr_va == 0 { return 0; }
+    if ptr_va == 0 {
+        return 0;
+    }
     // Copy template or zero-init.
     let templ = unsafe { *((obj + 24) as *const u64) };
     if templ != 0 {
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                templ as *const u8,
-                ptr_va as *mut u8,
-                sz as usize,
-            );
+            core::ptr::copy_nonoverlapping(templ as *const u8, ptr_va as *mut u8, sz as usize);
         }
     } else {
-        unsafe { core::ptr::write_bytes(ptr_va as *mut u8, 0, sz as usize); }
+        unsafe {
+            core::ptr::write_bytes(ptr_va as *mut u8, 0, sz as usize);
+        }
     }
     // Insert into per-thread cache. Intentionally DO NOT write obj+16.
     EMUTLS_TABLE.lock().insert((pid, obj), ptr_va);
@@ -1328,12 +1903,14 @@ pub fn sys_emutls_get_address(obj: u64) -> i64 {
 }
 
 pub fn sys_emutls_register_common(obj: u64, size: u64, align: u64, templ: u64) -> i64 {
-    if obj == 0 { return 0; }
+    if obj == 0 {
+        return 0;
+    }
     unsafe {
-        *(obj as *mut u64)          = size;
-        *((obj + 8)  as *mut u64)   = align;
-        *((obj + 16) as *mut u64)   = 0;    // legacy: clear cached ptr (unused now)
-        *((obj + 24) as *mut u64)   = templ;
+        *(obj as *mut u64) = size;
+        *((obj + 8) as *mut u64) = align;
+        *((obj + 16) as *mut u64) = 0; // legacy: clear cached ptr (unused now)
+        *((obj + 24) as *mut u64) = templ;
     }
     0
 }
@@ -1347,7 +1924,10 @@ pub fn sys_abort() -> ! {
     // it threads through the normal dispatch table; in practice it never
     // returns.
     let pid = crate::process::current_pid();
-    log::error!("[sys_abort] pid={} aborting — dumping recent syscalls:", pid);
+    log::error!(
+        "[sys_abort] pid={} aborting — dumping recent syscalls:",
+        pid
+    );
     super::dump_recent_syscalls(32);
     // Dump timerfd + epoll state to help diagnose event-loop starvation.
     super::dump_event_state();
@@ -1355,7 +1935,9 @@ pub fn sys_abort() -> ! {
     super::dump_user_backtrace(16);
     super::sys_exit((-6i64) as u64);
     loop {
-        unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        }
     }
 }
 
@@ -1385,12 +1967,16 @@ pub fn sys_sysconf(name: i32) -> i64 {
 }
 
 pub fn sys_nanosleep(req: u64, _rem: u64) -> i64 {
-    if req == 0 { return 0; }
+    if req == 0 {
+        return 0;
+    }
     // Read tv_sec from req (offset 0) and tv_nsec (offset 8).
     let secs = unsafe { *(req as *const u64) };
     // Yield for approximately secs * 1000 iterations (very rough).
     for _ in 0..(secs * 1000).min(10000) {
-        unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+        unsafe {
+            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+        }
     }
     0
 }
@@ -1399,36 +1985,43 @@ pub fn sys_nanosleep(req: u64, _rem: u64) -> i64 {
 fn read_tsc() -> u64 {
     let lo: u32;
     let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
     ((hi as u64) << 32) | lo as u64
 }
 
 pub fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
-    if tv == 0 { return 0; }
+    if tv == 0 {
+        return 0;
+    }
     // tv_sec at offset 0, tv_usec at offset 8.
     let tsc = read_tsc() / 3_000; // ~3 GHz TSC → microseconds
-    let sec  = 1_700_000_000u64 + tsc / 1_000_000;
+    let sec = 1_700_000_000u64 + tsc / 1_000_000;
     let usec = tsc % 1_000_000;
     unsafe {
-        *(tv as *mut u64)       = sec;
+        *(tv as *mut u64) = sec;
         *((tv + 8) as *mut u64) = usec;
     }
     0
 }
 
 pub fn sys_clock_gettime(clock_id: i32, tp: u64) -> i64 {
-    if tp == 0 { return -22; }
+    if tp == 0 {
+        return -22;
+    }
     let tsc_ns = read_tsc() / 3; // ~3 GHz → nanoseconds
     let (sec, nsec) = match clock_id {
-        0 | 1 => { // CLOCK_REALTIME or CLOCK_MONOTONIC
+        0 | 1 => {
+            // CLOCK_REALTIME or CLOCK_MONOTONIC
             let secs = 1_700_000_000u64 + tsc_ns / 1_000_000_000;
-            let ns   = tsc_ns % 1_000_000_000;
+            let ns = tsc_ns % 1_000_000_000;
             (secs, ns)
         }
         _ => (0, tsc_ns),
     };
     unsafe {
-        *(tp as *mut u64)       = sec;
+        *(tp as *mut u64) = sec;
         *((tp + 8) as *mut u64) = nsec;
     }
     0
@@ -1437,40 +2030,62 @@ pub fn sys_clock_gettime(clock_id: i32, tp: u64) -> i64 {
 pub fn sys_time(tloc: u64) -> i64 {
     let tsc = read_tsc() / 3_000_000_000; // seconds
     let t = 1_700_000_000u64 + tsc;
-    if tloc != 0 { unsafe { *(tloc as *mut u64) = t; } }
+    if tloc != 0 {
+        unsafe {
+            *(tloc as *mut u64) = t;
+        }
+    }
     t as i64
 }
 
 pub fn sys_getrusage(_who: u64, usage: u64) -> i64 {
-    if usage != 0 { unsafe { core::ptr::write_bytes(usage as *mut u8, 0, 144); } }
+    if usage != 0 {
+        unsafe {
+            core::ptr::write_bytes(usage as *mut u8, 0, 144);
+        }
+    }
     0
 }
 
 pub fn sys_getcwd(buf: u64, size: u64) -> i64 {
     let path = b"/\0";
-    if buf == 0 || size < 2 { return 0; }
-    unsafe { core::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, 2); }
+    if buf == 0 || size < 2 {
+        return 0;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(path.as_ptr(), buf as *mut u8, 2);
+    }
     buf as i64
 }
 
 pub fn sys_gethostname(buf: u64, size: u64) -> i64 {
     let name = b"oscortex\0";
     let n = name.len().min(size as usize);
-    if buf == 0 { return -1; }
-    unsafe { core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n); }
+    if buf == 0 {
+        return -1;
+    }
+    unsafe {
+        core::ptr::copy_nonoverlapping(name.as_ptr(), buf as *mut u8, n);
+    }
     0
 }
 
 pub fn sys_uname(buf: u64) -> i64 {
     // struct utsname: 6 fields × 65 bytes each = 390 bytes.
-    if buf == 0 { return -1; }
-    unsafe { core::ptr::write_bytes(buf as *mut u8, 0, 390); }
+    if buf == 0 {
+        return -1;
+    }
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, 390);
+    }
     let copy = |off: usize, s: &[u8]| {
         let n = s.len().min(64);
-        unsafe { core::ptr::copy_nonoverlapping(s.as_ptr(), (buf + off as u64) as *mut u8, n); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(s.as_ptr(), (buf + off as u64) as *mut u8, n);
+        }
     };
-    copy(0,   b"Linux");
-    copy(65,  b"oscortex");
+    copy(0, b"Linux");
+    copy(65, b"oscortex");
     copy(130, b"6.1.0");
     copy(195, b"#1 SMP");
     copy(260, b"x86_64");
@@ -1484,9 +2099,9 @@ pub fn sys_strerror(errnum: i32) -> i64 {
     // The user gets a pointer to read-only kernel text — valid since
     // user processes can read the kernel text in our current model.
     let s: &'static [u8] = match errnum.unsigned_abs() {
-        0  => b"Success\0",
-        1  => b"Operation not permitted\0",
-        2  => b"No such file or directory\0",
+        0 => b"Success\0",
+        1 => b"Operation not permitted\0",
+        2 => b"No such file or directory\0",
         11 => b"Resource temporarily unavailable\0",
         12 => b"Out of memory\0",
         13 => b"Permission denied\0",
@@ -1498,7 +2113,7 @@ pub fn sys_strerror(errnum: i32) -> i64 {
         28 => b"No space left on device\0",
         35 => b"Resource deadlock would occur\0", // EDEADLK
         38 => b"Function not implemented\0",
-        _  => b"Unknown error\0",
+        _ => b"Unknown error\0",
     };
     s.as_ptr() as i64
 }
@@ -1526,10 +2141,14 @@ pub fn sys_getenv(_name_ptr: u64, _name_len: u64) -> i64 {
 
 fn ensure_locale_obj() -> u64 {
     let cur = LOCALE_OBJ.load(Ordering::Acquire);
-    if cur != 0 { return cur; }
+    if cur != 0 {
+        return cur;
+    }
 
     let obj = sys_malloc(256) as u64;
-    if obj == 0 { return 0; }
+    if obj == 0 {
+        return 0;
+    }
     unsafe {
         core::ptr::write_bytes(obj as *mut u8, 0, 256);
         *(obj as *mut u64) = obj;
@@ -1563,13 +2182,19 @@ pub fn sys_uselocale(locale: u64) -> i64 {
     if use_ptr != 0 {
         LOCALE_CURRENT.store(use_ptr, Ordering::Release);
     }
-    if prev != 0 { prev as i64 } else { ensure_locale_obj() as i64 }
+    if prev != 0 {
+        prev as i64
+    } else {
+        ensure_locale_obj() as i64
+    }
 }
 
 pub fn sys_newlocale(_mask: u64, _name_ptr: u64, base: u64) -> i64 {
     // Some runtimes pass small sentinels here that are not real locale_t
     // pointers; only trust clearly pointer-like values.
-    if base >= 0x10000 { return base as i64; }
+    if base >= 0x10000 {
+        return base as i64;
+    }
     ensure_locale_obj() as i64
 }
 
@@ -1583,7 +2208,9 @@ pub fn sys_freelocale(_locale: u64) -> i64 {
 pub fn sys_open64(path_ptr: u64, _flags: u64, _mode: u64, _arg3: u64) -> i64 {
     // libc open64(path, flags, mode): arg1 is flags, NOT a path length.
     // Compute strlen ourselves so sys_open can read the user path.
-    if path_ptr == 0 { return -14; } // EFAULT
+    if path_ptr == 0 {
+        return -14;
+    } // EFAULT
     let path_len = sys_strlen(path_ptr) as u64 + 1; // include NUL
     crate::syscall::dispatch_fast(2, path_ptr, path_len, 0, 0, 0)
 }
@@ -1595,68 +2222,110 @@ pub fn sys_lseek64(fd: u64, offset: i64, whence: i32) -> i64 {
 pub fn sys_fopen64(path_ptr: u64, path_len: u64, _mode_ptr: u64, _mode_len: u64) -> i64 {
     // Open the VFS file via sys_open and return a tiny heap-allocated FILE*.
     // FILE layout: [i64 fd][u64 size][u64 pos]  = 24 bytes
-    let path_end = if path_len > 0 { path_len } else { sys_strlen(path_ptr) as u64 + 1 };
+    let path_end = if path_len > 0 {
+        path_len
+    } else {
+        sys_strlen(path_ptr) as u64 + 1
+    };
     let fd = crate::syscall::dispatch_fast(2, path_ptr, path_end, 0, 0, 0);
-    if fd < 0 { return 0; } // NULL on error
-    // Query file size via fstat.
+    if fd < 0 {
+        return 0;
+    } // NULL on error
+      // Query file size via fstat.
     let stat_buf = sys_malloc(144 + 16);
-    if stat_buf == 0 { crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0); return 0; }
+    if stat_buf == 0 {
+        crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0);
+        return 0;
+    }
     crate::syscall::dispatch_fast(5, fd as u64, stat_buf as u64, 0, 0, 0); // fstat
     let size = unsafe { *((stat_buf as u64 + 48) as *const u64) }; // st_size offset=48
     sys_free(stat_buf as u64);
     // Allocate FILE struct: [fd:i64][size:u64][pos:u64]
     let fp = sys_malloc(24);
-    if fp == 0 { crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0); return 0; }
+    if fp == 0 {
+        crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0);
+        return 0;
+    }
     unsafe {
-        *((fp as u64) as *mut i64)      = fd;
-        *((fp as u64 + 8) as *mut u64)  = size;
+        *((fp as u64) as *mut i64) = fd;
+        *((fp as u64 + 8) as *mut u64) = size;
         *((fp as u64 + 16) as *mut u64) = 0; // pos
     }
     fp
 }
 
 pub fn sys_fclose(fp: u64) -> i64 {
-    if fp == 0 { return -1; }
+    if fp == 0 {
+        return -1;
+    }
     let fd = unsafe { *(fp as *const i64) };
     sys_free(fp);
     crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0) // sys_close
 }
 
 pub fn sys_fread(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
-    if fp == 0 || buf == 0 { return 0; }
+    if fp == 0 || buf == 0 {
+        return 0;
+    }
     let fd = unsafe { *(fp as *const i64) } as u64;
     let total = size * count;
     let r = crate::syscall::dispatch_fast(0, fd, buf, total, 0, 0); // sys_read
-    if r <= 0 { return 0; }
+    if r <= 0 {
+        return 0;
+    }
     // Update pos in FILE struct.
-    unsafe { *((fp + 16) as *mut u64) += r as u64; }
-    if size == 0 { 0 } else { r / size as i64 }
+    unsafe {
+        *((fp + 16) as *mut u64) += r as u64;
+    }
+    if size == 0 {
+        0
+    } else {
+        r / size as i64
+    }
 }
 
 pub fn sys_fwrite(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
-    let fd: u64 = if fp == 0 { 1 } else { unsafe { *(fp as *const i64) as u64 } };
+    let fd: u64 = if fp == 0 {
+        1
+    } else {
+        unsafe { *(fp as *const i64) as u64 }
+    };
     let total = size * count;
     let r = crate::syscall::dispatch_fast(1, fd, buf, total, 0, 0);
-    if r < 0 { 0 } else { r / size as i64 }
+    if r < 0 {
+        0
+    } else {
+        r / size as i64
+    }
 }
 
 pub fn sys_fseek(fp: u64, offset: i64, whence: i32) -> i64 {
-    if fp == 0 { return -1; }
+    if fp == 0 {
+        return -1;
+    }
     let fd = unsafe { *(fp as *const i64) } as u64;
     let new_pos = crate::syscall::dispatch_fast(8, fd, offset as u64, whence as u64, 0, 0);
-    if new_pos < 0 { return -1; }
-    unsafe { *((fp + 16) as *mut u64) = new_pos as u64; }
+    if new_pos < 0 {
+        return -1;
+    }
+    unsafe {
+        *((fp + 16) as *mut u64) = new_pos as u64;
+    }
     0
 }
 
 pub fn sys_ftell(fp: u64) -> i64 {
-    if fp == 0 { return -1; }
+    if fp == 0 {
+        return -1;
+    }
     let pos = unsafe { *((fp + 16) as *const u64) };
     pos as i64
 }
 
 pub fn sys_fgets(buf: u64, size: i32, fp: u64) -> i64 {
-    if fp == 0 || buf == 0 || size <= 0 { return 0; }
+    if fp == 0 || buf == 0 || size <= 0 {
+        return 0;
+    }
     let fd = unsafe { *(fp as *const i64) } as u64;
     let cap = (size - 1).max(0) as u64;
     // Read byte by byte until newline or EOF.
@@ -1664,40 +2333,66 @@ pub fn sys_fgets(buf: u64, size: i32, fp: u64) -> i64 {
     while n < cap {
         let mut ch: u8 = 0;
         let r = crate::syscall::dispatch_fast(0, fd, &mut ch as *mut u8 as u64, 1, 0, 0);
-        if r <= 0 { break; }
-        unsafe { *((buf + n) as *mut u8) = ch; }
+        if r <= 0 {
+            break;
+        }
+        unsafe {
+            *((buf + n) as *mut u8) = ch;
+        }
         n += 1;
-        if ch == b'\n' { break; }
+        if ch == b'\n' {
+            break;
+        }
     }
-    unsafe { *((buf + n) as *mut u8) = 0; }
-    if n == 0 { 0 } else { buf as i64 }
+    unsafe {
+        *((buf + n) as *mut u8) = 0;
+    }
+    if n == 0 {
+        0
+    } else {
+        buf as i64
+    }
 }
 
 pub fn sys_fileno(fp: u64) -> i64 {
-    if fp == 0 { return -1; }
+    if fp == 0 {
+        return -1;
+    }
     unsafe { *(fp as *const i64) }
 }
 
 pub fn sys_feof(fp: u64) -> i64 {
-    if fp == 0 { return 1; }
-    let fd  = unsafe { *(fp as *const i64) } as usize;
+    if fp == 0 {
+        return 1;
+    }
+    let fd = unsafe { *(fp as *const i64) } as usize;
     let tbl = super::OPEN_FILES.lock();
     if fd < super::MAX_OPEN_FILES && tbl[fd].used {
-        if tbl[fd].offset >= tbl[fd].data.len() as u64 { 1 } else { 0 }
+        if tbl[fd].offset >= tbl[fd].data.len() as u64 {
+            1
+        } else {
+            0
+        }
     } else {
         1
     }
 }
 
-pub fn sys_ferror(_fp: u64) -> i64 { 0 }
+pub fn sys_ferror(_fp: u64) -> i64 {
+    0
+}
 
-pub fn sys_clearerr(_fp: u64) -> i64 { 0 }
+pub fn sys_clearerr(_fp: u64) -> i64 {
+    0
+}
 
 pub fn sys_rewind(fp: u64) -> i64 {
     sys_fseek(fp, 0, 0 /* SEEK_SET */)
 }
 
-pub fn sys_fflush(_fp: u64) -> i64 { 0 }
+pub fn sys_fflush(_fp: u64) -> i64 {
+    0
+}
 
 pub fn sys_stat(path_ptr: u64, path_len: u64, stat_ptr: u64) -> i64 {
     // The POSIX `stat()` ABI is `stat(const char *path, struct stat *buf)`.
@@ -1715,41 +2410,50 @@ pub fn sys_stat(path_ptr: u64, path_len: u64, stat_ptr: u64) -> i64 {
         let mut len: usize = 0;
         unsafe {
             let p = path_ptr as *const u8;
-            while len < 4096 && *p.add(len) != 0 { len += 1; }
+            while len < 4096 && *p.add(len) != 0 {
+                len += 1;
+            }
         }
         real_path_len = len as u64;
     }
     // Open the file, stat it, close it.
     let fd = crate::syscall::dispatch_fast(2, path_ptr, real_path_len, 0, 0, 0);
-    if fd < 0 { return -2; } // ENOENT
+    if fd < 0 {
+        return -2;
+    } // ENOENT
     let r = crate::syscall::dispatch_fast(5, fd as u64, real_stat_ptr, 0, 0, 0);
     crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0);
     r
 }
 
-fn format_into(
-    buf: u64,
-    size: u64,
-    fmt_ptr: u64,
-    mut next_int: impl FnMut() -> u64,
-) -> i64 {
+fn format_into(buf: u64, size: u64, fmt_ptr: u64, mut next_int: impl FnMut() -> u64) -> i64 {
     let fmt_valid = fmt_ptr >= 0x10000 && fmt_ptr < 0x0000_8000_0000_0000;
-    if !fmt_valid { return 0; }
+    if !fmt_valid {
+        return 0;
+    }
     let buf_valid = buf >= 0x10000 && buf < 0x0000_8000_0000_0000;
-    if size > 0 && !buf_valid { return 0; }
+    if size > 0 && !buf_valid {
+        return 0;
+    }
 
     let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
 
     // Safe C-string reader from user address space.
     let read_cstr = |p: u64, out: &mut [u8]| -> usize {
-        if p < 0x10000 || p >= 0x0000_8000_0000_0000 { return 0; }
-        if crate::mm::paging::translate_user_page(cur_cr3, p & !0xfff).is_none() { return 0; }
+        if p < 0x10000 || p >= 0x0000_8000_0000_0000 {
+            return 0;
+        }
+        if crate::mm::paging::translate_user_page(cur_cr3, p & !0xfff).is_none() {
+            return 0;
+        }
         let mut n = 0usize;
         unsafe {
             let pp = p as *const u8;
             while n < out.len() {
                 let c = *pp.add(n);
-                if c == 0 { break; }
+                if c == 0 {
+                    break;
+                }
                 out[n] = c;
                 n += 1;
             }
@@ -1787,31 +2491,60 @@ fn format_into(
 
         // Skip format spec modifiers and consume variable width/precision arguments
         let mut j = i + 1;
-        while j < flen && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#'|b'*') {
+        while j < flen
+            && matches!(
+                fmt[j],
+                b'l' | b'h' | b'z' | b'j' | b't' | b'L' | b'0'
+                    ..=b'9' | b'.' | b'-' | b'+' | b' ' | b'#' | b'*'
+            )
+        {
             if fmt[j] == b'*' {
                 let _ = next_int();
             }
             j += 1;
         }
-        if j >= flen { break; }
+        if j >= flen {
+            break;
+        }
         let conv = fmt[j];
         let mut tmp = [0u8; 32];
         match conv {
             b'd' | b'i' => {
                 let v = next_int() as i64;
                 let mut n = 0usize;
-                let (neg, mut u) = if v < 0 { (true, (v.wrapping_neg()) as u64) } else { (false, v as u64) };
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
-                if neg { tmp[n] = b'-'; n += 1; }
+                let (neg, mut u) = if v < 0 {
+                    (true, (v.wrapping_neg()) as u64)
+                } else {
+                    (false, v as u64)
+                };
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = b'0' + (u % 10) as u8;
+                    n += 1;
+                    u /= 10;
+                }
+                if neg {
+                    tmp[n] = b'-';
+                    n += 1;
+                }
                 tmp[..n].reverse();
                 append_bytes(&tmp[..n]);
             }
             b'u' => {
                 let mut u = next_int();
                 let mut n = 0usize;
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = b'0' + (u % 10) as u8;
+                    n += 1;
+                    u /= 10;
+                }
                 tmp[..n].reverse();
                 append_bytes(&tmp[..n]);
             }
@@ -1820,10 +2553,21 @@ fn format_into(
                 if conv == b'p' {
                     append_bytes(b"0x");
                 }
-                let hexd = if conv == b'X' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+                let hexd = if conv == b'X' {
+                    b"0123456789ABCDEF"
+                } else {
+                    b"0123456789abcdef"
+                };
                 let mut n = 0usize;
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = hexd[(u & 0xF) as usize]; n += 1; u >>= 4; }
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = hexd[(u & 0xF) as usize];
+                    n += 1;
+                    u >>= 4;
+                }
                 tmp[..n].reverse();
                 append_bytes(&tmp[..n]);
             }
@@ -1848,15 +2592,25 @@ fn format_into(
     }
 
     let fmt_str = core::str::from_utf8(fmt).unwrap_or("<non-utf8>");
-    let is_error = flen >= 5 && (fmt_str.contains("error") || fmt_str.contains("expected") || fmt_str.contains("assert") || fmt_str.contains("fail") || fmt_str.contains("FATAL"));
+    let is_error = flen >= 5
+        && (fmt_str.contains("error")
+            || fmt_str.contains("expected")
+            || fmt_str.contains("assert")
+            || fmt_str.contains("fail")
+            || fmt_str.contains("FATAL"));
     if is_error {
         static SNPRINTF_ERR_COUNT: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = SNPRINTF_ERR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 16 {
             let msg = core::str::from_utf8(&out_buf[..out_len]).unwrap_or("<non-utf8>");
-            log::error!("[snprintf-error] pid={} #{}: msg=\"{}\" fmt=\"{}\"",
-                crate::process::current_pid(), n, msg, fmt_str);
+            log::error!(
+                "[snprintf-error] pid={} #{}: msg=\"{}\" fmt=\"{}\"",
+                crate::process::current_pid(),
+                n,
+                msg,
+                fmt_str
+            );
         }
     }
 
@@ -1871,22 +2625,40 @@ fn format_into(
     total_len as i64
 }
 
-pub fn sys_snprintf(buf: u64, size: u64, fmt_ptr: u64, first_vararg: u64, second_vararg: u64) -> i64 {
+pub fn sys_snprintf(
+    buf: u64,
+    size: u64,
+    fmt_ptr: u64,
+    first_vararg: u64,
+    second_vararg: u64,
+) -> i64 {
     let user_rsp = crate::arch::syscall::user_rsp();
-    let third_vararg  = crate::arch::syscall::user_r9();
+    let third_vararg = crate::arch::syscall::user_r9();
     let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
     let safe_qword = |off: u64| -> u64 {
         let addr = user_rsp.wrapping_add(off);
         if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
             unsafe { core::ptr::read_volatile(addr as *const u64) }
-        } else { 0 }
+        } else {
+            0
+        }
     };
     let fourth_vararg = safe_qword(8);
-    let fifth_vararg  = safe_qword(16);
-    let varargs = [first_vararg, second_vararg, third_vararg, fourth_vararg, fifth_vararg];
+    let fifth_vararg = safe_qword(16);
+    let varargs = [
+        first_vararg,
+        second_vararg,
+        third_vararg,
+        fourth_vararg,
+        fifth_vararg,
+    ];
     let mut varg_idx = 0usize;
     format_into(buf, size, fmt_ptr, || {
-        let val = if varg_idx < varargs.len() { varargs[varg_idx] } else { 0 };
+        let val = if varg_idx < varargs.len() {
+            varargs[varg_idx]
+        } else {
+            0
+        };
         varg_idx += 1;
         val
     })
@@ -1894,15 +2666,16 @@ pub fn sys_snprintf(buf: u64, size: u64, fmt_ptr: u64, first_vararg: u64, second
 
 pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
     let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
-    let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) =
-        if plausible_user(ap) {
-            unsafe {
-                let g = core::ptr::read_unaligned((ap as *const u32));
-                let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
-                let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
-                (g, r, o)
-            }
-        } else { (48, 0, 0) };
+    let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) = if plausible_user(ap) {
+        unsafe {
+            let g = core::ptr::read_unaligned((ap as *const u32));
+            let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
+            let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
+            (g, r, o)
+        }
+    } else {
+        (48, 0, 0)
+    };
 
     static VSNPRINTF_DEBUG_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
@@ -1928,7 +2701,9 @@ pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
             let v = unsafe { core::ptr::read_unaligned(ovf as *const u64) };
             ovf += 8;
             v
-        } else { 0 };
+        } else {
+            0
+        };
         if dbg_n < 8 {
             log::warn!("[vsnprintf-debug] arg={:#x}", val);
         }
@@ -1967,8 +2742,14 @@ pub fn sys_perror(msg: u64) -> i64 {
             let rsp = crate::arch::syscall::user_rsp();
             let caller_rip = unsafe { *(rsp as *const u64) };
             let epoll_ret_rax = crate::process::get_saved_rax(crate::process::current_pid());
-            log::warn!("[sys_perror] #{} pid={} msg={:#x} caller_ret={:#x} prev_epoll_rax={}",
-                n, crate::process::current_pid(), msg, caller_rip, epoll_ret_rax as i64);
+            log::warn!(
+                "[sys_perror] #{} pid={} msg={:#x} caller_ret={:#x} prev_epoll_rax={}",
+                n,
+                crate::process::current_pid(),
+                msg,
+                caller_rip,
+                epoll_ret_rax as i64
+            );
         }
     }
     if msg != 0 {
@@ -2000,22 +2781,29 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
     //   off 4:   u32 fp_offset
     //   off 8:   *mut u8 overflow_arg_area
     //   off 16:  *mut u8 reg_save_area
-    if fmt_ptr == 0 { return 0; }
-    let fd: u64 = if fp == 0 || fp == 1 { 1 }
-                  else if fp == 2 { 2 }
-                  else { unsafe { *(fp as *const i64) as u64 } };
+    if fmt_ptr == 0 {
+        return 0;
+    }
+    let fd: u64 = if fp == 0 || fp == 1 {
+        1
+    } else if fp == 2 {
+        2
+    } else {
+        unsafe { *(fp as *const i64) as u64 }
+    };
 
     // Read va_list state if pointer is plausibly a user-mode pointer.
     let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
-    let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) =
-        if plausible_user(ap) {
-            unsafe {
-                let g = core::ptr::read_unaligned((ap as *const u32));
-                let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
-                let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
-                (g, r, o)
-            }
-        } else { (48, 0, 0) };
+    let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) = if plausible_user(ap) {
+        unsafe {
+            let g = core::ptr::read_unaligned((ap as *const u32));
+            let r = core::ptr::read_unaligned((ap as *const u64).offset(2));
+            let o = core::ptr::read_unaligned((ap as *const u64).offset(1));
+            (g, r, o)
+        }
+    } else {
+        (48, 0, 0)
+    };
 
     // Pull next u64-sized int arg from the va_list. Integers consume
     // 8 bytes of gp regs first, then overflow.
@@ -2028,7 +2816,9 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
             let v = unsafe { core::ptr::read_unaligned(ovf as *const u64) };
             ovf += 8;
             v
-        } else { 0 }
+        } else {
+            0
+        }
     };
 
     // Format into a stack buffer (cap 512 bytes) then sys_write.
@@ -2053,41 +2843,83 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
         // Skip flags/width — minimal: read a single conversion char,
         // ignoring length modifiers ('l','ll','h','z') and consuming variable arguments for '*'.
         let mut j = i + 1;
-        while j < fmt.len() && matches!(fmt[j], b'l'|b'h'|b'z'|b'j'|b't'|b'L'|b'0'..=b'9'|b'.'|b'-'|b'+'|b' '|b'#'|b'*') {
+        while j < fmt.len()
+            && matches!(
+                fmt[j],
+                b'l' | b'h' | b'z' | b'j' | b't' | b'L' | b'0'
+                    ..=b'9' | b'.' | b'-' | b'+' | b' ' | b'#' | b'*'
+            )
+        {
             if fmt[j] == b'*' {
                 let _ = next_int();
             }
             j += 1;
         }
-        if j >= fmt.len() { break; }
+        if j >= fmt.len() {
+            break;
+        }
         let conv = fmt[j];
         let mut tmp = [0u8; 32];
         match conv {
             b'd' | b'i' => {
                 let v = next_int() as i64;
                 let mut n = 0usize;
-                let (neg, mut u) = if v < 0 { (true, (v.wrapping_neg()) as u64) } else { (false, v as u64) };
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
-                if neg { tmp[n] = b'-'; n += 1; }
+                let (neg, mut u) = if v < 0 {
+                    (true, (v.wrapping_neg()) as u64)
+                } else {
+                    (false, v as u64)
+                };
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = b'0' + (u % 10) as u8;
+                    n += 1;
+                    u /= 10;
+                }
+                if neg {
+                    tmp[n] = b'-';
+                    n += 1;
+                }
                 tmp[..n].reverse();
                 push(&tmp[..n], &mut olen, &mut out);
             }
             b'u' => {
                 let mut u = next_int();
                 let mut n = 0usize;
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = b'0' + (u % 10) as u8; n += 1; u /= 10; }
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = b'0' + (u % 10) as u8;
+                    n += 1;
+                    u /= 10;
+                }
                 tmp[..n].reverse();
                 push(&tmp[..n], &mut olen, &mut out);
             }
             b'x' | b'X' | b'p' => {
                 let mut u = next_int();
-                if conv == b'p' { push(b"0x", &mut olen, &mut out); }
-                let hexd = if conv == b'X' { b"0123456789ABCDEF" } else { b"0123456789abcdef" };
+                if conv == b'p' {
+                    push(b"0x", &mut olen, &mut out);
+                }
+                let hexd = if conv == b'X' {
+                    b"0123456789ABCDEF"
+                } else {
+                    b"0123456789abcdef"
+                };
                 let mut n = 0usize;
-                if u == 0 { tmp[n] = b'0'; n += 1; }
-                while u > 0 { tmp[n] = hexd[(u & 0xF) as usize]; n += 1; u >>= 4; }
+                if u == 0 {
+                    tmp[n] = b'0';
+                    n += 1;
+                }
+                while u > 0 {
+                    tmp[n] = hexd[(u & 0xF) as usize];
+                    n += 1;
+                    u >>= 4;
+                }
                 tmp[..n].reverse();
                 push(&tmp[..n], &mut olen, &mut out);
             }
@@ -2105,7 +2937,9 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
                 let v = next_int() as u8;
                 push(&[v], &mut olen, &mut out);
             }
-            b'%' => { push(b"%", &mut olen, &mut out); }
+            b'%' => {
+                push(b"%", &mut olen, &mut out);
+            }
             _ => {
                 // Unknown — emit literally.
                 push(&fmt[i..=j], &mut olen, &mut out);
@@ -2113,7 +2947,9 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
         }
         i = j + 1;
     }
-    if olen == 0 { return 0; }
+    if olen == 0 {
+        return 0;
+    }
     crate::syscall::dispatch_fast(1, fd, out.as_ptr() as u64, olen as u64, 0, 0)
 }
 
@@ -2121,7 +2957,11 @@ pub fn sys_fprintf(fp: u64, fmt_ptr: u64, ap: u64) -> i64 {
 
 pub fn sys_sigfillset(set: u64) -> i64 {
     // Fill all bits in sigset_t (128 bytes on Linux x86_64).
-    if set != 0 { unsafe { core::ptr::write_bytes(set as *mut u8, 0xFF, 128); } }
+    if set != 0 {
+        unsafe {
+            core::ptr::write_bytes(set as *mut u8, 0xFF, 128);
+        }
+    }
     0
 }
 
@@ -2129,30 +2969,53 @@ pub fn sys_sigfillset(set: u64) -> i64 {
 
 pub fn sys_wcslen(s: u64) -> i64 {
     // wchar_t is 4 bytes on Linux.
-    if s == 0 { return 0; }
+    if s == 0 {
+        return 0;
+    }
     let mut len = 0i64;
     let mut p = s as *const u32;
-    unsafe { while *p != 0 { p = p.add(1); len += 1; } }
+    unsafe {
+        while *p != 0 {
+            p = p.add(1);
+            len += 1;
+        }
+    }
     len
 }
 
 pub fn sys_mbrtowc(pwc: u64, s: u64, n: u64, _ps: u64) -> i64 {
     // C locale: 1-byte encoding.
-    if s == 0 { return 0; }
-    if n == 0 { return -2; } // incomplete sequence
-    let b = unsafe { *(s as *const u8) };
-    if b == 0 {
-        if pwc != 0 { unsafe { *(pwc as *mut u32) = 0; } }
+    if s == 0 {
         return 0;
     }
-    if pwc != 0 { unsafe { *(pwc as *mut u32) = b as u32; } }
+    if n == 0 {
+        return -2;
+    } // incomplete sequence
+    let b = unsafe { *(s as *const u8) };
+    if b == 0 {
+        if pwc != 0 {
+            unsafe {
+                *(pwc as *mut u32) = 0;
+            }
+        }
+        return 0;
+    }
+    if pwc != 0 {
+        unsafe {
+            *(pwc as *mut u32) = b as u32;
+        }
+    }
     1
 }
 
 pub fn sys_mbsnrtowcs(dst: u64, srcp: u64, nmc: u64, len: u64, _ps: u64) -> i64 {
-    if srcp == 0 { return -1; }
+    if srcp == 0 {
+        return -1;
+    }
     let src_ptr = unsafe { *(srcp as *const u64) };
-    if src_ptr == 0 { return 0; }
+    if src_ptr == 0 {
+        return 0;
+    }
 
     let mut src = src_ptr as *const u8;
     let mut converted: u64 = 0;
@@ -2160,12 +3023,18 @@ pub fn sys_mbsnrtowcs(dst: u64, srcp: u64, nmc: u64, len: u64, _ps: u64) -> i64 
     while remaining > 0 {
         let b = unsafe { *src };
         if b == 0 {
-            unsafe { *(srcp as *mut u64) = 0; }
+            unsafe {
+                *(srcp as *mut u64) = 0;
+            }
             break;
         }
         if dst != 0 {
-            if converted >= len { break; }
-            unsafe { *((dst as *mut u32).add(converted as usize)) = b as u32; }
+            if converted >= len {
+                break;
+            }
+            unsafe {
+                *((dst as *mut u32).add(converted as usize)) = b as u32;
+            }
         }
         src = unsafe { src.add(1) };
         converted += 1;
@@ -2173,7 +3042,9 @@ pub fn sys_mbsnrtowcs(dst: u64, srcp: u64, nmc: u64, len: u64, _ps: u64) -> i64 
     }
 
     if unsafe { *src } != 0 {
-        unsafe { *(srcp as *mut u64) = src as u64; }
+        unsafe {
+            *(srcp as *mut u64) = src as u64;
+        }
     }
     converted as i64
 }
@@ -2184,21 +3055,31 @@ pub fn sys_mbsrtowcs(dst: u64, srcp: u64, len: u64, ps: u64) -> i64 {
 }
 
 pub fn sys_mbtowc(pwc: u64, s: u64, n: u64) -> i64 {
-    if s == 0 { return 0; } // reset shift state
+    if s == 0 {
+        return 0;
+    } // reset shift state
     sys_mbrtowc(pwc, s, n, 0)
 }
 
 pub fn sys_wcrtomb(s: u64, wc: u64, _ps: u64) -> i64 {
     // C locale: only single-byte characters.
-    if s == 0 { return 1; } // state reset query
+    if s == 0 {
+        return 1;
+    } // state reset query
     let ch = wc as u32;
-    if ch > 0xFF { return -1; }
-    unsafe { *(s as *mut u8) = ch as u8; }
+    if ch > 0xFF {
+        return -1;
+    }
+    unsafe {
+        *(s as *mut u8) = ch as u8;
+    }
     1
 }
 
 pub fn sys_wmemchr(s: u64, wc: u64, n: u64) -> i64 {
-    if s == 0 || n == 0 { return 0; }
+    if s == 0 || n == 0 {
+        return 0;
+    }
     let target = wc as u32;
     let p = s as *const u32;
     for i in 0..(n as usize) {
@@ -2216,4 +3097,3 @@ pub fn sys_futex_wake(addr: u64, count: u32) -> i64 {
     // Dispatch to the existing futex syscall.
     crate::syscall::dispatch_fast(0x39D, addr, 129, count as u64, 0, 0) // FUTEX_WAKE = 1
 }
-

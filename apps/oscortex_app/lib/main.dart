@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 const _shell = BasicMessageChannel<String>('oscortex/shell', StringCodec());
 
-const _bg = Color(0xFF0C1C26);
+const _bg = Colors.amber;
 const _accent = Color(0xFF2DD4BF);
 
 void main() {
@@ -44,15 +44,47 @@ class ShellDesktop extends StatefulWidget {
 class _ShellDesktopState extends State<ShellDesktop> {
   List<_AppTile> _apps = const [];
   String? _error;
+  String _status = 'Booting shell...';
   bool _loading = false;
+  bool _installingSeed = false;
+  final GlobalKey _installButtonKey = GlobalKey();
+
+  static const Map<String, dynamic> _emptyApps = <String, dynamic>{'apps': <dynamic>[]};
+
+  static void _trace(String message) {
+    print('[shell-ui] $message');
+  }
+
+  bool get _demoInstalled => _apps.any((app) => app.name == 'Demo');
+
+  void _setStatus(String message, {bool snack = false}) {
+    _trace('status $message');
+    if (mounted) {
+      setState(() {
+        _status = message;
+      });
+      if (snack) {
+        ScaffoldMessenger.of(context)
+          ..clearSnackBars()
+          ..showSnackBar(SnackBar(content: Text(message)));
+      }
+    }
+  }
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _trace('ready');
+    });
     _refreshApps();
   }
 
   Future<void> _refreshApps({bool showSpinner = false}) async {
+    _trace('refresh_start');
+    if (showSpinner) {
+      _setStatus('Refresh tapped: asking host for app list...', snack: true);
+    }
     if (showSpinner) {
       setState(() {
         _loading = true;
@@ -60,8 +92,8 @@ class _ShellDesktopState extends State<ShellDesktop> {
       });
     }
     try {
-      final raw = await _shell.send('list');
-      final decoded = jsonDecode(raw ?? '{"apps":[]}') as Map<String, dynamic>;
+      final raw = await _safeSend('list');
+      final decoded = _parseJsonObject(raw, fallback: _emptyApps);
       final items = (decoded['apps'] as List<dynamic>? ?? [])
           .map((e) => _AppTile.fromJson(e as Map<String, dynamic>))
           .toList();
@@ -71,116 +103,278 @@ class _ShellDesktopState extends State<ShellDesktop> {
         _loading = false;
         _error = null;
       });
+      _trace('refresh_ok count=${items.length}');
+      _setStatus('Refresh complete: ${items.length} app(s).', snack: showSpinner);
     } catch (e) {
+      _trace('refresh_error err=$e');
       if (!mounted) return;
       setState(() {
         _error = '$e';
         _loading = false;
       });
+      _setStatus('Refresh failed: $e', snack: showSpinner);
     }
   }
 
   Future<void> _launchApp(int id) async {
-    final raw = await _shell.send('launch:$id');
-    if (raw == null || !raw.contains('"ok":true')) {
+    _trace('launch_tap id=$id');
+    try {
+      final raw = await _safeSend('launch:$id');
+      if (!_isOkReply(raw)) {
+        _trace('launch_failed id=$id');
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Launch failed for app $id')),
+          );
+        }
+      } else {
+        _trace('launch_ok id=$id');
+      }
+    } catch (e) {
+      _trace('launch_error id=$id err=$e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Launch failed for app $id')),
+          SnackBar(content: Text('Launch error: $e')),
         );
       }
     }
   }
 
   Future<void> _installSeed() async {
-    final raw = await _shell.send('install:/system/seed/demo.osx');
-    if (raw != null && raw.contains('"ok":true')) {
-      await _refreshApps();
-    } else if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Install failed (seed missing?)')),
-      );
+    if (_installingSeed || _demoInstalled) {
+      _trace('install_skip');
+      _setStatus('Install skipped: Demo is already installed.', snack: true);
+      return;
     }
+    setState(() {
+      _installingSeed = true;
+    });
+    _trace('install_tap');
+    _setStatus('Install tapped: sending request to host...', snack: true);
+    try {
+      final raw = await _safeSend('install:/system/seed/demo.osx');
+      if (_isOkReply(raw)) {
+        _trace('install_ok');
+        _setStatus('Install complete: Demo is ready.', snack: true);
+        await _refreshApps();
+      } else if (mounted) {
+        _trace('install_failed');
+        _setStatus('Install failed: host rejected the request.', snack: true);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Install failed (seed missing?)')),
+        );
+      }
+    } catch (e) {
+      _trace('install_error err=$e');
+      _setStatus('Install error: $e', snack: true);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Install error: $e')),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _installingSeed = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _runPointerSmokeTest() async {
+    final context = _installButtonKey.currentContext;
+    final renderObject = context?.findRenderObject();
+    if (renderObject is! RenderBox) {
+      _trace('smoke_no_target');
+      return;
+    }
+
+    final center = renderObject.localToGlobal(renderObject.size.center(Offset.zero));
+    final x = center.dx.round();
+    final y = center.dy.round();
+    _trace('smoke_request x=$x y=$y');
+    final raw = await _safeSend('debug:tap:$x:$y');
+    _trace('smoke_reply raw=${raw ?? "null"}');
+  }
+
+  KeyEventResult _handleKeyEvent(FocusNode _, KeyEvent event) {
+    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.f12) {
+      _trace('smoke_hotkey');
+      _runPointerSmokeTest();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
+
+  Future<String?> _safeSend(String command) async {
+    try {
+      return await _shell.send(command);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static bool _isOkReply(String? raw) {
+    final json = _parseJsonObject(raw, fallback: const <String, dynamic>{'ok': false});
+    return json['ok'] == true;
+  }
+
+  static Map<String, dynamic> _parseJsonObject(
+    String? raw, {
+    required Map<String, dynamic> fallback,
+  }) {
+    if (raw == null || raw.isEmpty) return fallback;
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return fallback;
+
+    try {
+      final decoded = jsonDecode(trimmed);
+      if (decoded is Map<String, dynamic>) return decoded;
+      if (decoded is Map) return decoded.cast<String, dynamic>();
+    } catch (_) {
+      // Some host replies may include wrappers/noise around JSON payload.
+    }
+
+    final start = trimmed.indexOf('{');
+    final end = trimmed.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      final slice = trimmed.substring(start, end + 1);
+      try {
+        final decoded = jsonDecode(slice);
+        if (decoded is Map<String, dynamic>) return decoded;
+        if (decoded is Map) return decoded.cast<String, dynamic>();
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    return fallback;
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-              child: Row(
-                children: [
-                  const Text(
-                    'OSCortex',
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: -0.5,
-                    ),
+      body: Focus(
+        autofocus: true,
+        onKeyEvent: _handleKeyEvent,
+        child: Listener(
+          behavior: HitTestBehavior.translucent,
+          onPointerDown: (event) {
+            _trace(
+              'pointer_down x=${event.position.dx.toStringAsFixed(1)} y=${event.position.dy.toStringAsFixed(1)}',
+            );
+            _setStatus(
+              'Flutter saw pointer down at ${event.position.dx.toStringAsFixed(0)}, ${event.position.dy.toStringAsFixed(0)}',
+            );
+          },
+          child: SafeArea(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
+                  child: Row(
+                    children: [
+                      const Text(
+                        'OSCortex',
+                        style: TextStyle(
+                          fontSize: 28,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: -0.5,
+                        ),
+                      ),
+                      const Spacer(),
+                      TextButton.icon(
+                        key: _installButtonKey,
+                        style: ButtonStyle(
+                          backgroundColor: MaterialStateProperty.all(
+                            Colors.pink.withValues(alpha: 0.6),
+                          ),
+                          padding: MaterialStateProperty.all(
+                            const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                          ),
+                        ),
+                        onPressed: (_installingSeed || _demoInstalled) ? null : _installSeed,
+                        icon: const Icon(Icons.download_outlined),
+                        label: Text(_demoInstalled ? 'Installed' : 'Install demo'),
+                      ),
+                      IconButton(
+                        onPressed: _loading ? null : () => _refreshApps(showSpinner: true),
+                        icon: _loading
+                            ? const SizedBox.square(
+                                dimension: 24,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.refresh),
+                        tooltip: 'Refresh',
+                      ),
+                    ],
                   ),
-                  const Spacer(),
-                  TextButton.icon(
-                    onPressed: _installSeed,
-                    icon: const Icon(Icons.download_outlined),
-                    label: const Text('Install demo'),
-                  ),
-                  IconButton(
-                    onPressed: () => _refreshApps(showSpinner: true),
-                    icon: const Icon(Icons.refresh),
-                    tooltip: 'Refresh',
-                  ),
-                ],
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 24),
-              child: Text(
-                'Installed apps',
-                style: TextStyle(
-                  color: Colors.white.withValues(alpha: 0.7),
-                  fontSize: 14,
                 ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: _loading
-                  ? const Center(child: CircularProgressIndicator())
-                  : _error != null
-                      ? Center(child: Text(_error!))
-                      : _apps.isEmpty
-                          ? Center(
-                              child: Text(
-                                'No apps installed.\nUse Install demo or drop a .osx bundle.',
-                                textAlign: TextAlign.center,
-                                style: TextStyle(
-                                  color: Colors.white.withValues(alpha: 0.6),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Row(
+                    children: [
+                      Text(
+                        'Installed apps',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.7),
+                          fontSize: 14,
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Text(
+                          _status,
+                          textAlign: TextAlign.right,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.85),
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _error != null
+                          ? Center(child: Text(_error!))
+                          : _apps.isEmpty
+                              ? Center(
+                                  child: Text(
+                                    'No apps installed.\nUse Install demo or drop a .osx bundle.',
+                                    textAlign: TextAlign.center,
+                                    style: TextStyle(
+                                      color: Colors.white.withValues(alpha: 0.6),
+                                    ),
+                                  ),
+                                )
+                              : GridView.builder(
+                                  padding: const EdgeInsets.all(24),
+                                  gridDelegate:
+                                      const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 4,
+                                    mainAxisSpacing: 16,
+                                    crossAxisSpacing: 16,
+                                    childAspectRatio: 0.9,
+                                  ),
+                                  itemCount: _apps.length,
+                                  itemBuilder: (context, index) {
+                                    final app = _apps[index];
+                                    return _AppCard(
+                                      app: app,
+                                      onLaunch: () => _launchApp(app.id),
+                                    );
+                                  },
                                 ),
-                              ),
-                            )
-                          : GridView.builder(
-                              padding: const EdgeInsets.all(24),
-                              gridDelegate:
-                                  const SliverGridDelegateWithFixedCrossAxisCount(
-                                crossAxisCount: 4,
-                                mainAxisSpacing: 16,
-                                crossAxisSpacing: 16,
-                                childAspectRatio: 0.9,
-                              ),
-                              itemCount: _apps.length,
-                              itemBuilder: (context, index) {
-                                final app = _apps[index];
-                                return _AppCard(
-                                  app: app,
-                                  onLaunch: () => _launchApp(app.id),
-                                );
-                              },
-                            ),
+                ),
+              ],
             ),
-          ],
+          ),
         ),
       ),
     );

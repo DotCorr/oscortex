@@ -645,6 +645,27 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let _g = PTABLE_LOCK.lock();
 
+    // Input must preempt engine task-runner churn on single-core boots. The
+    // hardware/WM path can queue pointer/key events while PID 1 is not the
+    // registered WM waiter, so simply marking PID 1 Running is not enough:
+    // the scheduler also has to choose it before the queue backs up.
+    let focus = crate::wm::focus_pid();
+    let input_target = if focus != 0 { focus } else { 1 };
+    if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
+        if current == input_target {
+            return None;
+        }
+        let target = unsafe { &mut PTABLE[idx_of(input_target)] };
+        if target.pid == input_target {
+            if target.state == ProcState::Blocked {
+                target.state = ProcState::Running;
+            }
+            if target.state == ProcState::Running {
+                return Some(input_target);
+            }
+        }
+    }
+
     // The embedder event loop must run whenever vsync batons or other WM events
     // are queued — otherwise Flutter never reaches OnVsync / present_callback.
     if crate::wm::baton_vsync_queued_for(1) {
@@ -653,11 +674,11 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
             return None;
         }
     }
-    if crate::wm::embedder_baton_due() {
-        let embedder = unsafe { &PTABLE[idx_of(1)] };
+    if current != 1 && crate::wm::embedder_baton_due() {
+        let embedder = unsafe { &mut PTABLE[idx_of(1)] };
         if embedder.pid == 1 {
             if embedder.state == ProcState::Blocked {
-                crate::process::set_state(1, ProcState::Running);
+                embedder.state = ProcState::Running;
             }
             if embedder.state == ProcState::Running {
                 return Some(1);
@@ -1633,4 +1654,3 @@ pub fn debug_dump_processes() {
         log::info!("==========================");
     }
 }
-

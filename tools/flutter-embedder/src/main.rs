@@ -245,7 +245,7 @@ struct FlutterWindowMetricsEvent {
 #[derive(Clone, Copy)]
 struct FlutterPointerEvent {
     struct_size:    usize, // 8
-    phase:          i32,   // 4  (kAdd=0 kHover=1 kDown=2 kMove=3 kUp=4)
+    phase:          i32,   // 4  (kCancel=0 kUp=1 kDown=2 kMove=3 kAdd=4 kRemove=5 kHover=6)
     _pad0:          u32,   // 4  (alignment padding)
     timestamp:      u64,   // 8  (microseconds)
     x:              f64,   // 8
@@ -483,6 +483,19 @@ unsafe extern "C" fn post_task_callback(
     target_time_ns: u64,
     _user_data: *mut (),
 ) {
+    static POST_TASK_LOG: AtomicU32 = AtomicU32::new(0);
+    let log_n = POST_TASK_LOG.fetch_add(1, Ordering::Relaxed);
+    if log_n < 32 {
+        write(b"[embedder] post_task runner=");
+        write_hex(task.runner);
+        write(b" task=");
+        write_hex(task.task);
+        write(b" now=");
+        write_hex(rdtsc_ns());
+        write(b" target=");
+        write_hex(target_time_ns);
+        write(b"\n");
+    }
     let _guard = PLATFORM_TASKS_LOCK.lock();
     for slot in unsafe { &mut PLATFORM_TASKS } {
         if !slot.active {
@@ -516,39 +529,38 @@ static CUSTOM_TASK_RUNNERS: FlutterCustomTaskRunners = FlutterCustomTaskRunners 
 
 static PRESENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+fn default_platform_reply(msg: &FlutterPlatformMessage) -> &'static [u8] {
+    if msg.message == 0 || msg.message_size == 0 {
+        return METHOD_SUCCESS_NULL;
+    }
+    let payload = unsafe {
+        core::slice::from_raw_parts(msg.message as *const u8, msg.message_size)
+    };
+    let first = payload[0];
+
+    // JSONMessageCodec / JSONMethodCodec messages begin with JSON text.
+    // Reply with JSONMethodCodec success envelope `[null]`; plain `null`
+    // triggers "Expected envelope List" errors on flutter/platform/navigation.
+    if first == b'{' || first == b'[' || first == b'"' || first == b'n' {
+        return b"[null]";
+    }
+
+    // StandardMethodCodec fallback for framework method channels.
+    METHOD_SUCCESS_NULL
+}
+
 /// Present a rendered frame.  Called by the engine on the raster thread.
 /// `allocation` is a row-major RGBA8 buffer; `row_bytes` may be > width*4.
 unsafe extern "C" fn present_callback(
     _user_data: *mut (),
-    allocation: *const u8,
+    _allocation: *const u8,
     row_bytes:  usize,
     height:     usize,
 ) -> bool {
     unsafe {
         let surface_id = SURFACE_ID;
         let pixel_len  = row_bytes * height;
-        let pixels = core::slice::from_raw_parts(allocation, pixel_len);
-        let n = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-        if n < 4 {
-            // Diagnostic: find first non-zero byte to confirm the engine
-            // actually rasterized into this present buffer.
-            let mut first_nz: i64 = -1;
-            let mut nz_count: u64 = 0;
-            let scan = if pixel_len > 1_000_000 { 1_000_000 } else { pixel_len };
-            let mut i = 0usize;
-            while i < scan {
-                if pixels[i] != 0 {
-                    if first_nz < 0 { first_nz = i as i64; }
-                    nz_count += 1;
-                }
-                i += 1;
-            }
-            write_hex_u64(b"[present-scan] alloc_addr=", allocation as u64);
-            write_hex_u64(b"[present-scan] row_bytes=", row_bytes as u64);
-            write_hex_u64(b"[present-scan] pixel_len=", pixel_len as u64);
-            write_hex_u64(b"[present-scan] first_nz_off=", first_nz as u64);
-            write_hex_u64(b"[present-scan] nz_count=", nz_count);
-        }
+        let pixels = core::slice::from_raw_parts(_allocation, pixel_len);
         let ok = gpu_submit_strided(surface_id, pixels, row_bytes) >= 0;
         if ok {
             let n = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -605,11 +617,9 @@ unsafe extern "C" fn platform_message_callback(
         return;
     }
 
-    // Flutter framework MethodChannels (text input, mouse cursor, etc.) expect
-    // a StandardMethodCodec reply; without one BasicMessageChannel/MethodChannel
-    // `.send()` / `.invokeMethod()` calls hang forever.
+    // Keep framework channels responsive without forcing a single codec reply.
     if msg.response_handle != 0 {
-        respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        respond_platform_message(msg, default_platform_reply(msg));
     }
 }
 
@@ -747,15 +757,57 @@ fn run_due_platform_tasks(engine: u64, now: u64, max_tasks: usize) {
             }
         }
         let Some(task) = task_to_run else { break; };
-        unsafe {
-            run_task_fn(engine, &task as *const _);
+        static RUN_TASK_LOG: AtomicU32 = AtomicU32::new(0);
+        let log_n = RUN_TASK_LOG.fetch_add(1, Ordering::Relaxed);
+        if log_n < 32 {
+            write(b"[embedder] run_task runner=");
+            write_hex(task.runner);
+            write(b" task=");
+            write_hex(task.task);
+            write(b" now=");
+            write_hex(now);
+            write(b"\n");
+        }
+        let rc = unsafe {
+            run_task_fn(engine, &task as *const _)
+        };
+        if rc != 0 {
+            write(b"[embedder] run_task rc=");
+            write_dec(rc as u64);
+            write(b"\n");
         }
     }
+}
+
+fn schedule_frame_with_log(engine: u64, schedule_frame_addr: u64, reason: &[u8]) -> i32 {
+    if engine == 0 || schedule_frame_addr == 0 {
+        return -1;
+    }
+    static SCHEDULE_FRAME_LOG: AtomicU32 = AtomicU32::new(0);
+    let n = SCHEDULE_FRAME_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 48 {
+        write(b"[embedder] schedule_frame begin ");
+        write(reason);
+        write(b"\n");
+    }
+    let schedule_frame: ScheduleFrameFn = unsafe { core::mem::transmute(schedule_frame_addr) };
+    let rc = unsafe { schedule_frame(engine) };
+    if n < 48 || rc != 0 {
+        write(b"[embedder] schedule_frame end ");
+        write(reason);
+        write(b" rc=");
+        write_dec(rc as u64);
+        write(b"\n");
+    }
+    rc
 }
 
 fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
     if payload.starts_with(b"list") {
         return format_app_list_json();
+    }
+    if payload.starts_with(b"debug:tap:") {
+        return inject_debug_tap(payload);
     }
     if payload.starts_with(b"launch:") {
         let id = parse_u32_after_colon(payload);
@@ -805,9 +857,55 @@ fn parse_u32_after_colon(payload: &[u8]) -> u32 {
     n
 }
 
+fn parse_two_u32_after_prefix(payload: &[u8], prefix_len: usize) -> Option<(u32, u32)> {
+    if payload.len() <= prefix_len {
+        return None;
+    }
+    let rest = &payload[prefix_len..];
+    let split = rest.iter().position(|&b| b == b':')?;
+    let x = parse_ascii_u32(&rest[..split])?;
+    let y = parse_ascii_u32(&rest[split + 1..])?;
+    Some((x, y))
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut n = 0u32;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(n)
+}
+
 fn trim_line(s: &[u8]) -> &[u8] {
     let end = s.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(s.len());
     &s[..end]
+}
+
+fn inject_debug_tap(payload: &[u8]) -> &'static [u8] {
+    const PREFIX_LEN: usize = 10; // "debug:tap:"
+    let Some((x, y)) = parse_two_u32_after_prefix(payload, PREFIX_LEN) else {
+        return b"{\"ok\":false,\"err\":\"args\"}";
+    };
+    let packed = ((x as u64) << 32) | y as u64;
+    write(b"[embedder/shell] debug tap x=");
+    write_dec(x as u64);
+    write(b" y=");
+    write_dec(y as u64);
+    write(b"\n");
+
+    if sys::wm_event_inject(sys::EV_POINTER, packed, 1) < 0 {
+        return b"{\"ok\":false,\"err\":\"down\"}";
+    }
+    if sys::wm_event_inject(sys::EV_POINTER, packed, 0) < 0 {
+        return b"{\"ok\":false,\"err\":\"up\"}";
+    }
+    b"{\"ok\":true}"
 }
 
 static mut APP_LIST_JSON: [u8; 4096] = [0; 4096];
@@ -838,16 +936,19 @@ fn format_app_list_json() -> &'static [u8] {
         }
         out[pos] = b'{';
         pos += 1;
-        out[pos..pos + 5].copy_from_slice(b"\"id\":");
-        pos += 5;
+        const ID_PREFIX: &[u8] = b"\"id\":";
+        out[pos..pos + ID_PREFIX.len()].copy_from_slice(ID_PREFIX);
+        pos += ID_PREFIX.len();
         pos += write_json_u32(&mut out[pos..], id);
-        out[pos..pos + 9].copy_from_slice(b",\"name\":\"");
-        pos += 9;
+        const NAME_PREFIX: &[u8] = b",\"name\":\"";
+        out[pos..pos + NAME_PREFIX.len()].copy_from_slice(NAME_PREFIX);
+        pos += NAME_PREFIX.len();
         let copy = name.len().min(out.len().saturating_sub(pos).saturating_sub(12));
         out[pos..pos + copy].copy_from_slice(&name[..copy]);
         pos += copy;
-        out[pos..pos + 3].copy_from_slice(b"\"}");
-        pos += 3;
+        const ENTRY_SUFFIX: &[u8] = b"\"}";
+        out[pos..pos + ENTRY_SUFFIX.len()].copy_from_slice(ENTRY_SUFFIX);
+        pos += ENTRY_SUFFIX.len();
         i += 1;
     }
     out[pos..pos + 2].copy_from_slice(b"]}");
@@ -911,8 +1012,9 @@ fn install_osx_from_path(path: &[u8]) -> &'static [u8] {
     write_dec(id as u64);
     write(b"\n");
     let mut out = unsafe { &mut INSTALL_REPLY };
-    out[..18].copy_from_slice(b"{\"ok\":true,\"id\":");
-    let mut pos = 18usize;
+    const PREFIX: &[u8] = b"{\"ok\":true,\"id\":";
+    out[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut pos = PREFIX.len();
     pos += write_json_u32(&mut out[pos..], id);
     out[pos] = b'}';
     pos += 1;
@@ -985,9 +1087,8 @@ extern "C" fn main_embedder() {
         exit(-1);
     }
 
-    // 1b. Phase 33-A: request 60 Hz vsync cadence from the compositor.
-    vsync_set_hz(60);
-
+    // 1b. Phase 33-A: request high refresh cadence for smoother input/render.
+    vsync_set_hz(120);
 
     // 2. Open the engine library.
     let handle = dlopen(ENGINE_LIB_PATH, 0);
@@ -1017,7 +1118,6 @@ extern "C" fn main_embedder() {
             }
         }
     }
-
 
     // 3. Resolve FlutterEngineGetProcAddresses.
     let get_procs_va = dlsym(handle, b"FlutterEngineGetProcAddresses");
@@ -1094,7 +1194,6 @@ extern "C" fn main_embedder() {
     } else {
         (1280, 720)
     };
-
 
     // Create the surface at full framebuffer resolution so Flutter renders
     // to the entire screen. The kernel compositor handles memory allocation.
@@ -1290,8 +1389,7 @@ extern "C" fn main_embedder() {
         let rc = unsafe { send_metrics(engine_out, &metrics as *const _) };
         if rc == 0 {
             if proctable.schedule_frame != 0 {
-                let schedule_frame: ScheduleFrameFn = unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let rc_sf = unsafe { schedule_frame(engine_out) };
+                let rc_sf = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"initial");
                 if rc_sf == 0 {
                 } else {
                     let mut hex = *b"[embedder] FlutterEngineScheduleFrame FAILED rc=0x________\n";
@@ -1343,7 +1441,6 @@ extern "C" fn main_embedder() {
         }
     }
 
-
     // 12. Event loop: dispatch vsync / pointer / key / platform-channel events,
     // and run custom task runner platform tasks.
     let mut ev = WmEvent::default();
@@ -1387,9 +1484,7 @@ extern "C" fn main_embedder() {
             && startup_watchdog_stage < 6
         {
             if proctable.schedule_frame != 0 {
-                let schedule_frame: ScheduleFrameFn =
-                    unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let rc_sf = unsafe { schedule_frame(engine_out) };
+                let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"startup");
             }
 
             if startup_watchdog_stage >= 2 && proctable.send_platform_message != 0 {
@@ -1431,9 +1526,7 @@ extern "C" fn main_embedder() {
                 && proctable.schedule_frame != 0
                 && now_pump >= frame_pump_next_ns
             {
-                let schedule_frame: ScheduleFrameFn =
-                    unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let _ = unsafe { schedule_frame(engine_out) };
+                let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"idle");
                 let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
                 let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
                 frame_pump_next_ns = now_pump + interval;
@@ -1454,9 +1547,7 @@ extern "C" fn main_embedder() {
                 {
                     let now_pump = rdtsc_ns();
                     if now_pump >= frame_pump_next_ns {
-                        let schedule_frame: ScheduleFrameFn =
-                            unsafe { core::mem::transmute(proctable.schedule_frame) };
-                        let _ = unsafe { schedule_frame(engine_out) };
+                        let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"vsync0");
                         let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
                         let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
                         frame_pump_next_ns = now_pump + interval;
@@ -1474,10 +1565,15 @@ extern "C" fn main_embedder() {
                     // and stops it from scheduling further frames.
                     unsafe { f(engine_out, baton, now_ns, target_ns) };
 
-                    // OnVsync posts raster/UI work — yield so runner threads can execute.
-                    for _ in 0..12 {
-                        sched_yield();
-                    }
+                    // OnVsync posts raster/UI work to the engine's runner threads
+                    // (separate PIDs). We deliberately do NOT spin on sched_yield
+                    // here: sys_sched_yield switches to a busy-spinning runner via
+                    // enter_user_by_pid_noreturn and never regains the CPU, which
+                    // stalls this loop so it stops draining WM pointer/key events
+                    // (clicks never reach Flutter). Instead we fall through to
+                    // wm_event_wait below, which cooperatively yields CPU to the
+                    // runner threads while remaining wakeable on the next vsync or
+                    // input event.
 
                     // Consecutive-no-present watchdog: if 2 vsync→engine calls in a row
                     // produced no new present, force FlutterEngineScheduleFrame to
@@ -1491,9 +1587,7 @@ extern "C" fn main_embedder() {
                     } else if vsync_n >= 2 {
                         let cons = NO_PRESENT_CONSECUTIVE.fetch_add(1, Ordering::Relaxed) + 1;
                         if cons >= 2 && proctable.schedule_frame != 0 {
-                            let schedule_frame: ScheduleFrameFn =
-                                unsafe { core::mem::transmute(proctable.schedule_frame) };
-                            let _ = unsafe { schedule_frame(engine_out) };
+                            let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"watchdog");
                             NO_PRESENT_CONSECUTIVE.store(0, Ordering::Relaxed);
                         }
                     }
@@ -1501,9 +1595,7 @@ extern "C" fn main_embedder() {
                     let presents = cur_presents;
                     if presents == 0 && (vsync_n == 10 || vsync_n == 30) {
                         if proctable.schedule_frame != 0 {
-                            let schedule_frame: ScheduleFrameFn =
-                                unsafe { core::mem::transmute(proctable.schedule_frame) };
-                            let rc_sf = unsafe { schedule_frame(engine_out) };
+                            let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"late-vsync");
                         }
 
                         if vsync_n == 30 && proctable.send_platform_message != 0 {
@@ -1532,38 +1624,69 @@ extern "C" fn main_embedder() {
                     // push_pointer packs: a = (x as u32 as u64) << 32 | (y as u32)
                     let x = ((ev.a >> 32) as i32) as f64;
                     let y = (ev.a as u32) as f64;
-                    static POINTER_ADDED: AtomicU32 = AtomicU32::new(0);
-                    let phase = if buttons != 0 {
-                        2i32 // kDown
-                    } else if POINTER_ADDED.load(Ordering::Relaxed) == 0 {
-                        POINTER_ADDED.store(1, Ordering::Relaxed);
-                        0i32 // kAdd
-                    } else {
-                        3i32 // kMove
-                    };
-                    let evt = FlutterPointerEvent {
-                        struct_size:    core::mem::size_of::<FlutterPointerEvent>(),
-                        phase,
-                        _pad0:          0,
-                        timestamp:      rdtsc_ns() / 1000,
-                        x,
-                        y,
-                        device:         0,
-                        signal_kind:    0,
-                        scroll_delta_x: 0.0,
-                        scroll_delta_y: 0.0,
-                        device_kind:    1,
-                        _pad1:          0,
-                        buttons,
-                        pan_x:          0.0,
-                        pan_y:          0.0,
-                        scale:          1.0,
-                        rotation:       0.0,
-                        view_id:        0,
-                    };
                     let f: SendPointerEventFn =
                         unsafe { core::mem::transmute(proctable.send_pointer_event) };
-                    unsafe { f(engine_out, &evt as *const _, 1) };
+
+                    static POINTER_ADDED: AtomicU32 = AtomicU32::new(0);
+                    static LAST_POINTER_BUTTONS: AtomicU64 = AtomicU64::new(0);
+
+                    static PTR_LOG: AtomicU32 = AtomicU32::new(0);
+                    let log_n = PTR_LOG.fetch_add(1, Ordering::Relaxed);
+                    let do_log = log_n < 40 || buttons != 0;
+                    if do_log {
+                        write(b"[embedder/ptr] buttons=");
+                        write_dec(buttons as u64);
+                        write(b" x=");
+                        write_dec(((ev.a >> 32) as i32) as u64);
+                        write(b" y=");
+                        write_dec((ev.a as u32) as u64);
+                        write(b"\n");
+                    }
+
+                    let send = |phase: i32, btns: i64| {
+                        let evt = FlutterPointerEvent {
+                            struct_size:    core::mem::size_of::<FlutterPointerEvent>(),
+                            phase,
+                            _pad0:          0,
+                            timestamp:      rdtsc_ns() / 1000,
+                            x,
+                            y,
+                            device:         0,
+                            signal_kind:    0,
+                            scroll_delta_x: 0.0,
+                            scroll_delta_y: 0.0,
+                            device_kind:    1,
+                            _pad1:          0,
+                            buttons:        btns,
+                            pan_x:          0.0,
+                            pan_y:          0.0,
+                            scale:          1.0,
+                            rotation:       0.0,
+                            view_id:        0,
+                        };
+                        unsafe { f(engine_out, &evt as *const _, 1) };
+                    };
+
+                    if POINTER_ADDED.swap(1, Ordering::Relaxed) == 0 {
+                        send(4, 0); // kAdd
+                    }
+
+                    let prev_buttons = LAST_POINTER_BUTTONS.swap(buttons as u64, Ordering::Relaxed) as i64;
+                    let phase = if prev_buttons == 0 && buttons != 0 {
+                        2i32 // kDown
+                    } else if prev_buttons != 0 && buttons == 0 {
+                        1i32 // kUp
+                    } else if buttons == 0 {
+                        6i32 // kHover
+                    } else {
+                        3i32 // kMove (drag)
+                    };
+                    send(phase, buttons);
+                    if do_log {
+                        write(b"[embedder/ptr] sent phase=");
+                        write_dec(phase as u64);
+                        write(b"\n");
+                    }
                 }
             }
             EV_KEY => {
@@ -1644,4 +1767,3 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     write(b"[embedder] PANIC\n");
     exit(1)
 }
-

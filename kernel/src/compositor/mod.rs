@@ -726,6 +726,9 @@ pub fn render_frame() {
         let frame = c.frame_counter.wrapping_add(1);
         c.frame_counter = frame;
         drop(c);
+        if let Some((w, h)) = crate::drivers::fb::size_px() {
+            crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
+        }
         draw_software_cursor();
         crate::drivers::fb::swap_buffers();
         crate::wm::push_vsync(frame);

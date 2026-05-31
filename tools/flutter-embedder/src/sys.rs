@@ -29,7 +29,9 @@ pub const SYS_MMAP:                     u64 = 0x353;
 
 pub const SYS_WM_EVENT_POLL:            u64 = 0x320;
 pub const SYS_WM_EVENT_READ:            u64 = 0x321;
+pub const SYS_WM_EVENT_INJECT:          u64 = 0x322;
 pub const SYS_WM_EVENT_WAIT:            u64 = 0x323;
+pub const SYS_SCHED_YIELD:              u64 = 0x390;
 pub const SYS_FB_MAP:                   u64 = 0x377;
 pub const SYS_WM_NEXT_EVENT:            u64 = 0x378;
 pub const SYS_SURFACE_FULLSCREEN:       u64 = 0x381;
@@ -381,6 +383,10 @@ pub fn wm_event_wait(ev: &mut WmEvent, timeout_ms: u64) -> i64 {
     }
 }
 
+pub fn wm_event_inject(kind: u32, arg1: u64, arg2: u64) -> i64 {
+    unsafe { syscall3(SYS_WM_EVENT_INJECT, kind as u64, arg1, arg2) }
+}
+
 /// Post a platform-channel message.
 /// Returns the u64 sequence number cast to i64, or a negative errno.
 pub fn platform_msg_post(channel: &[u8], payload: &[u8]) -> i64 {
@@ -595,7 +601,8 @@ pub fn isolate_msg_pending(isolate_id: u32) -> i64 {
 
 /// Phase 61 — Allocate anonymous read-write pages via mmap(hint=0, size, prot=3).
 pub fn mmap_anon(size: usize) -> u64 {
-    unsafe { syscall3(SYS_MMAP, 0, size as u64, 3 /* PROT_READ|PROT_WRITE */) as u64 }
+    let ret = unsafe { syscall3(SYS_MMAP, 0, size as u64, 3 /* PROT_READ|PROT_WRITE */) };
+    if ret <= 0 { 0 } else { ret as u64 }
 }
 
 /// Phase 61 — Create a fullscreen compositor surface (replaces direct FB map).
@@ -626,9 +633,11 @@ pub fn wm_next_event(ev: &mut WmEvent) -> i64 {
     unsafe { syscall1(SYS_WM_NEXT_EVENT, ev as *mut WmEvent as u64) }
 }
 
-/// Yield the CPU by doing a short blocking event wait (timeout=1 ms).
+/// Yield the CPU to the next runnable process via the kernel cooperative
+/// scheduler (syscall 0x390).  This MUST NOT touch the WM event queue: the
+/// previous implementation used `wm_event_wait(1ms)` which popped and discarded
+/// a WM event on every yield, silently eating pointer/key input before the main
+/// loop's EV_POINTER handler could process it (clicks never reached Flutter).
 pub fn sched_yield() {
-    let mut ev = WmEvent::default();
-    wm_event_wait(&mut ev, 1);
+    unsafe { syscall0(SYS_SCHED_YIELD); }
 }
-

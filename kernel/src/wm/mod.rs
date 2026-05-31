@@ -13,9 +13,23 @@ pub const EVENT_CAP: usize = 256;
 pub use eabi::{EV_APP, EV_FOCUS, EV_KEY, EV_POINTER, EV_VSYNC};
 pub type WmEvent = eabi::WmEvent;
 
+#[inline(always)]
+fn canonical_pid(pid: u32) -> u32 {
+    if pid <= 1 {
+        pid
+    } else {
+        crate::process::get_group_leader(pid)
+    }
+}
+
+#[inline(always)]
+fn owner_visible_to_consumer(owner_pid: u32, consumer_pid: u32) -> bool {
+    owner_pid == 0 || owner_pid == canonical_pid(consumer_pid)
+}
+
 struct EventQueue {
     buf: [WmEvent; EVENT_CAP],
-    owner_pid: [u32; EVENT_CAP], // 0 = broadcast, otherwise targeted PID
+    owner_pid: [u32; EVENT_CAP], // 0 = broadcast, otherwise targeted group leader
     head: usize,
     tail: usize,
     len: usize,
@@ -37,6 +51,7 @@ impl EventQueue {
     }
 
     fn push(&mut self, mut ev: WmEvent, owner_pid: u32) {
+        let owner_pid = canonical_pid(owner_pid);
         ev.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
@@ -57,6 +72,26 @@ impl EventQueue {
             }
         }
 
+        // Coalesce consecutive pointer move/hover events into the most recent
+        // queued pointer event when the BUTTON STATE is unchanged.  PS/2 emits
+        // a flood of position updates; without this the queue fills with stale
+        // hover events and real clicks (button transitions) get buried behind a
+        // 100+ event backlog, arriving in Flutter far too late.  Only the tail
+        // event is examined, so every button transition (down/up) is preserved
+        // as its own distinct event and ordering is never violated.
+        if ev.kind == EV_POINTER && self.len > 0 {
+            let tail_idx = (self.tail + EVENT_CAP - 1) % EVENT_CAP;
+            if self.buf[tail_idx].kind == EV_POINTER
+                && self.owner_pid[tail_idx] == owner_pid
+                && self.buf[tail_idx].flags == ev.flags
+            {
+                // Same buttons: replace coordinates in place, keep latest pos.
+                self.buf[tail_idx].a = ev.a;
+                self.buf[tail_idx].b = ev.b;
+                return;
+            }
+        }
+
         if self.len == EVENT_CAP {
             self.head = (self.head + 1) % EVENT_CAP;
             self.len -= 1;
@@ -70,6 +105,7 @@ impl EventQueue {
     }
 
     fn push_front(&mut self, mut ev: WmEvent, owner_pid: u32) {
+        let owner_pid = canonical_pid(owner_pid);
         ev.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
@@ -96,7 +132,7 @@ impl EventQueue {
         for off in 0..self.len {
             let idx = (self.head + off) % EVENT_CAP;
             let owner = self.owner_pid[idx];
-            if (owner == 0 || owner == pid)
+            if owner_visible_to_consumer(owner, pid)
                 && self.buf[idx].kind == EV_VSYNC
                 && self.buf[idx].b != 0
             {
@@ -105,12 +141,30 @@ impl EventQueue {
             }
         }
 
+        // Input priority: deliver pointer/key events ahead of the constant
+        // EV_VSYNC(baton=0) tick stream.  Otherwise a single coalesced pointer
+        // event sits behind the perpetually-refreshed baton=0 vsync at the head
+        // and is never popped (clicks never reach Flutter).  Render batons
+        // (b!=0, handled above) still take precedence so frames keep flowing.
+        if found_off.is_none() {
+            for off in 0..self.len {
+                let idx = (self.head + off) % EVENT_CAP;
+                let owner = self.owner_pid[idx];
+                if owner_visible_to_consumer(owner, pid)
+                    && (self.buf[idx].kind == EV_POINTER || self.buf[idx].kind == EV_KEY)
+                {
+                    found_off = Some(off);
+                    break;
+                }
+            }
+        }
+
         // Find first event visible to this consumer.
         if found_off.is_none() {
             for off in 0..self.len {
                 let idx = (self.head + off) % EVENT_CAP;
                 let owner = self.owner_pid[idx];
-                if owner == 0 || owner == pid {
+                if owner_visible_to_consumer(owner, pid) {
                     found_off = Some(off);
                     break;
                 }
@@ -139,7 +193,21 @@ impl EventQueue {
         for off in 0..self.len {
             let idx = (self.head + off) % EVENT_CAP;
             let owner = self.owner_pid[idx];
-            if owner == 0 || owner == pid {
+            if owner_visible_to_consumer(owner, pid) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn input_pending_for(&self, pid: u32) -> usize {
+        let mut n = 0usize;
+        for off in 0..self.len {
+            let idx = (self.head + off) % EVENT_CAP;
+            let owner = self.owner_pid[idx];
+            if owner_visible_to_consumer(owner, pid)
+                && (self.buf[idx].kind == EV_POINTER || self.buf[idx].kind == EV_KEY)
+            {
                 n += 1;
             }
         }
@@ -150,7 +218,7 @@ impl EventQueue {
         for off in 0..self.len {
             let idx = (self.head + off) % EVENT_CAP;
             let owner = self.owner_pid[idx];
-            if (owner == 0 || owner == pid)
+            if owner_visible_to_consumer(owner, pid)
                 && self.buf[idx].kind == EV_VSYNC
                 && self.buf[idx].b != 0
             {
@@ -162,6 +230,47 @@ impl EventQueue {
 }
 
 static Q: Mutex<EventQueue> = Mutex::new(EventQueue::new());
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn irq_save() -> bool {
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags));
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+    (flags & 0x200) != 0
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn irq_save() -> bool {
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn irq_restore(was_enabled: bool) {
+    if was_enabled {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn irq_restore(_was_enabled: bool) {}
+
+#[inline(always)]
+fn with_queue<R>(f: impl FnOnce(&mut EventQueue) -> R) -> R {
+    let was_enabled = irq_save();
+    let mut q = Q.lock();
+    let out = f(&mut q);
+    drop(q);
+    irq_restore(was_enabled);
+    out
+}
 
 static WM_WAITER: AtomicU32 = AtomicU32::new(0);
 
@@ -213,6 +322,10 @@ pub fn set_flutter_init_ready() {
     FLUTTER_INIT_READY.store(true, Ordering::Release);
 }
 
+pub fn flutter_bootstrap_spin_active() -> bool {
+    !flutter_init_ready()
+}
+
 pub fn init() {
     log::info!("[WM] Event queue online (cap={})", EVENT_CAP);
 }
@@ -237,6 +350,7 @@ pub fn push_app_event(target_pid: u32, subkind: u32, surface_id: u32) {
 }
 
 pub fn set_focus_pid(pid: u32) {
+    let pid = canonical_pid(pid);
     let old = FOCUS_PID.swap(pid, Ordering::AcqRel);
     if old == pid {
         return;
@@ -367,20 +481,29 @@ pub fn event_size() -> usize {
 }
 
 pub fn pending_count() -> usize {
-    Q.lock().len
+    with_queue(|q| q.len)
 }
 
 pub fn pending_count_for(pid: u32) -> usize {
-    Q.lock().pending_for(pid)
+    let pid = canonical_pid(pid);
+    with_queue(|q| q.pending_for(pid))
+}
+
+/// Number of queued pointer/key (input) events visible to `pid`.
+/// Used by the epoll fast-path to yield the CPU to a starved WM consumer.
+pub fn input_pending_for(pid: u32) -> usize {
+    let pid = canonical_pid(pid);
+    with_queue(|q| q.input_pending_for(pid))
 }
 
 pub fn dropped_count() -> u64 {
-    Q.lock().dropped
+    with_queue(|q| q.dropped)
 }
 
 /// True when a baton≠0 EV_VSYNC is already in the queue for `pid`.
 pub fn baton_vsync_queued_for(pid: u32) -> bool {
-    Q.lock().has_baton_vsync_for(pid)
+    let pid = canonical_pid(pid);
+    with_queue(|q| q.has_baton_vsync_for(pid))
 }
 
 /// True when the embedder must run FlutterEngineOnVsync (baton queued or posted).
@@ -389,9 +512,67 @@ pub fn embedder_baton_due() -> bool {
 }
 
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
-    let ev = Q.lock().pop_for(pid)?;
+    let pid = canonical_pid(pid);
+    let (ev, pointer_pending) = with_queue(|q| {
+        let mut found = false;
+        for off in 0..q.len {
+            let idx = (q.head + off) % EVENT_CAP;
+            let owner = q.owner_pid[idx];
+            if owner_visible_to_consumer(owner, pid) && q.buf[idx].kind == EV_POINTER {
+                found = true;
+                break;
+            }
+        }
+        q.pop_for(pid).map(|ev| (ev, found))
+    })?;
     if ev.kind == EV_VSYNC && ev.b != 0 {
         BATON_VSYNC_QUEUED.store(false, Ordering::Release);
+    }
+    {
+        use core::sync::atomic::{AtomicU32, Ordering as O};
+        static POP_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = POP_LOG.fetch_add(1, O::Relaxed);
+        if n < 120 || ev.kind == EV_POINTER || ev.flags != 0 {
+            // Count how many pointer events (any owner) currently sit in queue.
+            let (qlen, ptr_owned1) = {
+                with_queue(|q| {
+                    let mut cnt = 0u32;
+                    for off in 0..q.len {
+                        let idx = (q.head + off) % EVENT_CAP;
+                        if q.buf[idx].kind == EV_POINTER {
+                            cnt += 1;
+                        }
+                    }
+                    (q.len, cnt)
+                })
+            };
+            log::warn!(
+                "[pop] #{} consumer_pid={} returned_kind={} b={} qlen={} ptr_in_q={}",
+                n,
+                pid,
+                ev.kind,
+                ev.b,
+                qlen,
+                ptr_owned1
+            );
+        }
+        let interesting = ev.kind == EV_POINTER || (pointer_pending && ev.kind != EV_POINTER);
+        if interesting {
+            static POP_LOG2: AtomicU32 = AtomicU32::new(0);
+            let n2 = POP_LOG2.fetch_add(1, O::Relaxed);
+            if n2 < 400 {
+                if ev.kind == EV_POINTER {
+                    log::warn!(
+                        "[ptr-pop] #{} DELIVERED pointer to pid={} flags={}",
+                        n2,
+                        pid,
+                        ev.flags
+                    );
+                } else {
+                    log::warn!("[ptr-pop] #{} STARVED: returned kind={} b={} to pid={} while pointer pending", n2, ev.kind, ev.b, pid);
+                }
+            }
+        }
     }
     Some(ev)
 }
@@ -401,19 +582,61 @@ pub fn push_event(kind: u32, flags: u32, a: u64, b: u64) {
 }
 
 pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
-    Q.lock().push(WmEvent {
-        seq: 0,
-        kind,
-        flags,
-        a,
-        b,
-    }, owner_pid);
+    let owner_pid = canonical_pid(owner_pid);
+    with_queue(|q| {
+        q.push(
+            WmEvent {
+                seq: 0,
+                kind,
+                flags,
+                a,
+                b,
+            },
+            owner_pid,
+        );
+    });
+
+    if kind == EV_POINTER {
+        use core::sync::atomic::{AtomicU32, Ordering as O};
+        static PUSH_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = PUSH_LOG.fetch_add(1, O::Relaxed);
+        if n < 60 || flags != 0 {
+            let (qlen, waiter) = (with_queue(|q| q.len), WM_WAITER.load(Ordering::Acquire));
+            log::warn!(
+                "[push-ptr] #{} owner={} flags={} qlen={} waiter={}",
+                n,
+                owner_pid,
+                flags,
+                qlen,
+                waiter
+            );
+        }
+    }
 
     // Wake the waiter if they are eligible for this event.
     let waiter = WM_WAITER.load(Ordering::Acquire);
-    if waiter != 0 && (owner_pid == 0 || owner_pid == waiter) {
+    if waiter != 0 && owner_visible_to_consumer(owner_pid, waiter) {
         WM_WAITER.store(0, Ordering::Release);
         crate::process::set_state(waiter, crate::process::ProcState::Running);
+    }
+
+    // Input events (pointer/key) MUST wake their target consumer even when no
+    // WM_WAITER is registered. The embedder host (pid 1) oscillates in and out
+    // of wm_event_wait — on a timeout==0 fast-return (platform task due) it
+    // exits without setting WM_WAITER, so at the instant a click arrives the
+    // waiter handshake is often 0 and the event is dropped on the floor while
+    // pid 1 stays frozen mid cooperative-yield and the engine threads hog the
+    // single core. Mirror push_vsync (which unconditionally wakes pid 1) so
+    // clicks and keystrokes are never lost.
+    if kind == EV_POINTER || kind == EV_KEY {
+        let target = if owner_pid != 0 {
+            owner_pid
+        } else {
+            focus_pid()
+        };
+        if target != 0 {
+            crate::process::set_state(target, crate::process::ProcState::Running);
+        }
     }
 }
 
@@ -436,7 +659,7 @@ pub fn push_vsync(frame: u64) {
         ev.kind = EV_VSYNC;
         ev.a = frame;
         ev.b = baton;
-        Q.lock().push_front(ev, 0);
+        with_queue(|q| q.push_front(ev, 0));
         BATON_VSYNC_QUEUED.store(true, Ordering::Release);
         crate::process::set_state(1, crate::process::ProcState::Running);
         let waiter = WM_WAITER.load(Ordering::Acquire);
@@ -469,7 +692,7 @@ pub fn set_vsync_baton(baton: u64) {
     ev.kind = EV_VSYNC;
     ev.a = 0;
     ev.b = baton;
-    Q.lock().push_front(ev, 0);
+    with_queue(|q| q.push_front(ev, 0));
     BATON_VSYNC_QUEUED.store(true, Ordering::Release);
     crate::process::set_state(1, crate::process::ProcState::Running);
     let waiter = WM_WAITER.load(Ordering::Acquire);
@@ -486,23 +709,45 @@ pub fn set_vsync_baton(baton: u64) {
 
 pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
-    
+    // Route to focused process first so the active UI always gets click input.
+    // Falling back to hit-test owner is useful when no explicit focus is set.
+    let focus = focus_pid();
+
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static PTR_ROUTE_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = PTR_ROUTE_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 40 || buttons != 0 {
+            log::warn!(
+                "[ptr-route] #{} x={} y={} buttons={} focus={} bypass={}",
+                n,
+                x,
+                y,
+                buttons,
+                focus,
+                crate::compositor::is_fb_bypass()
+            );
+        }
+    }
+
+    if focus != 0 {
+        push_event_for(focus, EV_POINTER, buttons, packed, 0);
+        return;
+    }
+
     // In bypass mode a userspace process owns the framebuffer directly.
-    // Skip compositor hit-testing entirely so the focused process receives
-    // every pointer event regardless of compositor surface layout.
+    // Skip compositor hit-testing and broadcast if there is no explicit focus.
     if !crate::compositor::is_fb_bypass() {
         if let Some((_surf_id, owner_pid)) = crate::compositor::surface_at_point(x, y) {
             push_event_for(owner_pid, EV_POINTER, buttons, packed, 0);
             return;
         }
     }
-    
-    // Route to focused process, or broadcast if no focus.
-    let focus = focus_pid();
+
     if focus == 0 {
-        push_event(EV_POINTER, buttons, packed, 0);
-    } else {
-        push_event_for(focus, EV_POINTER, buttons, packed, 0);
+        // Avoid broadcast consumption races: route fallback pointer events
+        // to the engine host (pid 1) so Flutter reliably receives clicks.
+        push_event_for(1, EV_POINTER, buttons, packed, 0);
     }
 }
 
@@ -515,4 +760,3 @@ pub fn push_key(scancode: u32, pressed: bool) {
         push_event_for(focus, EV_KEY, flags, scancode as u64, 0);
     }
 }
-

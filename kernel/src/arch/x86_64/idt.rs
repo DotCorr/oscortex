@@ -349,6 +349,8 @@ struct TimerTrapFrame {
     rip: u64,
     cs: u64,
     rflags: u64,
+    user_rsp: u64,
+    user_ss: u64,
 }
 
 #[unsafe(naked)]
@@ -437,9 +439,74 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     }
 
     if preempted_user {
-        // Cooperative `sched_yield` / futex paths handle userspace scheduling.
-        // Timer preemption back into a thread that yielded via SYSRET corrupts
-        // register state during bring-up (see init supervisor + Flutter host).
+        // Input is latency-sensitive on the single-core QEMU profile.  Runner
+        // threads can sit in userspace long enough that queued WM clicks never
+        // reach the embedder unless the timer interrupt performs this narrow
+        // same-thread-group handoff.
+        let cur = crate::process::current_pid();
+        let focus = crate::wm::focus_pid();
+        let target = if focus != 0 { focus } else { 1 };
+        if cur != 0
+            && target != 0
+            && cur != target
+            && !crate::wm::flutter_bootstrap_spin_active()
+            && crate::process::get_group_leader(cur) == crate::process::get_group_leader(target)
+            && crate::wm::input_pending_for(target) > 0
+        {
+            let cur_regs = crate::process::UserRegs {
+                rip: frame.rip,
+                rsp: frame.user_rsp,
+                rflags: frame.rflags,
+                rax: frame.rax,
+                rbx: frame.rbx,
+                rcx: frame.rcx,
+                rdx: frame.rdx,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                rbp: frame.rbp,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+            };
+            if let Some((next_pid, next_regs)) = crate::process::timer_preempt_switch(cur, &cur_regs) {
+                static INPUT_PREEMPT_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = INPUT_PREEMPT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 40 {
+                    log::warn!(
+                        "[input-preempt] #{} cur={} -> next={} target={} pending={}",
+                        n,
+                        cur,
+                        next_pid,
+                        target,
+                        crate::wm::input_pending_for(target)
+                    );
+                }
+                frame.r15 = next_regs.r15;
+                frame.r14 = next_regs.r14;
+                frame.r13 = next_regs.r13;
+                frame.r12 = next_regs.r12;
+                frame.r11 = next_regs.r11;
+                frame.r10 = next_regs.r10;
+                frame.r9 = next_regs.r9;
+                frame.r8 = next_regs.r8;
+                frame.rdi = next_regs.rdi;
+                frame.rsi = next_regs.rsi;
+                frame.rbp = next_regs.rbp;
+                frame.rbx = next_regs.rbx;
+                frame.rdx = next_regs.rdx;
+                frame.rcx = next_regs.rcx;
+                frame.rax = next_regs.rax;
+                frame.rip = next_regs.rip;
+                frame.rflags = next_regs.rflags | 0x200;
+                frame.user_rsp = next_regs.rsp;
+            }
+        }
         return;
     }
 
@@ -458,4 +525,3 @@ pub struct InterruptFrame {
     pub sp:     u64,
     pub ss:     u64,
 }
-

@@ -244,7 +244,7 @@ if [[ "${1:-}" == "--run" ]]; then
     qemu-system-x86_64 \
         -cdrom "$OUTPUT" \
         -cpu qemu64,+x2apic \
-        -m 512M \
+        -m 2G \
         -smp 2 \
         -serial stdio \
         -display none \
@@ -253,3 +253,4 @@ if [[ "${1:-}" == "--run" ]]; then
         -D "$ROOT/qemu-log.txt" \
         2>&1
 fi
+

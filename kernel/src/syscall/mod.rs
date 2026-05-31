@@ -109,4 +109,4 @@ pub(crate) use state::{
     FS_BOOTSTRAP_LOGGED, WM_WAITER_DEADLINE, WM_WAITER_PID,
 };
 pub(crate) use trace::{POSTEXIT_TRACE_ACTIVE, POSTEXIT_TRACE_COUNT, POSTEXIT_TRACE_LIMIT};
-pub(crate) use wait::{futex_waiter_add, futex_waiter_present, futex_waiter_remove};
+pub(crate) use wait::{futex_waiter_add, futex_waiter_for, futex_waiter_present, futex_waiter_remove};
