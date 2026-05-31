@@ -87,7 +87,7 @@ impl EventQueue {
             {
                 // Same buttons: replace coordinates in place, keep latest pos.
                 self.buf[tail_idx].a = ev.a;
-                self.buf[tail_idx].b = ev.b;
+                self.buf[tail_idx].b |= ev.b;
                 return;
             }
         }
@@ -444,7 +444,7 @@ pub fn high_priority_input_pending_for(pid: u32) -> bool {
                     return true;
                 }
                 if q.buf[idx].kind == EV_POINTER {
-                    if q.buf[idx].flags != 0 {
+                    if q.buf[idx].flags != 0 || q.buf[idx].b != 0 {
                         return true;
                     }
                 }
@@ -592,14 +592,22 @@ pub fn set_vsync_baton(baton: u64) {
     }
 }
 
+static LAST_BUTTONS: AtomicU32 = AtomicU32::new(0);
+
 pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
+
+    // Detect button transition (press or release) to flag it as high-priority.
+    let last = LAST_BUTTONS.swap(buttons, Ordering::AcqRel);
+    let is_transition = buttons != last;
+    let b_val = if is_transition { 1 } else { 0 };
+
     // Route to focused process first so the active UI always gets click input.
     // Falling back to hit-test owner is useful when no explicit focus is set.
     let focus = focus_pid();
 
     if focus != 0 {
-        push_event_for(focus, EV_POINTER, buttons, packed, 0);
+        push_event_for(focus, EV_POINTER, buttons, packed, b_val);
         return;
     }
 
@@ -607,7 +615,7 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     // Skip compositor hit-testing and broadcast if there is no explicit focus.
     if !crate::compositor::is_fb_bypass() {
         if let Some((_surf_id, owner_pid)) = crate::compositor::surface_at_point(x, y) {
-            push_event_for(owner_pid, EV_POINTER, buttons, packed, 0);
+            push_event_for(owner_pid, EV_POINTER, buttons, packed, b_val);
             return;
         }
     }
@@ -615,7 +623,7 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     if focus == 0 {
         // Avoid broadcast consumption races: route fallback pointer events
         // to the engine host (pid 1) so Flutter reliably receives clicks.
-        push_event_for(1, EV_POINTER, buttons, packed, 0);
+        push_event_for(1, EV_POINTER, buttons, packed, b_val);
     }
 }
 
