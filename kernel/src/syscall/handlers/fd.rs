@@ -344,7 +344,12 @@ pub(crate) fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 ts.pending = 0;
                 drop(tfd_tbl);
                 let pid = crate::process::current_pid();
-                log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
+                static TFD_READ_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = TFD_READ_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 24 {
+                    log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
+                }
                 unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
                 return 8;
             } else {

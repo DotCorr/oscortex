@@ -418,10 +418,6 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     if count < 10 {
         log::info!("[APIC TIMER] tick count={}", count);
     }
-    if count > 0 && count % 500 == 0 {
-        crate::process::debug_dump_processes();
-    }
-
     let frame = unsafe { &mut *frame_ptr };
     let preempted_user = (frame.cs & 0x3) == 0x3;
 
@@ -508,6 +504,38 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
             }
         }
         return;
+    }
+
+    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall
+    // hlt loop, queued input can otherwise leave PID 1 runnable-but-unentered.
+    // If the interrupt lands in idle (cur=0), PID 1 is still the safe target
+    // for post-init WM input. If it lands in PID 1's own wm_event_wait loop,
+    // re-entering PID 1 makes it re-execute the syscall and drain the queue.
+    let cur = crate::process::current_pid();
+    let focus = crate::wm::focus_pid();
+    let target = if focus != 0 { focus } else { 1 };
+    if target != 0
+        && crate::wm::flutter_init_ready()
+        && !crate::wm::flutter_bootstrap_spin_active()
+        && (cur == 0
+            || cur == target
+            || crate::process::get_group_leader(cur) == crate::process::get_group_leader(target))
+        && crate::wm::input_pending_for(target) > 0
+    {
+        crate::process::set_state(target, crate::process::ProcState::Running);
+        static INPUT_KERNEL_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = INPUT_KERNEL_HANDOFF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 40 {
+            log::warn!(
+                "[input-kernel-handoff] #{} cur={} -> target={} pending={}",
+                n,
+                cur,
+                target,
+                crate::wm::input_pending_for(target)
+            );
+        }
+        crate::process::enter_user_by_pid_noreturn(target);
     }
 
     // Kernel-mode preemption: run cooperative scheduler.

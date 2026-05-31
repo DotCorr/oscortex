@@ -513,66 +513,9 @@ pub fn embedder_baton_due() -> bool {
 
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
     let pid = canonical_pid(pid);
-    let (ev, pointer_pending) = with_queue(|q| {
-        let mut found = false;
-        for off in 0..q.len {
-            let idx = (q.head + off) % EVENT_CAP;
-            let owner = q.owner_pid[idx];
-            if owner_visible_to_consumer(owner, pid) && q.buf[idx].kind == EV_POINTER {
-                found = true;
-                break;
-            }
-        }
-        q.pop_for(pid).map(|ev| (ev, found))
-    })?;
+    let ev = with_queue(|q| q.pop_for(pid))?;
     if ev.kind == EV_VSYNC && ev.b != 0 {
         BATON_VSYNC_QUEUED.store(false, Ordering::Release);
-    }
-    {
-        use core::sync::atomic::{AtomicU32, Ordering as O};
-        static POP_LOG: AtomicU32 = AtomicU32::new(0);
-        let n = POP_LOG.fetch_add(1, O::Relaxed);
-        if n < 120 || ev.kind == EV_POINTER || ev.flags != 0 {
-            // Count how many pointer events (any owner) currently sit in queue.
-            let (qlen, ptr_owned1) = {
-                with_queue(|q| {
-                    let mut cnt = 0u32;
-                    for off in 0..q.len {
-                        let idx = (q.head + off) % EVENT_CAP;
-                        if q.buf[idx].kind == EV_POINTER {
-                            cnt += 1;
-                        }
-                    }
-                    (q.len, cnt)
-                })
-            };
-            log::warn!(
-                "[pop] #{} consumer_pid={} returned_kind={} b={} qlen={} ptr_in_q={}",
-                n,
-                pid,
-                ev.kind,
-                ev.b,
-                qlen,
-                ptr_owned1
-            );
-        }
-        let interesting = ev.kind == EV_POINTER || (pointer_pending && ev.kind != EV_POINTER);
-        if interesting {
-            static POP_LOG2: AtomicU32 = AtomicU32::new(0);
-            let n2 = POP_LOG2.fetch_add(1, O::Relaxed);
-            if n2 < 400 {
-                if ev.kind == EV_POINTER {
-                    log::warn!(
-                        "[ptr-pop] #{} DELIVERED pointer to pid={} flags={}",
-                        n2,
-                        pid,
-                        ev.flags
-                    );
-                } else {
-                    log::warn!("[ptr-pop] #{} STARVED: returned kind={} b={} to pid={} while pointer pending", n2, ev.kind, ev.b, pid);
-                }
-            }
-        }
     }
     Some(ev)
 }
@@ -595,23 +538,6 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
             owner_pid,
         );
     });
-
-    if kind == EV_POINTER {
-        use core::sync::atomic::{AtomicU32, Ordering as O};
-        static PUSH_LOG: AtomicU32 = AtomicU32::new(0);
-        let n = PUSH_LOG.fetch_add(1, O::Relaxed);
-        if n < 60 || flags != 0 {
-            let (qlen, waiter) = (with_queue(|q| q.len), WM_WAITER.load(Ordering::Acquire));
-            log::warn!(
-                "[push-ptr] #{} owner={} flags={} qlen={} waiter={}",
-                n,
-                owner_pid,
-                flags,
-                qlen,
-                waiter
-            );
-        }
-    }
 
     // Wake the waiter if they are eligible for this event.
     let waiter = WM_WAITER.load(Ordering::Acquire);
@@ -651,7 +577,7 @@ pub fn push_vsync(frame: u64) {
     let baton = VSYNC_BATON.swap(0, Ordering::AcqRel);
     static PV_SEQ: AtomicU32 = AtomicU32::new(0);
     let n = PV_SEQ.fetch_add(1, Ordering::Relaxed);
-    if baton != 0 || n < 30 || n % 300 == 0 {
+    if baton != 0 || n < 8 {
         log::info!("[push-vsync] #{} frame={} baton={:#x}", n, frame, baton);
     }
     if baton != 0 {
@@ -670,6 +596,7 @@ pub fn push_vsync(frame: u64) {
     } else {
         push_event(EV_VSYNC, 0, frame, baton);
     }
+
 }
 
 /// Deliver a vsync baton to the embedder (pid=1) immediately.
@@ -712,23 +639,6 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     // Route to focused process first so the active UI always gets click input.
     // Falling back to hit-test owner is useful when no explicit focus is set.
     let focus = focus_pid();
-
-    {
-        use core::sync::atomic::{AtomicU32, Ordering};
-        static PTR_ROUTE_LOG: AtomicU32 = AtomicU32::new(0);
-        let n = PTR_ROUTE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 40 || buttons != 0 {
-            log::warn!(
-                "[ptr-route] #{} x={} y={} buttons={} focus={} bypass={}",
-                n,
-                x,
-                y,
-                buttons,
-                focus,
-                crate::compositor::is_fb_bypass()
-            );
-        }
-    }
 
     if focus != 0 {
         push_event_for(focus, EV_POINTER, buttons, packed, 0);

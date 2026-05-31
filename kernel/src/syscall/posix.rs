@@ -1459,12 +1459,13 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
 
-    // Diagnostic only — log zero-wake cond broadcasts from the engine host.
+    // Diagnostic only — keep this very quiet. Engine zero-wake broadcasts are
+    // a normal hot path after Flutter starts rendering.
     if engine_host != 0 && pid_leader == engine_host && n == 0 {
         static COND_BROADCAST_ZERO_WAKE_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let z = COND_BROADCAST_ZERO_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
-        if z < 16 || z % 4096 == 0 {
+        if z < 4 {
             log::warn!(
                 "[cond-broadcast-zero-wake] #{} pid={} cond={:#x} skip_bridge={}",
                 z,
@@ -1475,7 +1476,11 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
 
-    if engine_host != 0 && engine_host_broadcast_group(pid, engine_host) && n == 0 {
+    if engine_host != 0
+        && engine_host_broadcast_group(pid, engine_host)
+        && n == 0
+        && crate::wm::flutter_bootstrap_spin_active()
+    {
         static COND_ZERO_WAKE_KICK: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let zkick = COND_ZERO_WAKE_KICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1490,7 +1495,7 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
             static COND_BROADCAST_BRIDGED_LOG: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             let k = COND_BROADCAST_BRIDGED_LOG.fetch_add(1, Ordering::Relaxed);
-            if k < 16 || k % 512 == 0 {
+            if k < 8 {
                 log::warn!(
                     "[cond-broadcast-bridged] #{} pid={} cond={:#x} woke={} bridged={}",
                     k,
@@ -1503,7 +1508,12 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
 
-    if n == 0 && bridged == 0 && crate::process::get_group_leader(pid) == 1 && pid >= 2 {
+    if n == 0
+        && bridged == 0
+        && crate::process::get_group_leader(pid) == 1
+        && pid >= 2
+        && crate::wm::flutter_bootstrap_spin_active()
+    {
         bridged = super::engine_broadcast_storm_wake(pid, cond);
         static ENGINE_ZERO_WAKE_KICK: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
@@ -1517,7 +1527,7 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let k = COND_BROADCAST_LOG.fetch_add(1, Ordering::Relaxed);
-    if k < 64 || k % 2048 == 0 {
+    if k < 8 {
         log::warn!(
             "[cond-broadcast] #{} pid={} cond={:#x} woke={}",
             k,

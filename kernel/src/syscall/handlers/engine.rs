@@ -377,7 +377,7 @@ pub(crate) fn sys_gpu_submit_strided(surface_id: u64, pixel_ptr: u64, row_bytes:
         Ok(()) => {
             static GPU_SUBMIT_LOG: AtomicU32 = AtomicU32::new(0);
             let n = GPU_SUBMIT_LOG.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n % 60 == 0 {
+            if n < 4 {
                 let sample = if bytes.len() >= 4 {
                     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
                 } else {

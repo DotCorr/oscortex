@@ -99,8 +99,17 @@ pub fn coop_target_ready(pid: u32) -> bool {
     }
     if crate::process::is_blocked(pid) {
         let wm = WM_WAITER_PID.load(Ordering::Acquire);
-        if wm == pid {
+        let focus = crate::wm::focus_pid();
+        let input_target = if focus != 0 { focus } else { 1 };
+        let input_priority_active =
+            crate::wm::flutter_init_ready() && !crate::wm::flutter_bootstrap_spin_active();
+        let input_is_waiting = input_priority_active
+            && input_target != 0
+            && crate::wm::input_pending_for(input_target) > 0;
+        if wm == pid || (input_is_waiting && pid == input_target) {
             crate::process::set_state(pid, crate::process::ProcState::Running);
+        } else if input_is_waiting && pid != input_target {
+            return false;
         }
     }
     crate::process::get_user_context(pid).is_some()
@@ -118,6 +127,18 @@ pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
 pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
     static COOP_TICK: AtomicU32 = AtomicU32::new(0);
     let tick = COOP_TICK.fetch_add(1, Ordering::Relaxed);
+
+    let focus = crate::wm::focus_pid();
+    let input_target = if focus != 0 { focus } else { 1 };
+    if crate::wm::flutter_init_ready()
+        && !crate::wm::flutter_bootstrap_spin_active()
+        && input_target != 0
+        && input_target != cur
+        && crate::wm::input_pending_for(input_target) > 0
+        && coop_target_ready(input_target)
+    {
+        return Some(input_target);
+    }
 
     let wm = WM_WAITER_PID.load(Ordering::Acquire);
     // Embedder must drain WM events (especially vsync batons) promptly.
@@ -805,7 +826,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         static EPOLL_70_ENTER_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_70_ENTER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 128 {
+        if n < 4 {
             log::warn!(
                 "[epoll70-enter] #{} pid={} to={} rip={:#x}",
                 n,
@@ -819,7 +840,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         static EPOLL_72_ENTER_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_72_ENTER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 24 {
+        if n < 4 {
             let watched = {
                 let tbl = EPOLL_TABLE.lock();
                 tbl.get(&(epfd as u32))
@@ -868,7 +889,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             static EPOLL_72_READY_LOG: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             let n = EPOLL_72_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 24 && events_out != 0 {
+            if n < 4 && events_out != 0 {
                 let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
                 let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                 log::warn!(
@@ -884,7 +905,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
         static EW_FIRE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = EW_FIRE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
+        if n < 4 {
             log::warn!("[epoll_fire] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
         }
         // Fairness de-starve: on a single core the engine threads busy-loop on
@@ -904,7 +925,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             let pend = crate::wm::input_pending_for(focus);
             if pend > 0 && focus != cur {
                 let g = YIELD_GATE_LOG.fetch_add(1, Ordering::Relaxed);
-                if g < 40 {
+                if g < 8 {
                     log::warn!(
                         "[yield-gate] #{} cur={} focus={} init_ready={} pend={} coop_ready={}",
                         g, cur, focus,
@@ -937,7 +958,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         static EPOLL_70_EMPTY_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_70_EMPTY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 128 {
+        if n < 4 {
             log::warn!("[epoll70-empty] #{} pid={} no-ready", n, cur);
         }
     }
@@ -951,7 +972,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 static EPOLL_72_READY_LOOP_LOG: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);
                 let n = EPOLL_72_READY_LOOP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 24 && events_out != 0 {
+                if n < 4 && events_out != 0 {
                     let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
                     let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                     log::warn!(
@@ -967,7 +988,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             }
             static EW_FIRE_LOOP_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let n = EW_FIRE_LOOP_LOG.fetch_add(1, Ordering::Relaxed);
-            if n < 32 {
+            if n < 4 {
                 log::warn!("[epoll_fire_loop] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
             }
             return ready as i64;

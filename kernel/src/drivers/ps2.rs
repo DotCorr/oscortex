@@ -379,4 +379,3 @@ pub fn device_info_packed(n: u32) -> u32 {
     }
     0
 }
-

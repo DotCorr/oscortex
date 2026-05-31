@@ -213,7 +213,7 @@ pub(crate) fn engine_broadcast_storm_wake(broadcaster: u32, cond: u64) -> u32 {
     if total > 0 {
         static STORM_WAKE_LOG: AtomicU32 = AtomicU32::new(0);
         let n = STORM_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 64 == 0 {
+        if n < 8 {
             log::warn!(
                 "[engine-bcast-storm] #{} pid={} cond={:#x} storm_wakes={}",
                 n,
@@ -684,14 +684,13 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
 /// Exit the current thread (or process if not a thread).
 pub(crate) fn sys_thread_exit(code: u64) -> i64 {
     let pid = crate::process::current_pid();
-    let user_rip = crate::arch::syscall::user_rip();
-    let user_rsp = crate::arch::syscall::user_rsp();
-    log::warn!("[trace] sys_thread_exit pid={} code={:#x} rip={:#x} rsp={:#x}",
-        pid, code, user_rip, user_rsp);
-    // Dump full syscall ring buffer so we can see EVERY syscall this thread
-    // made before exiting — critical for diagnosing the Flutter fml::Thread
-    // start_routine bail-out (only pthread_setname_np visible otherwise).
-    dump_recent_syscalls(SYSCALL_TRACE_DEPTH);
+    if code != 0 {
+        let user_rip = crate::arch::syscall::user_rip();
+        let user_rsp = crate::arch::syscall::user_rsp();
+        log::warn!("[trace] sys_thread_exit pid={} code={:#x} rip={:#x} rsp={:#x}",
+            pid, code, user_rip, user_rsp);
+        dump_recent_syscalls(SYSCALL_TRACE_DEPTH);
+    }
     // Activate post-exit syscall trace window so we can see what pid=1 does
     // after it resumes from pthread_cond_wait.
     POSTEXIT_TRACE_COUNT.store(0, Ordering::Relaxed);

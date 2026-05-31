@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 const _shell = BasicMessageChannel<String>('oscortex/shell', StringCodec());
 
-const _bg = Colors.amber;
+const _bg = Color(0xFF0C1C26);
 const _accent = Color(0xFF2DD4BF);
 
 void main() {
@@ -23,10 +23,7 @@ class OscortexShellApp extends StatelessWidget {
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: _bg,
-        colorScheme: const ColorScheme.dark(
-          primary: _accent,
-          surface: _bg,
-        ),
+        colorScheme: const ColorScheme.dark(primary: _accent, surface: _bg),
         useMaterial3: true,
       ),
       home: const ShellDesktop(),
@@ -47,9 +44,10 @@ class _ShellDesktopState extends State<ShellDesktop> {
   String _status = 'Booting shell...';
   bool _loading = false;
   bool _installingSeed = false;
-  final GlobalKey _installButtonKey = GlobalKey();
 
-  static const Map<String, dynamic> _emptyApps = <String, dynamic>{'apps': <dynamic>[]};
+  static const Map<String, dynamic> _emptyApps = <String, dynamic>{
+    'apps': <dynamic>[],
+  };
 
   static void _trace(String message) {
     print('[shell-ui] $message');
@@ -104,7 +102,10 @@ class _ShellDesktopState extends State<ShellDesktop> {
         _error = null;
       });
       _trace('refresh_ok count=${items.length}');
-      _setStatus('Refresh complete: ${items.length} app(s).', snack: showSpinner);
+      _setStatus(
+        'Refresh complete: ${items.length} app(s).',
+        snack: showSpinner,
+      );
     } catch (e) {
       _trace('refresh_error err=$e');
       if (!mounted) return;
@@ -123,9 +124,9 @@ class _ShellDesktopState extends State<ShellDesktop> {
       if (!_isOkReply(raw)) {
         _trace('launch_failed id=$id');
         if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Launch failed for app $id')),
-          );
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Launch failed for app $id')));
         }
       } else {
         _trace('launch_ok id=$id');
@@ -133,9 +134,9 @@ class _ShellDesktopState extends State<ShellDesktop> {
     } catch (e) {
       _trace('launch_error id=$id err=$e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Launch error: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Launch error: $e')));
       }
     }
   }
@@ -168,9 +169,9 @@ class _ShellDesktopState extends State<ShellDesktop> {
       _trace('install_error err=$e');
       _setStatus('Install error: $e', snack: true);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Install error: $e')),
-        );
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Install error: $e')));
       }
     } finally {
       if (mounted) {
@@ -179,31 +180,6 @@ class _ShellDesktopState extends State<ShellDesktop> {
         });
       }
     }
-  }
-
-  Future<void> _runPointerSmokeTest() async {
-    final context = _installButtonKey.currentContext;
-    final renderObject = context?.findRenderObject();
-    if (renderObject is! RenderBox) {
-      _trace('smoke_no_target');
-      return;
-    }
-
-    final center = renderObject.localToGlobal(renderObject.size.center(Offset.zero));
-    final x = center.dx.round();
-    final y = center.dy.round();
-    _trace('smoke_request x=$x y=$y');
-    final raw = await _safeSend('debug:tap:$x:$y');
-    _trace('smoke_reply raw=${raw ?? "null"}');
-  }
-
-  KeyEventResult _handleKeyEvent(FocusNode _, KeyEvent event) {
-    if (event is KeyDownEvent && event.logicalKey == LogicalKeyboardKey.f12) {
-      _trace('smoke_hotkey');
-      _runPointerSmokeTest();
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
   }
 
   Future<String?> _safeSend(String command) async {
@@ -215,7 +191,10 @@ class _ShellDesktopState extends State<ShellDesktop> {
   }
 
   static bool _isOkReply(String? raw) {
-    final json = _parseJsonObject(raw, fallback: const <String, dynamic>{'ok': false});
+    final json = _parseJsonObject(
+      raw,
+      fallback: const <String, dynamic>{'ok': false},
+    );
     return json['ok'] == true;
   }
 
@@ -254,126 +233,133 @@ class _ShellDesktopState extends State<ShellDesktop> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Focus(
-        autofocus: true,
-        onKeyEvent: _handleKeyEvent,
-        child: Listener(
-          behavior: HitTestBehavior.translucent,
-          onPointerDown: (event) {
-            _trace(
-              'pointer_down x=${event.position.dx.toStringAsFixed(1)} y=${event.position.dy.toStringAsFixed(1)}',
-            );
-            _setStatus(
-              'Flutter saw pointer down at ${event.position.dx.toStringAsFixed(0)}, ${event.position.dy.toStringAsFixed(0)}',
-            );
-          },
-          child: SafeArea(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-                  child: Row(
-                    children: [
-                      const Text(
-                        'OSCortex',
-                        style: TextStyle(
-                          fontSize: 28,
-                          fontWeight: FontWeight.w600,
-                          letterSpacing: -0.5,
-                        ),
+      body: SizedBox.expand(
+        child: SafeArea(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
+                child: Row(
+                  children: [
+                    const Text(
+                      'OSCortex',
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.w600,
+                        letterSpacing: -0.5,
                       ),
-                      const Spacer(),
-                      TextButton.icon(
-                        key: _installButtonKey,
-                        style: ButtonStyle(
-                          backgroundColor: MaterialStateProperty.all(
-                            Colors.pink.withValues(alpha: 0.6),
-                          ),
-                          padding: MaterialStateProperty.all(
-                            const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                    ),
+                    const Spacer(),
+                    TextButton.icon(
+                      style: ButtonStyle(
+                        backgroundColor: MaterialStateProperty.all(
+                          Colors.pink.withValues(alpha: 0.6),
+                        ),
+                        minimumSize: MaterialStateProperty.all(
+                          const Size(168, 52),
+                        ),
+                        padding: MaterialStateProperty.all(
+                          const EdgeInsets.symmetric(
+                            horizontal: 20,
+                            vertical: 14,
                           ),
                         ),
-                        onPressed: (_installingSeed || _demoInstalled) ? null : _installSeed,
-                        icon: const Icon(Icons.download_outlined),
-                        label: Text(_demoInstalled ? 'Installed' : 'Install demo'),
                       ),
-                      IconButton(
-                        onPressed: _loading ? null : () => _refreshApps(showSpinner: true),
-                        icon: _loading
-                            ? const SizedBox.square(
-                                dimension: 24,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Icon(Icons.refresh),
-                        tooltip: 'Refresh',
+                      onPressed: (_installingSeed || _demoInstalled)
+                          ? null
+                          : _installSeed,
+                      icon: const Icon(Icons.download_outlined),
+                      label: Text(
+                        _demoInstalled ? 'Installed' : 'Install demo',
                       ),
-                    ],
-                  ),
+                    ),
+                    const SizedBox(width: 12),
+                    IconButton(
+                      style: ButtonStyle(
+                        minimumSize: MaterialStateProperty.all(
+                          const Size.square(56),
+                        ),
+                        backgroundColor: MaterialStateProperty.all(
+                          Colors.white.withValues(alpha: 0.08),
+                        ),
+                      ),
+                      onPressed: _loading
+                          ? null
+                          : () => _refreshApps(showSpinner: true),
+                      icon: _loading
+                          ? const SizedBox.square(
+                              dimension: 24,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            )
+                          : const Icon(Icons.refresh),
+                      tooltip: 'Refresh',
+                    ),
+                  ],
                 ),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                  child: Row(
-                    children: [
-                      Text(
-                        'Installed apps',
+              ),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Row(
+                  children: [
+                    Text(
+                      'Installed apps',
+                      style: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.7),
+                        fontSize: 14,
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    Expanded(
+                      child: Text(
+                        _status,
+                        textAlign: TextAlign.right,
+                        overflow: TextOverflow.ellipsis,
                         style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.7),
-                          fontSize: 14,
+                          color: Colors.white.withValues(alpha: 0.85),
+                          fontSize: 13,
                         ),
                       ),
-                      const SizedBox(width: 16),
-                      Expanded(
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: _loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : _error != null
+                    ? Center(child: Text(_error!))
+                    : _apps.isEmpty
+                    ? Center(
                         child: Text(
-                          _status,
-                          textAlign: TextAlign.right,
-                          overflow: TextOverflow.ellipsis,
+                          'No apps installed.\nUse Install demo or drop a .osx bundle.',
+                          textAlign: TextAlign.center,
                           style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.85),
-                            fontSize: 13,
+                            color: Colors.white.withValues(alpha: 0.6),
                           ),
                         ),
+                      )
+                    : GridView.builder(
+                        padding: const EdgeInsets.all(24),
+                        gridDelegate:
+                            const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 4,
+                              mainAxisSpacing: 16,
+                              crossAxisSpacing: 16,
+                              childAspectRatio: 0.9,
+                            ),
+                        itemCount: _apps.length,
+                        itemBuilder: (context, index) {
+                          final app = _apps[index];
+                          return _AppCard(
+                            app: app,
+                            onLaunch: () => _launchApp(app.id),
+                          );
+                        },
                       ),
-                    ],
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Expanded(
-                  child: _loading
-                      ? const Center(child: CircularProgressIndicator())
-                      : _error != null
-                          ? Center(child: Text(_error!))
-                          : _apps.isEmpty
-                              ? Center(
-                                  child: Text(
-                                    'No apps installed.\nUse Install demo or drop a .osx bundle.',
-                                    textAlign: TextAlign.center,
-                                    style: TextStyle(
-                                      color: Colors.white.withValues(alpha: 0.6),
-                                    ),
-                                  ),
-                                )
-                              : GridView.builder(
-                                  padding: const EdgeInsets.all(24),
-                                  gridDelegate:
-                                      const SliverGridDelegateWithFixedCrossAxisCount(
-                                    crossAxisCount: 4,
-                                    mainAxisSpacing: 16,
-                                    crossAxisSpacing: 16,
-                                    childAspectRatio: 0.9,
-                                  ),
-                                  itemCount: _apps.length,
-                                  itemBuilder: (context, index) {
-                                    final app = _apps[index];
-                                    return _AppCard(
-                                      app: app,
-                                      onLaunch: () => _launchApp(app.id),
-                                    );
-                                  },
-                                ),
-                ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
