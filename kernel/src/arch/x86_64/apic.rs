@@ -29,6 +29,7 @@ const XAPIC_OFF_LINT0:     u32 = 0x350;
 const XAPIC_OFF_TMR_LVT:   u32 = 0x320;
 const XAPIC_OFF_TMR_INIT:  u32 = 0x380;
 const XAPIC_OFF_TMR_DIV:   u32 = 0x3E0;
+const XAPIC_OFF_TMR_CURR:  u32 = 0x390;
 
 /// True once x2APIC has been successfully initialised on the BSP.
 static X2APIC_READY: AtomicBool = AtomicBool::new(false);
@@ -36,6 +37,118 @@ static X2APIC_READY: AtomicBool = AtomicBool::new(false);
 static XAPIC_READY:  AtomicBool = AtomicBool::new(false);
 /// Virtual address of xAPIC MMIO region (HHDM-mapped).
 static XAPIC_BASE_VA: AtomicU64 = AtomicU64::new(0);
+
+pub static APIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(62500);
+
+fn print_u64_early(val: u64) {
+    let mut buf = [0u8; 32];
+    let mut cursor = 30usize;
+    let mut temp = val;
+    buf[31] = b'\0';
+    if temp == 0 {
+        cursor -= 1;
+        buf[cursor] = b'0';
+    } else {
+        while temp > 0 {
+            cursor -= 1;
+            buf[cursor] = b'0' + (temp % 10) as u8;
+            temp /= 10;
+        }
+    }
+    if let Ok(s) = core::str::from_utf8(&buf[cursor..31]) {
+        crate::logger::early_print(s);
+    }
+}
+
+fn calibrate_tsc() -> u64 {
+    unsafe {
+        let val = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, (val & 0xFD) | 1);
+
+        super::port_io::outb(0x43, 0xB0);
+
+        let count = 11932u16;
+        super::port_io::outb(0x42, (count & 0xFF) as u8);
+        super::port_io::outb(0x42, (count >> 8) as u8);
+
+        let val2 = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, val2 & 0xFE);
+        super::port_io::outb(0x61, val2 | 1);
+
+        let start = crate::arch::rdtsc();
+        while (super::port_io::inb(0x61) & 0x20) == 0 {
+            core::hint::spin_loop();
+        }
+        let end = crate::arch::rdtsc();
+
+        let elapsed = end.wrapping_sub(start);
+        
+        let val3 = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, val3 & 0xFC);
+
+        elapsed * 100
+    }
+}
+
+fn calibrate_apic_ticks_per_ms() -> u32 {
+    unsafe {
+        let val = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, (val & 0xFD) | 1);
+
+        super::port_io::outb(0x43, 0xB0);
+        let count = 1193u16;
+        super::port_io::outb(0x42, (count & 0xFF) as u8);
+        super::port_io::outb(0x42, (count >> 8) as u8);
+
+        let val2 = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, val2 & 0xFE);
+        super::port_io::outb(0x61, val2 | 1);
+
+        if has_x2apic() {
+            wrmsr(X2APIC_TIMER_DIVIDE, 0x3);
+            wrmsr(X2APIC_TIMER_LVT, 0x0030);
+            wrmsr(X2APIC_TIMER_INIT, 0xFFFFFFFF);
+        } else {
+            let base = XAPIC_BASE_VA.load(Ordering::Acquire);
+            if base != 0 {
+                xapic_write(XAPIC_OFF_TMR_DIV, 0x3);
+                xapic_write(XAPIC_OFF_TMR_LVT, 0x0030);
+                xapic_write(XAPIC_OFF_TMR_INIT, 0xFFFFFFFF);
+            }
+        }
+
+        while (super::port_io::inb(0x61) & 0x20) == 0 {
+            core::hint::spin_loop();
+        }
+
+        let current = if has_x2apic() {
+            rdmsr(0x839) as u32
+        } else {
+            let base = XAPIC_BASE_VA.load(Ordering::Acquire);
+            if base != 0 {
+                xapic_read(XAPIC_OFF_TMR_CURR)
+            } else {
+                0xFFFFFFFF
+            }
+        };
+
+        let val3 = super::port_io::inb(0x61);
+        super::port_io::outb(0x61, val3 & 0xFC);
+
+        let ticks = 0xFFFFFFFF - current;
+        
+        if has_x2apic() {
+            wrmsr(X2APIC_TIMER_INIT, 0);
+        } else {
+            let base = XAPIC_BASE_VA.load(Ordering::Acquire);
+            if base != 0 {
+                xapic_write(XAPIC_OFF_TMR_INIT, 0);
+            }
+        }
+
+        ticks
+    }
+}
 
 // ── Vsync timing ─────────────────────────────────────────────────────────────
 
@@ -185,38 +298,72 @@ pub fn init_bsp() {
     }
 }
 
-/// Phase-2 xAPIC init: map the MMIO region and arm the timer.
-/// Must be called after mm::init() (needs the frame allocator for page mapping).
-/// No-op if x2APIC was already initialised or if xAPIC is not pending.
+/// Phase-2 APIC init: map the MMIO region (if xAPIC), calibrate the TSC and APIC timer,
+/// and arm the timer in periodic mode at 1 ms (1000 Hz).
+/// Must be called after mm::init().
 pub fn finish_xapic_init() {
-    if X2APIC_READY.load(Ordering::Acquire) { return; }
-    if XAPIC_READY.load(Ordering::Acquire)  { return; }
-    let virt_base = XAPIC_BASE_VA.load(Ordering::Acquire);
-    if virt_base == 0 { return; }
-    let hhdm      = crate::mm::frame_allocator::hhdm_offset();
-    let phys_base = virt_base - hhdm;
+    let has_x2 = X2APIC_READY.load(Ordering::Acquire);
+    if !has_x2 && !XAPIC_READY.load(Ordering::Acquire) {
+        let virt_base = XAPIC_BASE_VA.load(Ordering::Acquire);
+        if virt_base != 0 {
+            let hhdm      = crate::mm::frame_allocator::hhdm_offset();
+            let phys_base = virt_base - hhdm;
 
-    // Map 4 KiB MMIO (one page covers all xAPIC registers up to 0x3FF).
-    unsafe { crate::mm::paging::map_mmio(phys_base, virt_base, 0x1000); }
+            // Map 4 KiB MMIO (one page covers all xAPIC registers up to 0x3FF).
+            unsafe { crate::mm::paging::map_mmio(phys_base, virt_base, 0x1000); }
 
-    unsafe {
-        // Ensure xAPIC enabled (bit 11) in base MSR.
-        let base_msr = rdmsr(IA32_APIC_BASE_MSR);
-        wrmsr(IA32_APIC_BASE_MSR, base_msr | (1 << 11));
-        // Software-enable + spurious vector 0xFF.
-        let sv = xapic_read(XAPIC_OFF_SPURIOUS);
-        xapic_write(XAPIC_OFF_SPURIOUS, sv | 0x100 | 0xFF);
-        // Timer: ÷16, periodic (bit 17), vector 0x30.
-        xapic_write(XAPIC_OFF_TMR_DIV,  0x3);
-        xapic_write(XAPIC_OFF_TMR_LVT,  0x0002_0030);
-        xapic_write(XAPIC_OFF_TMR_INIT, 0x0010_0000);
+            unsafe {
+                // Ensure xAPIC enabled (bit 11) in base MSR.
+                let base_msr = rdmsr(IA32_APIC_BASE_MSR);
+                wrmsr(IA32_APIC_BASE_MSR, base_msr | (1 << 11));
+                // Software-enable + spurious vector 0xFF.
+                let sv = xapic_read(XAPIC_OFF_SPURIOUS);
+                xapic_write(XAPIC_OFF_SPURIOUS, sv | 0x100 | 0xFF);
+            }
+            XAPIC_READY.store(true, Ordering::Release);
+            crate::logger::early_print("[APIC] xAPIC (MMIO) online\r\n");
+        }
     }
-    XAPIC_READY.store(true, Ordering::Release);
-    crate::logger::early_print("[APIC] xAPIC (MMIO) online — timer armed (vec 0x30)\r\n");
+
+    // Calibrate TSC.
+    let tsc_hz = calibrate_tsc();
+    set_tsc_hz(tsc_hz);
+    crate::logger::early_print("[APIC] Calibrated TSC frequency: ");
+    print_u64_early(tsc_hz);
+    crate::logger::early_print(" Hz\r\n");
+
+    // Calibrate APIC timer ticks in 1 ms.
+    let apic_ticks = calibrate_apic_ticks_per_ms();
+    let apic_ticks = if apic_ticks == 0 || apic_ticks == 0xFFFFFFFF {
+        62500
+    } else {
+        apic_ticks
+    };
+    APIC_TICKS_PER_MS.store(apic_ticks, Ordering::Release);
+    crate::logger::early_print("[APIC] Calibrated APIC ticks per ms: ");
+    print_u64_early(apic_ticks as u64);
+    crate::logger::early_print("\r\n");
+
+    // Arm the BSP APIC timer with the calibrated value in periodic mode (1 ms / 1000 Hz).
+    unsafe {
+        if has_x2apic() {
+            wrmsr(X2APIC_TIMER_DIVIDE, 0x3);
+            wrmsr(X2APIC_TIMER_LVT, 0x0002_0030); // periodic, vector 0x30
+            wrmsr(X2APIC_TIMER_INIT, apic_ticks as u64);
+        } else {
+            let base = XAPIC_BASE_VA.load(Ordering::Acquire);
+            if base != 0 {
+                xapic_write(XAPIC_OFF_TMR_DIV,  0x3);
+                xapic_write(XAPIC_OFF_TMR_LVT,  0x0002_0030);
+                xapic_write(XAPIC_OFF_TMR_INIT, apic_ticks);
+            }
+        }
+    }
 }
 
-/// Initialise the local APIC on an Application Processor.
+/// Initialise the local APIC on an Application Processor and arm its periodic timer at 1 ms.
 pub fn init_ap() {
+    let apic_ticks = APIC_TICKS_PER_MS.load(Ordering::Acquire);
     if has_x2apic() {
         let base = rdmsr(IA32_APIC_BASE_MSR);
         wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11) | (1 << 10));
@@ -224,7 +371,7 @@ pub fn init_ap() {
         wrmsr(X2APIC_SPURIOUS, u64::from(sv | 0x100 | 0xFF));
         wrmsr(X2APIC_TIMER_DIVIDE, 0x3);
         wrmsr(X2APIC_TIMER_LVT, 0x0002_0030);
-        wrmsr(X2APIC_TIMER_INIT, 0x0010_0000);
+        wrmsr(X2APIC_TIMER_INIT, apic_ticks as u64);
     } else {
         // xAPIC path — reuse the MMIO base set up by the BSP.
         unsafe {
@@ -232,7 +379,7 @@ pub fn init_ap() {
             xapic_write(XAPIC_OFF_SPURIOUS, sv | 0x100 | 0xFF);
             xapic_write(XAPIC_OFF_TMR_DIV,  0x3);
             xapic_write(XAPIC_OFF_TMR_LVT,  0x0002_0030);
-            xapic_write(XAPIC_OFF_TMR_INIT, 0x0010_0000);
+            xapic_write(XAPIC_OFF_TMR_INIT, apic_ticks);
         }
     }
 }
@@ -281,6 +428,23 @@ pub fn local_apic_id() -> u32 {
         if base == 0 { return 0; }
         let reg = unsafe { core::ptr::read_volatile((base + 0x20) as *const u32) };
         (reg >> 24) & 0xFF
+    }
+}
+
+/// Send a reschedule IPI (vector 0x40) to a specific target Local APIC ID.
+pub fn send_resched_ipi(target_lapic_id: u32) {
+    if X2APIC_READY.load(Ordering::Acquire) {
+        // x2APIC: write target to upper 32 bits, command to lower 32 bits.
+        // Delivery mode = 0 (Fixed), vector = 0x40.
+        let val = ((target_lapic_id as u64) << 32) | 0x40u64;
+        wrmsr(0x830, val);
+    } else if XAPIC_READY.load(Ordering::Acquire) {
+        unsafe {
+            // Write destination to ICR High.
+            xapic_write(0x310, target_lapic_id << 24);
+            // Write command to ICR Low (Delivery mode = 0, vector = 0x40).
+            xapic_write(0x300, 0x40);
+        }
     }
 }
 

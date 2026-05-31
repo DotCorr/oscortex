@@ -33,29 +33,24 @@ pub struct PerCpuData {
     pub cpu_id:   u32,
     pub lapic_id: u32,
     pub online:   AtomicBool,
+    pub current_pid: AtomicU32,
 }
 
 const ZERO_CPU: PerCpuData = PerCpuData {
     cpu_id:   0,
     lapic_id: 0,
     online:   AtomicBool::new(false),
+    current_pid: AtomicU32::new(0),
 };
 static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = [ZERO_CPU; MAX_CPUS];
 
 /// Total logical CPUs online (including BSP).
 pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
-/// Return this CPU's per-CPU entry by matching LAPIC ID.
+/// Return this CPU's per-CPU entry.
 pub fn this_cpu() -> &'static PerCpuData {
-    let apic_id = crate::arch::x86_64::apic::local_apic_id();
-    let n = CPU_COUNT.load(Ordering::Relaxed) as usize;
-    for i in 0..n {
-        let cpu = unsafe { &PER_CPU_DATA[i] };
-        if cpu.lapic_id == apic_id {
-            return cpu;
-        }
-    }
-    unsafe { &PER_CPU_DATA[0] }
+    let cpu_idx = crate::arch::syscall::current_cpu_id() as usize;
+    unsafe { &PER_CPU_DATA[cpu_idx] }
 }
 
 // ── AP entry ──────────────────────────────────────────────────────────────────
@@ -69,7 +64,7 @@ pub unsafe extern "C" fn ap_entry(info: &MpInfo) -> ! {
         core::hint::spin_loop();
     }
 
-    crate::arch::x86_64::ap_init();
+    crate::arch::x86_64::ap_init(cpu_idx);
 
     unsafe {
         PER_CPU_DATA[cpu_idx as usize].online.store(true, Ordering::Release);
@@ -142,4 +137,16 @@ pub fn init(smp_resp: Option<&'static MpResponse>) {
         .filter(|&i| unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) })
         .count();
     log::info!("[SMP] {}/{} CPU(s) online", online, expected);
+}
+
+/// Broadcast a reschedule IPI to all other online CPUs.
+pub fn broadcast_resched_ipi() {
+    let my_lapic_id = crate::arch::x86_64::apic::local_apic_id();
+    let n = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    for i in 0..n {
+        let cpu = unsafe { &PER_CPU_DATA[i] };
+        if cpu.online.load(Ordering::Acquire) && cpu.lapic_id != my_lapic_id {
+            crate::arch::x86_64::apic::send_resched_ipi(cpu.lapic_id);
+        }
+    }
 }

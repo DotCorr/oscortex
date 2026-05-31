@@ -87,8 +87,22 @@ pub fn init() {
 /// safe for concurrent scheduling decisions from multiple CPUs. Park APs with
 /// interrupts disabled so only the BSP drives preemption.
 pub fn ap_start(cpu_idx: u32) -> ! {
-    log::info!("[Sched] AP cpu={} ready, parked (BSP-only scheduler)", cpu_idx);
-    crate::arch::halt_forever();
+    log::info!("[Sched] AP cpu={} ready, entering scheduling loop", cpu_idx);
+    
+    // Enable interrupts so APIC timer and reschedule IPIs can fire.
+    crate::arch::enable_interrupts();
+    
+    loop {
+        // Find a runnable userspace process.
+        if let Some(pid) = crate::process::next_runnable_pid(0) {
+            crate::process::enter_user_by_pid_noreturn(pid);
+        }
+        
+        // If no process is runnable, halt until the next interrupt.
+        unsafe {
+            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+        }
+    }
 }
 
 /// Register the **current** execution context (BSP idle loop) as the idle task.

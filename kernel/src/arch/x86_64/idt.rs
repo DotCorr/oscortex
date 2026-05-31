@@ -76,6 +76,8 @@ pub fn init() {
 
         // APIC timer (used by scheduler)
         IDT.entries[0x30].set(apic_timer_entry as *const () as u64, 0, 0);
+        // APIC reschedule IPI
+        IDT.entries[0x40].set(apic_resched_entry as *const () as u64, 0, 0);
         // APIC spurious
         IDT.entries[0xFF].set(apic_spurious_handler as *const () as u64, 0, 0);
 
@@ -354,6 +356,101 @@ struct TimerTrapFrame {
 }
 
 #[unsafe(naked)]
+unsafe extern "C" fn apic_resched_entry() {
+    core::arch::naked_asm!(
+        // Save all GPRs so preemption is transparent to userspace code.
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym apic_resched_handler,
+    );
+}
+
+extern "C" fn apic_resched_handler(frame_ptr: *mut TimerTrapFrame) {
+    let frame = unsafe { &mut *frame_ptr };
+    let preempted_user = (frame.cs & 0x3) == 0x3;
+
+    // EOI first.
+    crate::arch::apic::eoi();
+
+    if preempted_user {
+        let cur = crate::process::current_pid();
+        if cur != 0 {
+            let cur_regs = crate::process::UserRegs {
+                rip: frame.rip,
+                rsp: frame.user_rsp,
+                rflags: frame.rflags,
+                rax: frame.rax,
+                rbx: frame.rbx,
+                rcx: frame.rcx,
+                rdx: frame.rdx,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                rbp: frame.rbp,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+            };
+            if let Some((next_pid, next_regs)) = crate::process::timer_preempt_switch(cur, &cur_regs) {
+                frame.r15 = next_regs.r15;
+                frame.r14 = next_regs.r14;
+                frame.r13 = next_regs.r13;
+                frame.r12 = next_regs.r12;
+                frame.r11 = next_regs.r11;
+                frame.r10 = next_regs.r10;
+                frame.r9 = next_regs.r9;
+                frame.r8 = next_regs.r8;
+                frame.rdi = next_regs.rdi;
+                frame.rsi = next_regs.rsi;
+                frame.rbp = next_regs.rbp;
+                frame.rbx = next_regs.rbx;
+                frame.rdx = next_regs.rdx;
+                frame.rcx = next_regs.rcx;
+                frame.rax = next_regs.rax;
+                frame.rip = next_regs.rip;
+                frame.rflags = next_regs.rflags | 0x200;
+                frame.user_rsp = next_regs.rsp;
+            }
+        }
+    }
+}
+
+#[unsafe(naked)]
 unsafe extern "C" fn apic_timer_entry() {
     core::arch::naked_asm!(
         // Save all GPRs so preemption is transparent to userspace code.
@@ -397,15 +494,17 @@ unsafe extern "C" fn apic_timer_entry() {
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     crate::syscall::check_timerfds_and_wake();
 
-    // Set a deferred-kick flag every ~500 ms (30 ticks × ~17 ms/tick).
+    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
+
+    // Set a deferred-kick flag every ~500 ms (500 ticks × 1 ms/tick).
     // The flag is consumed in syscall context (sys_pthread_mutex_unlock or
     // sys_wm_event_wait) where spinlock acquisition is safe.  This ISR path
     // only does an atomic store — completely lock-free.
-    {
+    if cpu_id == 0 {
         static TR_KICK_CTR: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let k = TR_KICK_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if k % 30 == 0 {
+        if k % 500 == 0 {
             crate::syscall::KICK_REQUESTED.store(
                 true,
                 core::sync::atomic::Ordering::Release,
@@ -415,7 +514,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
 
     static DUMP_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let count = DUMP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if count < 10 {
+    if count < 10 && cpu_id == 0 {
         log::info!("[APIC TIMER] tick count={}", count);
     }
     let frame = unsafe { &mut *frame_ptr };
@@ -425,13 +524,15 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // after iretq.
     crate::arch::apic::eoi();
 
-    // Call wm::tick() and compositor::tick() on vsync boundary even when running userspace threads.
-    let vsync = crate::arch::apic::vsync_due();
-    if vsync {
-        crate::wm::tick();
-        crate::compositor::tick();
-        crate::drivers::usb::poll();
-        crate::arch::apic::reset_vsync_last_tsc();
+    if cpu_id == 0 {
+        // Call wm::tick() and compositor::tick() on vsync boundary even when running userspace threads.
+        let vsync = crate::arch::apic::vsync_due();
+        if vsync {
+            crate::wm::tick();
+            crate::compositor::tick();
+            crate::drivers::usb::poll();
+            crate::arch::apic::reset_vsync_last_tsc();
+        }
     }
 
     if preempted_user {
@@ -544,7 +645,9 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // Kernel-mode preemption: run cooperative scheduler.
     // Do NOT call sched::tick() while a user thread was running —
     // those are reserved for kernel-idle context only.
-    crate::sched::tick();
+    if crate::arch::x86_64::smp::this_cpu().cpu_id == 0 {
+        crate::sched::tick();
+    }
 }
 
 /// CPU-provided interrupt frame (pushed by hardware).

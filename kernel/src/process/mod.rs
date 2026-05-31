@@ -162,6 +162,8 @@ pub struct Process {
     pub user_stack_base: u64,
     /// Size in bytes of this thread/process's user-space stack.
     pub user_stack_size: u64,
+    /// CPU core index that currently executes this process context (None if idle/blocked).
+    pub current_cpu: Option<u32>,
 }
 
 impl Process {
@@ -193,6 +195,7 @@ impl Process {
             preempted_by_timer: false,
             user_stack_base: 0,
             user_stack_size: 0,
+            current_cpu: None,
         }
     }
 }
@@ -263,11 +266,7 @@ pub(crate) static PTABLE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Next PID to hand out (starts at 1; PID 0 is the kernel).
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
-/// PID currently bound to the active userspace context on this CPU.
-///
-/// Today this is a global fallback (single active userspace context path).
-/// Per-CPU PID binding comes with full user scheduler integration.
-static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
+// static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
 
 // ── PID helpers ───────────────────────────────────────────────────────────────
 
@@ -480,6 +479,7 @@ pub fn exit(pid: u32, code: i32) {
 
     p.state     = ProcState::Zombie(code);
     p.exit_code = code;
+    p.current_cpu = None;
     log::info!("[Process] pid={} exited with code {}", pid, code);
 }
 
@@ -499,12 +499,12 @@ pub fn kill(pid: u32) -> Result<(), &'static str> {
 
 /// Set currently active userspace PID (called by exec/scheduler glue).
 pub fn set_current_pid(pid: u32) {
-    CURRENT_PID.store(pid, Ordering::Release);
+    crate::arch::smp::this_cpu().current_pid.store(pid, Ordering::Release);
 }
 
 /// Get currently active userspace PID.
 pub fn current_pid() -> u32 {
-    CURRENT_PID.load(Ordering::Acquire)
+    crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
 }
 
 /// Wait for `pid` to become zombie, then reap it and return exit code.
@@ -644,6 +644,7 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
 /// Round-robin pick of next runnable process after `current`.
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let _g = PTABLE_LOCK.lock();
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
 
     // Input must preempt engine task-runner churn on single-core boots. The
     // hardware/WM path can queue pointer/key events while PID 1 is not the
@@ -655,7 +656,9 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
         if current != input_target {
             let target = unsafe { &PTABLE[idx_of(input_target)] };
             if target.pid == input_target && target.state == ProcState::Running {
-                return Some(input_target);
+                if target.current_cpu.is_none() || target.current_cpu == Some(my_cpu) {
+                    return Some(input_target);
+                }
             }
         }
     }
@@ -664,7 +667,9 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     if current != 1 && crate::wm::embedder_baton_due() {
         let embedder = unsafe { &PTABLE[idx_of(1)] };
         if embedder.pid == 1 && embedder.state == ProcState::Running {
-            return Some(1);
+            if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
+                return Some(1);
+            }
         }
     }
 
@@ -678,9 +683,11 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
         let idx = (start + off) % MAX_PROCS;
         let p = unsafe { &PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
-            if current == 0 || p.pid != current {
-                res = Some(p.pid);
-                break;
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                if current == 0 || p.pid != current {
+                    res = Some(p.pid);
+                    break;
+                }
             }
         }
     }
@@ -688,7 +695,9 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     if res.is_none() && current != 0 {
         let c = unsafe { &PTABLE[idx_of(current)] };
         if c.pid == current && c.state == ProcState::Running {
-            res = Some(current);
+            if c.current_cpu.is_none() || c.current_cpu == Some(my_cpu) {
+                res = Some(current);
+            }
         }
     }
 
@@ -936,12 +945,23 @@ pub fn schedule_user_launch(pid: u32) {
 }
 
 pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let old_pid = current_pid();
+    if old_pid != 0 && old_pid != pid {
+        let _g = PTABLE_LOCK.lock();
+        let old_p = unsafe { &mut PTABLE[idx_of(old_pid)] };
+        if old_p.pid == old_pid && old_p.current_cpu == Some(my_cpu) {
+            old_p.current_cpu = None;
+        }
+    }
+
     let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
          rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
          syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
+        p.current_cpu = Some(my_cpu);
         let e = p.errno_to_deliver;
         p.errno_to_deliver = 0; // consume it
         let pbt = p.preempted_by_timer;
@@ -1170,6 +1190,7 @@ fn user_launch_task() {
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
 pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs)> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     // Find the next runnable thread (acquires/releases PTABLE_LOCK internally).
     let next_pid = next_runnable_pid(cur_pid)?;
     if next_pid == cur_pid { return None; }
@@ -1182,6 +1203,7 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
             p.regs = *cur_regs;
             p.regs.rflags |= 0x200; // ensure IF=1 on resume
             p.preempted_by_timer = true;
+            p.current_cpu = None; // Switch away from cur_pid
         }
     }
 
@@ -1191,12 +1213,17 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
     // Load the next thread's register context (acquires/releases PTABLE_LOCK).
     let next_regs = {
         let _g = PTABLE_LOCK.lock();
-        let p = unsafe { &PTABLE[idx_of(next_pid)] };
+        let p = unsafe { &mut PTABLE[idx_of(next_pid)] };
         if p.pid != next_pid || p.state != ProcState::Running {
             // Thread vanished between the two lock windows; abort the switch.
-            // cur_pid's preempted_by_timer=true is harmless (see field docs).
+            // Put cur_pid back as occupied
+            let p_cur = unsafe { &mut PTABLE[idx_of(cur_pid)] };
+            if p_cur.pid == cur_pid {
+                p_cur.current_cpu = Some(my_cpu);
+            }
             return None;
         }
+        p.current_cpu = Some(my_cpu); // Switch to next_pid
         p.regs
     };
 
@@ -1330,7 +1357,18 @@ pub fn get_saved_rip_rsp(pid: u32) -> Option<(u64, u64)> {
 pub fn set_state(pid: u32, state: ProcState) {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
-    if p.pid == pid { p.state = state; }
+    if p.pid == pid {
+        let old_state = p.state;
+        p.state = state;
+        if state != ProcState::Running {
+            p.current_cpu = None;
+        }
+        if state == ProcState::Running && old_state != ProcState::Running {
+            drop(_g);
+            crate::arch::smp::broadcast_resched_ipi();
+            return;
+        }
+    }
 }
 
 /// Dump a compact scheduler snapshot for the main Flutter bring-up threads.
@@ -1484,7 +1522,7 @@ pub fn set_signal_mask(pid: u32, mask: u32) {
 /// The child starts with identical register state; `rax` will be set to 0
 /// in the child by the caller (sys_fork).
 pub fn fork_current() -> Result<u32, &'static str> {
-    let parent_pid = CURRENT_PID.load(Ordering::Relaxed);
+    let parent_pid = current_pid();
     if parent_pid == 0 { return Err("fork from kernel"); }
 
     let child_pid = alloc_pid().ok_or("too many processes")?;

@@ -10,6 +10,7 @@
 
 use core::arch::asm;
 use spin::Once;
+use super::smp::MAX_CPUS;
 
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_DS: u16 = 0x10;
@@ -33,33 +34,22 @@ struct Tss {
     iomap_base: u16,
 }
 
-// Static interrupt stacks (each 16 KiB, 16-byte aligned).
+#[repr(C, align(16))]
+struct InterruptStack([u8; 16 * 1024]);
+
 static mut DOUBLE_FAULT_STACK: [u8; 16 * 1024] = [0; 16 * 1024];
-static mut KERNEL_STACK: [u8; 64 * 1024] = [0; 64 * 1024];
+static mut INTERRUPT_STACKS: [InterruptStack; MAX_CPUS] = [const { InterruptStack([0; 16 * 1024]) }; MAX_CPUS];
+static mut INTERRUPT_STACK_TOPS: [u64; MAX_CPUS] = [0; MAX_CPUS];
 
-static TSS: Once<Tss> = Once::new();
-
-fn tss() -> &'static Tss {
-    TSS.call_once(|| {
-        let kernel_stack_top =
-            unsafe { KERNEL_STACK.as_ptr().add(KERNEL_STACK.len()) as u64 };
-        let df_stack_top =
-            unsafe { DOUBLE_FAULT_STACK.as_ptr().add(DOUBLE_FAULT_STACK.len()) as u64 };
-
-        let mut tss = Tss {
-            _reserved0: 0,
-            rsp: [0; 3],
-            _reserved1: 0,
-            ist: [0; 7],
-            _reserved2: 0,
-            _reserved3: 0,
-            iomap_base: core::mem::size_of::<Tss>() as u16,
-        };
-        tss.rsp[0] = kernel_stack_top;
-        tss.ist[0] = df_stack_top; // IST1
-        tss
-    })
-}
+static mut TSS_ARR: [Tss; MAX_CPUS] = [const { Tss {
+    _reserved0: 0,
+    rsp: [0; 3],
+    _reserved1: 0,
+    ist: [0; 7],
+    _reserved2: 0,
+    _reserved3: 0,
+    iomap_base: 104,
+} }; MAX_CPUS];
 
 // ── GDT ──────────────────────────────────────────────────────────────────────
 
@@ -83,8 +73,8 @@ impl GdtEntry {
     }
 
     /// Low u64 of a TSS descriptor.
-    fn tss_low(tss: &'static Tss) -> Self {
-        let base = tss as *const _ as u64;
+    fn tss_low(tss: *const Tss) -> Self {
+        let base = tss as u64;
         let limit = (core::mem::size_of::<Tss>() - 1) as u64;
         // Type=9 (available 64-bit TSS), Present
         let lo = (limit & 0xFFFF)
@@ -96,8 +86,8 @@ impl GdtEntry {
     }
 
     /// High u64 of a TSS descriptor (upper 32 bits of base).
-    fn tss_high(tss: &'static Tss) -> Self {
-        let base = tss as *const _ as u64;
+    fn tss_high(tss: *const Tss) -> Self {
+        let base = tss as u64;
         Self(base >> 32)
     }
 }
@@ -115,25 +105,34 @@ struct Gdt {
     entries: [GdtEntry; 8],
 }
 
-static mut GDT: Gdt = Gdt {
-    entries: [GdtEntry::NULL; 8],
-};
+static mut GDTS: [Gdt; MAX_CPUS] = [const { Gdt { entries: [GdtEntry::NULL; 8] } }; MAX_CPUS];
 
 pub fn init() {
-    let t = tss();
     unsafe {
-        GDT.entries[0] = GdtEntry::NULL;
-        GDT.entries[1] = GdtEntry::code64(0);  // kernel CS 0x08
-        GDT.entries[2] = GdtEntry::data(0);    // kernel DS 0x10
-        GDT.entries[3] = GdtEntry::code64(3);  // user CS32 placeholder 0x18 (SYSRET base)
-        GDT.entries[4] = GdtEntry::data(3);    // user DS   0x20 (SYSRET SS = base+8)
-        GDT.entries[5] = GdtEntry::code64(3);  // user CS64 0x28 (SYSRET CS = base+16)
-        GDT.entries[6] = GdtEntry::tss_low(t); // TSS lo    0x30
-        GDT.entries[7] = GdtEntry::tss_high(t);// TSS hi    0x38
+        let df_stack_top =
+            DOUBLE_FAULT_STACK.as_ptr().add(DOUBLE_FAULT_STACK.len()) as u64;
+
+        for i in 0..MAX_CPUS {
+            let top = INTERRUPT_STACKS[i].0.as_ptr().add(16 * 1024) as u64;
+            INTERRUPT_STACK_TOPS[i] = top;
+
+            TSS_ARR[i].rsp[0] = top;
+            TSS_ARR[i].ist[0] = df_stack_top; // IST1
+
+            let t = &TSS_ARR[i] as *const Tss;
+            GDTS[i].entries[0] = GdtEntry::NULL;
+            GDTS[i].entries[1] = GdtEntry::code64(0);  // kernel CS 0x08
+            GDTS[i].entries[2] = GdtEntry::data(0);    // kernel DS 0x10
+            GDTS[i].entries[3] = GdtEntry::code64(3);  // user CS32 placeholder 0x18 (SYSRET base)
+            GDTS[i].entries[4] = GdtEntry::data(3);    // user DS   0x20 (SYSRET SS = base+8)
+            GDTS[i].entries[5] = GdtEntry::code64(3);  // user CS64 0x28 (SYSRET CS = base+16)
+            GDTS[i].entries[6] = GdtEntry::tss_low(t); // TSS lo    0x30
+            GDTS[i].entries[7] = GdtEntry::tss_high(t);// TSS hi    0x38
+        }
 
         let ptr = GdtPointer {
             limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-            base: (&GDT as *const Gdt) as u64,
+            base: (&GDTS[0] as *const Gdt) as u64,
         };
 
         asm!(
@@ -159,25 +158,31 @@ pub fn init() {
 }
 
 /// Reload GDT on an AP (uses already-initialised static GDT).
-/// Note: we do NOT call `ltr` here — the TSS "busy" bit is set after the BSP's
-/// `ltr`, and a second `ltr` on the same descriptor would raise #GP (busy TSS).
-/// APs don't need a TSS until ring-3 syscalls are introduced.
-pub fn init_ap() {
+pub fn init_ap(cpu_idx: u32) {
     unsafe {
         let ptr = GdtPointer {
             limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-            base: (&GDT as *const Gdt) as u64,
+            base: (&GDTS[cpu_idx as usize] as *const Gdt) as u64,
         };
-        asm!("lgdt [{ptr}]", ptr = in(reg) &ptr);
-        // Reload segment registers so the AP uses the kernel GDT.
         asm!(
+            "lgdt [{ptr}]",
             "mov ax, {ds}",
             "mov ds, ax",
             "mov es, ax",
             "mov ss, ax",
+            "push {cs}",
+            "lea rax, [rip + 2f]",
+            "push rax",
+            "retfq",
+            "2:",
+            ptr = in(reg) &ptr,
+            cs = const KERNEL_CS as u64,
             ds = const KERNEL_DS,
-            out("ax") _,
+            out("rax") _,
         );
+
+        // Load TSS.
+        asm!("ltr ax", in("ax") TSS_SELECTOR);
     }
 }
 
