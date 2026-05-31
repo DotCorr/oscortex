@@ -651,18 +651,16 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         }
 
         // Cooperatively switch to another runnable process.
-        if !crate::wm::baton_vsync_queued_for(1) {
-            let mut next = crate::process::next_runnable_pid(cur);
-            if next.is_none() {
-                let (_fds, woken) = force_wake_all_task_runners("wm-wait-no-runnable");
-                if woken > 0 {
-                    next = crate::process::next_runnable_pid(cur);
-                }
+        let mut next = crate::process::next_runnable_pid(cur);
+        if next.is_none() {
+            let (_fds, woken) = force_wake_all_task_runners("wm-wait-no-runnable");
+            if woken > 0 {
+                next = crate::process::next_runnable_pid(cur);
             }
-            if let Some(next) = next {
-                if next != cur {
-                    crate::process::enter_user_by_pid_noreturn(next);
-                }
+        }
+        if let Some(next) = next {
+            if next != cur {
+                crate::process::enter_user_by_pid_noreturn(next);
             }
         }
         crate::arch::interrupts_restore(wait_irq_flags);
