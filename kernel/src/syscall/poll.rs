@@ -521,7 +521,7 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
     };
     let raw_bytes = unsafe { core::slice::from_raw_parts(new_value as *const u8, 32) };
     let n = TFD_SETTIME_LOG.load(Ordering::Relaxed);
-    if n < 0 {
+    if n < 32 {
         log::warn!("[tfd-debug] fd={} raw: {:x?}", fd, raw_bytes);
         log::warn!("[tfd-debug] fd={} fields: int_s={} int_ns={} val_s={} val_ns={}", fd, int_s, int_ns, val_s, val_ns);
     }
@@ -817,7 +817,6 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
                 crate::process::save_xstate(cur);
-                crate::process::set_state(cur, crate::process::ProcState::Blocked);
                 crate::process::enter_user_by_pid_noreturn(target);
             }
         }
@@ -949,7 +948,6 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             crate::process::save_full_user_gprs(cur);
             crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
             crate::process::save_xstate(cur);
-            crate::process::set_state(cur, crate::process::ProcState::Blocked);
             crate::process::enter_user_by_pid_noreturn(focus);
         }
         return ready as i64;
@@ -1102,7 +1100,6 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B);
                 crate::process::save_xstate(cur);
-                crate::process::set_state(cur, crate::process::ProcState::Blocked);
                 crate::process::enter_user_by_pid_noreturn(1);
             }
         }

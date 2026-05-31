@@ -175,12 +175,46 @@ pub fn sys_malloc(size: u64) -> i64 {
     ptr as i64 // return ptr past header
 }
 
-fn take_free_malloc_block(pml4: u64, size: u64, pages: usize) -> Option<MallocBlock> {
+fn take_free_malloc_block(pml4: u64, _size: u64, pages: usize) -> Option<MallocBlock> {
     let mut free = MALLOC_FREE.lock();
     let idx = free
         .iter()
-        .position(|block| block.pml4 == pml4 && block.pages >= pages && block.size >= size)?;
-    Some(free.swap_remove(idx))
+        .position(|block| block.pml4 == pml4 && block.pages >= pages)?;
+    let mut block = free.swap_remove(idx);
+    if block.pages > pages {
+        let remaining_pages = block.pages - pages;
+        let split_block = MallocBlock {
+            pml4,
+            base: block.base + (pages * 4096) as u64,
+            size: 0,
+            pages: remaining_pages,
+        };
+        free.push(split_block);
+        block.pages = pages;
+    }
+    Some(block)
+}
+
+fn coalesce_free_blocks(free: &mut Vec<MallocBlock>) {
+    if free.len() < 2 {
+        return;
+    }
+    free.sort_unstable_by(|a, b| {
+        a.pml4.cmp(&b.pml4)
+            .then_with(|| a.base.cmp(&b.base))
+    });
+    let mut write_idx = 0;
+    for read_idx in 1..free.len() {
+        let next = free[read_idx];
+        let curr = &mut free[write_idx];
+        if curr.pml4 == next.pml4 && curr.base + (curr.pages * 4096) as u64 == next.base {
+            curr.pages += next.pages;
+        } else {
+            write_idx += 1;
+            free[write_idx] = next;
+        }
+    }
+    free.truncate(write_idx + 1);
 }
 
 pub fn sys_free(ptr: u64) -> i64 {
@@ -190,7 +224,9 @@ pub fn sys_free(ptr: u64) -> i64 {
     let (_, pml4) = pid_and_pml4();
     let block = MALLOC_ALLOCS.lock().remove(&(pml4, ptr));
     if let Some(block) = block {
-        MALLOC_FREE.lock().push(block);
+        let mut free = MALLOC_FREE.lock();
+        free.push(block);
+        coalesce_free_blocks(&mut free);
     }
     0
 }

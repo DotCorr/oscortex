@@ -588,9 +588,9 @@ unsafe extern "C" fn present_callback(
         let ok = gpu_submit_strided(surface_id, pixels, row_bytes) >= 0;
         if ok {
             let n = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 4 {
-                write(b"[embedder] present_callback\n");
-            }
+            write(b"[embedder] present_callback n=");
+            write_dec(n as u64);
+            write(b"\n");
         }
         ok
     }
@@ -1184,6 +1184,12 @@ extern "C" fn main_embedder() {
         (1280, 720)
     };
 
+    write(b"[embedder] FB resolution: w=");
+    write_dec(w as u64);
+    write(b" h=");
+    write_dec(h as u64);
+    write(b"\n");
+
     // Create the surface at full framebuffer resolution so Flutter renders
     // to the entire screen. The kernel compositor handles memory allocation.
     let surface_id = surface_create(w, h);
@@ -1602,6 +1608,11 @@ extern "C" fn main_embedder() {
                     let now_ns = rdtsc_ns();
                     let target_ns = now_ns + 16_666_666;
                     let f: OnVsyncFn = unsafe { core::mem::transmute(proctable.on_vsync) };
+                    write(b"[embedder/vsync] calling on_vsync n=");
+                    write_dec(vsync_n as u64);
+                    write(b" baton=");
+                    write_hex(baton as u64);
+                    write(b"\n");
                     // A baton is a one-shot token: call OnVsync EXACTLY once.
                     // Calling it twice corrupts the engine's vsync accounting
                     // and stops it from scheduling further frames.
@@ -1716,11 +1727,9 @@ extern "C" fn main_embedder() {
 
                     if POINTER_ADDED.swap(1, Ordering::Relaxed) == 0 {
                         let rc = send(4, 0); // kAdd
-                        if rc != 0 {
-                            write(b"[embedder/ptr] sent phase=4 rc=");
-                            write_dec(rc as u64);
-                            write(b"\n");
-                        }
+                        write(b"[embedder/ptr] kAdd (4) rc=");
+                        write_dec(rc as u64);
+                        write(b"\n");
                     }
 
                     let prev_buttons =
@@ -1735,13 +1744,17 @@ extern "C" fn main_embedder() {
                         3i32 // kMove (drag)
                     };
                     let rc = send(phase, buttons);
-                    if rc != 0 {
-                        write(b"[embedder/ptr] sent phase=");
-                        write_dec(phase as u64);
-                        write(b" rc=");
-                        write_dec(rc as u64);
-                        write(b"\n");
-                    }
+                    write(b"[embedder/ptr] send phase=");
+                    write_dec(phase as u64);
+                    write(b" x=");
+                    write_dec(x as u64);
+                    write(b" y=");
+                    write_dec(y as u64);
+                    write(b" buttons=");
+                    write_dec(buttons as u64);
+                    write(b" rc=");
+                    write_dec(rc as u64);
+                    write(b"\n");
                 }
             }
             EV_KEY => {

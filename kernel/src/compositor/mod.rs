@@ -606,27 +606,83 @@ fn has_visible_content(c: &CompositorState) -> bool {
 }
 
 /// Simple PS/2 pointer overlay (OS cursor — Flutter does not draw one in software mode).
+fn blend_pixel(bg: u32, fg: u32, alpha: u8) -> u32 {
+    if alpha == 255 {
+        return fg;
+    }
+    if alpha == 0 {
+        return bg;
+    }
+    let r_bg = (bg >> 16) & 0xFF;
+    let g_bg = (bg >> 8) & 0xFF;
+    let b_bg = bg & 0xFF;
+
+    let r_fg = (fg >> 16) & 0xFF;
+    let g_fg = (fg >> 8) & 0xFF;
+    let b_fg = fg & 0xFF;
+
+    let a = alpha as u32;
+    let r_out = (r_fg * a + r_bg * (255 - a)) / 255;
+    let g_out = (g_fg * a + g_bg * (255 - a)) / 255;
+    let b_out = (b_fg * a + b_bg * (255 - a)) / 255;
+
+    (r_out << 16) | (g_out << 8) | b_out
+}
+
+/// Circular cursor rendering with active click scaling, custom color, and inactivity auto-fade.
 fn draw_software_cursor() {
     use core::sync::atomic::Ordering;
     if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
         return;
     }
+
+    // Auto-disappear cursor after 3 seconds of inactivity (6,000,000,000 TSC cycles @ 2GHz)
+    let last_act = crate::drivers::ps2::last_activity_tsc();
+    let now = crate::arch::rdtsc();
+    if now.wrapping_sub(last_act) > 6_000_000_000 {
+        return;
+    }
+
     let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
+    let buttons = crate::drivers::ps2::cursor_buttons();
+
+    // Determine scale and color based on click/active state
+    let (r, r_glow, color) = if buttons != 0 {
+        (4i32, 8i32, 0x0038BDF8) // Clicked: 8px diameter, cyan accent
+    } else {
+        (6i32, 10i32, 0x00FFFFFF) // Idle: 12px diameter, white
+    };
+
     if let Some((w, h)) = crate::drivers::fb::size_px() {
-        x = x.clamp(0, w as i32 - 14);
-        y = y.clamp(0, h as i32 - 18);
+        x = x.clamp(r_glow, w as i32 - 1 - r_glow);
+        y = y.clamp(r_glow, h as i32 - 1 - r_glow);
     }
-    const FG: u32 = 0xFFFFFFFF;
-    const BG: u32 = 0xFF000000;
-    // Classic arrow: vertical shaft + diagonal fill.
-    for i in 0..14 {
-        crate::drivers::fb::fill_rect(x, y + i, 1, 1, BG);
-        crate::drivers::fb::fill_rect(x + 1, y + i, 1, 1, FG);
-    }
-    for i in 0..9 {
-        crate::drivers::fb::fill_rect(x + i, y + i, 2, 2, BG);
-        if i < 8 {
-            crate::drivers::fb::fill_rect(x + i + 1, y + i + 1, 1, 1, FG);
+
+    // Draw circular pointer and fading radial glow using integer distance metric
+    for dy in -r_glow..=r_glow {
+        for dx in -r_glow..=r_glow {
+            let dist2 = dx * dx + dy * dy;
+            let px = x + dx;
+            let py = y + dy;
+
+            if px >= 0 && py >= 0 {
+                let px = px as u32;
+                let py = py as u32;
+
+                if dist2 <= r * r {
+                    // Solid central core
+                    crate::drivers::fb::set_pixel(px, py, color);
+                } else if dist2 <= r_glow * r_glow {
+                    // Soft radial shadow/glow
+                    let bg = crate::drivers::fb::get_pixel(px, py);
+                    let t = (r_glow * r_glow) - dist2;
+                    let max_t = (r_glow * r_glow) - (r * r);
+                    let alpha = if max_t > 0 { (t * 80) / max_t } else { 0 } as u8;
+                    let glow_color = if buttons != 0 { 0x0038BDF8 } else { 0x00FFFFFF };
+                    let blended = blend_pixel(bg, glow_color, alpha);
+                    crate::drivers::fb::set_pixel(px, py, blended);
+                }
+            }
         }
     }
 }

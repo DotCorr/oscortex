@@ -136,7 +136,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         fi
     done
 
-    for d in fonts packages shaders; do
+    for d in fonts packages shaders assets; do
         if [ -d "$APP_ASSETS_DIR/$d" ]; then
             rm -rf "$ROOT/initramfs/system/flutter/flutter_assets/$d"
             cp -R "$APP_ASSETS_DIR/$d" "$ROOT/initramfs/system/flutter/flutter_assets/$d"

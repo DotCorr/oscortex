@@ -446,6 +446,7 @@ fn poll_ps2_input(s: &mut SynthInput, max_w: i32, max_h: i32) -> bool {
                 crate::drivers::ps2::set_cursor_pos(s.x, s.y);
 
                 let buttons = (p0 & 0x07) as u32;
+                crate::drivers::ps2::set_cursor_buttons(buttons);
                 crate::compositor::invalidate();
                 push_pointer(s.x, s.y, buttons);
                 produced = true;

@@ -447,7 +447,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
             && cur != target
             && !crate::wm::flutter_bootstrap_spin_active()
             && crate::process::get_group_leader(cur) == crate::process::get_group_leader(target)
-            && crate::wm::input_pending_for(target) > 0
+            && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
         {
             let cur_regs = crate::process::UserRegs {
                 rip: frame.rip,
@@ -475,12 +475,13 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
                 let n = INPUT_PREEMPT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if n < 40 {
                     log::warn!(
-                        "[input-preempt] #{} cur={} -> next={} target={} pending={}",
+                        "[input-preempt] #{} cur={} -> next={} target={} pending={} baton={}",
                         n,
                         cur,
                         next_pid,
                         target,
-                        crate::wm::input_pending_for(target)
+                        crate::wm::input_pending_for(target),
+                        crate::wm::embedder_baton_due()
                     );
                 }
                 frame.r15 = next_regs.r15;
@@ -517,10 +518,8 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     if target != 0
         && crate::wm::flutter_init_ready()
         && !crate::wm::flutter_bootstrap_spin_active()
-        && (cur == 0
-            || cur == target
-            || crate::process::get_group_leader(cur) == crate::process::get_group_leader(target))
-        && crate::wm::input_pending_for(target) > 0
+        && (cur == 0 || crate::process::is_blocked(cur))
+        && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
     {
         crate::process::set_state(target, crate::process::ProcState::Running);
         static INPUT_KERNEL_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
@@ -528,14 +527,17 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         let n = INPUT_KERNEL_HANDOFF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 40 {
             log::warn!(
-                "[input-kernel-handoff] #{} cur={} -> target={} pending={}",
+                "[input-kernel-handoff] #{} cur={} -> target={} pending={} baton={}",
                 n,
                 cur,
                 target,
-                crate::wm::input_pending_for(target)
+                crate::wm::input_pending_for(target),
+                crate::wm::embedder_baton_due()
             );
         }
-        crate::process::enter_user_by_pid_noreturn(target);
+        if cur != target {
+            crate::process::enter_user_by_pid_noreturn(target);
+        }
     }
 
     // Kernel-mode preemption: run cooperative scheduler.

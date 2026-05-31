@@ -374,8 +374,12 @@ fn wm_event_copy_to_user(ev_ptr: u64, ev_len: u64, platform_poll_slack: bool) ->
         return -22; // EINVAL
     }
 
-    let ev = match crate::wm::pop_event_for(wm_consumer_pid()) {
-        Some(e) => e,
+    let consumer = wm_consumer_pid();
+    let ev = match crate::wm::pop_event_for(consumer) {
+        Some(e) => {
+            log::warn!("[wm-copy] popped event: kind={} flags={} a={} b={} for consumer={}", e.kind, e.flags, e.a, e.b, consumer);
+            e
+        }
         None => return -11, // EAGAIN
     };
 
@@ -667,8 +671,6 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         // Cooperative yield already happened once above.  Re-yield only every
         // 16th hlt wake so reentrant wm_event_wait can hit eagain-top for
         // platform-recv without the sched ping-pong that starved pid=2 init.
-        static HLT_YIELD_TICK: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
         while crate::process::is_blocked(cur) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -690,11 +692,9 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
                 break;
             }
 
-            if (HLT_YIELD_TICK.fetch_add(1, Ordering::Relaxed) & 15) == 0 {
-                if let Some(next) = crate::process::next_runnable_pid(cur) {
-                    if next != cur {
-                        crate::process::enter_user_by_pid_noreturn(next);
-                    }
+            if let Some(next) = crate::process::next_runnable_pid(cur) {
+                if next != cur {
+                    crate::process::enter_user_by_pid_noreturn(next);
                 }
             }
         }
