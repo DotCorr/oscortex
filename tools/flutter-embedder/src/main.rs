@@ -1689,6 +1689,7 @@ extern "C" fn main_embedder() {
 
                     static POINTER_ADDED: AtomicU32 = AtomicU32::new(0);
                     static LAST_POINTER_BUTTONS: AtomicU64 = AtomicU64::new(0);
+                    static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
 
                     let engine_now_us = || -> u64 {
                         if get_current_time_va != 0 {
@@ -1701,7 +1702,15 @@ extern "C" fn main_embedder() {
                     };
 
                     let send = |phase: i32, btns: i64| -> i32 {
-                        let timestamp = engine_now_us();
+                        let mut timestamp = engine_now_us();
+                        loop {
+                            let last = LAST_TIMESTAMP.load(Ordering::SeqCst);
+                            let next = if timestamp <= last { last + 1 } else { timestamp };
+                            if LAST_TIMESTAMP.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                timestamp = next;
+                                break;
+                            }
+                        }
                         let evt = FlutterPointerEvent {
                             struct_size: core::mem::size_of::<FlutterPointerEvent>(),
                             phase,

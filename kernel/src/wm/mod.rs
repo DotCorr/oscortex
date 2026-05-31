@@ -403,73 +403,7 @@ unsafe fn in8(port: u16) -> u8 {
 
 #[cfg(target_arch = "x86_64")]
 fn poll_ps2_input(s: &mut SynthInput, max_w: i32, max_h: i32) -> bool {
-    let mut produced = false;
-
-    // Drain a bounded number of queued controller bytes per tick.
-    for _ in 0..64 {
-        let status = unsafe { in8(0x64) };
-        if status & 0x01 == 0 {
-            break; // output buffer empty
-        }
-
-        let byte = unsafe { in8(0x60) };
-        let is_mouse = (status & 0x20) != 0;
-
-        if is_mouse {
-            s.mouse_pkt[s.mouse_len] = byte;
-            s.mouse_len += 1;
-            if s.mouse_len == 3 {
-                let p0 = s.mouse_pkt[0];
-                let p1 = s.mouse_pkt[1];
-                let p2 = s.mouse_pkt[2];
-                s.mouse_len = 0;
-
-                // Ignore overflow packets.
-                if (p0 & 0xC0) != 0 {
-                    continue;
-                }
-
-                let dx = if (p0 & 0x10) != 0 {
-                    (p1 as i16 as i8) as i32
-                } else {
-                    p1 as i32
-                };
-                let dy = if (p0 & 0x20) != 0 {
-                    (p2 as i16 as i8) as i32
-                } else {
-                    p2 as i32
-                };
-
-                s.x = (s.x + dx).clamp(0, (max_w - 1).max(0));
-                // PS/2 Y is positive when moving down? In practice invert for screen space.
-                s.y = (s.y - dy).clamp(0, (max_h - 1).max(0));
-                crate::drivers::ps2::set_cursor_pos(s.x, s.y);
-
-                let buttons = (p0 & 0x07) as u32;
-                crate::drivers::ps2::set_cursor_buttons(buttons);
-                crate::compositor::invalidate();
-                push_pointer(s.x, s.y, buttons);
-                produced = true;
-            }
-        } else {
-            if byte == 0xE0 {
-                s.e0_prefix = true;
-                continue;
-            }
-            let pressed = (byte & 0x80) == 0;
-            let sc = (byte & 0x7F) as u32;
-            let scancode = if s.e0_prefix {
-                s.e0_prefix = false;
-                0xE000 | sc
-            } else {
-                sc
-            };
-            push_key(scancode, pressed);
-            produced = true;
-        }
-    }
-
-    produced
+    false
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -495,6 +429,29 @@ pub fn pending_count_for(pid: u32) -> usize {
 pub fn input_pending_for(pid: u32) -> usize {
     let pid = canonical_pid(pid);
     with_queue(|q| q.input_pending_for(pid))
+}
+
+/// True when there is a high-priority input event (key event, or mouse click/drag)
+/// queued and visible to `pid`.
+pub fn high_priority_input_pending_for(pid: u32) -> bool {
+    let pid = canonical_pid(pid);
+    with_queue(|q| {
+        for off in 0..q.len {
+            let idx = (q.head + off) % EVENT_CAP;
+            let owner = q.owner_pid[idx];
+            if owner_visible_to_consumer(owner, pid) {
+                if q.buf[idx].kind == EV_KEY {
+                    return true;
+                }
+                if q.buf[idx].kind == EV_POINTER {
+                    if q.buf[idx].flags != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    })
 }
 
 pub fn dropped_count() -> u64 {

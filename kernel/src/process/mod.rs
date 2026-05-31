@@ -652,16 +652,18 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let focus = crate::wm::focus_pid();
     let input_target = if focus != 0 { focus } else { 1 };
     if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
-        if current == input_target {
-            return None;
-        }
-        let target = unsafe { &mut PTABLE[idx_of(input_target)] };
-        if target.pid == input_target {
-            if target.state == ProcState::Blocked {
-                target.state = ProcState::Running;
-            }
-            if target.state == ProcState::Running {
-                return Some(input_target);
+        if get_group_leader_locked(current) == get_group_leader_locked(input_target) {
+            // Do not prioritize input_target over its own sibling threads;
+            // fall through to normal round-robin so they get scheduled fairly.
+        } else {
+            let target = unsafe { &mut PTABLE[idx_of(input_target)] };
+            if target.pid == input_target {
+                if target.state == ProcState::Blocked {
+                    target.state = ProcState::Running;
+                }
+                if target.state == ProcState::Running {
+                    return Some(input_target);
+                }
             }
         }
     }

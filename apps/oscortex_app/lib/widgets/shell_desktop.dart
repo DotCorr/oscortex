@@ -124,135 +124,161 @@ class _ShellDesktopState extends State<ShellDesktop> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SizedBox.expand(
-        child: SafeArea(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
-                child: Row(
-                  children: [
-                    const Text(
-                      'OSCortex',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: -0.5,
-                      ),
-                    ),
-                    const Spacer(),
-                    TextButton.icon(
-                      style: ButtonStyle(
-                        backgroundColor: WidgetStateProperty.all(
-                          Colors.pink.withValues(alpha: 0.6),
-                        ),
-                        minimumSize: WidgetStateProperty.all(
-                          const Size(168, 52),
-                        ),
-                        padding: WidgetStateProperty.all(
-                          const EdgeInsets.symmetric(
-                            horizontal: 20,
-                            vertical: 14,
-                          ),
-                        ),
-                      ),
-                      onPressed: (_installingSeed || _demoInstalled)
-                          ? null
-                          : _installSeed,
-                      icon: const Icon(Icons.download_outlined),
-                      label: Text(
-                        _demoInstalled ? 'Installed' : 'Install demo',
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    IconButton(
-                      style: ButtonStyle(
-                        minimumSize: WidgetStateProperty.all(
-                          const Size.square(56),
-                        ),
-                        backgroundColor: WidgetStateProperty.all(
-                          Colors.white.withValues(alpha: 0.08),
-                        ),
-                      ),
-                      onPressed: _loading
-                          ? null
-                          : () => _refreshApps(showSpinner: true),
-                      icon: _loading
-                          ? const SizedBox.square(
-                              dimension: 24,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.refresh),
-                      tooltip: 'Refresh',
-                    ),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
-                child: Row(
-                  children: [
-                    Text(
-                      'Installed apps',
-                      style: TextStyle(
-                        color: Colors.white.withValues(alpha: 0.7),
-                        fontSize: 14,
-                      ),
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(
-                      child: Text(
-                        _status,
-                        textAlign: TextAlign.right,
-                        overflow: TextOverflow.ellipsis,
+    return Listener(
+      onPointerDown: (event) {
+        ShellService.trace('pointer_down x=${event.position.dx} y=${event.position.dy} btns=${event.buttons}');
+      },
+      onPointerMove: (event) {
+        ShellService.trace('pointer_move x=${event.position.dx} y=${event.position.dy} btns=${event.buttons}');
+      },
+      onPointerUp: (event) {
+        ShellService.trace('pointer_up x=${event.position.dx} y=${event.position.dy} btns=${event.buttons}');
+      },
+      onPointerHover: (event) {
+        ShellService.trace('pointer_hover x=${event.position.dx} y=${event.position.dy}');
+      },
+      child: Scaffold(
+        body: SizedBox.expand(
+          child: SafeArea(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(24, 20, 24, 8),
+                  child: Row(
+                    children: [
+                      const Text(
+                        'OSCortex',
                         style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.85),
-                          fontSize: 13,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: -0.5,
                         ),
                       ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: _loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : _error != null
-                    ? Center(child: Text(_error!))
-                    : _apps.isEmpty
-                    ? Center(
-                        child: Text(
-                          'No apps installed.\nUse Install demo or drop a .osx bundle.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(
-                            color: Colors.white.withValues(alpha: 0.6),
+                      const Spacer(),
+                      TextButton.icon(
+                        style: ButtonStyle(
+                          backgroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
+                            if (states.contains(WidgetState.hovered)) {
+                              return Colors.pink.withValues(alpha: 0.85);
+                            }
+                            if (states.contains(WidgetState.pressed)) {
+                              return Colors.pink.withValues(alpha: 1.0);
+                            }
+                            return Colors.pink.withValues(alpha: 0.6);
+                          }),
+                          minimumSize: WidgetStateProperty.all(
+                            const Size(168, 52),
+                          ),
+                          padding: WidgetStateProperty.all(
+                            const EdgeInsets.symmetric(
+                              horizontal: 20,
+                              vertical: 14,
+                            ),
                           ),
                         ),
-                      )
-                    : GridView.builder(
-                        padding: const EdgeInsets.all(24),
-                        gridDelegate:
-                            const SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: 4,
-                          mainAxisSpacing: 16,
-                          crossAxisSpacing: 16,
-                          childAspectRatio: 0.9,
+                        onPressed: (_installingSeed || _demoInstalled)
+                            ? null
+                            : _installSeed,
+                        icon: const Icon(Icons.download_outlined),
+                        label: Text(
+                          _demoInstalled ? 'Installed' : 'Install demo',
                         ),
-                        itemCount: _apps.length,
-                        itemBuilder: (context, index) {
-                          final app = _apps[index];
-                          return AppCard(
-                            app: app,
-                            onLaunch: () => _launchApp(app.id),
-                            accentColor: widget.accentColor,
-                          );
-                        },
                       ),
-              ),
-            ],
+                      const SizedBox(width: 12),
+                      IconButton(
+                        style: ButtonStyle(
+                          minimumSize: WidgetStateProperty.all(
+                            const Size.square(56),
+                          ),
+                          backgroundColor: WidgetStateProperty.resolveWith<Color?>((states) {
+                            if (states.contains(WidgetState.hovered)) {
+                              return Colors.white.withValues(alpha: 0.18);
+                            }
+                            if (states.contains(WidgetState.pressed)) {
+                              return Colors.white.withValues(alpha: 0.28);
+                            }
+                            return Colors.white.withValues(alpha: 0.08);
+                          }),
+                        ),
+                        onPressed: _loading
+                            ? null
+                            : () => _refreshApps(showSpinner: true),
+                        icon: _loading
+                            ? const SizedBox.square(
+                                dimension: 24,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(Icons.refresh),
+                        tooltip: 'Refresh',
+                      ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 24),
+                  child: Row(
+                    children: [
+                      Text(
+                        'Installed apps',
+                        style: TextStyle(
+                          color: Colors.white.withValues(alpha: 0.7),
+                          fontSize: 14,
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Text(
+                          _status,
+                          textAlign: TextAlign.right,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.85),
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Expanded(
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _error != null
+                      ? Center(child: Text(_error!))
+                      : _apps.isEmpty
+                      ? Center(
+                          child: Text(
+                            'No apps installed.\nUse Install demo or drop a .osx bundle.',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Colors.white.withValues(alpha: 0.6),
+                            ),
+                          ),
+                        )
+                      : GridView.builder(
+                          padding: const EdgeInsets.all(24),
+                          gridDelegate:
+                              const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 4,
+                            mainAxisSpacing: 16,
+                            crossAxisSpacing: 16,
+                            childAspectRatio: 0.9,
+                          ),
+                          itemCount: _apps.length,
+                          itemBuilder: (context, index) {
+                            final app = _apps[index];
+                            return AppCard(
+                              app: app,
+                              onLaunch: () => _launchApp(app.id),
+                              accentColor: widget.accentColor,
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
