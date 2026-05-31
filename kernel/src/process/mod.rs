@@ -651,30 +651,11 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     // the scheduler also has to choose it before the queue backs up.
     let focus = crate::wm::focus_pid();
     let input_target = if focus != 0 { focus } else { 1 };
-    if input_target != 0 {
-        let has_priority = if get_group_leader_locked(current) == get_group_leader_locked(input_target) {
-            // Do not prioritize input_target over its own sibling threads for low-priority input
-            // (like pointer moves), to avoid thread starvation. Only prioritize if there is
-            // a high-priority transition (press/release) event pending.
-            crate::wm::high_priority_input_pending_for(input_target)
-        } else {
-            crate::wm::input_pending_for(input_target) > 0
-        };
-
-        if has_priority {
-            if current == input_target {
-                // Do not prioritize input_target when it is already the current thread and its slice
-                // has expired or it has yielded; fall through to normal round-robin so siblings get CPU.
-            } else {
-                let target = unsafe { &mut PTABLE[idx_of(input_target)] };
-                if target.pid == input_target {
-                    if target.state == ProcState::Blocked {
-                        target.state = ProcState::Running;
-                    }
-                    if target.state == ProcState::Running {
-                        return Some(input_target);
-                    }
-                }
+    if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
+        if current != input_target {
+            let target = unsafe { &PTABLE[idx_of(input_target)] };
+            if target.pid == input_target && target.state == ProcState::Running {
+                return Some(input_target);
             }
         }
     }
@@ -688,14 +669,9 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
         }
     }
     if current != 1 && crate::wm::embedder_baton_due() {
-        let embedder = unsafe { &mut PTABLE[idx_of(1)] };
-        if embedder.pid == 1 {
-            if embedder.state == ProcState::Blocked {
-                embedder.state = ProcState::Running;
-            }
-            if embedder.state == ProcState::Running {
-                return Some(1);
-            }
+        let embedder = unsafe { &PTABLE[idx_of(1)] };
+        if embedder.pid == 1 && embedder.state == ProcState::Running {
+            return Some(1);
         }
     }
 

@@ -441,26 +441,12 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         let focus = crate::wm::focus_pid();
         let target = if focus != 0 { focus } else { 1 };
 
-        let cur_group = crate::process::get_group_leader(cur);
-        let target_group = crate::process::get_group_leader(target);
-
-        let has_high_priority = target != 0 && (
-            crate::wm::embedder_baton_due() ||
-            crate::wm::high_priority_input_pending_for(target)
-        );
-
         let should_preempt = slice_expired || (
             cur != 0
             && target != 0
             && cur != target
             && !crate::wm::flutter_bootstrap_spin_active()
-            && (
-                // If same group: only preempt immediately for high priority events.
-                (cur_group == target_group && has_high_priority)
-                ||
-                // If different group: preempt immediately for any input or baton.
-                (cur_group != target_group && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due())))
-            )
+            && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
         );
 
         if should_preempt {
