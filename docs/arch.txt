@@ -1,6 +1,6 @@
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                           O S C O R T E X   A R C H                            ║
-║                     Canonical target — updated 2026-05-27                        ║
+║                     Canonical target — updated 2026-06-01                        ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
   DECISION (one sentence)
@@ -21,7 +21,7 @@
   USER APPS (Flutter)     one process each · /bin/oscortex-host · .osx bundles
   SYSTEM SHELL (Flutter)  one process · same host binary · shell bootstrap mode
   INIT (PID 1)            userspace/init — spawns shell, reaps children
-  KERNEL                  compositor, WM, syscalls, app registry
+  KERNEL                  compositor, WM, syscalls, app registry, pkg delivery
 
 
   ARTIFACT NAMING
@@ -30,6 +30,7 @@
   /init              PID 1 supervisor ELF
   /bin/oscortex-host Flutter engine host ELF (shell + user apps)
   libflutter_engine.so   shared engine (mapped per host process)
+  catalog.bin        binary package manifest served by pkg-server
 
 
   APP LIFECYCLE
@@ -39,6 +40,12 @@
   Launch:  app_launch → spawn /bin/oscortex-host (new PID) + map app AOT
   ISO:     kernel + init + engine + shell only — no apps/* bake loop
 
+  On-Demand (new):
+  Resolve: shell calls pkg_resolve(name) → kernel checks cache → fetches if
+           miss → SHA-256 verifies → loads into registry → returns app_id
+  Launch:  same as above — app_launch with the resolved app_id
+  Evict:   LRU eviction when cache is full (system apps never evicted)
+
 
   BOOT (steady state)
   ───────────────────
@@ -47,6 +54,113 @@
        → Flutter shell renders
   User launch → app_launch → new oscortex-host process (app mode)
 
+  On-demand sequence:
+  Limine → kernel → net::init (DHCP) → pkg::init (catalog fetch)
+       → /init → shell → catalog shown
+  User taps remote app → pkg_resolve → HTTP fetch → verify → cache → launch
+
+
+  FULL SYSTEM DIAGRAM (ASCII)
+  ───────────────────────────
+
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │                         U S E R S P A C E                            │
+  │                                                                      │
+  │  ┌──────────────────────────────────────────────────────────────┐    │
+  │  │  Flutter Shell (oscortex_app)     PID = shell host process  │    │
+  │  │  ┌────────────────────────────────────────────────────────┐  │    │
+  │  │  │  App Catalog                                           │  │    │
+  │  │  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │  │    │
+  │  │  │  │  Files   │ │  Canvas  │ │ Remote ☁ │ │ Remote ☁ │ │  │    │
+  │  │  │  │ (local)  │ │ (local)  │ │ (server) │ │ (server) │ │  │    │
+  │  │  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ │  │    │
+  │  │  └────────────────────────────────────────────────────────┘  │    │
+  │  └──────────────────────────────────────────────────────────────┘    │
+  │                                                                      │
+  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │
+  │  │ User App A  │  │ User App B  │  │ User App C  │   … N apps      │
+  │  │ PID = own   │  │ PID = own   │  │ PID = own   │   own PIDs      │
+  │  └─────────────┘  └─────────────┘  └─────────────┘                 │
+  ├─────────────────────────────── syscall ABI ─────────────────────────┤
+  │                         K E R N E L                                  │
+  │                                                                      │
+  │  ┌────────────────────────────────────────────────────────────────┐  │
+  │  │                   Package Resolver (pkg/)                      │  │
+  │  │                                                                │  │
+  │  │  pkg_resolve(name)                                             │  │
+  │  │    │                                                           │  │
+  │  │    ├─→ LRU Cache ──→ hit? ──→ return app_id                   │  │
+  │  │    │     (16 slots,           (instant launch)                 │  │
+  │  │    │      pinned +                                             │  │
+  │  │    │      ephemeral)                                           │  │
+  │  │    │                                                           │  │
+  │  │    └─→ miss ──→ HTTP GET /pkg/<hash>.osx ──→ SHA-256 verify   │  │
+  │  │                      │                           │             │  │
+  │  │                      │                    app_registry.install  │  │
+  │  │                      │                           │             │  │
+  │  │                      └── TCP (smoltcp) ──→  cache.insert       │  │
+  │  │                            │                     │             │  │
+  │  │                       virtio-net            return app_id      │  │
+  │  └────────────────────────────────────────────────────────────────┘  │
+  │                                                                      │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐  │
+  │  │compositor│ │    WM    │ │app_regist│ │   VFS    │ │ net/tcp  │  │
+  │  │(surfaces)│ │(focus/ev)│ │(.osx mgr)│ │(initramfs│ │(smoltcp) │  │
+  │  │          │ │          │ │          │ │ ramdisk) │ │          │  │
+  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────┘  │
+  │                                                                      │
+  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐               │
+  │  │ drivers  │ │  sched   │ │ security │ │    mm    │               │
+  │  │(ps2,blk, │ │(round-   │ │(caps)    │ │(phys/virt│               │
+  │  │ net,usb) │ │ robin)   │ │          │ │ alloc)   │               │
+  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘               │
+  └─────────────────────────────── hardware ────────────────────────────┘
+
+                               ┌─────────────────────────────────────┐
+                               │   Package Server (host / LAN)       │
+                               │                                     │
+                               │   GET /catalog.bin → manifest list  │
+                               │   GET /pkg/<hash>.osx → bundle      │
+                               │                                     │
+                               │   tools/pkg-server (Rust CLI)       │
+                               │   Listens on 0.0.0.0:8080           │
+                               └─────────────────────────────────────┘
+
+
+  ON-DEMAND PACKAGE DELIVERY
+  ──────────────────────────
+  Inspired by Google Fuchsia's ephemeral software model. Apps are never
+  "installed" in the traditional sense — they are fetched on demand, verified,
+  cached in memory, and evicted when space is needed.
+
+  KEY DIFFERENCES FROM TRADITIONAL INSTALL:
+  ● No download + install step visible to user
+  ● Apps stream from server on first tap, launch from cache on re-tap
+  ● System apps are pinned (never evicted); user apps are ephemeral
+  ● Cache is bounded (16 slots) with LRU eviction
+  ● Every bundle is SHA-256 verified before loading into memory
+
+  SYSCALL SURFACE:
+  0x390  pkg_resolve(name_ptr, name_len) → app_id   resolve + fetch if needed
+  0x391  pkg_catalog(buf_ptr, buf_len) → count       list available packages
+  0x392  pkg_set_server(ip_be, port) → 0             configure server IP
+  0x393  pkg_evict(app_id) → 0                       manual eviction
+
+  CATALOG FORMAT (binary, no JSON parsing in kernel):
+  [4 bytes: entry_count LE]
+  [N × 128-byte PkgManifest entries]
+
+  PkgManifest (128 bytes, repr C packed):
+    name:       [u8; 64]   fully qualified package name
+    version:    [u8; 16]   semver string
+    hash:       [u8; 32]   SHA-256 of the .osx bundle
+    size_bytes: u32 LE     bundle size
+    flags:      u32 LE     0x01 = system (pinned)
+    _reserved:  [u8; 8]
+
+  SYSFS ENDPOINT:
+  /sys/pkg/cache → "slots=3/16\npinned=1\nephemeral=2\n"
+
 
   KEY PATHS
   ─────────
@@ -54,10 +168,18 @@
   tools/flutter-embedder/      builds oscortex-host
   apps/oscortex_app/           system shell Dart source
   kernel/src/app_registry/     .osx install/launch
+  kernel/src/pkg/              on-demand package delivery module
+  kernel/src/pkg/resolver.rs   resolution pipeline
+  kernel/src/pkg/http.rs       HTTP/1.1 client over smoltcp TCP
+  kernel/src/pkg/sha256.rs     pure Rust SHA-256 (no crate deps)
+  kernel/src/pkg/cache.rs      LRU cache (16 slots, pinned + ephemeral)
+  kernel/src/pkg/manifest.rs   binary catalog format + parser
+  tools/pkg-server/            host-side package server (Rust CLI)
   tools/flutter-engine/engine_patch.py
   scripts/build-iso.sh
   docs/hardware.txt            drivers, display/GPU, device classes, CDP
   docs/multiarch.txt           shared vs per-CPU porting model
+  docs/pkg-delivery.txt        on-demand package delivery spec
 
 
   HARDWARE (summary — full spec in docs/hardware.txt)
@@ -75,10 +197,15 @@
   ✅ Shell = separate oscortex-host process
   ✅ app_launch spawns host process (not isolate-in-caller)
   ✅ ISO: no apps/* registry loop
+  ✅ On-demand package delivery (pkg/ module, syscalls, shell UI)
+  ✅ Package server tool (tools/pkg-server)
+  ✅ SHA-256 bundle verification
+  ✅ LRU cache with system app pinning
   ⏳ Persistent .osx storage on disk (ext2 write)
   ⏳ tools/oscortex-pack
-  ⏳ Shell launcher UI + platform channels
+  ⏳ TLS / HTTPS for remote package servers
+  ⏳ TUF signing framework
 
   Skills: .cursor/skills/oscortex-architecture · oscortex-hardware · codebase-audit-cleanup
   Rule:   .cursor/rules/oscortex-core.mdc
-  Docs:   docs/arch.txt · docs/hardware.txt
+  Docs:   docs/arch.txt · docs/hardware.txt · docs/pkg-delivery.txt

@@ -1,0 +1,339 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║              O N - D E M A N D   P A C K A G E   D E L I V E R Y               ║
+║                     Technical Spec — updated 2026-06-01                          ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+
+  OVERVIEW
+  ────────
+  OSCortex delivers software on demand — inspired by Google's Fuchsia OS. Apps
+  are never permanently "installed" in the traditional sense. Instead, the kernel
+  fetches, verifies, and caches app bundles (.osx) from an HTTP package server
+  the first time you launch them. Subsequent launches are instant (from cache).
+  When cache space runs low, the least-recently-used app is evicted silently.
+
+  This model eliminates:
+  ● App store download-then-install friction
+  ● Disk space management by the user
+  ● Stale local copies (server is always source of truth)
+  ● Large OTA system updates (apps update individually)
+
+  System apps (shell, files, canvas) are pinned — never evicted from cache.
+  User apps are ephemeral — evicted LRU when the 16-slot cache fills up.
+
+
+  HOW IT WORKS (end to end)
+  ─────────────────────────
+
+  ┌─────────┐     ┌──────────────────────────────────────────────────────┐
+  │  USER   │     │                    KERNEL (pkg/)                     │
+  │         │     │                                                      │
+  │ taps    │     │  1. pkg_resolve("com.dotcorr.notes")                 │
+  │ app     │────→│     │                                                │
+  │ card    │     │     ├─→ check LRU cache (by SHA-256 hash)            │
+  │         │     │     │     └─→ HIT: return app_id (instant)           │
+  │         │     │     │                                                │
+  │         │     │     └─→ MISS:                                        │
+  │         │     │           │                                          │
+  │         │     │           ├─→ HTTP GET /pkg/<hash>.osx               │
+  │         │     │           │     (smoltcp TCP → virtio-net → server)  │
+  │         │     │           │                                          │
+  │         │     │           ├─→ SHA-256 verify downloaded bytes        │
+  │         │     │           │     (pure Rust, no external crates)      │
+  │         │     │           │                                          │
+  │         │     │           ├─→ app_registry::install(bundle)          │
+  │         │     │           │     (parse OSCP header, map AOT data)    │
+  │         │     │           │                                          │
+  │         │     │           └─→ cache::insert(app_id, hash, pinned?)   │
+  │         │     │                 (LRU evicts oldest if full)          │
+  │         │     │                                                      │
+  │         │     │  2. return app_id                                    │
+  │         │     │                                                      │
+  │         │     │  3. app_launch(app_id)                               │
+  │         │     │     → spawn /bin/oscortex-host (new PID)             │
+  │         │     │     → map AOT snapshot into process memory           │
+  │         │     │     → Flutter engine initializes + renders           │
+  └─────────┘     └──────────────────────────────────────────────────────┘
+                          │
+                          │ HTTP/1.1 over TCP
+                          ▼
+                  ┌──────────────────────────────────────┐
+                  │     Package Server (host / LAN)      │
+                  │                                      │
+                  │  GET /catalog.bin                     │
+                  │    → [u32 LE count][N × 128B entry]  │
+                  │                                      │
+                  │  GET /pkg/ab3f7c…d2.osx              │
+                  │    → raw .osx bundle bytes           │
+                  │                                      │
+                  │  tools/pkg-server (Rust CLI)          │
+                  │  Listens on 0.0.0.0:8080              │
+                  └──────────────────────────────────────┘
+
+
+  KERNEL MODULE STRUCTURE
+  ───────────────────────
+
+  kernel/src/pkg/
+  ├── mod.rs           barrel module + init()
+  ├── resolver.rs      resolution pipeline (the brain)
+  ├── cache.rs         LRU cache manager (16 slots)
+  ├── http.rs          HTTP/1.1 GET client over smoltcp
+  ├── sha256.rs        pure Rust SHA-256 (no crate deps)
+  └── manifest.rs      PkgManifest struct + catalog parser
+
+
+  RESOLUTION PIPELINE (resolver.rs)
+  ──────────────────────────────────
+
+  resolve(name: &[u8]) → Result<app_id, Error>
+
+  Step 1:  Find PkgManifest in the cached catalog (by name)
+           └─→ NotFound if name doesn't match any catalog entry
+
+  Step 2:  Check LRU cache (by SHA-256 hash of the bundle)
+           └─→ Cache hit: update last_used timestamp, return app_id
+
+  Step 3:  HTTP fetch from package server
+           GET /pkg/<hex(sha256)>.osx
+           Uses net::tcp::tcp_connect() → tcp_write() → tcp_read()
+           Max body size: 8 MiB
+
+  Step 4:  SHA-256 verify downloaded bytes against catalog hash
+           └─→ HashMismatch error if verification fails
+
+  Step 5:  Install into app_registry (ephemeral — not persisted to disk)
+           app_registry::install(&bundle) → app_id
+
+  Step 6:  Insert into LRU cache
+           If full: evict the least-recently-used non-pinned entry
+           If all slots are pinned: log warning, app works but isn't tracked
+
+
+  LRU CACHE (cache.rs)
+  ────────────────────
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  CACHE STATE (16 slots)                                           │
+  │                                                                    │
+  │  Slot  App ID  Hash (first 8)  Last Used   Pinned   State         │
+  │  ────  ──────  ──────────────  ─────────   ──────   ─────         │
+  │   0    1       ab3f7c2d…       frame 1420  YES      system        │
+  │   1    2       f8e91b3a…       frame 1380  YES      system        │
+  │   2    5       c4d2e5f1…       frame 890   NO       ephemeral     │
+  │   3    —       —               —           —        empty         │
+  │  ...                                                               │
+  │  15    —       —               —           —        empty         │
+  └────────────────────────────────────────────────────────────────────┘
+
+  Rules:
+  ● Pinned entries (flag 0x01) are NEVER evicted — these are system apps
+  ● Ephemeral entries are evicted LRU when all 16 slots are occupied
+  ● Every launch updates the last_used timestamp (touch)
+  ● Eviction calls app_registry::uninstall() to free memory
+  ● Manual eviction via SYS_PKG_EVICT (0x393) syscall
+
+
+  CATALOG FORMAT (manifest.rs)
+  ────────────────────────────
+
+  The catalog is a simple binary blob. No JSON. No XML. No parsing overhead
+  in the kernel. The package server generates it; the kernel reads it raw.
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  CATALOG WIRE FORMAT                                       │
+  │                                                            │
+  │  Offset  Size   Field            Encoding                  │
+  │  ──────  ────   ─────            ────────                  │
+  │  0       4      entry_count      u32 LE                    │
+  │  4       128×N  manifest array   N × PkgManifest           │
+  └────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  PkgManifest (128 bytes, repr C packed)                    │
+  │                                                            │
+  │  Offset  Size   Field            Type                      │
+  │  ──────  ────   ─────            ────                      │
+  │  0       64     name             [u8; 64]  null-padded     │
+  │  64      16     version          [u8; 16]  null-padded     │
+  │  80      32     hash             [u8; 32]  SHA-256         │
+  │  112     4      size_bytes       u32 LE                    │
+  │  116     4      flags            u32 LE    (0x01 = system) │
+  │  120     8      _reserved        zero                      │
+  └────────────────────────────────────────────────────────────┘
+
+  The .osx bundle header (first 112 bytes) provides name and version:
+    offset 0:   magic "OSCP" (4 bytes)
+    offset 4:   format_version u32le (must be 1)
+    offset 8:   name [u8; 64]
+    offset 72:  version [u8; 16]
+    offset 88:  AOT snapshot data follows
+
+
+  HTTP CLIENT (http.rs)
+  ─────────────────────
+  Minimal HTTP/1.1 GET client. No TLS. No keep-alive. No redirects.
+  Built directly on top of the kernel's smoltcp TCP/IP stack.
+
+  Connection flow:
+  1. tcp_connect(server_ip, server_port)
+  2. Busy-poll until connected (~2 seconds timeout)
+  3. Send GET request with Host and Connection: close headers
+  4. Read response, accumulate body
+  5. Parse status line (must be 200)
+  6. Parse Content-Length header (case-insensitive)
+  7. Return body bytes
+  8. tcp_close()
+
+  Error cases:
+  ● Connect timeout → HttpError::Connect
+  ● Non-200 status → HttpError::Status(code)
+  ● Body > 8 MiB → HttpError::TooLarge
+  ● 5 seconds of no data → assume response complete
+
+
+  SHA-256 VERIFICATION (sha256.rs)
+  ─────────────────────────────────
+  Pure Rust implementation. No external crates. ~150 lines.
+  Used to verify every downloaded .osx bundle before loading.
+
+  Functions:
+  ● hash(data) → [u8; 32]          compute SHA-256 digest
+  ● hash_eq(a, b) → bool           constant-time comparison
+  ● hash_hex(hash, buf) → 64       format as lowercase hex string
+
+
+  SYSCALL INTERFACE
+  ─────────────────
+
+  ┌───────┬──────────────────┬──────────────────────────┬──────────────┐
+  │  Num  │  Name            │  Arguments               │  Returns     │
+  ├───────┼──────────────────┼──────────────────────────┼──────────────┤
+  │ 0x390 │ SYS_PKG_RESOLVE  │ (name_ptr, name_len)     │ app_id / -E  │
+  │ 0x391 │ SYS_PKG_CATALOG  │ (buf_ptr, buf_len)       │ count        │
+  │ 0x392 │ SYS_PKG_SET_SVR  │ (ip_packed_be, port)     │ 0            │
+  │ 0x393 │ SYS_PKG_EVICT    │ (app_id)                 │ 0 / -E       │
+  └───────┴──────────────────┴──────────────────────────┴──────────────┘
+
+  Error codes:
+  -2   ENOENT     package not found in catalog
+  -5   EIO        HTTP fetch failed
+  -12  ENOMEM     app_registry install failed
+  -14  EFAULT     bad user pointer
+  -22  EINVAL     SHA-256 hash mismatch
+  -28  ENOSPC     cache full, all slots pinned
+
+  SYSFS ENDPOINT:
+  /sys/pkg/cache → "slots=3/16\npinned=1\nephemeral=2\n"
+
+
+  PACKAGE SERVER (tools/pkg-server/)
+  ──────────────────────────────────
+  Standalone Rust CLI that serves .osx bundles over HTTP.
+  Run on the host machine — QEMU guest reaches it via gateway 10.0.2.2.
+
+  Usage:
+    cargo run -p pkg-server -- /path/to/bundles/
+
+  Routes:
+    GET /catalog.bin          binary catalog of all .osx files
+    GET /pkg/<hex_hash>.osx   raw bundle bytes
+    (everything else)         404
+
+  Startup:
+  1. Scan directory for *.osx files
+  2. Validate OSCP magic + format version in each header
+  3. Extract name + version from header bytes
+  4. Compute SHA-256 hash of entire file
+  5. Build in-memory catalog (binary format)
+  6. Start TCP listener on 0.0.0.0:8080
+  7. Log every request to stdout
+
+  QEMU setup:
+    Host runs:   cargo run -p pkg-server -- ./packages/
+    Guest sees:  pkg server at 10.0.2.2:8080 (QEMU user-mode gateway)
+    Kernel uses: default server config (10.0.2.2:8080)
+
+
+  SHELL UI INTEGRATION
+  ────────────────────
+  The Flutter shell (oscortex_app) shows ALL available apps — both locally
+  cached and remotely available from the package server.
+
+  App states:
+    local       installed in app_registry, launches instantly
+    remote      available from server, shows cloud badge ☁
+    resolving   currently being fetched, shows spinner ⟳
+
+  On refresh:
+  1. Fetch local app list (ShellService.refreshApps → 'list' command)
+  2. Fetch remote catalog (ShellService.fetchCatalog → 'pkg_catalog')
+  3. Merge: local apps first, then remote-only apps from catalog
+  4. Status bar: "3 local · 5 on-demand · 8 total"
+
+  On tap of remote app:
+  1. Set card state to 'resolving' (spinner replaces icon)
+  2. Call ShellService.resolvePackage(name) → 'pkg_resolve:name'
+  3. Kernel fetches → verifies → installs → returns app_id
+  4. Move app from remote list to local list
+  5. Call ShellService.launchApp(app_id)
+  6. App launches as its own PID process
+
+  On tap of cached app:
+  1. ShellService.launchApp(id) → 'launch:id'
+  2. Instant launch (no network round-trip)
+
+
+  SECURITY MODEL
+  ──────────────
+  Current:
+  ● SHA-256 integrity check on every downloaded bundle
+  ● Constant-time hash comparison (timing-attack resistant)
+  ● Max body size guard (8 MiB) prevents memory exhaustion
+  ● Pinned system apps cannot be evicted by user-space syscalls
+
+  Future (not yet implemented):
+  ● TLS/HTTPS for encrypted transport
+  ● TUF (The Update Framework) for repository signing
+  ● Per-package capability manifests
+  ● Code signing with ed25519 public keys
+
+
+  COMPARISON WITH FUCHSIA
+  ───────────────────────
+
+  ┌──────────────────────────┬──────────────────┬──────────────────────┐
+  │  Feature                 │  Fuchsia          │  OSCortex            │
+  ├──────────────────────────┼──────────────────┼──────────────────────┤
+  │  Package format          │  FAR archive      │  .osx (OSCP header)  │
+  │  URL scheme              │  fuchsia-pkg://   │  HTTP path           │
+  │  Content addressing      │  Merkle tree      │  SHA-256 per bundle  │
+  │  Signing                 │  TUF framework    │  SHA-256 (TUF later) │
+  │  Cache model             │  Per-blob LRU     │  Per-bundle LRU      │
+  │  Base vs cached          │  base + cache     │  pinned + ephemeral  │
+  │  Delta updates           │  Yes              │  Not yet             │
+  │  Server protocol         │  fuchsia-pkg      │  HTTP/1.1 GET        │
+  │  Max cache slots         │  Dynamic          │  16 (fixed)          │
+  │  Runtime                 │  Component FW     │  Flutter engine      │
+  └──────────────────────────┴──────────────────┴──────────────────────┘
+
+
+  FILES REFERENCE
+  ───────────────
+  kernel/src/pkg/mod.rs           barrel module + init()
+  kernel/src/pkg/resolver.rs      resolution pipeline
+  kernel/src/pkg/cache.rs         LRU cache manager
+  kernel/src/pkg/http.rs          HTTP/1.1 GET client
+  kernel/src/pkg/sha256.rs        pure Rust SHA-256
+  kernel/src/pkg/manifest.rs      PkgManifest + catalog format
+  kernel/src/embedder/abi.rs      SYS_PKG_* constants (0x390-0x393)
+  kernel/src/syscall/dispatch.rs  syscall dispatch entries
+  kernel/src/syscall/handlers/engine.rs  handler implementations
+  kernel/src/fs/mod.rs            /sys/pkg/cache sysfs endpoint
+  kernel/src/main.rs              mod pkg + pkg::init() in boot
+  tools/pkg-server/Cargo.toml     host-side server manifest
+  tools/pkg-server/src/main.rs    host-side server implementation
+  apps/oscortex_app/lib/models/app_tile.dart     AppSource enum
+  apps/oscortex_app/lib/services/shell_service.dart  pkg commands
+  apps/oscortex_app/lib/widgets/app_card.dart    cloud badge + spinner
+  apps/oscortex_app/lib/widgets/shell_desktop.dart   catalog merge flow

@@ -26,10 +26,10 @@
 //!
 //! | Num   | Name            | Args                        | Returns        |
 //! |-------|-----------------|-----------------------------|----------------|
-//! | 0x380 | pkg_resolve     | (name_ptr, name_len)        | app_id / -ERR  |
-//! | 0x381 | pkg_catalog     | (buf_ptr, buf_len)          | count          |
-//! | 0x382 | pkg_set_server  | (ip_packed_be, port)        | 0              |
-//! | 0x383 | pkg_evict       | (app_id)                    | 0 / -ERRNO     |
+//! | 0x390 | pkg_resolve     | (name_ptr, name_len)        | app_id / -ERR  |
+//! | 0x391 | pkg_catalog     | (buf_ptr, buf_len)          | count          |
+//! | 0x392 | pkg_set_server  | (ip_packed_be, port)        | 0              |
+//! | 0x393 | pkg_evict       | (app_id)                    | 0 / -ERRNO     |
 
 pub mod sha256;
 pub mod http;

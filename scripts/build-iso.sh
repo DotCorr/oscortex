@@ -167,7 +167,7 @@ if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
     exit 1
 fi
 mkdir -p "$ROOT/initramfs/system/lib"
-cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
+unzip -p "$ROOT/tools/flutter-engine/linux-x64-embedder.zip" libflutter_engine.so > "$ROOT/initramfs/system/lib/libflutter_engine.so"
 if [ "${OSC_SKIP_ENGINE_PATCH:-0}" = "1" ]; then
     echo "[0.5/5] OSC_SKIP_ENGINE_PATCH=1 — staging PRISTINE engine (no P1-P10 patches)"
 else

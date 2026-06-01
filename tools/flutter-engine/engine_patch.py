@@ -52,7 +52,7 @@ def call_rel32(at_va: int, to_va: int) -> bytes:
 
 # P1–P6 from HANDOFF.md (verified offsets).
 PATCHES: dict[str, tuple[int, bytes]] = {
-    "P1": (0x196E300, bytes([0x01])),
+    "P1": (0x196E300, bytes([0x00])),
     "P2": (0x19BEA36, bytes([0x90, 0x90])),
     "P3": (0x1AB64D1, bytes([0x90, 0x90])),
     "P4": (0x1AA629C, bytes([0x90] * 6)),
@@ -62,6 +62,8 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     # "P8": (0x1B2222F, bytes([0xEB, 0x38])),
     # P10: SkBitmapDevice::drawPaint — always take post-onAccessPixels path.
     "P10": (0x1A8AE87, bytes([0xEB, 0x10])),
+    # P_SDK_HASH: null the engine's internal expected SDK hash.
+    "P_SDK_HASH": (0x188ced, b"0000000000"),
 }
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
@@ -316,7 +318,7 @@ def main() -> int:
 
     if args.verify:
         names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]
+            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]
             if args.apply_all
             else None
         )
@@ -326,7 +328,7 @@ def main() -> int:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]:
+            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -339,7 +341,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]
+        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]
         if args.apply_all
         else (args.apply or [])
     )

@@ -38,19 +38,28 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
     // 1. Connect
     let fd = crate::net::tcp::tcp_connect(host_ip, port).map_err(|_| HttpError::Connect)?;
 
+    let mut connected = false;
     // Busy-poll until connection is established (max ~2 seconds).
     for _ in 0..120 {
         crate::net::tcp::poll();
         // Try a zero-byte read to check if connected.
         let mut probe = [0u8; 0];
         match crate::net::tcp::tcp_read(fd, &mut probe) {
-            Ok(_) => break,
+            Ok(_) => {
+                connected = true;
+                break;
+            }
             Err(-11) => {
                 // EAGAIN — still connecting, wait a tick.
                 for _ in 0..50_000u64 { core::hint::spin_loop(); }
             }
             Err(_) => break, // connected or error — proceed
         }
+    }
+
+    if !connected {
+        let _ = crate::net::tcp::tcp_close(fd);
+        return Err(HttpError::Connect);
     }
 
     // 2. Build and send GET request
@@ -60,11 +69,20 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
     let req_bytes = request.as_bytes();
 
     let mut sent = 0usize;
+    let mut write_eagain = 0u32;
     while sent < req_bytes.len() {
         crate::net::tcp::poll();
         match crate::net::tcp::tcp_write(fd, &req_bytes[sent..]) {
-            Ok(n) => sent += n,
+            Ok(n) => {
+                sent += n;
+                write_eagain = 0;
+            }
             Err(-11) => {
+                write_eagain += 1;
+                if write_eagain > 300 {
+                    let _ = crate::net::tcp::tcp_close(fd);
+                    return Err(HttpError::Send);
+                }
                 for _ in 0..10_000u64 { core::hint::spin_loop(); }
             }
             Err(_) => {
