@@ -33,7 +33,7 @@ use crate::mm::{frame_allocator, paging};
 // ── PID to launch via the "user-init" kernel task ─────────────────────────────
 
 /// PID stored here before `schedule_user_launch` spawns the kernel task.
-static PENDING_INIT_PID: AtomicU32 = AtomicU32::new(0);
+static PENDING_INIT_PID: AtomicU32 = AtomicU32::new(1);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
