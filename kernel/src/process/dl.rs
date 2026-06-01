@@ -796,12 +796,21 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
 /// `name` is a raw byte slice (no null terminator).
 /// Returns the virtual address, or `None` if not found.
 pub fn dlsym(handle: u32, name: &[u8]) -> Option<u64> {
+    let pid = crate::process::current_pid();
     let t = LIBS.lock();
     for lib in &t.entries {
-        if lib.handle != handle { continue; }
+        if lib.pid != pid { continue; }
+        if handle != 0 && lib.handle != handle { continue; }
         for sym in &lib.exports {
             if sym.name.as_slice() == name {
                 return Some(sym.vaddr);
+            }
+        }
+    }
+    if handle == 0 {
+        if let Ok(name_str) = core::str::from_utf8(name) {
+            if let Some(va) = crate::process::posix_trampolines::find_posix_symbol(name_str) {
+                return Some(va);
             }
         }
     }

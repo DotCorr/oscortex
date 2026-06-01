@@ -381,6 +381,7 @@ static mut SURFACE_H: u32 = 0;
 /// Handle returned by `FlutterEngineRun`; 0 until the engine starts.
 static ENGINE: AtomicU64 = AtomicU64::new(0);
 static NOTIFY_DISPLAY_UPDATE: AtomicU64 = AtomicU64::new(0);
+static IS_AOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // Custom task runner ABI structs
 #[repr(C)]
@@ -707,52 +708,87 @@ fn write_hex(mut val: u64) {
     }
 }
 
+fn load_jit_snapshot(path: &[u8]) -> (u64, u64) {
+    let size = sys::vfs_stat(path);
+    if size <= 0 {
+        write(b"[embedder] JIT snapshot stat failed for path: ");
+        write(path);
+        write(b"\n");
+        return (0, 0);
+    }
+    let size = size as usize;
+    let va = sys::mmap_anon(size);
+    if va == 0 {
+        write(b"[embedder] JIT snapshot mmap failed\n");
+        return (0, 0);
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, size) };
+    let n = sys::vfs_read(path, buf);
+    if n as usize != size {
+        write(b"[embedder] JIT snapshot read failed or short: read=");
+        write_dec(n as u64);
+        write(b" expected=");
+        write_dec(size as u64);
+        write(b"\n");
+        return (0, 0);
+    }
+    write(b"[embedder] JIT snapshot loaded: ");
+    write(path);
+    write(b" size=");
+    write_dec(size as u64);
+    write(b"\n");
+    (va, size as u64)
+}
+
 /// Pass JIT vm/isolate snapshot file paths to the engine (debug engine build).
 fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, assets_dir: &[u8]) {
-    static VM_TAIL: &[u8] = b"/vm_snapshot_data\0";
-    static ISO_TAIL: &[u8] = b"/isolate_snapshot_data\0";
-    static mut VM_PATH: [u8; 128] = [0; 128];
-    static mut ISO_PATH: [u8; 128] = [0; 128];
-
-    const PATH_CAP: usize = 128;
-    if assets_dir.len() + VM_TAIL.len() > PATH_CAP || assets_dir.len() + ISO_TAIL.len() > PATH_CAP {
-        write(b"[embedder] JIT asset path too long\n");
-        exit(-1);
+    if IS_AOT.load(Ordering::SeqCst) {
+        return; // No-op for AOT mode
     }
+    write(b"[embedder] JIT mode: leaving snapshot buffers as NULL\n");
+}
 
-    unsafe {
-        VM_PATH[..assets_dir.len()].copy_from_slice(assets_dir);
-        VM_PATH[assets_dir.len()..assets_dir.len() + VM_TAIL.len()].copy_from_slice(VM_TAIL);
-        ISO_PATH[..assets_dir.len()].copy_from_slice(assets_dir);
-        ISO_PATH[assets_dir.len()..assets_dir.len() + ISO_TAIL.len()].copy_from_slice(ISO_TAIL);
+fn log_bytes(label: &[u8], ptr: u64, len: usize) {
+    write(label);
+    if ptr == 0 {
+        write(b"NULL\n");
+        return;
+    }
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let digits = b"0123456789abcdef";
+    for &b in slice {
+        let mut hex = [b'0', b'0', b' '];
+        hex[0] = digits[(b >> 4) as usize];
+        hex[1] = digits[(b & 0xF) as usize];
+        write(&hex);
+    }
+    write(b"\n");
+}
 
-        let vm_path_len = assets_dir.len() + VM_TAIL.len() - 1;
-        let iso_path_len = assets_dir.len() + ISO_TAIL.len() - 1;
+fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64) {
+    let manifest = if aot_va != 0 {
+        write(b"[embedder] loading Dart snapshot from mapping...\n");
+        aot_loader::load_dart_snapshot_from_mapping(aot_va)
+    } else {
+        write(b"[embedder] loading Dart snapshot from /system/flutter/libapp.so...\n");
+        aot_loader::load_dart_snapshot(b"/system/flutter/libapp.so")
+    };
 
-        write(b"[embedder] JIT snapshots: ");
-        write(&VM_PATH[..vm_path_len]);
-        write(b"\n");
-
-        write_u64_at(
-            &mut project_args.bytes,
-            OFF_PA_VM_SNAPSHOT_DATA,
-            VM_PATH.as_ptr() as u64,
-        );
-        write_u64_at(
-            &mut project_args.bytes,
-            OFF_PA_VM_SNAPSHOT_DATA_SIZE,
-            vm_path_len as u64,
-        );
-        write_u64_at(
-            &mut project_args.bytes,
-            OFF_PA_ISO_SNAPSHOT_DATA,
-            ISO_PATH.as_ptr() as u64,
-        );
-        write_u64_at(
-            &mut project_args.bytes,
-            OFF_PA_ISO_SNAPSHOT_DATA_SIZE,
-            iso_path_len as u64,
-        );
+    if let Some(m) = manifest {
+        aot_loader::log_manifest(&m);
+        log_bytes(b"[embedder] vm_data content: ", m.vm_data, 32);
+        log_bytes(b"[embedder] iso_data content: ", m.iso_data, 32);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, m.vm_data);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, m.vm_data_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS, m.vm_instr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, m.vm_instr_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, m.iso_data);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, m.iso_data_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS, m.iso_instr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE, m.iso_instr_size);
+    } else {
+        write(b"[embedder] ERROR: Failed to load Dart AOT snapshot!\n");
+        exit(-1);
     }
 }
 
@@ -1373,6 +1409,24 @@ extern "C" fn main_embedder() {
         exit(-1);
     }
 
+    // Verify engine compilation mode: AOT vs JIT
+    let runs_aot_va = dlsym(handle, b"FlutterEngineRunsAOTCompiledDartCode");
+    write(b"[embedder] FlutterEngineRunsAOTCompiledDartCode VA: ");
+    write_hex(runs_aot_va);
+    write(b"\n");
+    let mut is_aot = false;
+    if runs_aot_va != 0 {
+        let runs_aot: unsafe extern "C" fn() -> bool = unsafe { core::mem::transmute(runs_aot_va) };
+        is_aot = unsafe { runs_aot() };
+        write(b"[embedder] runs_aot_compiled_dart_code returned: ");
+        if is_aot {
+            write(b"true\n");
+        } else {
+            write(b"false\n");
+        }
+    }
+    IS_AOT.store(is_aot, Ordering::SeqCst);
+
     // 5. Register proc table with the kernel.
     engine_proctable_set(
         &proctable as *const FlutterEngineProcTable as u64,
@@ -1495,9 +1549,15 @@ extern "C" fn main_embedder() {
         write_hex(aot_va);
         write(b"\n");
         configure_app_assets(&mut project_args, app_id);
+        if is_aot {
+            configure_aot_snapshots(&mut project_args, aot_va);
+        }
     } else {
         write(b"[host] SHELL mode\n");
         configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
+        if is_aot {
+            configure_aot_snapshots(&mut project_args, 0);
+        }
     }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
