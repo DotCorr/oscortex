@@ -68,10 +68,13 @@ pub(crate) fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> i64 {
         Some(b) => b,
         None => return 0, // not found
     };
-    match crate::process::dl::dlsym(handle as u32, name) {
+    let name_str = core::str::from_utf8(name).unwrap_or("");
+    let res = match crate::process::dl::dlsym(handle as u32, name) {
         Some(addr) => addr as i64,
         None       => 0, // POSIX: NULL (0) means not found
-    }
+    };
+    log::info!("[dlsym] pid={} handle={} query='{}' res={:#x}", crate::process::current_pid(), handle, name_str, res);
+    res
 }
 
 pub(crate) fn sys_dlclose(handle: u64) -> i64 {

@@ -102,6 +102,12 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     "P_SDK_HASH_3": (0xd81028, b"1a420a3f9a"),
     # P_RUNS_AOT: patch runs_aot_compiled_dart_code to return true.
     "P_RUNS_AOT": (0x195f260, b"\xb0\x01\xc3\x90\x90"),
+    # P_JIT_AOT_CHECK: bypass "JIT runtime cannot run a precompiled snapshot" panic
+    "P_JIT_AOT_CHECK": (0x22b181b, bytes([0x90, 0x90])),
+    # P_SNAPSHOT_FEATURES_CHECK: bypass snapshot/VM features mismatch panic (e.g. macos vs linux)
+    "P_SNAPSHOT_FEATURES_CHECK": (0x2290fe6, bytes([0xeb, 0x73])),
+    # P_ALLOW_ALL_DART_FLAGS: bypass switches.cc allowed Dart flags whitelist check
+    "P_ALLOW_ALL_DART_FLAGS": (0x21c3f40, bytes([0x74, 0xac])),
 }
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
@@ -374,7 +380,7 @@ def main() -> int:
 
     if args.verify:
         names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]
+            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]
             if args.apply_all
             else None
         )
@@ -384,7 +390,7 @@ def main() -> int:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]:
+            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -397,7 +403,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]
+        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]
         if args.apply_all
         else (args.apply or [])
     )

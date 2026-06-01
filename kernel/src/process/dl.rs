@@ -543,10 +543,12 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         // 2. Check other already-loaded libraries for this process.
         {
             let t = LIBS.lock();
+            let leader_pid = crate::process::get_group_leader(pid);
             for lib in &t.entries {
-                if lib.pid != pid { continue; }
+                let lib_leader = crate::process::get_group_leader(lib.pid);
+                if lib_leader != leader_pid { continue; }
                 for exp in &lib.exports {
-                    if exp.name.as_slice() == name.as_slice() {
+                    if sym_name_eq(exp.name.as_slice(), name.as_slice()) {
                         return exp.vaddr;
                     }
                 }
@@ -797,12 +799,14 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
 /// Returns the virtual address, or `None` if not found.
 pub fn dlsym(handle: u32, name: &[u8]) -> Option<u64> {
     let pid = crate::process::current_pid();
+    let leader_pid = crate::process::get_group_leader(pid);
     let t = LIBS.lock();
-    for lib in &t.entries {
-        if lib.pid != pid { continue; }
+    for lib in t.entries.iter().rev() {
+        let lib_leader = crate::process::get_group_leader(lib.pid);
+        if lib_leader != leader_pid { continue; }
         if handle != 0 && lib.handle != handle { continue; }
         for sym in &lib.exports {
-            if sym.name.as_slice() == name {
+            if sym_name_eq(sym.name.as_slice(), name) {
                 return Some(sym.vaddr);
             }
         }
@@ -822,8 +826,9 @@ pub fn dlsym(handle: u32, name: &[u8]) -> Option<u64> {
 /// The physical frames remain mapped — full reclamation requires a VMM with
 /// reverse-mappings and is deferred to a future milestone.
 pub fn dlclose(handle: u32, pid: u32) {
+    let leader_pid = crate::process::get_group_leader(pid);
     let mut t = LIBS.lock();
-    if let Some(pos) = t.entries.iter().position(|l| l.handle == handle && l.pid == pid) {
+    if let Some(pos) = t.entries.iter().position(|l| l.handle == handle && crate::process::get_group_leader(l.pid) == leader_pid) {
         t.entries.remove(pos);
     }
 }
@@ -835,9 +840,11 @@ pub fn dlclose(handle: u32, pid: u32) {
 /// - `init_array_va` is the VA of the first DT_INIT_ARRAY entry (0 = none)
 /// - `init_array_len` is the number of entries in the array
 pub fn get_init_fns(handle: u32, pid: u32) -> Option<(u64, u64, usize)> {
+    let leader_pid = crate::process::get_group_leader(pid);
     let t = LIBS.lock();
     for lib in &t.entries {
-        if lib.handle == handle && lib.pid == pid {
+        let lib_leader = crate::process::get_group_leader(lib.pid);
+        if lib.handle == handle && lib_leader == leader_pid {
             return Some((lib.init_fn_va, lib.init_array_va, lib.init_array_len));
         }
     }
@@ -846,9 +853,11 @@ pub fn get_init_fns(handle: u32, pid: u32) -> Option<(u64, u64, usize)> {
 
 /// Return the load base address for a loaded library.
 pub fn get_load_base(handle: u32, pid: u32) -> Option<u64> {
+    let leader_pid = crate::process::get_group_leader(pid);
     let t = LIBS.lock();
     for lib in &t.entries {
-        if lib.handle == handle && lib.pid == pid {
+        let lib_leader = crate::process::get_group_leader(lib.pid);
+        if lib.handle == handle && lib_leader == leader_pid {
             return Some(lib.load_base);
         }
     }
@@ -934,5 +943,11 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
     }
 
     base_va
+}
+
+fn sym_name_eq(a: &[u8], b: &[u8]) -> bool {
+    let a_clean = if a.starts_with(b"_") { &a[1..] } else { a };
+    let b_clean = if b.starts_with(b"_") { &b[1..] } else { b };
+    a_clean == b_clean
 }
 

@@ -1518,11 +1518,20 @@ extern "C" fn main_embedder() {
     static ARG1: &[u8] = b"--enable-impeller=false\0";
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
+    static ARG4: &[u8] = b"--dart-flags=--precompiled_mode\0";
+    static ARG5: &[u8] = b"--precompiled-mode\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 4]);
+    struct ArgvPtrs([*const u8; 6]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
-        ArgvPtrs([ARG0.as_ptr(), ARG1.as_ptr(), ARG2.as_ptr(), ARG3.as_ptr()]);
+        ArgvPtrs([
+            ARG0.as_ptr(),
+            ARG1.as_ptr(),
+            ARG2.as_ptr(),
+            ARG3.as_ptr(),
+            ARG4.as_ptr(),
+            ARG5.as_ptr(),
+        ]);
 
     let mut project_args = FlutterProjectArgsRaw {
         bytes: [0; FLUTTER_PROJECT_ARGS_SIZE],
