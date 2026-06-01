@@ -412,10 +412,9 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
 
 /// Handle a demand-page fault. Returns `true` if the fault was resolved.
 pub fn demand_page(cr2: u64, error: u64) -> bool {
-    // Only handle user-mode not-present faults (bits: present=0, user=1).
-    // Ignore write-protection violations (bit1=1, bit0=1) and kernel faults.
+    // Only handle not-present faults (bit 0 = 0).
+    // Ignore write-protection violations (bit 1 = 1).
     if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
-    if error & 0x4 == 0 { return false; } // kernel mode fault — do not silently map
 
     // Valid user-space VA range: 0x100000 – canonical limit (below kernel half).
     // Exclude the trampoline pages at 0x7FFF_E000 (only 2GB mark — but user

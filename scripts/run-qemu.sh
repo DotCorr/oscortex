@@ -67,4 +67,5 @@ exec qemu-system-x86_64 \
     $SERIAL_FLAGS \
     -no-reboot \
     $DISPLAY_FLAGS \
+    -s \
     $EXTRA

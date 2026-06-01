@@ -107,7 +107,18 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     # P_SNAPSHOT_FEATURES_CHECK: bypass snapshot/VM features mismatch panic (e.g. macos vs linux)
     "P_SNAPSHOT_FEATURES_CHECK": (0x2290fe6, bytes([0xeb, 0x73])),
     # P_ALLOW_ALL_DART_FLAGS: bypass switches.cc allowed Dart flags whitelist check
-    "P_ALLOW_ALL_DART_FLAGS": (0x21c3f40, bytes([0x74, 0xac])),
+    # We change the conditional jump (je success_path) at 0x21c3f2f to an unconditional
+    # jump (jmp success_path) so all Dart flags are accepted.
+    "P_ALLOW_ALL_DART_FLAGS": (0x21c3f2f, bytes([0xe9, 0xba, 0x00, 0x00, 0x00, 0x90])),
+    # P_FINISH_INIT_HOOK and P_FINISH_INIT_CAVE: bypass NULL pointer dereference in
+    # dart::Object::FinishInit(dart::IsolateGroup*). If rax (type testing stub code) is 0,
+    # jump directly to the end of the stub initialization to avoid segfaulting.
+    "P_FINISH_INIT_HOOK": (0x23147e0, bytes([0xe9, 0x1b, 0xfe, 0xc2, 0xff])),
+    "P_FINISH_INIT_CAVE": (0x1F44600, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0xda, 0x01, 0x3d, 0x00, 0xe9, 0xd1, 0x01, 0x3d, 0x00])),
+    "P_FINISH_INIT_HOOK_2": (0x2314861, bytes([0xe9, 0xba, 0xfd, 0xc2, 0xff])),
+    "P_FINISH_INIT_CAVE_2": (0x1F44620, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0x3b, 0x02, 0x3d, 0x00, 0xe9, 0x32, 0x02, 0x3d, 0x00])),
+    "P_INIT_TTS_HOOK": (0x23148cf, bytes([0xe9, 0x6c, 0xfd, 0xc2, 0xff])),
+    "P_INIT_TTS_CAVE": (0x1F44640, bytes([0x48, 0x85, 0xd2, 0x74, 0x0a, 0x4c, 0x39, 0xc2, 0x74, 0x05, 0xe9, 0x89, 0x02, 0x3d, 0x00, 0xe9, 0x80, 0x02, 0x3d, 0x00])),
 }
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
@@ -380,7 +391,7 @@ def main() -> int:
 
     if args.verify:
         names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]
+            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
             if args.apply_all
             else None
         )
@@ -390,7 +401,7 @@ def main() -> int:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]:
+            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -403,7 +414,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS"]
+        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
         if args.apply_all
         else (args.apply or [])
     )
