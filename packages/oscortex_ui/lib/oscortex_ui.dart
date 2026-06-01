@@ -28,13 +28,21 @@ export 'src/theme/osc_theme.dart';
 
 // ── Widgets ────────────────────────────────────────────────────────────
 export 'src/widgets/osc_app_rail.dart';
+export 'src/widgets/osc_banner.dart';
+export 'src/widgets/osc_breadcrumbs.dart';
+export 'src/widgets/osc_button.dart';
 export 'src/widgets/osc_card.dart';
+export 'src/widgets/osc_chip.dart';
 export 'src/widgets/osc_hub_dock.dart';
+export 'src/widgets/osc_icon_button.dart';
 export 'src/widgets/osc_intent_bar.dart';
+export 'src/widgets/osc_popup_menu.dart';
 export 'src/widgets/osc_scaffold.dart';
 export 'src/widgets/osc_section_label.dart';
 export 'src/widgets/osc_status_badge.dart';
+export 'src/widgets/osc_status_bar.dart';
 export 'src/widgets/osc_tag.dart';
+export 'src/widgets/osc_text_field.dart';
 export 'src/widgets/osc_toolbar.dart';
 export 'src/widgets/osc_waveform.dart';
 

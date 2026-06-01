@@ -892,14 +892,17 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
                         mutex
                     );
                 }
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(pid, urip - 2, ursp);
-                crate::process::save_full_user_gprs(pid);
-                crate::process::set_rax(pid, sys_nr);
-                crate::process::save_xstate(pid);
-                crate::process::set_state(pid, crate::process::ProcState::Blocked);
-                crate::process::enter_user_by_pid_noreturn(owner_candidate);
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for(owner_candidate, my_cpu) {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_full_user_gprs(pid);
+                    crate::process::set_rax(pid, sys_nr);
+                    crate::process::save_xstate(pid);
+                    crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                    crate::process::enter_user_by_pid_noreturn(owner_candidate);
+                }
             }
         }
 
@@ -1601,13 +1604,16 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
             && crate::wm::input_pending_for(focus) > 0
             && super::coop_target_ready(focus)
         {
-            let urip = crate::arch::syscall::user_rip();
-            let ursp = crate::arch::syscall::user_rsp();
-            crate::process::save_return_context(wpid, urip, ursp);
-            crate::process::save_full_user_gprs(wpid);
-            crate::process::set_rax(wpid, 0);
-            crate::process::save_xstate(wpid);
-            crate::process::enter_user_by_pid_noreturn(focus);
+            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            if crate::process::try_claim_cpu_for(focus, my_cpu) {
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(wpid, urip, ursp);
+                crate::process::save_full_user_gprs(wpid);
+                crate::process::set_rax(wpid, 0);
+                crate::process::save_xstate(wpid);
+                crate::process::enter_user_by_pid_noreturn(focus);
+            }
         }
     }
 

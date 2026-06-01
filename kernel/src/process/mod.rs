@@ -598,6 +598,22 @@ pub fn restore_xstate(pid: u32) {
     unsafe { crate::arch::cpu::restore_xstate_from(ptr) };
 }
 
+/// Safely attempt to claim the given PID for execution on `my_cpu`.
+/// Returns `true` if the process is Running and either unclaimed or already assigned to `my_cpu`.
+pub fn try_claim_cpu_for(pid: u32, my_cpu: u32) -> bool {
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx] };
+    if p.pid == pid && p.state == ProcState::Running {
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return true;
+        }
+    }
+    false
+}
+
+
 /// Round-robin pick of next Running *user* thread that belongs to the same
 /// address space as `current` (i.e. shares its `parent_pid` group), excluding
 /// `current` itself. Returns `None` if no sibling thread is runnable.

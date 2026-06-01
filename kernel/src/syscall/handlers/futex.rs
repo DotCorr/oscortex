@@ -662,13 +662,16 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
             // enough to starve wake-source setup (pipe/timer arming).
             let parent = crate::process::current_pid();
             if parent != 0 && child_pid != parent {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(parent, urip, ursp);
-                crate::process::save_full_user_gprs(parent);
-                crate::process::set_rax(parent, 0);
-                crate::process::save_xstate(parent);
-                crate::process::enter_user_by_pid_noreturn(child_pid);
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(parent, urip, ursp);
+                    crate::process::save_full_user_gprs(parent);
+                    crate::process::set_rax(parent, 0);
+                    crate::process::save_xstate(parent);
+                    crate::process::enter_user_by_pid_noreturn(child_pid);
+                }
             }
         }
         r
