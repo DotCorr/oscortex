@@ -741,11 +741,47 @@ fn load_jit_snapshot(path: &[u8]) -> (u64, u64) {
 }
 
 /// Pass JIT vm/isolate snapshot file paths to the engine (debug engine build).
-fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, assets_dir: &[u8]) {
+fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, _assets_dir: &[u8]) {
     if IS_AOT.load(Ordering::SeqCst) {
         return; // No-op for AOT mode
     }
-    write(b"[embedder] JIT mode: leaving snapshot buffers as NULL\n");
+    static mut VM_PATH: [u8; 64] = [0; 64];
+    static mut ISO_PATH: [u8; 64] = [0; 64];
+    const VM_STR: &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
+    const ISO_STR: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
+
+    unsafe {
+        VM_PATH[..VM_STR.len()].copy_from_slice(VM_STR);
+        ISO_PATH[..ISO_STR.len()].copy_from_slice(ISO_STR);
+
+        let vm_path_len = VM_STR.len() - 1;
+        let iso_path_len = ISO_STR.len() - 1;
+
+        write(b"[embedder] JIT snapshots: ");
+        write(&VM_PATH[..vm_path_len]);
+        write(b"\n");
+
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_VM_SNAPSHOT_DATA,
+            VM_PATH.as_ptr() as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_VM_SNAPSHOT_DATA_SIZE,
+            vm_path_len as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_ISO_SNAPSHOT_DATA,
+            ISO_PATH.as_ptr() as u64,
+        );
+        write_u64_at(
+            &mut project_args.bytes,
+            OFF_PA_ISO_SNAPSHOT_DATA_SIZE,
+            iso_path_len as u64,
+        );
+    }
 }
 
 fn log_bytes(label: &[u8], ptr: u64, len: usize) {

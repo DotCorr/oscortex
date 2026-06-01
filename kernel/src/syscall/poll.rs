@@ -442,16 +442,42 @@ fn finish_cond_timedout_return(pid: u32, mutex: u64) {
     if pid == 0 {
         return;
     }
+    // 1. Try to acquire the locks first in a consistent order
+    let mut cws = match COND_WAIT_STATE.try_lock() {
+        Some(c) => c,
+        None => return,
+    };
+    let mut g_ptable = match crate::process::PTABLE_LOCK.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+
+    // 2. Try to acquire the userspace mutex
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
     if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_err() {
         return;
     }
-    if let Some((rip, rsp)) = crate::process::get_saved_rip_rsp(pid) {
-        crate::process::save_return_context(pid, rip.wrapping_add(2), rsp);
+
+    // 3. Perform register modifications and state update
+    let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+    if p.pid == pid {
+        let rip = p.regs.rip;
+        let rsp = p.regs.rsp;
+        let fs = crate::arch::cpu::get_fs_base();
+        p.regs.rip    = rip.wrapping_add(2);
+        p.regs.rsp    = rsp;
+        p.regs.rflags = 0x202;
+        p.preempted_by_timer = false;
+        p.fs_base = fs;
+        p.regs.rax = 110; // ETIMEDOUT
     }
-    crate::process::set_rax(pid, 110);
-    COND_WAIT_STATE.lock().remove(&pid);
+
+    drop(g_ptable);
+    cws.remove(&pid);
+    drop(cws);
+
     crate::process::wake_process(pid);
+
     static FINISH_LOG: AtomicU32 = AtomicU32::new(0);
     let n = FINISH_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n % 64 == 0 {
@@ -518,7 +544,10 @@ pub fn check_timerfds_and_wake_try() {
     // Finish at most one timed-out AcquiringMutex waiter per tick (mutex free).
     {
         let stuck = {
-            let cws = COND_WAIT_STATE.lock();
+            let cws = match COND_WAIT_STATE.try_lock() {
+                Some(c) => c,
+                None => return,
+            };
             cws.iter()
                 .find_map(|(&pid, st)| {
                     if let CondWaitState::AcquiringMutex {

@@ -6,6 +6,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "=== Fast Kernel ISO Build ==="
 cd "$ROOT"
 
+touch "$ROOT/kernel/src/fs/initramfs.rs"
 cargo +nightly build \
     --release \
     --package oscortex-kernel \

@@ -198,6 +198,7 @@ for req in "${REQUIRED_FILES[@]}"; do
 done
 
 echo "[1/5] Building kernel ELF..."
+touch "$ROOT/kernel/src/fs/initramfs.rs"
 cd "$ROOT"
 cargo +nightly build \
     --release \
