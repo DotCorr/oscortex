@@ -16,8 +16,11 @@ impl Log for KernelLogger {
         let mut buf = FmtBuf::new();
         let _ = write!(buf, "[{}] {}: {}\n", record.level(), record.target(), record.args());
         let s = buf.as_str();
+
+        let rflags = crate::arch::interrupts_save_and_disable();
         SERIAL.lock().write_str(s).ok();
         crate::drivers::fb::write_str(s);
+        crate::arch::interrupts_restore(rflags);
     }
     fn flush(&self) {}
 }

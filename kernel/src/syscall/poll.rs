@@ -223,7 +223,8 @@ pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
     }
 
     for prefer in [2u32, 3, 4, 7, 1] {
-        if prefer != cur && coop_target_ready_locked(prefer, my_cpu) {
+        let ready = coop_target_ready_locked(prefer, my_cpu);
+        if prefer != cur && ready {
             let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(prefer)] };
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
                 p.current_cpu = Some(my_cpu);
@@ -324,7 +325,36 @@ pub(crate) fn epoll_wake(fd: u32) {
     };
     for pid in pids_to_wake {
         // rax=1 and the fake event were written before yielding.
-        crate::process::set_state(pid, crate::process::ProcState::Running);
+        crate::process::wake_process(pid);
+    }
+}
+
+pub(crate) fn epoll_wake_try(fd: u32) {
+    let watching_epfds: Vec<u32> = {
+        let epoll_tbl = match EPOLL_TABLE.try_lock() {
+            Some(t) => t,
+            None => return,
+        };
+        epoll_tbl.iter()
+            .filter(|(_, entries)| entries.iter().any(|e| e.fd == fd))
+            .map(|(&epfd, _)| epfd)
+            .collect()
+    };
+    if watching_epfds.is_empty() { return; }
+    let pids_to_wake: Vec<u32> = {
+        let mut blocked = match EPOLL_BLOCKED.try_lock() {
+            Some(b) => b,
+            None => return,
+        };
+        let pids: Vec<u32> = blocked.iter()
+            .filter(|(_, &epfd)| watching_epfds.contains(&epfd))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for &pid in &pids { blocked.remove(&pid); }
+        pids
+    };
+    for pid in pids_to_wake {
+        crate::process::wake_process(pid);
     }
 }
 
@@ -421,7 +451,7 @@ fn finish_cond_timedout_return(pid: u32, mutex: u64) {
     }
     crate::process::set_rax(pid, 110);
     COND_WAIT_STATE.lock().remove(&pid);
-    crate::process::set_state(pid, crate::process::ProcState::Running);
+    crate::process::wake_process(pid);
     static FINISH_LOG: AtomicU32 = AtomicU32::new(0);
     let n = FINISH_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n % 64 == 0 {
@@ -451,6 +481,34 @@ pub fn check_timerfds_and_wake() {
     }
     for fd in to_wake {
         epoll_wake(fd);
+    }
+}
+
+pub fn check_timerfds_and_wake_try() {
+    let now = monotonic_ns();
+    let mut to_wake = Vec::new();
+    {
+        let mut tbl = match TIMERFD_TABLE.try_lock() {
+            Some(t) => t,
+            None => return,
+        };
+        for (&fd, t) in tbl.iter_mut() {
+            if t.deadline_ns != 0 && now >= t.deadline_ns {
+                if t.period_ns != 0 {
+                    let elapsed = now.saturating_sub(t.deadline_ns);
+                    let n = 1u64 + elapsed / t.period_ns;
+                    t.deadline_ns = t.deadline_ns.saturating_add(n * t.period_ns);
+                    t.pending = t.pending.saturating_add(n);
+                } else {
+                    t.deadline_ns = 0; // disarm one-shot
+                    t.pending = t.pending.saturating_add(1);
+                }
+                to_wake.push(fd);
+            }
+        }
+    }
+    for fd in to_wake {
+        epoll_wake_try(fd);
     }
 
     // Timed pthread_cond wait expiry is handled inside
@@ -492,8 +550,8 @@ pub fn check_timerfds_and_wake() {
     let wm_deadline = WM_WAITER_DEADLINE.load(Ordering::Acquire);
     if wm_deadline != 0 && now >= wm_deadline {
         let wm_waiter = WM_WAITER_PID.load(Ordering::Acquire);
-        if wm_waiter != 0 && crate::process::is_blocked(wm_waiter) {
-            crate::process::set_state(wm_waiter, crate::process::ProcState::Running);
+        if wm_waiter != 0 && crate::process::is_blocked_try(wm_waiter) {
+            crate::process::wake_process(wm_waiter);
         }
     }
 }
@@ -724,12 +782,27 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
 
 /// Returns ready events. event slot layout (packed): u32 events; u64 data.
 fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
-    if events_out == 0 || maxevents <= 0 { return 0; }
+    static ECR_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = ECR_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 48 {
+        log::warn!("[ec-ready-enter] #{} epfd={} ev_out={:#x} max={}", n, epfd, events_out, maxevents);
+    }
+    if events_out == 0 || maxevents <= 0 {
+        if n < 48 {
+            log::warn!("[ec-ready-exit-early] #{} epfd={}", n, epfd);
+        }
+        return 0;
+    }
     let now = monotonic_ns();
     let mut count: i32 = 0;
     let entries = {
         let tbl = EPOLL_TABLE.lock();
-        let Some(list) = tbl.get(&epfd) else { return 0; };
+        let Some(list) = tbl.get(&epfd) else {
+            if n < 48 {
+                log::warn!("[ec-ready-exit-no-epfd] #{} epfd={}", n, epfd);
+            }
+            return 0;
+        };
         list.clone()
     };
     let mut tfd_tbl = TIMERFD_TABLE.lock();
@@ -828,6 +901,9 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                 count += 1;
             }
         }
+    }
+    if n < 48 {
+        log::warn!("[ec-ready-exit] #{} epfd={} count={}", n, epfd, count);
     }
     count
 }
@@ -1032,8 +1108,21 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
 
     let start = monotonic_ns();
     loop {
+        // Block ourselves on epoll BEFORE checking readiness to prevent lost wakeups
+        {
+            let mut blocked = EPOLL_BLOCKED.lock();
+            blocked.insert(cur as u32, epfd as u32);
+        }
+        crate::process::set_state(cur, crate::process::ProcState::Blocked);
+
         let ready = epoll_collect_ready(epfd as u32, events_out, max);
         if ready > 0 {
+            {
+                let mut blocked = EPOLL_BLOCKED.lock();
+                blocked.remove(&(cur as u32));
+            }
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+
             if epfd == 72 || cur == 8 {
                 static EPOLL_72_READY_LOOP_LOG: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);
@@ -1062,6 +1151,11 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if !infinite {
             let elapsed_ms = (monotonic_ns().saturating_sub(start)) / 1_000_000;
             if elapsed_ms >= timeout_ms {
+                {
+                    let mut blocked = EPOLL_BLOCKED.lock();
+                    blocked.remove(&(cur as u32));
+                }
+                crate::process::set_state(cur, crate::process::ProcState::Running);
                 return 0; // timeout expired
             }
         }
@@ -1075,11 +1169,20 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             && crate::process::get_group_leader(cur) == 1
             && crate::wm::flutter_bootstrap_spin_active()
         {
-            let spin_until = monotonic_ns().saturating_add(2_000_000);
+            let start_time = monotonic_ns();
+            let spin_until = start_time.saturating_add(2_000_000);
+            let mut iters = 0u64;
             loop {
+                iters += 1;
                 check_timerfds_and_wake();
                 let ready = epoll_collect_ready(epfd as u32, events_out, max);
                 if ready > 0 {
+                    {
+                        let mut blocked = EPOLL_BLOCKED.lock();
+                        blocked.remove(&(cur as u32));
+                    }
+                    crate::process::set_state(cur, crate::process::ProcState::Running);
+
                     static EPOLL_SPIN_READY_LOG: core::sync::atomic::AtomicU32 =
                         core::sync::atomic::AtomicU32::new(0);
                     let n = EPOLL_SPIN_READY_LOG.fetch_add(1, Ordering::Relaxed);
@@ -1095,7 +1198,17 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                     }
                     return ready as i64;
                 }
-                if monotonic_ns() >= spin_until {
+                let now = core::hint::black_box(monotonic_ns());
+                if now >= spin_until {
+                    static SPIN_TIMEOUT_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = SPIN_TIMEOUT_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        log::warn!(
+                            "[epoll-spin-timeout] #{} pid={} epfd={} iters={} start={} now={} limit={}",
+                            n, cur, epfd, iters, start_time, now, spin_until
+                        );
+                    }
                     break;
                 }
                 core::hint::spin_loop();
@@ -1103,47 +1216,40 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
 
         if cur != 0 {
-            if let Some(next) = cooperative_sched_target(cur) {
-                if next != cur {
-                    if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
-                        static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
-                            core::sync::atomic::AtomicU32::new(0);
-                        let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
-                        if n < 48 {
-                            log::warn!(
-                                "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
-                                n,
-                                cur,
-                                epfd,
-                                next,
-                                crate::arch::syscall::user_rip()
-                            );
-                        }
+            let coop_target = cooperative_sched_target(cur);
+            if let Some(next) = coop_target.filter(|&n| n != cur) {
+                if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
+                    static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 48 {
+                        log::warn!(
+                            "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
+                            n,
+                            cur,
+                            epfd,
+                            next,
+                            crate::arch::syscall::user_rip()
+                        );
                     }
-                    // Block ourselves on epoll
-                    {
-                        let mut blocked = EPOLL_BLOCKED.lock();
-                        blocked.insert(cur as u32, epfd as u32);
-                    }
-                    // Re-execute the epoll_wait syscall on resume (do NOT return
-                    // -1/EINTR to userspace). Returning EINTR here makes the
-                    // Flutter engine retry epoll_wait immediately; if it is woken
-                    // before any fd is actually ready it gets EINTR again and
-                    // busy-spins, monopolizing the single core and starving the
-                    // embedder host (pid 1) input loop. Saving the context at the
-                    // syscall instruction (urip - 2) with rax = the epoll_wait
-                    // syscall number makes the thread re-enter the kernel on wake
-                    // and re-check readiness — returning real events when ready or
-                    // blocking again — exactly like sys_wm_event_wait does.
-                    let urip = crate::arch::syscall::user_rip();
-                    let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
-                    crate::process::save_full_user_gprs(cur);
-                    crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
-                    crate::process::save_xstate(cur);
-                    crate::process::set_state(cur, crate::process::ProcState::Blocked);
-                    crate::process::enter_user_by_pid_noreturn(next);
                 }
+                // Re-execute the epoll_wait syscall on resume (do NOT return
+                // -1/EINTR to userspace). Returning EINTR here makes the
+                // Flutter engine retry epoll_wait immediately; if it is woken
+                // before any fd is actually ready it gets EINTR again and
+                // busy-spins, monopolizing the single core and starving the
+                // embedder host (pid 1) input loop. Saving the context at the
+                // syscall instruction (urip - 2) with rax = the epoll_wait
+                // syscall number makes the thread re-enter the kernel on wake
+                // and re-check readiness — returning real events when ready or
+                // blocking again — exactly like sys_wm_event_wait does.
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(next);
             } else if cur >= 2
                 && crate::process::get_group_leader(cur) == 1
                 && !crate::wm::flutter_init_ready()
@@ -1154,11 +1260,12 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 let n = EPOLL_INIT_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
                 if n < 32 {
                     log::warn!(
-                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x}",
+                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x} target={:?}",
                         n,
                         cur,
                         epfd,
-                        crate::arch::syscall::user_rip()
+                        crate::arch::syscall::user_rip(),
+                        coop_target
                     );
                 }
                 crate::process::set_state(1, crate::process::ProcState::Running);

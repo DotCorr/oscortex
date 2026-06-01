@@ -224,7 +224,6 @@ pub extern "C" fn kernel_main() -> ! {
             };
             match process::spawn_with_bootstrap(elf_bytes, "init", bootstrap) {
                 Ok(pid) => {
-                    process::set_current_pid(pid);
                     process::schedule_user_launch(pid);
                     crate::wm::set_focus_pid(pid);
                     log::info!("[INIT] Spawned shell host as PID {}", pid);

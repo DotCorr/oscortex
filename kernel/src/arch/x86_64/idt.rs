@@ -496,7 +496,8 @@ unsafe extern "C" fn apic_timer_entry() {
 }
 
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
-    crate::syscall::check_timerfds_and_wake();
+    crate::syscall::check_timerfds_and_wake_try();
+    crate::process::handle_pending_wakes_try();
 
     let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
 
@@ -516,11 +517,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         }
     }
 
-    static DUMP_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let count = DUMP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if count < 10 && cpu_id == 0 {
-        log::info!("[APIC TIMER] tick count={}", count);
-    }
+
     let frame = unsafe { &mut *frame_ptr };
     let preempted_user = (frame.cs & 0x3) == 0x3;
 
@@ -541,7 +538,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
 
     if preempted_user {
         let cur = crate::process::current_pid();
-        let slice_expired = crate::process::account_tick(cur);
+        let slice_expired = crate::process::account_tick_try(cur).unwrap_or(false);
 
         let focus = crate::wm::focus_pid();
         let target = if focus != 0 { focus } else { 1 };
@@ -575,24 +572,11 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
                 r14: frame.r14,
                 r15: frame.r15,
             };
-            if let Some((next_pid, next_regs, pml4_phys)) = crate::process::timer_preempt_switch(cur, &cur_regs) {
+            if let Some((next_pid, next_regs, pml4_phys)) = crate::process::timer_preempt_switch_try(cur, &cur_regs) {
                 unsafe {
                     super::memory::write_cr3(pml4_phys);
                 }
-                static INPUT_PREEMPT_LOG: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let n = INPUT_PREEMPT_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 40 {
-                    log::warn!(
-                        "[input-preempt] #{} cur={} -> next={} target={} pending={} baton={}",
-                        n,
-                        cur,
-                        next_pid,
-                        target,
-                        crate::wm::input_pending_for(target),
-                        crate::wm::embedder_baton_due()
-                    );
-                }
+
                 frame.r15 = next_regs.r15;
                 frame.r14 = next_regs.r14;
                 frame.r13 = next_regs.r13;
@@ -627,27 +611,16 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     if target != 0
         && crate::wm::flutter_init_ready()
         && !crate::wm::flutter_bootstrap_spin_active()
-        && (cur == 0 || crate::process::is_blocked(cur))
+        && (cur == 0 || crate::process::is_blocked_try(cur))
         && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
     {
-        crate::process::set_state(target, crate::process::ProcState::Running);
-        static INPUT_KERNEL_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        let n = INPUT_KERNEL_HANDOFF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 40 {
-            log::warn!(
-                "[input-kernel-handoff] #{} cur={} -> target={} pending={} baton={}",
-                n,
-                cur,
-                target,
-                crate::wm::input_pending_for(target),
-                crate::wm::embedder_baton_due()
-            );
-        }
-        if cur != target {
-            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
-            if crate::process::try_claim_cpu_for(target, my_cpu) {
-                crate::process::enter_user_by_pid_noreturn(target);
+        if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+
+            if cur != target {
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for_try(target, my_cpu) {
+                    crate::process::enter_user_by_pid_noreturn(target);
+                }
             }
         }
     }
@@ -655,7 +628,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // Kernel-mode preemption: run cooperative scheduler.
     // Do NOT call sched::tick() while a user thread was running —
     // those are reserved for kernel-idle context only.
-    if crate::arch::x86_64::smp::this_cpu().cpu_id == 0 {
+    if crate::arch::x86_64::smp::this_cpu().cpu_id == 0 && crate::process::current_pid() == 0 {
         crate::sched::tick();
     }
 }

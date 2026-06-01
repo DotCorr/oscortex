@@ -501,7 +501,7 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
     let waiter = WM_WAITER.load(Ordering::Acquire);
     if waiter != 0 && owner_visible_to_consumer(owner_pid, waiter) {
         WM_WAITER.store(0, Ordering::Release);
-        crate::process::set_state(waiter, crate::process::ProcState::Running);
+        crate::process::wake_process(waiter);
     }
 
     // Input events (pointer/key) MUST wake their target consumer even when no
@@ -519,7 +519,7 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
             focus_pid()
         };
         if target != 0 {
-            crate::process::set_state(target, crate::process::ProcState::Running);
+            crate::process::wake_process(target);
         }
     }
 }
@@ -545,11 +545,11 @@ pub fn push_vsync(frame: u64) {
         ev.b = baton;
         with_queue(|q| q.push_front(ev, 0));
         BATON_VSYNC_QUEUED.store(true, Ordering::Release);
-        crate::process::set_state(1, crate::process::ProcState::Running);
+        crate::process::wake_process(1);
         let waiter = WM_WAITER.load(Ordering::Acquire);
         if waiter != 0 {
             WM_WAITER.store(0, Ordering::Release);
-            crate::process::set_state(waiter, crate::process::ProcState::Running);
+            crate::process::wake_process(waiter);
         }
     } else {
         push_event(EV_VSYNC, 0, frame, baton);
@@ -579,11 +579,11 @@ pub fn set_vsync_baton(baton: u64) {
     ev.b = baton;
     with_queue(|q| q.push_front(ev, 0));
     BATON_VSYNC_QUEUED.store(true, Ordering::Release);
-    crate::process::set_state(1, crate::process::ProcState::Running);
+    crate::process::wake_process(1);
     let waiter = WM_WAITER.load(Ordering::Acquire);
     if waiter != 0 {
         WM_WAITER.store(0, Ordering::Release);
-        crate::process::set_state(waiter, crate::process::ProcState::Running);
+        crate::process::wake_process(waiter);
     }
     static DELIVER_SEQ: AtomicU32 = AtomicU32::new(0);
     let n = DELIVER_SEQ.fetch_add(1, Ordering::Relaxed);

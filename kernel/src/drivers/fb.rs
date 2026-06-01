@@ -215,6 +215,7 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
 pub fn write_str(s: &str) {
     if !FB_READY.load(Ordering::Acquire) { return; }
     if FB_SILENT.load(Ordering::Relaxed) { return; }
+    let _guard = InterruptGuard::new();
     for b in s.bytes() {
         write_byte(b);
     }
