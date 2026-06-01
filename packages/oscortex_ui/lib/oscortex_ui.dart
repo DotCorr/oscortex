@@ -48,3 +48,6 @@ export 'src/widgets/osc_waveform.dart';
 
 // ── Previews ───────────────────────────────────────────────────────────
 export 'src/preview/osc_preview.dart';
+
+// ── A2UI Protocol ──────────────────────────────────────────────────────
+export 'src/a2ui/a2ui.dart';

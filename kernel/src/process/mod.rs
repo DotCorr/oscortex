@@ -400,6 +400,14 @@ pub fn spawn_with_bootstrap(
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
         p.user_stack_size = USER_STACK_SIZE as u64;
+        p.current_cpu        = None;
+        p.cpu_ticks          = 0;
+        p.slice_left         = 10;
+        p.pending_sigs       = 0;
+        p.sig_mask           = 0;
+        p.sig_handlers       = [0u64; 32];
+        p.errno_to_deliver   = 0;
+        p.preempted_by_timer = false;
     }
 
     log::info!(
@@ -979,6 +987,16 @@ pub fn clone_thread(
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
         p.fs_base            = 0;
+        p.current_cpu        = None;
+        p.cpu_ticks          = 0;
+        p.slice_left         = 10;
+        p.pending_sigs       = 0;
+        p.sig_mask           = 0;
+        p.sig_handlers       = [0u64; 32];
+        p.errno_to_deliver   = 0;
+        p.preempted_by_timer = false;
+        p.user_stack_base    = 0;
+        p.user_stack_size    = 0;
     }
 
     log::info!("[Process] clone_thread tid={} in pid={} rip={:#x}", tid, owning_pid, child_rip);

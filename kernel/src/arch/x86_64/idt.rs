@@ -645,7 +645,10 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
             );
         }
         if cur != target {
-            crate::process::enter_user_by_pid_noreturn(target);
+            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            if crate::process::try_claim_cpu_for(target, my_cpu) {
+                crate::process::enter_user_by_pid_noreturn(target);
+            }
         }
     }
 
