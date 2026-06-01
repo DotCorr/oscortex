@@ -22,6 +22,45 @@
   User apps are ephemeral — evicted LRU when the 16-slot cache fills up.
 
 
+  WHERE THIS FITS — BUILD vs DISTRIBUTE
+  ──────────────────────────────────────
+  ALL OSCortex apps are Flutter projects compiled to AOT and packaged as .osx
+  bundles. The build step is always the same. On-demand delivery is one of
+  THREE distribution paths for getting that compiled bundle to the device:
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │  BUILD (always the same)          DISTRIBUTE (3 options)            │
+  │  ─────────────────────            ──────────────────────            │
+  │                                                                      │
+  │  Flutter project                                                     │
+  │      │                                                               │
+  │      ▼                            ┌────────────────────────────┐    │
+  │  flutter AOT compile              │ A) Preloaded in ISO        │    │
+  │      │                            │    baked at build time      │    │
+  │      ▼                            │    system apps: shell/files │    │
+  │  .osx bundle ─────────────────→   ├────────────────────────────┤    │
+  │  (compiled binary)                │ B) Sideloaded via Files    │    │
+  │                                   │    manual copy + install    │    │
+  │                                   │    good for dev testing     │    │
+  │                                   ├────────────────────────────┤    │
+  │                                   │ C) On-demand from server ★ │    │
+  │                                   │    fetched on first tap     │    │
+  │                                   │    cached in memory         │    │
+  │                                   │    evicted when space low   │    │
+  │                                   └────────────────────────────┘    │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  Think of it like iOS: apps are always compiled to native ARM, but the
+  App Store is how they get distributed. Similarly, .osx bundles are always
+  Flutter AOT, but on-demand delivery is how they reach the device without
+  requiring a full ISO rebuild or manual sideloading.
+
+  The key difference: there's no "install" step. The app is fetched, verified,
+  cached, and launched — all in one seamless tap. If the cache is full, the
+  oldest unused app is silently evicted. Next time the user taps it, it's
+  re-fetched transparently.
+
+
   HOW IT WORKS (end to end)
   ─────────────────────────
 

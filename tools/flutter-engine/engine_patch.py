@@ -38,6 +38,40 @@ def file_to_va(fo: int) -> int:
     return fo
 
 
+def get_sdk_hash_from_elf(elf_path: Path) -> bytes | None:
+    import subprocess
+    try:
+        out = subprocess.check_output(["nm", "-D", str(elf_path)], text=True)
+        for line in out.splitlines():
+            if "_kDartVmSnapshotData" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    val = int(parts[0], 16)
+                    data = elf_path.read_bytes()
+                    e_phoff = struct.unpack("<Q", data[0x20:0x28])[0]
+                    e_phnum = struct.unpack("<H", data[0x38:0x3a])[0]
+                    e_phentsize = struct.unpack("<H", data[0x36:0x38])[0]
+                    
+                    file_offset = None
+                    for i in range(e_phnum):
+                        ph_offset = e_phoff + i * e_phentsize
+                        p_type = struct.unpack("<I", data[ph_offset : ph_offset + 4])[0]
+                        if p_type == 1: # PT_LOAD
+                            p_offset = struct.unpack("<Q", data[ph_offset + 8 : ph_offset + 16])[0]
+                            p_vaddr = struct.unpack("<Q", data[ph_offset + 16 : ph_offset + 24])[0]
+                            p_filesz = struct.unpack("<Q", data[ph_offset + 32 : ph_offset + 40])[0]
+                            if val >= p_vaddr and val < p_vaddr + p_filesz:
+                                file_offset = p_offset + (val - p_vaddr)
+                                break
+                    
+                    if file_offset is not None:
+                        hash_bytes = data[file_offset + 20 : file_offset + 30]
+                        return hash_bytes
+    except Exception as e:
+        print(f"Error extracting SDK hash: {e}")
+    return None
+
+
 def rel32(from_va: int, to_va: int) -> bytes:
     return struct.pack("<i", to_va - (from_va + 5))
 
@@ -52,7 +86,7 @@ def call_rel32(at_va: int, to_va: int) -> bytes:
 
 # P1–P6 from HANDOFF.md (verified offsets).
 PATCHES: dict[str, tuple[int, bytes]] = {
-    "P1": (0x196E300, bytes([0x00])),
+    "P1": (0x196E300, bytes([0x01])),
     "P2": (0x19BEA36, bytes([0x90, 0x90])),
     "P3": (0x1AB64D1, bytes([0x90, 0x90])),
     "P4": (0x1AA629C, bytes([0x90] * 6)),
@@ -62,8 +96,12 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     # "P8": (0x1B2222F, bytes([0xEB, 0x38])),
     # P10: SkBitmapDevice::drawPaint — always take post-onAccessPixels path.
     "P10": (0x1A8AE87, bytes([0xEB, 0x10])),
-    # P_SDK_HASH: null the engine's internal expected SDK hash.
-    "P_SDK_HASH": (0x188ced, b"0000000000"),
+    # P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3: expected SDK hash offsets in pristine engine.
+    "P_SDK_HASH": (0x188ced, b"1a420a3f9a"),
+    "P_SDK_HASH_2": (0x3bd638, b"1a420a3f9a"),
+    "P_SDK_HASH_3": (0xd81028, b"1a420a3f9a"),
+    # P_RUNS_AOT: patch runs_aot_compiled_dart_code to return true.
+    "P_RUNS_AOT": (0x195f260, b"\xb0\x01\xc3\x90\x90"),
 }
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
@@ -257,7 +295,11 @@ PATCHES["P7_EPILOGUE"] = PATCHES["P9_EPILOGUE"]
 
 
 def patch_kernel_blob(path: Path) -> None:
-    """Null the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8)."""
+    """Patch the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8)."""
+    libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
+    extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
+    target_hash = extracted_hash or b"78da37fed6"
+    
     data = path.read_bytes()
     if len(data) < 18:
         raise ValueError(f"kernel blob too short: {path}")
@@ -271,8 +313,8 @@ def patch_kernel_blob(path: Path) -> None:
     print(f"kernel blob SDK hash in {path}: {current_str}")
     with path.open("r+b") as f:
         f.seek(8)
-        f.write(b"0000000000")
-    print(f"patched -> 0000000000")
+        f.write(target_hash)
+    print(f"patched -> {target_hash.decode('ascii')}")
 
 def verify(data: bytes, name: str | None = None) -> list[str]:
     errors: list[str] = []
@@ -314,11 +356,25 @@ def main() -> int:
         print(f"engine not found: {engine}", file=sys.stderr)
         return 1
 
+    # Extract dynamic SDK hash from libapp.so to update P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3
+    libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
+    extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
+    if extracted_hash:
+        print(f"Extracted dynamic SDK hash from libapp.so: {extracted_hash.decode('ascii')}")
+        PATCHES["P_SDK_HASH"] = (0x188ced, extracted_hash)
+        PATCHES["P_SDK_HASH_2"] = (0x3bd638, extracted_hash)
+        PATCHES["P_SDK_HASH_3"] = (0xd81028, extracted_hash)
+    else:
+        print("Using fallback SDK hash 78da37fed6")
+        PATCHES["P_SDK_HASH"] = (0x188ced, b"78da37fed6")
+        PATCHES["P_SDK_HASH_2"] = (0x3bd638, b"78da37fed6")
+        PATCHES["P_SDK_HASH_3"] = (0xd81028, b"78da37fed6")
+
     data = bytearray(engine.read_bytes())
 
     if args.verify:
         names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]
+            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]
             if args.apply_all
             else None
         )
@@ -328,7 +384,7 @@ def main() -> int:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]:
+            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -341,7 +397,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH"]
+        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT"]
         if args.apply_all
         else (args.apply or [])
     )

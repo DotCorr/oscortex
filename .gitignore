@@ -39,3 +39,5 @@ iso_root/boot/limine/
 qemu-current*.log
 qemu-log.txt
 serial.log
+docs/goal-embedded.md
+docs/goal-general-purpose.md

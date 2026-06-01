@@ -1,0 +1,320 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                       O S C O R T E X   U S E   C A S E S                     ║
+║                  Where & Why to Deploy — updated 2026-06-01                    ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+
+  OVERVIEW
+  ────────
+  OSCortex isn't another Linux distro. It's a purpose-built OS with a Rust
+  kernel, Flutter-native UI, process isolation, on-demand software delivery,
+  and a kernel AI layer. These properties unlock use cases that traditional
+  operating systems struggle with.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  1. EMBEDDED KIOSK / DIGITAL SIGNAGE
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A retail chain deploys 500 display kiosks. Each runs a single-purpose
+  Flutter app showing product catalogs. When a promotion changes, the new
+  app is pushed to the package server. Every kiosk picks it up on next
+  refresh — no firmware update, no reflashing, no downtime.
+
+  WHY OSCORTEX:
+  ● Boot → desktop in ~1.5 seconds (no GNOME, no systemd, no login)
+  ● On-demand delivery: new content app fetched automatically
+  ● No terminal, no shell escape — kiosk lockdown by default
+  ● Process isolation: if the catalog app crashes, the shell recovers
+  ● Minimal attack surface: no package manager, no root, no ssh
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │  Kiosk Boot Flow                                              │
+  │                                                               │
+  │  Power On → Limine → Kernel → pkg_resolve("kiosk-app")      │
+  │    → HTTP fetch from central server → SHA-256 verify          │
+  │    → Launch as fullscreen Flutter process                     │
+  │                                                               │
+  │  Content Update: change .osx on server → kiosk auto-refreshes │
+  └───────────────────────────────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● Linux kiosk: needs X11/Wayland, window manager, autologin config,
+    kiosk-mode Chrome, systemd service — 200+ packages to maintain
+  ● OSCortex: kernel + Flutter + one app. Zero configuration.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  2. AI-NATIVE WORKSTATION
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A developer uses an OSCortex workstation where AI agents compose UI on the
+  fly. Need a data visualization? The agent sends an A2UI JSON tree, the shell
+  renders it instantly. Need a missing tool? The kernel fetches it from the
+  package server — no "sudo apt install", no waiting.
+
+  WHY OSCORTEX:
+  ● Cortex AI (PID 0): kernel-level intelligence for self-healing
+  ● A2UI protocol: AI agents compose UI from JSON component trees
+  ● On-demand tools: "I need a debugger" → fetched, cached, launched
+  ● Every tool is its own process — crash isolation guaranteed
+  ● No configuration files to manage
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │  AI-Composed UI Flow                                          │
+  │                                                               │
+  │  Agent → A2UI JSON → oscortex_ui renderer → Osc* widgets     │
+  │                                                               │
+  │  Example A2UI payload:                                        │
+  │  {                                                            │
+  │    "type": "Column",                                          │
+  │    "children": [                                              │
+  │      {"type": "Text", "text": "CPU Usage: 42%"},              │
+  │      {"type": "Slider", "value": 0.42, "label": "CPU"},       │
+  │      {"type": "Button", "label": "Optimize", "action": "opt"} │
+  │    ]                                                          │
+  │  }                                                            │
+  │                                                               │
+  │  Renders as native OSCortex widgets — not HTML, not WebView   │
+  └───────────────────────────────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● macOS/Linux: AI tools run in browser tabs, fragmented UX
+  ● OSCortex: AI is the OS. Native widget rendering. Zero friction.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  3. EDGE COMPUTING / IoT GATEWAY
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A factory deploys IoT gateways running OSCortex. Each gateway collects
+  sensor data and runs analytics apps. Apps are delivered on-demand from a
+  central package server. When a sensor protocol changes, the new handler
+  app is pushed to the server — every gateway picks it up automatically.
+  Stale apps are evicted from the 16-slot cache as new ones arrive.
+
+  WHY OSCORTEX:
+  ● Minimal footprint: kernel + Flutter engine (~100 MB total)
+  ● Ephemeral apps: no disk space management, LRU eviction
+  ● Network-first model: apps treated like web pages
+  ● SHA-256 verified bundles: tamper-proof delivery
+  ● Multi-arch: same apps on x86_64, aarch64, riscv64 (planned)
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │  Fleet Management                                             │
+  │                                                               │
+  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                      │
+  │  │ Gateway │  │ Gateway │  │ Gateway │   (N devices)          │
+  │  │  #1     │  │  #2     │  │  #3     │                        │
+  │  └────┬────┘  └────┬────┘  └────┬────┘                        │
+  │       │            │            │                              │
+  │       └────────────┼────────────┘                              │
+  │                    │  HTTP (10.0.x.x)                          │
+  │              ┌─────┴─────┐                                    │
+  │              │ pkg-server│ ← update .osx here                 │
+  │              │ (central) │ ← all gateways auto-refresh        │
+  │              └───────────┘                                    │
+  └───────────────────────────────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● Linux IoT: Docker + containerd + OTA agent + full apt
+  ● OSCortex: kernel + one HTTP fetch. 100x simpler stack.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  4. DEVELOPMENT PLATFORM
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A team builds cross-platform Flutter apps. They develop on macOS/Linux
+  as usual, then package to .osx for OSCortex. The same Dart code runs on
+  mobile, web, and OSCortex — the UI package (oscortex_ui) provides native-
+  feeling widgets that match the OS design language.
+
+  WHY OSCORTEX:
+  ● Flutter-native: write once, run on OSCortex and every other platform
+  ● oscortex_ui package: consistent design language across all apps
+  ● A2UI protocol: every widget supports AI-driven composition
+  ● Widget previews: @OscPreview annotation for rapid development
+  ● Real syscall API: apps talk to a real kernel, not an emulator
+
+  DEVELOPER WORKFLOW:
+    1. flutter create my_app
+    2. Add oscortex_ui dependency
+    3. Build with Osc* widgets
+    4. ./tools/build-flutter-osx.sh → my_app.osx
+    5. cargo run -p pkg-server → serve for testing
+    6. QEMU → shell shows app → tap to launch
+
+  VS TRADITIONAL:
+  ● Android: Java/Kotlin, Gradle, complex SDK
+  ● iOS: Swift/ObjC, Xcode only, Apple hardware required
+  ● OSCortex: Flutter + one CLI tool. Works on any host OS.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  5. SECURE APPLIANCE
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A healthcare device runs a patient monitoring app. It must be secure,
+  auditable, and impossible for staff to install unauthorized software.
+  OSCortex's process isolation ensures the monitoring app can't interfere
+  with the system shell. SHA-256 bundle verification ensures only approved
+  software runs.
+
+  WHY OSCORTEX:
+  ● No shell/terminal — staff can't type arbitrary commands
+  ● No root user — no privilege escalation path
+  ● No package manager — no "apt install" attack surface
+  ● Process isolation — monitoring app failure doesn't crash the OS
+  ● SHA-256 verification — tampered bundles are rejected
+  ● Rust kernel — memory-safe, no buffer overflow exploits
+
+  SECURITY LAYERS:
+  ┌────────────────────────────────────────────────────────────┐
+  │  Layer         │  Protection                               │
+  ├────────────────┼───────────────────────────────────────────┤
+  │  App isolation │  Separate PID, separate page tables        │
+  │  Syscall gate  │  All hardware access mediated by kernel    │
+  │  Bundle verify │  SHA-256 before any code execution         │
+  │  No terminal   │  Zero interactive attack surface           │
+  │  Rust kernel   │  Memory safety, no C exploits              │
+  │  Pinned apps   │  System apps can't be evicted/replaced     │
+  └────────────────┴───────────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● Linux: requires SELinux/AppArmor, user lockdown, shell removal
+  ● OSCortex: secure by default. No configuration needed.
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  6. EDUCATION / TEACHING OS
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A university OS course uses OSCortex as a teaching platform. Students
+  can see every kernel subsystem: scheduler, memory manager, compositor,
+  VFS, network stack, syscall dispatch. They write Flutter apps that call
+  real syscalls on a real kernel, then test in QEMU. No dual-booting, no
+  risk of bricking hardware.
+
+  WHY OSCORTEX:
+  ● Clean Rust codebase: modern, readable, well-structured
+  ● All subsystems visible: no hidden complexity behind Linux's 30M LOC
+  ● QEMU testing: safe experimentation, instant rebuild cycle
+  ● Real syscalls: students write apps against a real ABI
+  ● Well-documented: architecture specs, boot sequence, syscall reference
+  ● Small enough to understand: ~50K lines vs Linux's 30M
+
+  TEACHING MODULES:
+  ┌─────────────────────────┬──────────────────────────────────────┐
+  │  Module                 │  OSCortex Subsystem                  │
+  ├─────────────────────────┼──────────────────────────────────────┤
+  │  Process Scheduling     │  kernel/src/sched/ (round-robin)     │
+  │  Virtual Memory         │  kernel/src/mm/ (4-level page tables)│
+  │  Filesystems            │  kernel/src/fs/ (initramfs + ramdisk)│
+  │  Device Drivers         │  kernel/src/drivers/ (PS/2, VirtIO)  │
+  │  Networking             │  kernel/src/net/ (smoltcp TCP/IP)    │
+  │  Window Management      │  kernel/src/compositor/ (surfaces)   │
+  │  Syscall Design         │  kernel/src/syscall/ (dispatch.rs)   │
+  │  App Development        │  apps/ + tools/ (.osx bundles)       │
+  └─────────────────────────┴──────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● xv6: educational but no GUI, no networking, no real apps
+  ● Minix: educational but dated C codebase, complex build
+  ● OSCortex: modern Rust + Flutter GUI + real app ecosystem
+
+
+  ═══════════════════════════════════════════════════════════════════════════
+  7. ON-DEMAND SOFTWARE DELIVERY PLATFORM
+  ═══════════════════════════════════════════════════════════════════════════
+
+  SCENARIO:
+  A company provides software-as-a-service on dedicated hardware. Instead of
+  pre-installing every possible tool, they run OSCortex with a package server.
+  Users tap an app tile → the kernel fetches it from the server → SHA-256
+  verifies → caches in memory → launches. The app runs as its own process.
+  When cache is full, the least-recently-used app is evicted silently.
+
+  WHY OSCORTEX:
+  ● No "install" step — apps appear and run on first tap
+  ● Apps treated like web pages — ephemeral, cacheable, replaceable
+  ● Server is source of truth — update an app by replacing the .osx file
+  ● System apps pinned — shell/files never evicted
+  ● User apps ephemeral — evicted when space is needed
+  ● Content-addressed by SHA-256 — same hash = same binary = instant cache hit
+
+  ON-DEMAND FLOW:
+  ┌───────────────────────────────────────────────────────────┐
+  │                                                           │
+  │  User taps "Notes" (☁ cloud badge)                       │
+  │    │                                                      │
+  │    ▼                                                      │
+  │  Shell: set state = resolving (⟳ spinner)                │
+  │    │                                                      │
+  │    ▼                                                      │
+  │  Kernel: pkg_resolve("com.dotcorr.notes")                │
+  │    ├─→ cache miss → HTTP GET /pkg/ab3f…d2.osx            │
+  │    ├─→ SHA-256 verify ✓                                   │
+  │    ├─→ app_registry::install → app_id = 7                │
+  │    └─→ cache::insert(7, hash, ephemeral)                 │
+  │    │                                                      │
+  │    ▼                                                      │
+  │  Shell: move to local list, launch app_id = 7            │
+  │    │                                                      │
+  │    ▼                                                      │
+  │  New PID spawned → Flutter Notes app renders              │
+  │                                                           │
+  │  Next time: cache hit → instant launch (no network)       │
+  └───────────────────────────────────────────────────────────┘
+
+  VS TRADITIONAL:
+  ● Chrome OS: browser-based, limited native app support
+  ● Fuchsia: similar model but Component Framework complexity
+  ● OSCortex: simpler — HTTP + SHA-256 + LRU. No Merkle trees.
+
+
+  COMPARISON MATRIX
+  ─────────────────
+
+  ┌─────────────────────────┬──────────┬───────┬─────────┬─────────┬──────────┐
+  │  Use Case               │ OSCortex │ Linux │ Fuchsia │ Android │ ChromeOS │
+  ├─────────────────────────┼──────────┼───────┼─────────┼─────────┼──────────┤
+  │  Embedded Kiosk         │  ★★★★★  │ ★★★  │  ★★★★  │  ★★    │  ★★★    │
+  │  AI-Native Workstation  │  ★★★★★  │ ★★   │  ★★★   │  ★     │  ★★     │
+  │  Edge / IoT Gateway     │  ★★★★   │ ★★★  │  ★★★★  │  ★     │  ★      │
+  │  Development Platform   │  ★★★★   │ ★★★★★│  ★★    │  ★★★★  │  ★★     │
+  │  Secure Appliance       │  ★★★★   │ ★★   │  ★★★★  │  ★★★   │  ★★★    │
+  │  Teaching / Education   │  ★★★★★  │ ★★   │  ★★    │  ★     │  ★      │
+  │  On-Demand SaaS         │  ★★★★★  │ ★★   │  ★★★★★ │  ★★    │  ★★★★   │
+  ├─────────────────────────┼──────────┼───────┼─────────┼─────────┼──────────┤
+  │  Boot time              │  ~1.5s   │ 5-30s │  ~2s   │  10-30s │  5-15s   │
+  │  Kernel language        │  Rust    │ C     │  C++/RS│  C      │  C       │
+  │  UI runtime             │  Flutter │ GTK/Qt│  Flutter│  Android│  Chrome  │
+  │  App isolation          │  PID     │ PID   │  NS    │  Sandbox│  NaCl    │
+  │  On-demand delivery     │  ✅     │  ❌   │  ✅    │  ❌    │  ❌      │
+  │  Lines of code (kernel) │  ~50K   │ ~30M  │  ~10M  │  ~30M  │  ~30M    │
+  └─────────────────────────┴──────────┴───────┴─────────┴─────────┴──────────┘
+
+  ★ = suitability for use case (1-5 stars)
+
+
+  WHEN NOT TO USE OSCORTEX
+  ────────────────────────
+  Be honest about limitations:
+
+  ● Heavy desktop workloads: no mature app ecosystem yet
+  ● Server workloads: no containerization, no cgroups
+  ● Legacy hardware: limited driver support (PS/2, VirtIO, NVMe)
+  ● Multi-user environments: single-user model only
+  ● Gaming: no GPU acceleration (CPU raster only)
+  ● Enterprise: no Active Directory, no Group Policy, no MDM
+
+  OSCortex excels at purpose-built, single-task, kiosk-style, and
+  edge/IoT deployments where simplicity, security, and on-demand
+  delivery matter more than breadth of application support.

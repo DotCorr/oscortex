@@ -422,17 +422,16 @@ pub fn map_aot_into_process(app_id: u32, pid: u32) -> Result<(u64, u64), i64> {
         None => return Err(-3),
     };
 
-    let pages = (aot_data.len() + 4095) / 4096;
-    let va = crate::process::dl::mmap_anon(pid, pml4_phys, 0, pages, 5);
-    if va == u64::MAX {
-        return Err(-12);
-    }
+    // Load the AOT ELF and register it globally in the dynamic linker's LIBS table.
+    let handle = match crate::process::dl::dlopen(pid, pml4_phys, &aot_data) {
+        Ok(h) => h,
+        Err(e) => {
+            log::warn!("[APP] dlopen app AOT failed: {}", e);
+            return Err(-12);
+        }
+    };
 
-    unsafe {
-        let hhdm = crate::mm::frame_allocator::hhdm_offset();
-        let dst = (va + hhdm) as *mut u8;
-        core::ptr::copy_nonoverlapping(aot_data.as_ptr(), dst, aot_data.len());
-    }
+    let va = crate::process::dl::get_load_base(handle, pid).ok_or(-12i64)?;
 
     Ok((va, aot_data.len() as u64))
 }

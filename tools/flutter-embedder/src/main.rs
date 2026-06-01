@@ -1592,6 +1592,13 @@ extern "C" fn main_embedder() {
         write(b"[host] SHELL mode\n");
         configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
         if is_aot {
+            write(b"[embedder] registering shell libapp.so globally...\n");
+            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so", 0);
+            if aot_handle <= 0 {
+                write(b"[embedder] WARNING: dlopen /system/flutter/libapp.so failed\n");
+            } else {
+                write(b"[embedder] shell libapp.so registered globally\n");
+            }
             configure_aot_snapshots(&mut project_args, 0);
         }
     }

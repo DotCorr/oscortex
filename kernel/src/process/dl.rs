@@ -844,6 +844,17 @@ pub fn get_init_fns(handle: u32, pid: u32) -> Option<(u64, u64, usize)> {
     None
 }
 
+/// Return the load base address for a loaded library.
+pub fn get_load_base(handle: u32, pid: u32) -> Option<u64> {
+    let t = LIBS.lock();
+    for lib in &t.entries {
+        if lib.handle == handle && lib.pid == pid {
+            return Some(lib.load_base);
+        }
+    }
+    None
+}
+
 /// Allocate `pages * 4096` bytes of anonymous memory in process `pid`'s
 /// address space, mapped at `hint_va` (rounded down to page) if non-zero,
 /// or at the next available VA in the process's dynamic mapping region.
