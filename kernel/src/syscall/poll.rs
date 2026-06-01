@@ -26,23 +26,7 @@ pub fn acqmutex_waiter_for(mutex: u64, exclude: u32) -> Option<u32> {
 }
 
 /// Pick a thread that needs to finish a cond-wait state machine step.
-fn cond_resched_target(exclude: u32) -> Option<u32> {
-    let cws = COND_WAIT_STATE.lock();
-    for (&pid, st) in cws.iter() {
-        if pid == exclude {
-            continue;
-        }
-        if let CondWaitState::AcquiringMutex { .. } = st {
-            if crate::process::is_blocked(pid) {
-                crate::process::set_state(pid, crate::process::ProcState::Running);
-            }
-            if crate::process::get_user_context(pid).is_some() {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
+// (Not used directly anymore, functionality inline in cooperative_yield_to under lock)
 
 fn perform_cooperative_yield(cur: u32, sys_nr: u64, next: u32) -> ! {
     let urip = crate::arch::syscall::user_rip();
@@ -68,23 +52,63 @@ pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
 
     static YIELD_TICK: AtomicU32 = AtomicU32::new(0);
     let tick = YIELD_TICK.fetch_add(1, Ordering::Relaxed);
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
 
-    let next = prefer
-        .filter(|&p| p != cur && crate::process::get_user_context(p).is_some())
-        .or_else(|| cond_resched_target(cur))
-        .or_else(|| {
-            if (tick & 31) == 0 {
-                crate::process::next_runnable_sibling_thread(cur)
-            } else {
+    let next = {
+        let _g = crate::process::PTABLE_LOCK.lock();
+        let next_candidate = prefer
+            .filter(|&p| {
+                if p == cur { return false; }
+                let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(p)] };
+                if slot.pid == p && slot.state == crate::process::ProcState::Running {
+                    if slot.current_cpu.is_none() || slot.current_cpu == Some(my_cpu) {
+                        slot.current_cpu = Some(my_cpu);
+                        return true;
+                    }
+                }
+                false
+            })
+            .or_else(|| {
+                // cond_resched_target_locked
+                let cws = COND_WAIT_STATE.lock();
+                for (&pid, st) in cws.iter() {
+                    if pid == cur { continue; }
+                    if let CondWaitState::AcquiringMutex { .. } = st {
+                        let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+                        if slot.pid == pid {
+                            if slot.state == crate::process::ProcState::Blocked {
+                                slot.state = crate::process::ProcState::Running;
+                                crate::arch::smp::broadcast_resched_ipi();
+                            }
+                            if slot.state == crate::process::ProcState::Running {
+                                if slot.current_cpu.is_none() || slot.current_cpu == Some(my_cpu) {
+                                    slot.current_cpu = Some(my_cpu);
+                                    return Some(pid);
+                                }
+                            }
+                        }
+                    }
+                }
                 None
-            }
-        });
+            })
+            .or_else(|| {
+                if (tick & 31) == 0 {
+                    crate::process::next_runnable_sibling_thread_locked(cur, my_cpu).map(|sib| {
+                        let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(sib)] };
+                        slot.current_cpu = Some(my_cpu);
+                        sib
+                    })
+                } else {
+                    None
+                }
+            });
+        next_candidate
+    };
+
     let Some(next) = next else {
         return;
     };
-    if next == cur || crate::process::get_user_context(next).is_none() {
-        return;
-    }
+
     perform_cooperative_yield(cur, sys_nr, next);
 }
 
@@ -93,11 +117,15 @@ pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
 /// Prefer the embedder when it is blocked in `wm_event_wait`, then core Flutter
 /// runner threads (typically pid 2–7), avoiding Dart worker isolates (8+) that
 /// starve init when given equal round-robin weight.
-pub fn coop_target_ready(pid: u32) -> bool {
+pub fn coop_target_ready_locked(pid: u32, my_cpu: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    if crate::process::is_blocked(pid) {
+    let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+    if p.pid != pid {
+        return false;
+    }
+    if matches!(p.state, crate::process::ProcState::Blocked) {
         let wm = WM_WAITER_PID.load(Ordering::Acquire);
         let focus = crate::wm::focus_pid();
         let input_target = if focus != 0 { focus } else { 1 };
@@ -106,25 +134,38 @@ pub fn coop_target_ready(pid: u32) -> bool {
         let input_is_waiting = input_priority_active
             && input_target != 0
             && crate::wm::input_pending_for(input_target) > 0;
-        if wm == pid || (input_is_waiting && pid == input_target) {
-            crate::process::set_state(pid, crate::process::ProcState::Running);
+        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due();
+        if (wm == pid && has_pending) || (input_is_waiting && pid == input_target) {
+            p.state = crate::process::ProcState::Running;
+            crate::arch::smp::broadcast_resched_ipi();
         } else if input_is_waiting && pid != input_target {
             return false;
         }
     }
-    crate::process::get_user_context(pid).is_some()
+    p.state == crate::process::ProcState::Running
+}
+
+pub fn coop_target_ready(pid: u32) -> bool {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    coop_target_ready_locked(pid, my_cpu)
 }
 
 /// When a vsync baton is waiting, always prefer the embedder over engine spins.
 pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
-    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready(1) {
-        Some(1)
-    } else {
-        None
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready_locked(1, my_cpu) {
+        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(1)] };
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return Some(1);
+        }
     }
+    None
 }
 
-pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
+pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
     static COOP_TICK: AtomicU32 = AtomicU32::new(0);
     let tick = COOP_TICK.fetch_add(1, Ordering::Relaxed);
 
@@ -135,29 +176,35 @@ pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
         && input_target != 0
         && input_target != cur
         && crate::wm::input_pending_for(input_target) > 0
-        && coop_target_ready(input_target)
+        && coop_target_ready_locked(input_target, my_cpu)
     {
-        return Some(input_target);
+        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(input_target)] };
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return Some(input_target);
+        }
     }
 
     let wm = WM_WAITER_PID.load(Ordering::Acquire);
     // Embedder must drain WM events (especially vsync batons) promptly.
     if wm != 0 && wm != cur && crate::wm::embedder_baton_due() {
-        if crate::process::is_blocked(wm) {
-            crate::process::set_state(wm, crate::process::ProcState::Running);
-        }
-        if coop_target_ready(wm) {
-            return Some(wm);
+        if coop_target_ready_locked(wm, my_cpu) {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(wm);
+            }
         }
     }
-    // When a vsync baton is queued, always prefer the embedder — even over
+    // When a vsync baton is waiting, always prefer the embedder — even over
     // Flutter runner threads that would otherwise monopolise the CPU.
     if wm != 0 && wm != cur && crate::wm::vsync_baton_pending() {
-        if crate::process::is_blocked(wm) {
-            crate::process::set_state(wm, crate::process::ProcState::Running);
-        }
-        if coop_target_ready(wm) {
-            return Some(wm);
+        if coop_target_ready_locked(wm, my_cpu) {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(wm);
+            }
         }
     }
     // Do not preempt Flutter runner threads (2–7) for baton=0 vsync ticks only.
@@ -165,30 +212,45 @@ pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
         let pending = crate::wm::pending_count_for(wm);
         let wm_due = pending > 0 || (tick & 3) == 0;
         if wm_due {
-            if crate::process::is_blocked(wm) {
-                crate::process::set_state(wm, crate::process::ProcState::Running);
-            }
-            if coop_target_ready(wm) {
-                return Some(wm);
+            if coop_target_ready_locked(wm, my_cpu) {
+                let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+                if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                    p.current_cpu = Some(my_cpu);
+                    return Some(wm);
+                }
             }
         }
     }
 
     for prefer in [2u32, 3, 4, 7, 1] {
-        if prefer != cur && coop_target_ready(prefer) {
-            return Some(prefer);
-        }
-    }
-
-    if (tick & 31) == 0 {
-        if let Some(sib) = crate::process::next_runnable_sibling_thread(cur) {
-            if sib <= 7 && coop_target_ready(sib) {
-                return Some(sib);
+        if prefer != cur && coop_target_ready_locked(prefer, my_cpu) {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(prefer)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(prefer);
             }
         }
     }
 
-    crate::process::next_runnable_pid(cur)
+    if (tick & 31) == 0 {
+        if let Some(sib) = crate::process::next_runnable_sibling_thread_locked(cur, my_cpu) {
+            if sib <= 7 && coop_target_ready_locked(sib, my_cpu) {
+                let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(sib)] };
+                if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                    p.current_cpu = Some(my_cpu);
+                    return Some(sib);
+                }
+            }
+        }
+    }
+
+    crate::process::next_runnable_pid_locked(cur, my_cpu)
+}
+
+pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    cooperative_sched_target_locked(cur, my_cpu)
 }
 
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
@@ -647,7 +709,7 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
         1 | 3 => { // ADD or MOD
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 8) as *const u64) };
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -724,10 +786,10 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     );
                 }
                 // Report EPOLLIN; leave pending for the read() call to drain.
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * 16;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -748,20 +810,20 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                         eventfd_count
                     );
                 }
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * 16;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
                 }
                 count += 1;
                 continue;
             }
             // Check pipe readability for non-timerfd fds.
             if pipe_readable_for_fd(entry.fd) {
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * 16;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -890,7 +952,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             let n = EPOLL_72_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 4 && events_out != 0 {
                 let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
-                let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
+                let data = unsafe { core::ptr::read_unaligned((events_out + 8) as *const u64) };
                 log::warn!(
                     "[epoll72-ready-fast] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
                     n,
@@ -972,7 +1034,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 let n = EPOLL_72_READY_LOOP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if n < 4 && events_out != 0 {
                     let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
-                    let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
+                    let data = unsafe { core::ptr::read_unaligned((events_out + 8) as *const u64) };
                     log::warn!(
                         "[epoll72-ready-loop] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
                         n,

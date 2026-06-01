@@ -388,3 +388,14 @@ class _WebLinkHomeState extends State<WebLinkHome> {
   }
 }
 
+// ─── Previews ──────────────────────────────────────────────────────────
+
+@OscPreview(name: 'Web Link App', group: 'Apps')
+Widget webLinkAppPreview() {
+  return const WebLinkApp();
+}
+
+@OscPreview(name: 'Web Link Home', group: 'Apps')
+Widget webLinkHomePreview() {
+  return const WebLinkHome();
+}

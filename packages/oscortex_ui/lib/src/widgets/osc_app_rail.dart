@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+
+import '../preview/osc_preview.dart';
 import '../tokens/colors.dart';
 import '../tokens/radii.dart';
 import '../tokens/spacing.dart';
@@ -163,4 +165,28 @@ class _OscRailButtonState extends State<OscRailButton> {
     }
     return child;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+@OscPreview(name: 'App Rail with Buttons', group: 'OscAppRail')
+Widget oscAppRailPreview() {
+  return SizedBox(
+    height: 400,
+    child: OscAppRail(
+      bottom: OscRailButton(
+        icon: Icons.grid_view_rounded,
+        label: 'All Apps',
+        dashed: true,
+      ),
+      children: [
+        OscRailButton(icon: Icons.dashboard_customize_rounded, label: 'Canvas', active: true),
+        OscRailButton(icon: Icons.folder_rounded, label: 'Files'),
+        OscRailButton(icon: Icons.link_rounded, label: 'Web'),
+        OscRailButton(icon: Icons.apps_rounded, label: 'MyApp'),
+      ],
+    ),
+  );
 }

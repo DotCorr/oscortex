@@ -934,3 +934,102 @@ enum InstallStage {
   success,
   failed,
 }
+
+// ─── Previews ──────────────────────────────────────────────────────────
+
+@OscPreview(name: 'Files App Shell', group: 'Apps')
+Widget filesAppShellPreview() {
+  return MaterialApp(
+    debugShowCheckedModeBanner: false,
+    theme: OscTheme.dark(accent: OscColors.skyBlue),
+    home: Scaffold(
+      backgroundColor: OscColors.bodyBg,
+      body: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.folder_rounded, size: 48,
+                color: OscColors.skyBlue.withValues(alpha: 0.5)),
+            const SizedBox(height: 12),
+            Text('Files App — requires kernel VFS channel',
+                style: TextStyle(color: OscColors.textMuted, fontSize: 12)),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+@OscPreview(name: 'Files App', group: 'Apps')
+Widget filesAppPreview() {
+  return const FilesApp();
+}
+
+@OscPreview(name: 'Header Button', group: 'Files Components')
+Widget filesHeaderButtonPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: _HeaderButton(
+      tooltip: 'Refresh',
+      child: Icon(Icons.refresh_rounded, size: 16, color: OscColors.skyBlue),
+    ),
+  );
+}
+
+@OscPreview(name: 'Quick Access Chips', group: 'Files Components')
+Widget filesQuickChipsPreview() {
+  return Padding(
+    padding: const EdgeInsets.all(16),
+    child: Wrap(
+      spacing: 8,
+      children: [
+        _QuickChip(label: '/Applications', icon: Icons.apps_rounded, onTap: () {}),
+        _QuickChip(label: '/tmp', icon: Icons.folder_open_rounded, onTap: () {}),
+        _QuickChip(label: '/sys/app', icon: Icons.settings_rounded, onTap: () {}),
+      ],
+    ),
+  );
+}
+
+@OscPreview(name: 'File Card — Directory', group: 'Files Components')
+Widget filesCardDirectoryPreview() {
+  return SizedBox(
+    width: 160,
+    child: _FileCard(
+      entry: const FsEntry(name: 'Documents', installable: false),
+      isInstallingThis: false,
+      isAnyInstalling: false,
+      onOpen: () {},
+      onInstall: () {},
+    ),
+  );
+}
+
+@OscPreview(name: 'File Card — Bundle', group: 'Files Components')
+Widget filesCardBundlePreview() {
+  return SizedBox(
+    width: 160,
+    child: _FileCard(
+      entry: const FsEntry(name: 'myapp.osx', installable: true),
+      isInstallingThis: false,
+      isAnyInstalling: false,
+      onOpen: () {},
+      onInstall: () {},
+    ),
+  );
+}
+
+@OscPreview(name: 'File Card — Installing', group: 'Files Components')
+Widget filesCardInstallingPreview() {
+  return SizedBox(
+    width: 160,
+    child: _FileCard(
+      entry: const FsEntry(name: 'game.osx', installable: true),
+      isInstallingThis: true,
+      isAnyInstalling: true,
+      onOpen: () {},
+      onInstall: () {},
+    ),
+  );
+}
+

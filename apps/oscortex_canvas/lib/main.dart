@@ -409,3 +409,15 @@ class _EditorLine {
 
   const _EditorLine(this.number, this.text, this.isHeading);
 }
+
+// ─── Previews ──────────────────────────────────────────────────────────
+
+@OscPreview(name: 'Canvas App', group: 'Apps')
+Widget canvasAppPreview() {
+  return const CanvasApp();
+}
+
+@OscPreview(name: 'Canvas Home', group: 'Apps')
+Widget canvasHomePreview() {
+  return const CanvasHome();
+}

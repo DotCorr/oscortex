@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../tokens/colors.dart';
 import '../tokens/radii.dart';
 import '../tokens/shadows.dart';
+import '../preview/osc_preview.dart';
 
 /// A surface card matching the OSCortex `canvas-surface` spec.
 ///
@@ -96,4 +97,52 @@ class _OscCardState extends State<OscCard> {
       ),
     );
   }
+}
+
+@OscPreview(name: 'Default Card', group: 'OscCard')
+Widget oscCardDefaultPreview() {
+  return const SizedBox(
+    width: 320,
+    child: OscCard(
+      child: Text('Default surface card with standard border and shadow.',
+          style: TextStyle(color: Color(0xFFD4D4D8), fontSize: 12)),
+    ),
+  );
+}
+
+@OscPreview(name: 'Violet Gradient Card', group: 'OscCard')
+Widget oscCardVioletPreview() {
+  return SizedBox(
+    width: 320,
+    child: OscCard(
+      gradient: OscCard.violetGradient,
+      padding: const EdgeInsets.all(18),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text('DOCUMENT CANVAS',
+              style: TextStyle(
+                  fontFamily: 'RobotoMono', fontSize: 10, fontWeight: FontWeight.w600,
+                  letterSpacing: 1.4, color: Color(0xFFA78BFA))),
+          SizedBox(height: 6),
+          Text('\u201CProject Proposal.md\u201D',
+              style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600, color: Colors.white)),
+        ],
+      ),
+    ),
+  );
+}
+
+@OscPreview(name: 'Active Border Card', group: 'OscCard')
+Widget oscCardActivePreview() {
+  return SizedBox(
+    width: 320,
+    child: OscCard(
+      activeBorder: true,
+      gradient: OscCard.liveGradient,
+      child: Text('Active border card with live gradient.',
+          style: TextStyle(color: Color(0xFFD4D4D8), fontSize: 12)),
+    ),
+  );
 }

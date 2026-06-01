@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
+
+import '../preview/osc_preview.dart';
 import '../tokens/colors.dart';
 
 /// Animated audio waveform bars matching the spec's media player.
@@ -101,4 +103,44 @@ class _OscWaveformState extends State<OscWaveform>
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+@OscPreview(name: 'Default Waveform', group: 'OscWaveform')
+Widget oscWaveformDefaultPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(24),
+    child: OscWaveform(),
+  );
+}
+
+@OscPreview(name: 'Tall Green Waveform', group: 'OscWaveform')
+Widget oscWaveformGreenPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(24),
+    child: OscWaveform(
+      barCount: 12,
+      height: 48,
+      barWidth: 5,
+      barGap: 4,
+      colorStart: OscColors.green,
+      colorEnd: OscColors.skyBlue,
+    ),
+  );
+}
+
+@OscPreview(name: 'Compact Waveform', group: 'OscWaveform')
+Widget oscWaveformCompactPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(24),
+    child: OscWaveform(
+      barCount: 6,
+      height: 20,
+      barWidth: 2,
+      barGap: 2,
+    ),
+  );
 }

@@ -37,3 +37,6 @@ export 'src/widgets/osc_status_badge.dart';
 export 'src/widgets/osc_tag.dart';
 export 'src/widgets/osc_toolbar.dart';
 export 'src/widgets/osc_waveform.dart';
+
+// ── Previews ───────────────────────────────────────────────────────────
+export 'src/preview/osc_preview.dart';

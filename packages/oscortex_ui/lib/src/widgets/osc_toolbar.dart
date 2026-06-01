@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../tokens/colors.dart';
 import '../tokens/spacing.dart';
+import '../preview/osc_preview.dart';
 
 /// Top chrome toolbar matching the spec's 44px header.
 ///
@@ -74,4 +75,33 @@ class OscToolbar extends StatelessWidget {
       ),
     );
   }
+}
+
+@OscPreview(name: 'Default Toolbar', group: 'OscToolbar')
+Widget oscToolbarPreview() {
+  return SizedBox(
+    width: 600,
+    child: OscToolbar(
+      title: 'Personal Canvas',
+      status: '3 apps available from the OS registry.',
+      trailing: [
+        Text('12:34 PM', style: TextStyle(fontSize: 12, color: Color(0xFF71717A))),
+        SizedBox(
+          width: 32, height: 32,
+          child: Icon(Icons.refresh_rounded, size: 16, color: Color(0x80FFFFFF)),
+        ),
+      ],
+    ),
+  );
+}
+
+@OscPreview(name: 'Toolbar with Leading', group: 'OscToolbar')
+Widget oscToolbarLeadingPreview() {
+  return SizedBox(
+    width: 600,
+    child: OscToolbar(
+      title: 'Files',
+      leading: Icon(Icons.folder_rounded, size: 18, color: Color(0xFF38BDF8)),
+    ),
+  );
 }

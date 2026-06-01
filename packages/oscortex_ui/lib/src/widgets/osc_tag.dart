@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../tokens/colors.dart';
 import '../tokens/radii.dart';
+import '../preview/osc_preview.dart';
 
 /// A tag chip matching the spec's small tag/label style.
 ///
@@ -104,4 +105,24 @@ class OscTag extends StatelessWidget {
       ),
     );
   }
+}
+
+@OscPreview(name: 'All Tag Variants', group: 'OscTag')
+Widget oscTagAllPreview() {
+  return Padding(
+    padding: EdgeInsets.all(16),
+    child: Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        OscTag(label: 'Default'),
+        OscTag.violet(label: 'Spatial Audio Active'),
+        OscTag.green(label: 'Connected'),
+        OscTag.sky(label: 'Downloading'),
+        OscTag.red(label: 'Error'),
+        OscTag.violet(label: 'With Icon', icon: Icons.music_note),
+        OscTag.green(label: 'Saved', icon: Icons.check_circle),
+      ],
+    ),
+  );
 }

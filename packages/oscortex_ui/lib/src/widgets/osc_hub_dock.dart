@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+
+import '../preview/osc_preview.dart';
 import '../tokens/radii.dart';
 import '../tokens/shadows.dart';
 
@@ -121,4 +123,38 @@ class _OscHubSegmentState extends State<OscHubSegment> {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+@OscPreview(name: 'Hub Dock with Segments', group: 'OscHubDock')
+Widget oscHubDockPreview() {
+  return SizedBox(
+    width: 500,
+    height: 80,
+    child: OscHubDock(
+      segments: [
+        OscHubSegment(label: 'Canvas Hub', active: true, onTap: () {}),
+        OscHubSegment(label: 'Files', onTap: () {}),
+        OscHubSegment(label: 'Web Link', onTap: () {}),
+      ],
+    ),
+  );
+}
+
+@OscPreview(name: 'Hub Dock Disabled Segment', group: 'OscHubDock')
+Widget oscHubDockDisabledPreview() {
+  return SizedBox(
+    width: 500,
+    height: 80,
+    child: OscHubDock(
+      segments: [
+        OscHubSegment(label: 'Canvas Hub', active: true, onTap: () {}),
+        OscHubSegment(label: 'Files', enabled: false),
+        OscHubSegment(label: 'Web Link', enabled: false),
+      ],
+    ),
+  );
 }

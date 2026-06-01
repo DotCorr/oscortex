@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../tokens/typography.dart';
+import '../preview/osc_preview.dart';
 
 /// A mono-uppercase section header label.
 ///
@@ -34,4 +35,28 @@ class OscSectionLabel extends StatelessWidget {
       ),
     );
   }
+}
+
+@OscPreview(name: 'Default Label', group: 'OscSectionLabel')
+Widget oscSectionLabelPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: OscSectionLabel('DOCUMENT CANVAS'),
+  );
+}
+
+@OscPreview(name: 'Violet Colored', group: 'OscSectionLabel')
+Widget oscSectionLabelVioletPreview() {
+  return Padding(
+    padding: const EdgeInsets.all(16),
+    child: OscSectionLabel('KNOWLEDGE SOURCE ENGINE', color: Color(0xFFA78BFA)),
+  );
+}
+
+@OscPreview(name: 'Small Label', group: 'OscSectionLabel')
+Widget oscSectionLabelSmallPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: OscSectionLabel('NOW PLAYING', small: true),
+  );
 }

@@ -98,3 +98,31 @@ class _AppCardState extends State<AppCard> {
     );
   }
 }
+
+// ─── Previews ──────────────────────────────────────────────────────────
+
+@OscPreview(name: 'App Card — Default', group: 'AppCard')
+Widget appCardPreview() {
+  return SizedBox(
+    width: 180,
+    height: 180,
+    child: AppCard(
+      app: AppTile(id: 1, name: 'My App', version: 'v0.1.0', system: false),
+      onLaunch: () {},
+      accentColor: OscColors.violet,
+    ),
+  );
+}
+
+@OscPreview(name: 'App Card — Sky Blue', group: 'AppCard')
+Widget appCardSkyPreview() {
+  return SizedBox(
+    width: 180,
+    height: 180,
+    child: AppCard(
+      app: AppTile(id: 2, name: 'File Manager', version: 'v1.2.0', system: false),
+      onLaunch: () {},
+      accentColor: OscColors.skyBlue,
+    ),
+  );
+}

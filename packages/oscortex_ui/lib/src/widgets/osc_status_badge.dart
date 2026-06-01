@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../tokens/colors.dart';
 import '../tokens/radii.dart';
+import '../preview/osc_preview.dart';
 
 /// A status badge with an animated pulsing dot.
 ///
@@ -93,4 +94,28 @@ class _OscStatusBadgeState extends State<OscStatusBadge>
       ),
     );
   }
+}
+
+@OscPreview(name: 'Green Auto-saving', group: 'OscStatusBadge')
+Widget oscStatusBadgeGreenPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: OscStatusBadge(label: 'Auto-saving', color: OscColors.green),
+  );
+}
+
+@OscPreview(name: 'Violet Live', group: 'OscStatusBadge')
+Widget oscStatusBadgeVioletPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: OscStatusBadge(label: 'Live', color: OscColors.violetLight),
+  );
+}
+
+@OscPreview(name: 'Sky Blue Syncing', group: 'OscStatusBadge')
+Widget oscStatusBadgeSkyPreview() {
+  return const Padding(
+    padding: EdgeInsets.all(16),
+    child: OscStatusBadge(label: 'Syncing', color: OscColors.skyBlue),
+  );
 }

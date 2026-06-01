@@ -2,6 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+
+import '../preview/osc_preview.dart';
 import '../tokens/colors.dart';
 import '../tokens/typography.dart';
 
@@ -135,4 +137,39 @@ class _OscIntentBarState extends State<OscIntentBar> {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+@OscPreview(name: 'Static Prompt', group: 'OscIntentBar')
+Widget oscIntentBarStaticPreview() {
+  return const SizedBox(
+    width: 500,
+    child: OscIntentBar(),
+  );
+}
+
+@OscPreview(name: 'Custom Prompt', group: 'OscIntentBar')
+Widget oscIntentBarCustomPreview() {
+  return const SizedBox(
+    width: 500,
+    child: OscIntentBar(
+      prompt: 'Search files...',
+      accentColor: OscColors.skyBlue,
+    ),
+  );
+}
+
+@OscPreview(name: 'Editable Input', group: 'OscIntentBar')
+Widget oscIntentBarEditablePreview() {
+  return SizedBox(
+    width: 500,
+    child: OscIntentBar(
+      prompt: 'Type a command...',
+      editable: true,
+      accentColor: OscColors.green,
+    ),
+  );
 }

@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+
+import '../preview/osc_preview.dart';
 import '../tokens/colors.dart';
 import '../tokens/radii.dart';
 import '../tokens/shadows.dart';
@@ -114,4 +116,42 @@ class _AmbientLayer extends StatelessWidget {
       ),
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Previews
+// ---------------------------------------------------------------------------
+
+@OscPreview(name: 'Violet Scaffold', group: 'OscScaffold')
+Widget oscScaffoldVioletPreview() {
+  return OscScaffold(
+    accent: OscColors.violet,
+    body: Center(
+      child: Text('Violet Accent Scaffold',
+          style: TextStyle(color: Color(0xFFD4D4D8), fontSize: 14)),
+    ),
+  );
+}
+
+@OscPreview(name: 'Sky Blue Scaffold', group: 'OscScaffold')
+Widget oscScaffoldSkyPreview() {
+  return OscScaffold(
+    accent: OscColors.skyBlue,
+    body: Center(
+      child: Text('Sky Blue Accent Scaffold',
+          style: TextStyle(color: Color(0xFFD4D4D8), fontSize: 14)),
+    ),
+  );
+}
+
+@OscPreview(name: 'Frameless Scaffold', group: 'OscScaffold')
+Widget oscScaffoldFramelessPreview() {
+  return OscScaffold(
+    accent: OscColors.green,
+    showFrame: false,
+    body: Center(
+      child: Text('No Frame — Emerald',
+          style: TextStyle(color: Color(0xFFD4D4D8), fontSize: 14)),
+    ),
+  );
 }

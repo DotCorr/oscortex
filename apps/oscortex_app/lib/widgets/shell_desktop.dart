@@ -575,3 +575,33 @@ class _GeneratedEngineCard extends StatelessWidget {
     );
   }
 }
+
+// ─── Previews ──────────────────────────────────────────────────────────
+
+@OscPreview(name: 'Document Canvas Card', group: 'Shell Workspace')
+Widget documentCanvasPreview() {
+  return const SizedBox(width: 500, child: _DocumentCanvasCard());
+}
+
+@OscPreview(name: 'Media Player Card', group: 'Shell Workspace')
+Widget mediaPlayerPreview() {
+  return const SizedBox(width: 300, child: _MediaPlayerCard());
+}
+
+@OscPreview(name: 'Knowledge Source Card', group: 'Shell Workspace')
+Widget knowledgeSourcePreview() {
+  return const SizedBox(width: 300, child: _KnowledgeSourceCard());
+}
+
+@OscPreview(name: 'Generated Engine Card', group: 'Shell Workspace')
+Widget generatedEnginePreview() {
+  return const SizedBox(width: 500, child: _GeneratedEngineCard());
+}
+
+@OscPreview(name: 'Settings Button', group: 'Shell Chrome')
+Widget settingsButtonPreview() {
+  return Padding(
+    padding: const EdgeInsets.all(16),
+    child: _SettingsButton(),
+  );
+}
