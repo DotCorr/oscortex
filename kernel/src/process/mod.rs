@@ -421,6 +421,15 @@ pub fn set_bootstrap_regs(pid: u32, rdi: u64, rsi: u64, rdx: u64) {
     }
 }
 
+pub fn claim_process_on_cpu(pid: u32, cpu_id: u32) {
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx] };
+    if p.pid == pid {
+        p.current_cpu = Some(cpu_id);
+    }
+}
+
 /// Reap one zombie child of `parent`. Returns `(pid, exit_code)` or None.
 pub fn reap_one_zombie(parent: u32) -> Option<(u32, i32)> {
     let _g = PTABLE_LOCK.lock();
@@ -665,9 +674,10 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let input_target = if focus != 0 { focus } else { 1 };
     if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
         if current != input_target {
-            let target = unsafe { &PTABLE[idx_of(input_target)] };
+            let target = unsafe { &mut PTABLE[idx_of(input_target)] };
             if target.pid == input_target && target.state == ProcState::Running {
                 if target.current_cpu.is_none() || target.current_cpu == Some(my_cpu) {
+                    target.current_cpu = Some(my_cpu);
                     return Some(input_target);
                 }
             }
@@ -676,9 +686,10 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
 
 
     if current != 1 && crate::wm::embedder_baton_due() {
-        let embedder = unsafe { &PTABLE[idx_of(1)] };
+        let embedder = unsafe { &mut PTABLE[idx_of(1)] };
         if embedder.pid == 1 && embedder.state == ProcState::Running {
             if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
+                embedder.current_cpu = Some(my_cpu);
                 return Some(1);
             }
         }
@@ -692,10 +703,11 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let mut res = None;
     for off in 0..MAX_PROCS {
         let idx = (start + off) % MAX_PROCS;
-        let p = unsafe { &PTABLE[idx] };
+        let p = unsafe { &mut PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
                 if current == 0 || p.pid != current {
+                    p.current_cpu = Some(my_cpu);
                     res = Some(p.pid);
                     break;
                 }
@@ -704,9 +716,10 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     }
 
     if res.is_none() && current != 0 {
-        let c = unsafe { &PTABLE[idx_of(current)] };
+        let c = unsafe { &mut PTABLE[idx_of(current)] };
         if c.pid == current && c.state == ProcState::Running {
             if c.current_cpu.is_none() || c.current_cpu == Some(my_cpu) {
+                c.current_cpu = Some(my_cpu);
                 res = Some(current);
             }
         }
@@ -860,6 +873,7 @@ pub fn spawn_thread(
     log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, tls_va, arg);
     unsafe { core::ptr::write_volatile(tls_va as *mut u64, tls_va); }
 
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx_of(tid)] };
@@ -877,6 +891,7 @@ pub fn spawn_thread(
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base    = stack_va;
         p.user_stack_size    = stack_size as u64;
+        p.current_cpu        = Some(my_cpu);
     }
 
     log::info!("[Process] Thread tid={} spawned in pid={} entry={:#x} tls={:#x}",
@@ -975,6 +990,14 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
+        if let Some(other_cpu) = p.current_cpu {
+            if other_cpu != my_cpu {
+                panic!(
+                    "[Process] enter_user_by_pid_noreturn: PID {} is already running on CPU {}, but CPU {} is trying to enter it!",
+                    pid, other_cpu, my_cpu
+                );
+            }
+        }
         p.current_cpu = Some(my_cpu);
         let e = p.errno_to_deliver;
         p.errno_to_deliver = 0; // consume it
@@ -1204,6 +1227,14 @@ fn user_launch_task() {
     // saving a corrupt interrupt-stack RSP into our kernel_sp on subsequent
     // preemptions, and prevents the round-robin from ever selecting it again.
     crate::sched::mark_current_zombie();
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.current_cpu = Some(my_cpu);
+        }
+    }
     PENDING_INIT_PID.store(0, Ordering::Release);
     enter_user_by_pid_noreturn(pid)
 }

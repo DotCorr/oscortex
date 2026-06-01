@@ -1,24 +1,11 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
+import 'package:oscortex_ui/oscortex_ui.dart';
 
 import '../models/app_tile.dart';
 import '../services/shell_service.dart';
 import 'app_card.dart';
-
-// ─── OSCortex Design Tokens (from oscortex-ui-spec.html) ───────────────
-const _kBodyBg = Color(0xFF07080B);
-const _kCanvasBg = Color(0xFF0B0D12);
-const _kSurfaceCard = Color(0x06FFFFFF);
-const _kAccentViolet = Color(0xFF7C3AED);
-const _kAccentVioletLight = Color(0xFFA78BFA);
-const _kActiveBorder = Color(0x40A78BFA);
-const _kSignalGreen = Color(0xFF10B981);
-const _kSkyBlue = Color(0xFF38BDF8);
-const _kBorder = Color(0x14FFFFFF);
-const _kBorderLight = Color(0x0DFFFFFF);
-const _kTextMuted = Color(0xFF71717A);
 
 // ─── Shell Desktop ─────────────────────────────────────────────────────
 class ShellDesktop extends StatefulWidget {
@@ -143,209 +130,146 @@ class _ShellDesktopState extends State<ShellDesktop> {
           'pointer_down x=${event.position.dx} y=${event.position.dy} btns=${event.buttons}',
         );
       },
-      child: Scaffold(
-        body: Container(
-          decoration: const BoxDecoration(
-            color: _kBodyBg,
-            gradient: RadialGradient(
-              center: Alignment(0, -1.2),
-              radius: 1.1,
-              colors: [Color(0x337C3AED), Color(0x00070808)],
-            ),
-          ),
-          child: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: _kCanvasBg,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(color: _kBorderLight),
-                  boxShadow: const [
-                    BoxShadow(
-                      color: Color(0xB3000000),
-                      blurRadius: 120,
-                      offset: Offset(0, 48),
-                      spreadRadius: -24,
+      child: OscScaffold(
+        accent: OscColors.violet,
+        showFrame: true,
+        body: Column(
+          children: [
+            _buildToolbar(),
+            Expanded(
+              child: Row(
+                children: [
+                  _buildAppRail(),
+                  Expanded(
+                    child: _Workspace(
+                      apps: _nonCoreApps,
+                      error: _error,
+                      loading: _loading,
+                      onLaunch: _launchApp,
                     ),
-                  ],
-                ),
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(20),
-                  child: Stack(
-                    children: [
-                      const Positioned.fill(child: _AmbientLayer()),
-                      Column(
-                        children: [
-                          _TopChrome(
-                            status: _status,
-                            loading: _loading,
-                            clockLabel: _clockLabel,
-                            onRefresh: _loading
-                                ? null
-                                : () => _refreshApps(showSpinner: true),
-                          ),
-                          Expanded(
-                            child: Row(
-                              children: [
-                                _AppRail(
-                                  apps: _apps.take(5).toList(),
-                                  activeCoreRole: _activeHub,
-                                  onLaunch: _launchApp,
-                                ),
-                                Expanded(
-                                  child: _Workspace(
-                                    apps: _nonCoreApps,
-                                    error: _error,
-                                    loading: _loading,
-                                    onLaunch: _launchApp,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          _HubDock(
-                            canvas: _core(CoreAppRole.canvas),
-                            files: _core(CoreAppRole.files),
-                            web: _core(CoreAppRole.web),
-                            active: _activeHub,
-                            onActivate: _setActiveHub,
-                            onLaunch: _launchApp,
-                          ),
-                        ],
-                      ),
-                    ],
                   ),
-                ),
+                ],
               ),
             ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ─── Ambient Glow Layer (dual radial gradients from spec) ──────────────
-class _AmbientLayer extends StatelessWidget {
-  const _AmbientLayer();
-
-  @override
-  Widget build(BuildContext context) {
-    return DecoratedBox(
-      decoration: BoxDecoration(
-        gradient: RadialGradient(
-          center: Alignment.topLeft,
-          radius: 1.4,
-          colors: [
-            _kAccentViolet.withValues(alpha: 0.14),
-            Colors.transparent,
+            _buildHubDock(),
           ],
         ),
       ),
-      child: DecoratedBox(
-        decoration: BoxDecoration(
-          gradient: RadialGradient(
-            center: const Alignment(0.85, -0.3),
-            radius: 1.1,
-            colors: [
-              _kSkyBlue.withValues(alpha: 0.05),
-              Colors.transparent,
-            ],
-          ),
-        ),
-      ),
     );
   }
-}
 
-// ─── Top Chrome (44px header) ──────────────────────────────────────────
-class _TopChrome extends StatelessWidget {
-  const _TopChrome({
-    required this.status,
-    required this.loading,
-    required this.clockLabel,
-    required this.onRefresh,
-  });
-
-  final String status;
-  final bool loading;
-  final String clockLabel;
-  final VoidCallback? onRefresh;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 16),
-      decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: Colors.white.withValues(alpha: 0.07)),
-        ),
-      ),
-      child: Row(
-        children: [
-          const Text(
-            'Personal Canvas',
-            style: TextStyle(
-              fontSize: 13,
-              fontWeight: FontWeight.w600,
-              color: Color(0xFFE5E5E5),
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Text(
-              status,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 11,
-                color: Colors.white.withValues(alpha: 0.40),
-              ),
-            ),
-          ),
-          const SizedBox(width: 8),
-          _SettingsButton(),
-          const SizedBox(width: 10),
-          Text(
-            clockLabel,
-            style: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w500,
-              color: _kTextMuted,
-              fontFeatures: [FontFeature.tabularFigures()],
-            ),
-          ),
-          const SizedBox(width: 4),
-          SizedBox(
-            width: 32,
-            height: 32,
-            child: IconButton(
-              onPressed: onRefresh,
-              tooltip: 'Refresh installed apps',
-              padding: EdgeInsets.zero,
-              iconSize: 16,
-              icon: loading
-                  ? const SizedBox.square(
-                      dimension: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 1.5,
-                        color: _kAccentVioletLight,
-                      ),
-                    )
-                  : Icon(
-                      Icons.refresh_rounded,
-                      size: 16,
-                      color: Colors.white.withValues(alpha: 0.50),
+  Widget _buildToolbar() {
+    return OscToolbar(
+      title: 'Personal Canvas',
+      status: _status,
+      trailing: [
+        _SettingsButton(),
+        const SizedBox(width: 2),
+        Text(_clockLabel, style: OscTypography.clock),
+        SizedBox(
+          width: 32,
+          height: 32,
+          child: IconButton(
+            onPressed: _loading ? null : () => _refreshApps(showSpinner: true),
+            tooltip: 'Refresh installed apps',
+            padding: EdgeInsets.zero,
+            iconSize: 16,
+            icon: _loading
+                ? const SizedBox.square(
+                    dimension: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.5,
+                      color: OscColors.violetLight,
                     ),
-            ),
+                  )
+                : Icon(
+                    Icons.refresh_rounded,
+                    size: 16,
+                    color: Colors.white.withValues(alpha: 0.50),
+                  ),
           ),
-        ],
-      ),
+        ),
+      ],
     );
+  }
+
+  Widget _buildAppRail() {
+    final railApps = _apps.take(5).toList();
+    return OscAppRail(
+      bottom: OscRailButton(
+        icon: Icons.grid_view_rounded,
+        label: 'All Apps',
+        dashed: true,
+        onTap: () {},
+      ),
+      children: [
+        for (final app in railApps)
+          OscRailButton(
+            icon: _iconForRole(app.coreRole),
+            label: _shortName(app.name),
+            active: app.coreRole == _activeHub,
+            accentColor: OscColors.violetLight,
+            onTap: () => _launchApp(app),
+            tooltip: app.name,
+          ),
+      ],
+    );
+  }
+
+  Widget _buildHubDock() {
+    final canvas = _core(CoreAppRole.canvas);
+    final files = _core(CoreAppRole.files);
+    final web = _core(CoreAppRole.web);
+
+    return OscHubDock(
+      segments: [
+        OscHubSegment(
+          label: 'Canvas Hub',
+          active: _activeHub == CoreAppRole.canvas,
+          enabled: canvas != null,
+          onTap: () {
+            _setActiveHub(CoreAppRole.canvas);
+            if (canvas != null) _launchApp(canvas);
+          },
+        ),
+        OscHubSegment(
+          label: 'Files',
+          active: _activeHub == CoreAppRole.files,
+          enabled: files != null,
+          onTap: () {
+            _setActiveHub(CoreAppRole.files);
+            if (files != null) _launchApp(files);
+          },
+        ),
+        OscHubSegment(
+          label: 'Web Link',
+          active: _activeHub == CoreAppRole.web,
+          enabled: web != null,
+          onTap: () {
+            _setActiveHub(CoreAppRole.web);
+            if (web != null) _launchApp(web);
+          },
+        ),
+      ],
+    );
+  }
+
+  static IconData _iconForRole(CoreAppRole? role) {
+    return switch (role) {
+      CoreAppRole.canvas => Icons.dashboard_customize_rounded,
+      CoreAppRole.files => Icons.folder_rounded,
+      CoreAppRole.web => Icons.link_rounded,
+      null => Icons.apps_rounded,
+    };
+  }
+
+  static String _shortName(String name) {
+    if (name.length <= 8) return name;
+    return '${name.substring(0, 7)}…';
   }
 }
 
+// ─── Settings Button ───────────────────────────────────────────────────
 class _SettingsButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
@@ -354,8 +278,8 @@ class _SettingsButton extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10),
       decoration: BoxDecoration(
         color: Colors.white.withValues(alpha: 0.04),
-        borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: Colors.white.withValues(alpha: 0.08)),
+        borderRadius: OscRadii.iconBorder,
+        border: Border.all(color: OscColors.border),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -368,192 +292,13 @@ class _SettingsButton extends StatelessWidget {
           const SizedBox(width: 5),
           Text(
             'Settings',
-            style: TextStyle(
-              fontSize: 11,
+            style: OscTypography.settingsButton.copyWith(
               color: Colors.white.withValues(alpha: 0.45),
             ),
           ),
         ],
       ),
     );
-  }
-}
-
-// ─── App Rail (68px, spec-compliant) ───────────────────────────────────
-class _AppRail extends StatelessWidget {
-  const _AppRail({
-    required this.apps,
-    required this.activeCoreRole,
-    required this.onLaunch,
-  });
-
-  final List<AppTile> apps;
-  final CoreAppRole activeCoreRole;
-  final ValueChanged<AppTile> onLaunch;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 68,
-      decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.20),
-        border: Border(
-          right: BorderSide(color: Colors.white.withValues(alpha: 0.07)),
-        ),
-      ),
-      child: Column(
-        children: [
-          const SizedBox(height: 10),
-          for (final app in apps)
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-              child: Tooltip(
-                message: app.name,
-                child: _RailAppButton(
-                  app: app,
-                  active: app.coreRole == activeCoreRole,
-                  onTap: () => onLaunch(app),
-                ),
-              ),
-            ),
-          const Spacer(),
-          // "All Apps" dashed button at bottom
-          Padding(
-            padding: const EdgeInsets.fromLTRB(6, 0, 6, 12),
-            child: Container(
-              decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: Colors.white.withValues(alpha: 0.10),
-                  style: BorderStyle.solid,
-                ),
-              ),
-              child: Column(
-                children: [
-                  const SizedBox(height: 8),
-                  Icon(
-                    Icons.grid_view_rounded,
-                    size: 16,
-                    color: Colors.white.withValues(alpha: 0.40),
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    'All Apps',
-                    style: TextStyle(
-                      fontSize: 7,
-                      fontWeight: FontWeight.w500,
-                      color: Colors.white.withValues(alpha: 0.40),
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─── Rail App Button (icon + label, violet active state) ───────────────
-class _RailAppButton extends StatefulWidget {
-  const _RailAppButton({
-    required this.app,
-    required this.active,
-    required this.onTap,
-  });
-
-  final AppTile app;
-  final bool active;
-  final VoidCallback onTap;
-
-  @override
-  State<_RailAppButton> createState() => _RailAppButtonState();
-}
-
-class _RailAppButtonState extends State<_RailAppButton> {
-  bool _hovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final icon = switch (widget.app.coreRole) {
-      CoreAppRole.canvas => Icons.dashboard_customize_rounded,
-      CoreAppRole.files => Icons.folder_rounded,
-      CoreAppRole.web => Icons.link_rounded,
-      null => Icons.apps_rounded,
-    };
-
-    final isActive = widget.active;
-    final bgAlpha = isActive
-        ? 0.06
-        : _hovered
-            ? 0.04
-            : 0.0;
-
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovered = true),
-      onExit: (_) => setState(() => _hovered = false),
-      child: GestureDetector(
-        onTap: widget.onTap,
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 160),
-          curve: Curves.easeOut,
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: bgAlpha),
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: Column(
-            children: [
-              const SizedBox(height: 8),
-              Container(
-                width: 28,
-                height: 28,
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(8),
-                  border: Border.all(
-                    color: isActive
-                        ? _kAccentViolet.withValues(alpha: 0.30)
-                        : Colors.white.withValues(alpha: 0.06),
-                  ),
-                  color: isActive
-                      ? _kAccentViolet.withValues(alpha: 0.15)
-                      : Colors.white.withValues(alpha: 0.03),
-                ),
-                child: Icon(
-                  icon,
-                  size: 14,
-                  color: widget.app.isCore
-                      ? (isActive
-                          ? _kAccentVioletLight
-                          : Colors.white.withValues(alpha: 0.50))
-                      : Colors.white.withValues(
-                          alpha: _hovered ? 0.60 : 0.40),
-                ),
-              ),
-              const SizedBox(height: 4),
-              Text(
-                _shortName(widget.app.name),
-                style: TextStyle(
-                  fontSize: 7.5,
-                  fontWeight: isActive ? FontWeight.w600 : FontWeight.w400,
-                  color: isActive
-                      ? Colors.white.withValues(alpha: 0.85)
-                      : Colors.white.withValues(alpha: 0.45),
-                ),
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 6),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  String _shortName(String name) {
-    if (name.length <= 8) return name;
-    return '${name.substring(0, 7)}…';
   }
 }
 
@@ -575,12 +320,12 @@ class _Workspace extends StatelessWidget {
   Widget build(BuildContext context) {
     if (loading) {
       return const Center(
-        child: CircularProgressIndicator(color: _kAccentVioletLight),
+        child: CircularProgressIndicator(color: OscColors.violetLight),
       );
     }
     if (error != null) {
       return Center(
-        child: Text(error!, style: const TextStyle(color: _kTextMuted)),
+        child: Text(error!, style: const TextStyle(color: OscColors.textMuted)),
       );
     }
 
@@ -590,7 +335,7 @@ class _Workspace extends StatelessWidget {
         // Intent Bar
         const Padding(
           padding: EdgeInsets.fromLTRB(16, 0, 16, 0),
-          child: _IntentInputBar(),
+          child: OscIntentBar(),
         ),
         // Scrollable workspace cards
         Expanded(
@@ -617,15 +362,9 @@ class _Workspace extends StatelessWidget {
                 const SizedBox(height: 16),
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: Text(
+                  child: OscSectionLabel(
                     'INSTALLED APPS',
-                    style: TextStyle(
-                      fontFamily: 'RobotoMono',
-                      fontSize: 9,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 1.4,
-                      color: Colors.white.withValues(alpha: 0.35),
-                    ),
+                    small: true,
                   ),
                 ),
                 const SizedBox(height: 8),
@@ -644,7 +383,7 @@ class _Workspace extends StatelessWidget {
                     return AppCard(
                       app: app,
                       onLaunch: () => onLaunch(app),
-                      accentColor: _kAccentViolet,
+                      accentColor: OscColors.violet,
                     );
                   },
                 ),
@@ -657,114 +396,15 @@ class _Workspace extends StatelessWidget {
   }
 }
 
-// ─── Intent Input Bar ──────────────────────────────────────────────────
-class _IntentInputBar extends StatefulWidget {
-  const _IntentInputBar();
-
-  @override
-  State<_IntentInputBar> createState() => _IntentInputBarState();
-}
-
-class _IntentInputBarState extends State<_IntentInputBar> {
-  bool _caretOn = true;
-  Timer? _caretTimer;
-
-  @override
-  void initState() {
-    super.initState();
-    _caretTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
-      if (!mounted) return;
-      setState(() => _caretOn = !_caretOn);
-    });
-  }
-
-  @override
-  void dispose() {
-    _caretTimer?.cancel();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      decoration: BoxDecoration(
-        border: Border(
-          bottom: BorderSide(color: Colors.white.withValues(alpha: 0.06)),
-        ),
-      ),
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.035),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.white.withValues(alpha: 0.06)),
-        ),
-        child: Row(
-          children: [
-            const Text(
-              '>',
-              style: TextStyle(
-                fontFamily: 'RobotoMono',
-                fontSize: 13,
-                fontWeight: FontWeight.w700,
-                color: _kAccentVioletLight,
-              ),
-            ),
-            const SizedBox(width: 8),
-            Text(
-              'What are we building today?',
-              style: TextStyle(
-                fontFamily: 'RobotoMono',
-                fontSize: 12,
-                color: Colors.white.withValues(alpha: 0.70),
-              ),
-            ),
-            const SizedBox(width: 2),
-            AnimatedOpacity(
-              duration: const Duration(milliseconds: 80),
-              opacity: _caretOn ? 1 : 0,
-              child: Container(
-                width: 7,
-                height: 16,
-                decoration: BoxDecoration(
-                  color: _kAccentVioletLight,
-                  borderRadius: BorderRadius.circular(1),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 // ─── Document Canvas Card ──────────────────────────────────────────────
 class _DocumentCanvasCard extends StatelessWidget {
   const _DocumentCanvasCard();
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    return OscCard(
+      gradient: OscCard.violetGradient,
       padding: const EdgeInsets.all(18),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kBorder),
-        gradient: const LinearGradient(
-          begin: Alignment(-0.6, -1),
-          end: Alignment(0.8, 1),
-          colors: [Color(0x0D7C3AED), Color(0x06FFFFFF)],
-        ),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x80000000),
-            blurRadius: 24,
-            offset: Offset(0, 8),
-            spreadRadius: -12,
-          ),
-        ],
-      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -775,28 +415,21 @@ class _DocumentCanvasCard extends StatelessWidget {
               Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
+                  OscSectionLabel(
                     'DOCUMENT CANVAS',
-                    style: TextStyle(
-                      fontFamily: 'RobotoMono',
-                      fontSize: 10,
-                      fontWeight: FontWeight.w600,
-                      letterSpacing: 1.4,
-                      color: _kAccentVioletLight.withValues(alpha: 0.85),
-                    ),
+                    color: OscColors.violetLight.withValues(alpha: 0.85),
                   ),
                   const SizedBox(height: 6),
-                  const Text(
+                  Text(
                     '\u201CProject Proposal.md\u201D',
-                    style: TextStyle(
-                      fontSize: 15,
-                      fontWeight: FontWeight.w600,
-                      color: Colors.white,
-                    ),
+                    style: OscTypography.heading3,
                   ),
                 ],
               ),
-              const _AutoSaveBadge(),
+              const OscStatusBadge(
+                label: 'Auto-saving',
+                color: OscColors.green,
+              ),
             ],
           ),
           const SizedBox(height: 14),
@@ -806,86 +439,7 @@ class _DocumentCanvasCard extends StatelessWidget {
             'frameworks at the system core layer, users no longer interact with '
             'isolated platforms, but rather text environments that shift dynamically '
             'based on temporary workflow requirements\u2026',
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.75,
-              color: Colors.white.withValues(alpha: 0.45),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _AutoSaveBadge extends StatefulWidget {
-  const _AutoSaveBadge();
-
-  @override
-  State<_AutoSaveBadge> createState() => _AutoSaveBadgeState();
-}
-
-class _AutoSaveBadgeState extends State<_AutoSaveBadge>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
-  late final Animation<double> _pulse;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1800),
-    )..repeat(reverse: true);
-    _pulse = Tween(begin: 1.0, end: 0.4).animate(
-      CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut),
-    );
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(999),
-        border: Border.all(color: _kSignalGreen.withValues(alpha: 0.20)),
-        color: _kSignalGreen.withValues(alpha: 0.10),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          AnimatedBuilder(
-            animation: _pulse,
-            builder: (_, child) => Opacity(
-              opacity: _pulse.value,
-              child: Transform.scale(
-                scale: 0.85 + (_pulse.value * 0.15),
-                child: child,
-              ),
-            ),
-            child: Container(
-              width: 6,
-              height: 6,
-              decoration: const BoxDecoration(
-                shape: BoxShape.circle,
-                color: _kSignalGreen,
-              ),
-            ),
-          ),
-          const SizedBox(width: 6),
-          const Text(
-            'Auto-saving',
-            style: TextStyle(
-              fontSize: 9,
-              fontWeight: FontWeight.w500,
-              color: _kSignalGreen,
-            ),
+            style: OscTypography.bodySmall,
           ),
         ],
       ),
@@ -899,34 +453,11 @@ class _MediaPlayerCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kBorder),
-        color: _kSurfaceCard,
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x80000000),
-            blurRadius: 24,
-            offset: Offset(0, 8),
-            spreadRadius: -12,
-          ),
-        ],
-      ),
+    return OscCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'NOW PLAYING',
-            style: TextStyle(
-              fontFamily: 'RobotoMono',
-              fontSize: 9,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 1.2,
-              color: Colors.white.withValues(alpha: 0.35),
-            ),
-          ),
+          const OscSectionLabel('NOW PLAYING', small: true),
           const SizedBox(height: 10),
           Row(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -935,26 +466,23 @@ class _MediaPlayerCard extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
+                    Text(
                       'Ambient Waves',
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w500,
-                        color: Color(0xFFE5E5E5),
+                      style: OscTypography.body.copyWith(
+                        color: OscColors.textBright,
                       ),
                     ),
                     const SizedBox(height: 3),
                     Text(
                       'Cortex Generative Radio',
-                      style: TextStyle(
-                        fontSize: 11,
+                      style: OscTypography.caption.copyWith(
                         color: Colors.white.withValues(alpha: 0.35),
                       ),
                     ),
                   ],
                 ),
               ),
-              const _WaveformBars(),
+              const OscWaveform(),
             ],
           ),
           const SizedBox(height: 12),
@@ -962,119 +490,11 @@ class _MediaPlayerCard extends StatelessWidget {
             spacing: 6,
             runSpacing: 4,
             children: [
-              _TagChip(
-                label: 'Local Sync',
-                bg: Colors.white.withValues(alpha: 0.04),
-                border: Colors.white.withValues(alpha: 0.05),
-                textColor: Colors.white.withValues(alpha: 0.45),
-              ),
-              _TagChip(
-                label: 'Spatial Audio Active',
-                bg: _kAccentViolet.withValues(alpha: 0.10),
-                border: _kAccentViolet.withValues(alpha: 0.20),
-                textColor: _kAccentVioletLight,
-              ),
+              const OscTag(label: 'Local Sync'),
+              OscTag.violet(label: 'Spatial Audio Active'),
             ],
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _TagChip extends StatelessWidget {
-  const _TagChip({
-    required this.label,
-    required this.bg,
-    required this.border,
-    required this.textColor,
-  });
-
-  final String label;
-  final Color bg;
-  final Color border;
-  final Color textColor;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(6),
-        border: Border.all(color: border),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontFamily: 'RobotoMono',
-          fontSize: 9,
-          color: textColor,
-        ),
-      ),
-    );
-  }
-}
-
-// ─── Waveform Bars (animated) ──────────────────────────────────────────
-class _WaveformBars extends StatefulWidget {
-  const _WaveformBars();
-
-  @override
-  State<_WaveformBars> createState() => _WaveformBarsState();
-}
-
-class _WaveformBarsState extends State<_WaveformBars>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
-
-  static const _barHeights = [10.0, 20.0, 12.0, 24.0, 16.0, 28.0, 18.0, 10.0];
-  static const _barDelays = [0.0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.48, 0.56];
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1200),
-    )..repeat(reverse: true);
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return SizedBox(
-      height: 32,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: List.generate(8, (i) {
-          return AnimatedBuilder(
-            animation: _ctrl,
-            builder: (_, _) {
-              final phase = (_ctrl.value + _barDelays[i]) % 1.0;
-              final scale = 0.3 + 0.7 * math.sin(phase * math.pi);
-              return Container(
-                width: 3,
-                height: _barHeights[i] * scale,
-                margin: const EdgeInsets.only(left: 3),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(999),
-                  gradient: const LinearGradient(
-                    begin: Alignment.bottomCenter,
-                    end: Alignment.topCenter,
-                    colors: [Color(0xFF7C3AED), Color(0xFFA78BFA)],
-                  ),
-                ),
-              );
-            },
-          );
-        }),
       ),
     );
   }
@@ -1086,51 +506,23 @@ class _KnowledgeSourceCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kBorder),
-        color: _kSurfaceCard,
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x80000000),
-            blurRadius: 24,
-            offset: Offset(0, 8),
-            spreadRadius: -12,
-          ),
-        ],
-      ),
+    return OscCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            'KNOWLEDGE SOURCE ENGINE',
-            style: TextStyle(
-              fontFamily: 'RobotoMono',
-              fontSize: 9,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 1.2,
-              color: Colors.white.withValues(alpha: 0.35),
-            ),
-          ),
+          const OscSectionLabel('KNOWLEDGE SOURCE ENGINE', small: true),
           const SizedBox(height: 8),
-          const Text(
+          Text(
             'https://en.wikipedia.org/wiki/Operating_system',
-            style: TextStyle(
-              fontFamily: 'RobotoMono',
-              fontSize: 10,
-              color: _kSkyBlue,
-            ),
+            style: OscTypography.monoSmall.copyWith(color: OscColors.skyBlue),
             overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 6),
-          const Text(
+          Text(
             'Operating Systems Architecture Evolution',
-            style: TextStyle(
-              fontSize: 12,
+            style: OscTypography.bodySmall.copyWith(
               fontWeight: FontWeight.w500,
-              color: Color(0xFFE5E5E5),
+              color: OscColors.textBright,
             ),
           ),
           const SizedBox(height: 8),
@@ -1151,111 +543,24 @@ class _KnowledgeSourceCard extends StatelessWidget {
 }
 
 // ─── Generated Engine View Card ────────────────────────────────────────
-class _GeneratedEngineCard extends StatefulWidget {
+class _GeneratedEngineCard extends StatelessWidget {
   const _GeneratedEngineCard();
 
   @override
-  State<_GeneratedEngineCard> createState() => _GeneratedEngineCardState();
-}
-
-class _GeneratedEngineCardState extends State<_GeneratedEngineCard>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _ctrl;
-  late final Animation<double> _pulse;
-
-  @override
-  void initState() {
-    super.initState();
-    _ctrl = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1800),
-    )..repeat(reverse: true);
-    _pulse = Tween(begin: 1.0, end: 0.4).animate(
-      CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut),
-    );
-  }
-
-  @override
-  void dispose() {
-    _ctrl.dispose();
-    super.dispose();
-  }
-
-  @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _kActiveBorder),
-        gradient: const LinearGradient(
-          begin: Alignment.centerLeft,
-          end: Alignment.centerRight,
-          colors: [Color(0x127C3AED), _kSurfaceCard],
-        ),
-        boxShadow: const [
-          BoxShadow(
-            color: Color(0x80000000),
-            blurRadius: 24,
-            offset: Offset(0, 8),
-            spreadRadius: -12,
-          ),
-        ],
-      ),
+    return OscCard(
+      activeBorder: true,
+      gradient: OscCard.liveGradient,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              Text(
-                'GENERATED ENGINE VIEW',
-                style: TextStyle(
-                  fontFamily: 'RobotoMono',
-                  fontSize: 9,
-                  fontWeight: FontWeight.w600,
-                  letterSpacing: 1.2,
-                  color: Colors.white.withValues(alpha: 0.35),
-                ),
-              ),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  borderRadius: BorderRadius.circular(6),
-                  color: _kAccentViolet.withValues(alpha: 0.10),
-                  border: Border.all(
-                      color: _kAccentViolet.withValues(alpha: 0.25)),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    AnimatedBuilder(
-                      animation: _pulse,
-                      builder: (_, child) => Opacity(
-                        opacity: _pulse.value,
-                        child: child,
-                      ),
-                      child: Container(
-                        width: 6,
-                        height: 6,
-                        decoration: const BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _kAccentVioletLight,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    const Text(
-                      'Live',
-                      style: TextStyle(
-                        fontSize: 9,
-                        fontWeight: FontWeight.w500,
-                        color: _kAccentVioletLight,
-                      ),
-                    ),
-                  ],
-                ),
+              const OscSectionLabel('GENERATED ENGINE VIEW', small: true),
+              OscStatusBadge(
+                label: 'Live',
+                color: OscColors.violetLight,
               ),
             ],
           ),
@@ -1263,165 +568,9 @@ class _GeneratedEngineCardState extends State<_GeneratedEngineCard>
           Text(
             'Injected general-purpose widget context directly into active '
             'space. Render layout optimized natively.',
-            style: TextStyle(
-              fontSize: 12,
-              height: 1.6,
-              color: Colors.white.withValues(alpha: 0.45),
-            ),
+            style: OscTypography.bodySmall,
           ),
         ],
-      ),
-    );
-  }
-}
-
-// ─── Hub Dock (glassmorphic bottom bar) ────────────────────────────────
-class _HubDock extends StatelessWidget {
-  const _HubDock({
-    required this.canvas,
-    required this.files,
-    required this.web,
-    required this.active,
-    required this.onActivate,
-    required this.onLaunch,
-  });
-
-  final AppTile? canvas;
-  final AppTile? files;
-  final AppTile? web;
-  final CoreAppRole active;
-  final ValueChanged<CoreAppRole> onActivate;
-  final ValueChanged<AppTile> onLaunch;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 6, 16, 16),
-      child: Center(
-        child: Container(
-          decoration: BoxDecoration(
-            color: const Color(0xC70E0E12),
-            borderRadius: BorderRadius.circular(999),
-            border: Border.all(color: Colors.white.withValues(alpha: 0.10)),
-            boxShadow: const [
-              BoxShadow(
-                color: Color(0x99000000),
-                blurRadius: 40,
-                offset: Offset(0, 12),
-                spreadRadius: -8,
-              ),
-            ],
-          ),
-          child: Padding(
-            padding: const EdgeInsets.all(5),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                _HubSegment(
-                  label: 'Canvas Hub',
-                  app: canvas,
-                  role: CoreAppRole.canvas,
-                  active: active,
-                  onActivate: onActivate,
-                  onLaunch: onLaunch,
-                ),
-                const SizedBox(width: 2),
-                _HubSegment(
-                  label: 'Files',
-                  app: files,
-                  role: CoreAppRole.files,
-                  active: active,
-                  onActivate: onActivate,
-                  onLaunch: onLaunch,
-                ),
-                const SizedBox(width: 2),
-                _HubSegment(
-                  label: 'Web Link',
-                  app: web,
-                  role: CoreAppRole.web,
-                  active: active,
-                  onActivate: onActivate,
-                  onLaunch: onLaunch,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-class _HubSegment extends StatefulWidget {
-  const _HubSegment({
-    required this.label,
-    required this.app,
-    required this.role,
-    required this.active,
-    required this.onActivate,
-    required this.onLaunch,
-  });
-
-  final String label;
-  final AppTile? app;
-  final CoreAppRole role;
-  final CoreAppRole active;
-  final ValueChanged<CoreAppRole> onActivate;
-  final ValueChanged<AppTile> onLaunch;
-
-  @override
-  State<_HubSegment> createState() => _HubSegmentState();
-}
-
-class _HubSegmentState extends State<_HubSegment> {
-  bool _hovered = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final enabled = widget.app != null;
-    final selected = widget.active == widget.role;
-
-    final bgAlpha = selected
-        ? 0.10
-        : _hovered
-            ? 0.04
-            : enabled
-                ? 0.02
-                : 0.01;
-
-    final textAlpha = selected
-        ? 0.98
-        : _hovered
-            ? 0.90
-            : enabled
-                ? 0.74
-                : 0.35;
-
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovered = true),
-      onExit: (_) => setState(() => _hovered = false),
-      child: GestureDetector(
-        onTap: () {
-          widget.onActivate(widget.role);
-          if (enabled) widget.onLaunch(widget.app!);
-        },
-        child: AnimatedContainer(
-          duration: const Duration(milliseconds: 180),
-          curve: Curves.easeOut,
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: bgAlpha),
-            borderRadius: BorderRadius.circular(999),
-          ),
-          child: Text(
-            widget.label,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
-              color: Colors.white.withValues(alpha: textAlpha),
-            ),
-          ),
-        ),
       ),
     );
   }

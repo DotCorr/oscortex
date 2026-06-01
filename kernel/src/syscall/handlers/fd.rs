@@ -745,6 +745,11 @@ pub(crate) fn sys_exec_wait(path_ptr: u64, path_len: u64) -> i64 {
         Err(_)  => return -12, // ENOMEM
     };
 
+    // Claim the child process immediately on the current CPU to prevent any
+    // concurrent CPU scheduler from picking it up before we do.
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    crate::process::claim_process_on_cpu(child_pid, my_cpu);
+
     // Wire the child back to the parent so sys_exit knows who to wake.
     crate::process::set_child_parent(child_pid, parent_pid);
 

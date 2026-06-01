@@ -2,21 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-
-// ─────────────────────────────────────────────────────────────
-// Design Tokens
-// ─────────────────────────────────────────────────────────────
-const Color _bodyBg = Color(0xFF07080B);
-const Color _canvasBg = Color(0xFF0B0D12);
-const Color _surfaceCard = Color(0x06FFFFFF);
-const Color _border = Color(0x14FFFFFF);
-const Color _accentSky = Color(0xFF38BDF8);
-const Color _signalGreen = Color(0xFF10B981);
-const Color _signalRed = Color(0xFFEF4444);
-const Color _textMain = Color(0xFFD4D4D8);
-const Color _textMuted = Color(0xFF71717A);
-
-const double _cardRadius = 14.0;
+import 'package:oscortex_ui/oscortex_ui.dart';
 
 // ─────────────────────────────────────────────────────────────
 // App entry
@@ -32,114 +18,7 @@ class FilesApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        brightness: Brightness.dark,
-        fontFamily: 'NotoSans',
-        scaffoldBackgroundColor: _bodyBg,
-        colorScheme: const ColorScheme.dark(
-          primary: _accentSky,
-          onPrimary: Color(0xFF07080B),
-          surface: _canvasBg,
-          onSurface: _textMain,
-        ),
-        useMaterial3: true,
-        cardTheme: CardThemeData(
-          color: _surfaceCard,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(_cardRadius),
-            side: const BorderSide(color: _border),
-          ),
-          elevation: 0,
-          margin: EdgeInsets.zero,
-        ),
-        filledButtonTheme: FilledButtonThemeData(
-          style: FilledButton.styleFrom(
-            backgroundColor: _accentSky,
-            foregroundColor: const Color(0xFF07080B),
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(10),
-            ),
-            textStyle: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              fontFamily: 'NotoSans',
-            ),
-          ),
-        ),
-        outlinedButtonTheme: OutlinedButtonThemeData(
-          style: OutlinedButton.styleFrom(
-            foregroundColor: _textMain,
-            side: const BorderSide(color: _border),
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
-            shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(10),
-            ),
-            textStyle: const TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w600,
-              fontFamily: 'NotoSans',
-            ),
-          ),
-        ),
-        inputDecorationTheme: InputDecorationTheme(
-          filled: true,
-          fillColor: _surfaceCard,
-          contentPadding:
-              const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-          border: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: const BorderSide(color: _border),
-          ),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: const BorderSide(color: _border),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(10),
-            borderSide: const BorderSide(color: _accentSky, width: 1.5),
-          ),
-          labelStyle: const TextStyle(color: _textMuted, fontSize: 13),
-          hintStyle: const TextStyle(color: _textMuted, fontSize: 13),
-        ),
-        chipTheme: ChipThemeData(
-          backgroundColor: _surfaceCard,
-          side: const BorderSide(color: _border),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
-          ),
-          labelStyle: const TextStyle(
-            color: _textMain,
-            fontSize: 12,
-            fontWeight: FontWeight.w500,
-          ),
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-        ),
-        popupMenuTheme: PopupMenuThemeData(
-          color: const Color(0xFF111318),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
-            side: const BorderSide(color: _border),
-          ),
-          textStyle: const TextStyle(
-            color: _textMain,
-            fontSize: 13,
-            fontFamily: 'NotoSans',
-          ),
-        ),
-        snackBarTheme: SnackBarThemeData(
-          backgroundColor: const Color(0xFF111318),
-          contentTextStyle: const TextStyle(
-            color: _textMain,
-            fontSize: 13,
-            fontFamily: 'NotoSans',
-          ),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(10),
-          ),
-          behavior: SnackBarBehavior.floating,
-        ),
-      ),
+      theme: OscTheme.dark(accent: OscColors.skyBlue),
       home: const FilesHome(),
     );
   }
@@ -161,6 +40,8 @@ class _FilesHomeState extends State<FilesHome>
     'oscortex/shell',
     StringCodec(),
   );
+
+  static const Color _accent = OscColors.skyBlue;
 
   final _pathController = TextEditingController(text: '/Applications');
   final _scrollController = ScrollController();
@@ -272,16 +153,16 @@ class _FilesHomeState extends State<FilesHome>
                         ? Icons.check_circle_rounded
                         : Icons.error_outline_rounded,
                     size: 16,
-                    color: ok ? _signalGreen : _signalRed,
+                    color: ok ? OscColors.green : OscColors.red,
                   ),
-                  const SizedBox(width: 10),
+                  const SizedBox(width: OscSpacing.lg),
                   Expanded(child: Text(_status)),
                 ],
               ),
               action: ok
                   ? SnackBarAction(
                       label: 'Refresh',
-                      textColor: _accentSky,
+                      textColor: _accent,
                       onPressed: _refresh,
                     )
                   : null,
@@ -343,13 +224,13 @@ class _FilesHomeState extends State<FilesHome>
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _bodyBg,
+      backgroundColor: OscColors.bodyBg,
       body: Container(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           gradient: RadialGradient(
             center: Alignment.topRight,
             radius: 1.4,
-            colors: [Color(0x2238BDF8), Color(0x0007080B)],
+            colors: [_accent.withValues(alpha: 0.13), const Color(0x0007080B)],
           ),
         ),
         child: SafeArea(
@@ -358,32 +239,32 @@ class _FilesHomeState extends State<FilesHome>
             children: [
               // ── Header ─────────────────────────────────
               Padding(
-                padding: const EdgeInsets.fromLTRB(24, 20, 24, 0),
+                padding: const EdgeInsets.fromLTRB(
+                    OscSpacing.xl5, 20, OscSpacing.xl5, 0),
                 child: Row(
                   children: [
                     Container(
                       width: 40,
                       height: 40,
                       decoration: BoxDecoration(
-                        color: _accentSky.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(11),
+                        color: _accent.withValues(alpha: 0.12),
+                        borderRadius:
+                            BorderRadius.circular(OscRadii.inner - 1),
                         border: Border.all(
-                          color: _accentSky.withValues(alpha: 0.18),
+                          color: _accent.withValues(alpha: 0.18),
                         ),
                       ),
                       child: const Icon(
                         Icons.folder_rounded,
-                        color: _accentSky,
+                        color: _accent,
                         size: 22,
                       ),
                     ),
-                    const SizedBox(width: 14),
-                    const Text(
+                    const SizedBox(width: OscSpacing.xl2),
+                    Text(
                       'Files',
-                      style: TextStyle(
-                        fontSize: 28,
-                        fontWeight: FontWeight.w800,
-                        color: _textMain,
+                      style: OscTypography.heading2.copyWith(
+                        color: OscColors.textPrimary,
                         letterSpacing: -0.5,
                       ),
                     ),
@@ -417,10 +298,10 @@ class _FilesHomeState extends State<FilesHome>
                                   label: '/sys/app')),
                         ],
                         child: const Icon(Icons.source_rounded,
-                            size: 18, color: _textMuted),
+                            size: 18, color: OscColors.textMuted),
                       ),
                     ),
-                    const SizedBox(width: 6),
+                    const SizedBox(width: OscSpacing.sm),
                     _HeaderButton(
                       tooltip: 'Refresh',
                       child: IconButton(
@@ -430,11 +311,11 @@ class _FilesHomeState extends State<FilesHome>
                                 dimension: 16,
                                 child: CircularProgressIndicator(
                                   strokeWidth: 2,
-                                  color: _accentSky,
+                                  color: _accent,
                                 ),
                               )
                             : const Icon(Icons.refresh_rounded,
-                                size: 18, color: _textMuted),
+                                size: 18, color: OscColors.textMuted),
                         padding: EdgeInsets.zero,
                         constraints: const BoxConstraints(
                             minWidth: 36, minHeight: 36),
@@ -443,11 +324,12 @@ class _FilesHomeState extends State<FilesHome>
                   ],
                 ),
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: OscSpacing.xl4),
 
               // ── Breadcrumbs ────────────────────────────
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: OscSpacing.xl5),
                 child: SizedBox(
                   height: 32,
                   child: ListView.separated(
@@ -457,7 +339,7 @@ class _FilesHomeState extends State<FilesHome>
                       padding: EdgeInsets.symmetric(horizontal: 2),
                       child: Center(
                         child: Icon(Icons.chevron_right_rounded,
-                            size: 14, color: _textMuted),
+                            size: 14, color: OscColors.textMuted),
                       ),
                     ),
                     itemBuilder: (context, index) {
@@ -471,16 +353,16 @@ class _FilesHomeState extends State<FilesHome>
                             fontSize: 12,
                             fontWeight:
                                 isLast ? FontWeight.w700 : FontWeight.w500,
-                            color: isLast ? _accentSky : _textMuted,
+                            color: isLast ? _accent : OscColors.textMuted,
                           ),
                         ),
                         backgroundColor: isLast
-                            ? _accentSky.withValues(alpha: 0.08)
-                            : _surfaceCard,
+                            ? _accent.withValues(alpha: 0.08)
+                            : OscColors.surface,
                         side: BorderSide(
                           color: isLast
-                              ? _accentSky.withValues(alpha: 0.2)
-                              : _border,
+                              ? _accent.withValues(alpha: 0.2)
+                              : OscColors.border,
                         ),
                         onPressed: () => _jump(crumb),
                       );
@@ -488,47 +370,49 @@ class _FilesHomeState extends State<FilesHome>
                   ),
                 ),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: OscSpacing.xl),
 
               // ── Path field ─────────────────────────────
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: OscSpacing.xl5),
                 child: TextField(
                   controller: _pathController,
                   onSubmitted: (_) => _refresh(),
-                  style: const TextStyle(
-                    fontSize: 13,
-                    color: _textMain,
+                  style: OscTypography.body.copyWith(
+                    color: OscColors.textPrimary,
                     fontWeight: FontWeight.w500,
                   ),
                   decoration: InputDecoration(
                     hintText: 'Enter filesystem path…',
                     prefixIcon: const Icon(Icons.terminal_rounded,
-                        size: 18, color: _textMuted),
+                        size: 18, color: OscColors.textMuted),
                     suffixIcon: IconButton(
                       onPressed: _refresh,
                       icon: Container(
                         width: 28,
                         height: 28,
                         decoration: BoxDecoration(
-                          color: _accentSky.withValues(alpha: 0.15),
-                          borderRadius: BorderRadius.circular(7),
+                          color: _accent.withValues(alpha: 0.15),
+                          borderRadius:
+                              BorderRadius.circular(OscRadii.tag + 1),
                         ),
                         child: const Icon(Icons.arrow_forward_rounded,
-                            size: 16, color: _accentSky),
+                            size: 16, color: _accent),
                       ),
                     ),
                   ),
                 ),
               ),
-              const SizedBox(height: 12),
+              const SizedBox(height: OscSpacing.xl),
 
               // ── Quick-access chips ─────────────────────
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: OscSpacing.xl5),
                 child: Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
+                  spacing: OscSpacing.md,
+                  runSpacing: OscSpacing.sm,
                   children: [
                     _QuickChip(
                       label: '/Applications',
@@ -548,20 +432,21 @@ class _FilesHomeState extends State<FilesHome>
                   ],
                 ),
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: OscSpacing.xl2),
 
               // ── Install banner ─────────────────────────
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 24),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: OscSpacing.xl5),
                 child: _buildInstallBanner(),
               ),
 
               // ── Divider ───────────────────────────────
               const Padding(
-                padding: EdgeInsets.symmetric(horizontal: 24),
-                child: Divider(color: _border, height: 1),
+                padding: EdgeInsets.symmetric(horizontal: OscSpacing.xl5),
+                child: Divider(color: OscColors.border, height: 1),
               ),
-              const SizedBox(height: 14),
+              const SizedBox(height: OscSpacing.xl2),
 
               // ── File grid ──────────────────────────────
               Expanded(
@@ -572,21 +457,24 @@ class _FilesHomeState extends State<FilesHome>
                           children: [
                             Icon(Icons.folder_off_rounded,
                                 size: 48,
-                                color: _textMuted.withValues(alpha: 0.4)),
-                            const SizedBox(height: 12),
+                                color: OscColors.textMuted
+                                    .withValues(alpha: 0.4)),
+                            const SizedBox(height: OscSpacing.xl),
                             Text(
                               'No files found here',
                               style: TextStyle(
-                                color: _textMuted.withValues(alpha: 0.6),
+                                color: OscColors.textMuted
+                                    .withValues(alpha: 0.6),
                                 fontSize: 14,
                                 fontWeight: FontWeight.w500,
                               ),
                             ),
-                            const SizedBox(height: 4),
+                            const SizedBox(height: OscSpacing.xs),
                             Text(
                               _pathController.text,
                               style: TextStyle(
-                                color: _textMuted.withValues(alpha: 0.35),
+                                color: OscColors.textMuted
+                                    .withValues(alpha: 0.35),
                                 fontSize: 12,
                               ),
                             ),
@@ -594,14 +482,15 @@ class _FilesHomeState extends State<FilesHome>
                         ),
                       )
                     : Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 24),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: OscSpacing.xl5),
                         child: GridView.builder(
                           controller: _scrollController,
                           gridDelegate:
                               const SliverGridDelegateWithMaxCrossAxisExtent(
                             maxCrossAxisExtent: 260,
-                            mainAxisSpacing: 10,
-                            crossAxisSpacing: 10,
+                            mainAxisSpacing: OscSpacing.lg,
+                            crossAxisSpacing: OscSpacing.lg,
                             childAspectRatio: 1.15,
                           ),
                           itemCount: _entries.length,
@@ -627,10 +516,11 @@ class _FilesHomeState extends State<FilesHome>
 
               // ── Status bar ─────────────────────────────
               Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 24, vertical: 10),
+                padding: const EdgeInsets.symmetric(
+                    horizontal: OscSpacing.xl5, vertical: OscSpacing.lg),
                 decoration: const BoxDecoration(
-                  border: Border(top: BorderSide(color: _border)),
+                  border: Border(
+                      top: BorderSide(color: OscColors.border)),
                 ),
                 child: Row(
                   children: [
@@ -639,20 +529,18 @@ class _FilesHomeState extends State<FilesHome>
                       height: 6,
                       decoration: BoxDecoration(
                         color: _loading
-                            ? _accentSky
+                            ? _accent
                             : _entries.isEmpty
-                                ? _textMuted
-                                : _signalGreen,
+                                ? OscColors.textMuted
+                                : OscColors.green,
                         shape: BoxShape.circle,
                       ),
                     ),
-                    const SizedBox(width: 8),
+                    const SizedBox(width: OscSpacing.md),
                     Expanded(
                       child: Text(
                         _status,
-                        style: const TextStyle(
-                          color: _textMuted,
-                          fontSize: 11,
+                        style: OscTypography.caption.copyWith(
                           fontWeight: FontWeight.w500,
                         ),
                         overflow: TextOverflow.ellipsis,
@@ -660,9 +548,9 @@ class _FilesHomeState extends State<FilesHome>
                     ),
                     Text(
                       _pathController.text,
-                      style: TextStyle(
-                        color: _textMuted.withValues(alpha: 0.5),
-                        fontSize: 11,
+                      style: OscTypography.caption.copyWith(
+                        color:
+                            OscColors.textMuted.withValues(alpha: 0.5),
                       ),
                     ),
                   ],
@@ -688,20 +576,20 @@ class _FilesHomeState extends State<FilesHome>
 
     switch (_installStage) {
       case InstallStage.installing:
-        borderColor = _accentSky.withValues(alpha: 0.35);
-        bgColor = _accentSky.withValues(alpha: 0.06);
+        borderColor = _accent.withValues(alpha: 0.35);
+        bgColor = _accent.withValues(alpha: 0.06);
         icon = Icons.hourglass_bottom_rounded;
         label = 'Installing ${_installTarget ?? ''}…';
       case InstallStage.success:
-        borderColor = _signalGreen.withValues(alpha: 0.35);
-        bgColor = _signalGreen.withValues(alpha: 0.06);
+        borderColor = OscColors.green.withValues(alpha: 0.35);
+        bgColor = OscColors.green.withValues(alpha: 0.06);
         icon = Icons.check_circle_outline_rounded;
         label = _lastInstalledId == null
             ? 'Install complete'
             : 'Install complete  ·  app id $_lastInstalledId';
       case InstallStage.failed:
-        borderColor = _signalRed.withValues(alpha: 0.35);
-        bgColor = _signalRed.withValues(alpha: 0.06);
+        borderColor = OscColors.red.withValues(alpha: 0.35);
+        bgColor = OscColors.red.withValues(alpha: 0.06);
         icon = Icons.error_outline_rounded;
         label = 'Install failed';
       case InstallStage.idle:
@@ -716,12 +604,13 @@ class _FilesHomeState extends State<FilesHome>
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 300),
         curve: Curves.easeOut,
-        margin: const EdgeInsets.only(bottom: 14),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        margin: const EdgeInsets.only(bottom: OscSpacing.xl2),
+        padding: const EdgeInsets.symmetric(
+            horizontal: OscSpacing.xl2, vertical: OscSpacing.xl),
         decoration: BoxDecoration(
           color: bgColor,
           border: Border.all(color: borderColor),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: OscRadii.innerBorder,
         ),
         child: Row(
           children: [
@@ -731,19 +620,19 @@ class _FilesHomeState extends State<FilesHome>
                 height: 16,
                 child: CircularProgressIndicator(
                   strokeWidth: 2,
-                  color: _accentSky,
+                  color: _accent,
                 ),
               )
             else
-              Icon(icon, size: 16, color: _textMain),
-            const SizedBox(width: 10),
+              Icon(icon, size: 16, color: OscColors.textPrimary),
+            const SizedBox(width: OscSpacing.lg),
             Expanded(
               child: Text(
                 label,
                 style: const TextStyle(
                   fontSize: 12,
                   fontWeight: FontWeight.w600,
-                  color: _textMain,
+                  color: OscColors.textPrimary,
                 ),
               ),
             ),
@@ -753,13 +642,13 @@ class _FilesHomeState extends State<FilesHome>
                   _channel.send('list');
                 },
                 icon: const Icon(Icons.refresh_rounded,
-                    size: 14, color: _accentSky),
+                    size: 14, color: _accent),
                 label: const Text(
                   'Refresh Shell',
                   style: TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
-                    color: _accentSky,
+                    color: _accent,
                   ),
                 ),
               ),
@@ -776,7 +665,8 @@ class _FilesHomeState extends State<FilesHome>
                   });
                 },
                 icon: Icon(Icons.close_rounded,
-                    size: 14, color: _textMuted.withValues(alpha: 0.6)),
+                    size: 14,
+                    color: OscColors.textMuted.withValues(alpha: 0.6)),
                 padding: EdgeInsets.zero,
                 constraints:
                     const BoxConstraints(minWidth: 24, minHeight: 24),
@@ -805,9 +695,9 @@ class _HeaderButton extends StatelessWidget {
         width: 38,
         height: 38,
         decoration: BoxDecoration(
-          color: _surfaceCard,
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: _border),
+          color: OscColors.surface,
+          borderRadius: OscRadii.buttonBorder,
+          border: Border.all(color: OscColors.border),
         ),
         child: Center(child: child),
       ),
@@ -828,10 +718,10 @@ class _PopupRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Row(
       children: [
-        Icon(icon, size: 16, color: _textMuted),
-        const SizedBox(width: 10),
+        Icon(icon, size: 16, color: OscColors.textMuted),
+        const SizedBox(width: OscSpacing.lg),
         Text(label,
-            style: const TextStyle(fontSize: 13, color: _textMain)),
+            style: const TextStyle(fontSize: 13, color: OscColors.textPrimary)),
       ],
     );
   }
@@ -854,13 +744,13 @@ class _QuickChip extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ActionChip(
-      avatar: Icon(icon, size: 14, color: _accentSky),
+      avatar: Icon(icon, size: 14, color: OscColors.skyBlue),
       label: Text(
         label,
         style: const TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.w500,
-          color: _textMain,
+          color: OscColors.textPrimary,
         ),
       ),
       onPressed: onTap,
@@ -906,22 +796,20 @@ class _FileCardState extends State<_FileCard> {
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
           decoration: BoxDecoration(
-            color: _hovered
-                ? const Color(0x0DFFFFFF)
-                : _surfaceCard,
-            borderRadius: BorderRadius.circular(_cardRadius),
+            color: _hovered ? OscColors.surfaceHover : OscColors.surface,
+            borderRadius: OscRadii.cardBorder,
             border: Border.all(
               color: _hovered
                   ? isBundle
-                      ? _accentSky.withValues(alpha: 0.25)
-                      : const Color(0x28FFFFFF)
-                  : _border,
+                      ? OscColors.skyBlue.withValues(alpha: 0.25)
+                      : OscColors.borderHover
+                  : OscColors.border,
             ),
             boxShadow: _hovered
                 ? [
                     BoxShadow(
                       color: isBundle
-                          ? _accentSky.withValues(alpha: 0.06)
+                          ? OscColors.skyBlue.withValues(alpha: 0.06)
                           : Colors.black.withValues(alpha: 0.15),
                       blurRadius: 16,
                       offset: const Offset(0, 4),
@@ -930,7 +818,7 @@ class _FileCardState extends State<_FileCard> {
                 : [],
           ),
           child: Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(OscSpacing.xl3),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -940,24 +828,25 @@ class _FileCardState extends State<_FileCard> {
                   height: 42,
                   decoration: BoxDecoration(
                     color: isBundle
-                        ? _accentSky.withValues(alpha: 0.10)
+                        ? OscColors.skyBlue.withValues(alpha: 0.10)
                         : const Color(0x0AFFFFFF),
-                    borderRadius: BorderRadius.circular(11),
+                    borderRadius:
+                        BorderRadius.circular(OscRadii.inner - 1),
                     border: Border.all(
                       color: isBundle
-                          ? _accentSky.withValues(alpha: 0.15)
-                          : _border,
+                          ? OscColors.skyBlue.withValues(alpha: 0.15)
+                          : OscColors.border,
                     ),
                   ),
                   child: Icon(
                     isBundle
                         ? Icons.inventory_2_rounded
                         : Icons.folder_rounded,
-                    color: isBundle ? _accentSky : _textMuted,
+                    color: isBundle ? OscColors.skyBlue : OscColors.textMuted,
                     size: 22,
                   ),
                 ),
-                const SizedBox(height: 14),
+                const SizedBox(height: OscSpacing.xl2),
 
                 // Name
                 Text(
@@ -965,7 +854,7 @@ class _FileCardState extends State<_FileCard> {
                   style: const TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
-                    color: _textMain,
+                    color: OscColors.textPrimary,
                   ),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
@@ -979,8 +868,8 @@ class _FileCardState extends State<_FileCard> {
                     fontSize: 11,
                     fontWeight: FontWeight.w500,
                     color: isBundle
-                        ? _accentSky.withValues(alpha: 0.7)
-                        : _textMuted,
+                        ? OscColors.skyBlue.withValues(alpha: 0.7)
+                        : OscColors.textMuted,
                   ),
                 ),
 
@@ -1000,7 +889,7 @@ class _FileCardState extends State<_FileCard> {
                                   dimension: 14,
                                   child: CircularProgressIndicator(
                                     strokeWidth: 2,
-                                    color: Color(0xFF07080B),
+                                    color: OscColors.bodyBg,
                                   ),
                                 )
                               : const Text('Install'),

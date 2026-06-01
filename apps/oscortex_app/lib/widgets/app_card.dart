@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:oscortex_ui/oscortex_ui.dart';
 
 import '../models/app_tile.dart';
 
@@ -39,22 +40,13 @@ class _AppCardState extends State<AppCard> {
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(14),
+            borderRadius: OscRadii.cardBorder,
             border: Border.all(
-              color: _hovered
-                  ? Colors.white.withValues(alpha: 0.12)
-                  : Colors.white.withValues(alpha: 0.08),
+              color: _hovered ? OscColors.borderHover : OscColors.border,
             ),
-            color: _hovered
-                ? Colors.white.withValues(alpha: 0.035)
-                : Colors.white.withValues(alpha: 0.025),
+            color: _hovered ? OscColors.surfaceHover : OscColors.surface,
             boxShadow: [
-              BoxShadow(
-                color: const Color(0x80000000),
-                blurRadius: _hovered ? 20 : 12,
-                offset: const Offset(0, 6),
-                spreadRadius: -8,
-              ),
+              _hovered ? OscShadows.hover : OscShadows.card,
             ],
           ),
           child: Padding(
@@ -66,7 +58,7 @@ class _AppCardState extends State<AppCard> {
                   width: 44,
                   height: 44,
                   decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: OscRadii.innerBorder,
                     color: widget.accentColor.withValues(alpha: 0.12),
                     border: Border.all(
                       color: widget.accentColor.withValues(alpha: 0.20),
@@ -84,10 +76,9 @@ class _AppCardState extends State<AppCard> {
                   textAlign: TextAlign.center,
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    fontSize: 13,
+                  style: OscTypography.body.copyWith(
                     fontWeight: FontWeight.w600,
-                    color: Color(0xFFE5E5E5),
+                    color: OscColors.textBright,
                   ),
                 ),
                 const SizedBox(height: 4),
