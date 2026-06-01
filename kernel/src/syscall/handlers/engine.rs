@@ -646,6 +646,66 @@ pub(crate) fn sys_app_uninstall(app_id: u64) -> i64 {
     if crate::app_registry::uninstall(app_id as u32) { 0 } else { -2 } // ENOENT
 }
 
+// ── On-demand package delivery ───────────────────────────────────────────────
+
+/// Resolve a package by name — fetch on demand if not cached.
+/// `arg0` = name_ptr, `arg1` = name_len.
+/// Returns app_id on success, or negative errno.
+pub(crate) fn sys_pkg_resolve(name_ptr: u64, name_len: u64) -> i64 {
+    let name = match unsafe { read_user_bytes(name_ptr, name_len as usize) } {
+        Some(b) => b,
+        None => return -14, // EFAULT
+    };
+    match crate::pkg::resolver::resolve(name) {
+        Ok(app_id) => app_id as i64,
+        Err(crate::pkg::resolver::ResolveError::NotFound) => -2,    // ENOENT
+        Err(crate::pkg::resolver::ResolveError::NoCatalog) => -2,   // ENOENT
+        Err(crate::pkg::resolver::ResolveError::FetchFailed) => -5, // EIO
+        Err(crate::pkg::resolver::ResolveError::HashMismatch) => -22, // EINVAL
+        Err(crate::pkg::resolver::ResolveError::InstallFailed) => -12, // ENOMEM
+        Err(crate::pkg::resolver::ResolveError::CacheFull) => -28,  // ENOSPC
+    }
+}
+
+/// Serialise the package catalog into a user buffer.
+/// Each entry is 128 bytes (PkgManifest).
+/// If buf_ptr=0, returns the count of available packages.
+pub(crate) fn sys_pkg_catalog(buf_ptr: u64, buf_len: u64) -> i64 {
+    let catalog = crate::pkg::resolver::catalog();
+    if buf_ptr == 0 || buf_len == 0 {
+        return catalog.len() as i64;
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
+    let entry_size = crate::pkg::manifest::MANIFEST_SIZE;
+    let mut written = 0usize;
+    for entry in catalog.iter() {
+        if written + entry_size > buf.len() { break; }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                entry as *const crate::pkg::manifest::PkgManifest as *const u8,
+                entry_size,
+            )
+        };
+        buf[written..written + entry_size].copy_from_slice(bytes);
+        written += entry_size;
+    }
+    catalog.len() as i64
+}
+
+/// Set the package server IP and port.
+/// `arg0` = ip_packed_be (big-endian u32), `arg1` = port.
+pub(crate) fn sys_pkg_set_server(ip: u64, port: u64) -> i64 {
+    crate::pkg::resolver::set_server(ip as u32, port as u16);
+    // Refresh catalog from the new server.
+    let _ = crate::pkg::resolver::refresh_catalog();
+    0
+}
+
+/// Evict a cached package by app_id.
+pub(crate) fn sys_pkg_evict(app_id: u64) -> i64 {
+    if crate::pkg::cache::remove(app_id as u32) { 0 } else { -2 } // ENOENT
+}
+
 // ── Phase 39 — Named port IPC namespace ──────────────────────────────────────
 
 /// Bind the calling process's isolate under `name`.

@@ -134,8 +134,10 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         fi
         cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
     done
-    # python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
-
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 
     rm -f \
         "$ROOT/initramfs/system/flutter/kernel_blob.bin" \

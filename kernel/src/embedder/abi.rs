@@ -185,6 +185,12 @@ pub const SYS_SURFACE_FULLSCREEN: u64 = 0x381; // surface_fullscreen() → surfa
 pub const SYS_DL_GET_INIT_ARRAY: u64 = 0x382;
 // dl_get_init_array(handle, out_init_fn: *mut u64, out_array_va: *mut u64, out_count: *mut u64) → 0/-EBADF
 
+// On-demand package delivery — Fuchsia-inspired ephemeral fetch.
+pub const SYS_PKG_RESOLVE:    u64 = 0x390; // pkg_resolve(name_ptr, name_len) → app_id / -ERRNO
+pub const SYS_PKG_CATALOG:    u64 = 0x391; // pkg_catalog(buf_ptr, buf_len) → count (writes manifest entries)
+pub const SYS_PKG_SET_SERVER: u64 = 0x392; // pkg_set_server(ip_packed_be, port) → 0
+pub const SYS_PKG_EVICT:      u64 = 0x393; // pkg_evict(app_id) → 0 / -ERRNO
+
 // WM event kind for incoming platform-channel messages.
 pub const EV_PLATFORM_MSG: u32 = 6;
 

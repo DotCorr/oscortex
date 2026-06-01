@@ -106,4 +106,46 @@ class ShellService {
       return false;
     }
   }
+
+  // ── On-demand package delivery ─────────────────────────────────────────
+
+  /// Fetch the remote package catalog from the configured server.
+  /// Returns a list of available packages (not yet cached locally).
+  static Future<List<AppTile>> fetchCatalog() async {
+    trace('pkg_catalog_start');
+    final raw = await _safeSend('pkg_catalog');
+    final decoded = _parseJsonObject(
+      raw,
+      fallback: const <String, dynamic>{'packages': <dynamic>[]},
+    );
+    return (decoded['packages'] as List<dynamic>? ?? [])
+        .map((e) => AppTile.fromCatalog(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// Resolve (fetch + verify + cache) a package by name and return the app_id.
+  /// The kernel handles the full pipeline: HTTP fetch → SHA-256 verify → install.
+  static Future<int> resolvePackage(String name) async {
+    trace('pkg_resolve name=$name');
+    final raw = await _safeSend('pkg_resolve:$name');
+    final decoded = _parseJsonObject(
+      raw,
+      fallback: const <String, dynamic>{'app_id': -1},
+    );
+    final appId = decoded['app_id'] as int? ?? -1;
+    if (appId >= 0) {
+      trace('pkg_resolve_ok name=$name app_id=$appId');
+    } else {
+      trace('pkg_resolve_failed name=$name');
+    }
+    return appId;
+  }
+
+  /// Set the package server address (IP + port).
+  static Future<bool> setPackageServer(String ip, int port) async {
+    trace('pkg_set_server ip=$ip port=$port');
+    final raw = await _safeSend('pkg_set_server:$ip:$port');
+    return _isOkReply(raw);
+  }
 }
+

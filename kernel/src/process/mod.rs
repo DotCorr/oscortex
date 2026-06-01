@@ -1370,6 +1370,168 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     }
 }
 
+pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
+    let context = {
+        let mut g = match PTABLE_LOCK.try_lock() {
+            Some(guard) => guard,
+            None => return false,
+        };
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid != pid {
+            return false;
+        }
+        let e = p.errno_to_deliver;
+        p.errno_to_deliver = 0; // consume it
+        let pbt = p.preempted_by_timer;
+        p.preempted_by_timer = false; // consume the flag
+        let context = (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
+         p.regs.rdi, p.regs.rsi, p.regs.rdx,
+         p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,
+         p.regs.r11, p.regs.r12, p.regs.r13, p.regs.r14, p.regs.r15,
+         p.regs.rcx,
+         p.syscall_stack_top, p.fs_base, e, pbt);
+        drop(g);
+        context
+    };
+
+    let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
+         rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
+         syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = context;
+
+    crate::process::set_current_pid(pid);
+    if pid == 8 || pid == 9 {
+        static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log::warn!(
+                "[enter-user-89-try] #{} pid={} rip={:#x} rsp={:#x} fs={:#x} preempted={} errno={}",
+                n,
+                pid,
+                rip,
+                rsp,
+                fs_base,
+                preempted_by_timer,
+                errno_to_deliver
+            );
+        }
+    }
+    crate::arch::syscall::set_active_stack_top(syscall_stack_top);
+    crate::process::restore_xstate(pid);
+    crate::arch::cpu::set_fs_base(fs_base);
+
+    // Switch to the user address space.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {cr3}",
+            cr3 = in(reg) pml4_phys,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+
+    if errno_to_deliver != 0 {
+        unsafe {
+            core::ptr::write_volatile(
+                crate::process::posix_trampolines::SD_ERRNO as *mut u32,
+                errno_to_deliver,
+            );
+        }
+    }
+
+    if preempted_by_timer {
+        let iret_frame: [u64; 20] = [
+            /* 0x00 */ rip,
+            /* 0x08 */ crate::arch::gdt::USER_CS as u64,
+            /* 0x10 */ rflags | 0x200,
+            /* 0x18 */ rsp,
+            /* 0x20 */ crate::arch::gdt::USER_DS as u64,
+            /* 0x28 */ rax,
+            /* 0x30 */ rbx,
+            /* 0x38 */ rcx,
+            /* 0x40 */ rdx,
+            /* 0x48 */ rdi,
+            /* 0x50 */ rsi,
+            /* 0x58 */ rbp,
+            /* 0x60 */ r8,
+            /* 0x68 */ r9,
+            /* 0x70 */ r10,
+            /* 0x78 */ r11,
+            /* 0x80 */ r12,
+            /* 0x88 */ r13,
+            /* 0x90 */ r14,
+            /* 0x98 */ r15,
+        ];
+        unsafe {
+            core::arch::asm!(
+                "push qword ptr [r11 + 0x20]",
+                "push qword ptr [r11 + 0x18]",
+                "push qword ptr [r11 + 0x10]",
+                "push qword ptr [r11 + 0x08]",
+                "push qword ptr [r11 + 0x00]",
+                "mov rax, [r11 + 0x28]",
+                "mov rbx, [r11 + 0x30]",
+                "mov rcx, [r11 + 0x38]",
+                "mov rdx, [r11 + 0x40]",
+                "mov rdi, [r11 + 0x48]",
+                "mov rsi, [r11 + 0x50]",
+                "mov rbp, [r11 + 0x58]",
+                "mov r8,  [r11 + 0x60]",
+                "mov r9,  [r11 + 0x68]",
+                "mov r10, [r11 + 0x70]",
+                "mov r12, [r11 + 0x80]",
+                "mov r13, [r11 + 0x88]",
+                "mov r14, [r11 + 0x90]",
+                "mov r15, [r11 + 0x98]",
+                "mov r11, [r11 + 0x78]",
+                "iretq",
+                in("r11") iret_frame.as_ptr(),
+                options(noreturn),
+            )
+        }
+    }
+
+    let frame: [u64; 16] = [
+        /* 0x00 */ rip,
+        /* 0x08 */ rflags,
+        /* 0x10 */ rsp,
+        /* 0x18 */ rdi,
+        /* 0x20 */ rsi,
+        /* 0x28 */ rdx,
+        /* 0x30 */ rax,
+        /* 0x38 */ rbx,
+        /* 0x40 */ rbp,
+        /* 0x48 */ r8,
+        /* 0x50 */ r9,
+        /* 0x58 */ r10,
+        /* 0x60 */ r12,
+        /* 0x68 */ r13,
+        /* 0x70 */ r14,
+        /* 0x78 */ r15,
+    ];
+    unsafe {
+        core::arch::asm!(
+            "mov rax, [r11 + 0x30]",
+            "mov rdi, [r11 + 0x18]",
+            "mov rsi, [r11 + 0x20]",
+            "mov rdx, [r11 + 0x28]",
+            "mov rbx, [r11 + 0x38]",
+            "mov rbp, [r11 + 0x40]",
+            "mov r8,  [r11 + 0x48]",
+            "mov r9,  [r11 + 0x50]",
+            "mov r10, [r11 + 0x58]",
+            "mov r12, [r11 + 0x60]",
+            "mov r13, [r11 + 0x68]",
+            "mov r14, [r11 + 0x70]",
+            "mov r15, [r11 + 0x78]",
+            "mov rcx, [r11 + 0x00]",
+            "mov rsp, [r11 + 0x10]",
+            "mov r11, [r11 + 0x08]",
+            "sysretq",
+            in("r11") frame.as_ptr(),
+            options(noreturn),
+        )
+    }
+}
+
 /// Kernel-task entry point: loads the user PML4 and SYSRETs to ring-3.
 ///
 /// This function never returns — it ends with `sysretq` which transfers

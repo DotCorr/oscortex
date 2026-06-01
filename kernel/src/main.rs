@@ -40,6 +40,7 @@ mod logger;
 mod mm;
 mod net;
 mod panic;
+mod pkg;
 mod port_ns;
 mod process;
 mod sched;
@@ -204,6 +205,9 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── 7c. Block, serial, and networking ─────────────────────────────────
     drivers::platform::init_block_and_net();
+
+    // ── 7d. On-demand package delivery ────────────────────────────────
+    pkg::init();
 
     // ── 8. AI Cortex ─────────────────────────────────────────────────────
     // The Cortex boots last so every kernel subsystem is available to it.

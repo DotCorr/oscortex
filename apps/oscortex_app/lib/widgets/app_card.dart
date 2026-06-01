@@ -31,18 +31,28 @@ class _AppCardState extends State<AppCard> {
       null => Icons.apps_rounded,
     };
 
+    final isRemote = widget.app.isRemote;
+    final isResolving = widget.app.isResolving;
+    final iconColor = isRemote
+        ? widget.accentColor.withValues(alpha: 0.50)
+        : widget.accentColor.withValues(alpha: 0.85);
+
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
       child: GestureDetector(
-        onTap: widget.onLaunch,
+        onTap: isResolving ? null : widget.onLaunch,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           curve: Curves.easeOut,
           decoration: BoxDecoration(
             borderRadius: OscRadii.cardBorder,
             border: Border.all(
-              color: _hovered ? OscColors.borderHover : OscColors.border,
+              color: isResolving
+                  ? widget.accentColor.withValues(alpha: 0.40)
+                  : _hovered
+                      ? OscColors.borderHover
+                      : OscColors.border,
             ),
             color: _hovered ? OscColors.surfaceHover : OscColors.surface,
             boxShadow: [
@@ -51,45 +61,84 @@ class _AppCardState extends State<AppCard> {
           ),
           child: Padding(
             padding: const EdgeInsets.all(16),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
+            child: Stack(
               children: [
-                Container(
-                  width: 44,
-                  height: 44,
-                  decoration: BoxDecoration(
-                    borderRadius: OscRadii.innerBorder,
-                    color: widget.accentColor.withValues(alpha: 0.12),
-                    border: Border.all(
-                      color: widget.accentColor.withValues(alpha: 0.20),
+                // Main content
+                Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Container(
+                      width: 44,
+                      height: 44,
+                      decoration: BoxDecoration(
+                        borderRadius: OscRadii.innerBorder,
+                        color: widget.accentColor.withValues(alpha: 0.12),
+                        border: Border.all(
+                          color: widget.accentColor.withValues(alpha: 0.20),
+                        ),
+                      ),
+                      child: isResolving
+                          ? Center(
+                              child: SizedBox.square(
+                                dimension: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: widget.accentColor,
+                                ),
+                              ),
+                            )
+                          : Icon(icon, size: 20, color: iconColor),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      widget.app.name,
+                      textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: OscTypography.body.copyWith(
+                        fontWeight: FontWeight.w600,
+                        color: OscColors.textBright,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      isResolving
+                          ? 'Resolving…'
+                          : isRemote
+                              ? '${widget.app.version} · ${widget.app.sizeLabel}'
+                              : widget.app.version,
+                      style: TextStyle(
+                        fontSize: 10,
+                        fontWeight: FontWeight.w400,
+                        color: isResolving
+                            ? widget.accentColor.withValues(alpha: 0.60)
+                            : Colors.white.withValues(alpha: 0.35),
+                      ),
+                    ),
+                  ],
+                ),
+                // Cloud badge for remote apps
+                if (isRemote)
+                  Positioned(
+                    top: 0,
+                    right: 0,
+                    child: Container(
+                      width: 18,
+                      height: 18,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        color: OscColors.surface,
+                        border: Border.all(
+                          color: widget.accentColor.withValues(alpha: 0.30),
+                        ),
+                      ),
+                      child: Icon(
+                        Icons.cloud_download_outlined,
+                        size: 10,
+                        color: widget.accentColor.withValues(alpha: 0.70),
+                      ),
                     ),
                   ),
-                  child: Icon(
-                    icon,
-                    size: 20,
-                    color: widget.accentColor.withValues(alpha: 0.85),
-                  ),
-                ),
-                const SizedBox(height: 12),
-                Text(
-                  widget.app.name,
-                  textAlign: TextAlign.center,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: OscTypography.body.copyWith(
-                    fontWeight: FontWeight.w600,
-                    color: OscColors.textBright,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  widget.app.version,
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.w400,
-                    color: Colors.white.withValues(alpha: 0.35),
-                  ),
-                ),
               ],
             ),
           ),

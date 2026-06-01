@@ -19,6 +19,7 @@ class ShellDesktop extends StatefulWidget {
 
 class _ShellDesktopState extends State<ShellDesktop> {
   List<AppTile> _apps = const [];
+  List<AppTile> _catalogApps = const []; // remote catalog entries
   String? _error;
   String _status = 'Scanning /Applications...';
   bool _loading = false;
@@ -79,13 +80,33 @@ class _ShellDesktopState extends State<ShellDesktop> {
       _error = null;
     });
     try {
-      final items = await ShellService.refreshApps();
+      // Fetch both local registry AND remote catalog in parallel.
+      final results = await Future.wait([
+        ShellService.refreshApps(),
+        ShellService.fetchCatalog(),
+      ]);
+      final localApps = results[0];
+      final catalogApps = results[1];
+
       if (!mounted) return;
+
+      // Merge: catalog apps that aren't already local.
+      final localNames = localApps.map((a) => a.name).toSet();
+      final remoteOnly = catalogApps
+          .where((a) => !localNames.contains(a.name))
+          .toList();
+
       setState(() {
-        _apps = items;
+        _apps = localApps;
+        _catalogApps = remoteOnly;
         _loading = false;
       });
-      _setStatus('${items.length} app(s) available from the OS registry.');
+
+      final total = localApps.length + remoteOnly.length;
+      final label = remoteOnly.isEmpty
+          ? '${localApps.length} app(s) available.'
+          : '${localApps.length} local · ${remoteOnly.length} on-demand · $total total';
+      _setStatus(label);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -97,6 +118,12 @@ class _ShellDesktopState extends State<ShellDesktop> {
   }
 
   Future<void> _launchApp(AppTile app) async {
+    // On-demand resolution for remote apps.
+    if (app.isRemote) {
+      await _resolveAndLaunch(app);
+      return;
+    }
+
     _setStatus('Launching ${app.name} as a separate app PID...', snack: true);
     final success = await ShellService.launchApp(app.id);
     if (!success) {
@@ -104,6 +131,53 @@ class _ShellDesktopState extends State<ShellDesktop> {
       return;
     }
     _setStatus('${app.name} launch requested.');
+  }
+
+  Future<void> _resolveAndLaunch(AppTile app) async {
+    // Set the app to resolving state.
+    setState(() {
+      final idx = _catalogApps.indexWhere((a) => a.name == app.name);
+      if (idx >= 0) {
+        _catalogApps = List.of(_catalogApps);
+        _catalogApps[idx] = app.copyWith(source: AppSource.resolving);
+      }
+    });
+    _setStatus('Fetching ${app.name} from package server...', snack: true);
+
+    final appId = await ShellService.resolvePackage(app.name);
+
+    if (!mounted) return;
+
+    if (appId < 0) {
+      // Resolve failed — revert to remote state.
+      setState(() {
+        final idx = _catalogApps.indexWhere((a) => a.name == app.name);
+        if (idx >= 0) {
+          _catalogApps = List.of(_catalogApps);
+          _catalogApps[idx] = app.copyWith(source: AppSource.remote);
+        }
+      });
+      _setStatus('Failed to fetch ${app.name}.', snack: true);
+      return;
+    }
+
+    // Move from catalog to local apps.
+    final localApp = app.copyWith(source: AppSource.local, id: appId);
+    setState(() {
+      _catalogApps = _catalogApps
+          .where((a) => a.name != app.name)
+          .toList();
+      _apps = [..._apps, localApp];
+    });
+    _setStatus('${app.name} cached — launching...', snack: true);
+
+    // Now launch.
+    final success = await ShellService.launchApp(appId);
+    if (!success) {
+      _setStatus('Launch failed for ${app.name}.', snack: true);
+      return;
+    }
+    _setStatus('${app.name} launched.');
   }
 
   void _setActiveHub(CoreAppRole role) {
@@ -117,9 +191,11 @@ class _ShellDesktopState extends State<ShellDesktop> {
     return null;
   }
 
+  /// All apps shown in the workspace: local non-core first, then remote catalog.
   List<AppTile> get _nonCoreApps => [
         for (final app in _apps)
           if (!app.isCore) app,
+        ..._catalogApps,
       ];
 
   @override
