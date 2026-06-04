@@ -1,0 +1,1548 @@
+diff --git a/apps/oscortex_app/lib/widgets/shell_desktop.dart b/apps/oscortex_app/lib/widgets/shell_desktop.dart
+index 54dfddd..88a460b 100644
+--- a/apps/oscortex_app/lib/widgets/shell_desktop.dart
++++ b/apps/oscortex_app/lib/widgets/shell_desktop.dart
+@@ -236,7 +236,7 @@ class _ShellDesktopState extends State<ShellDesktop> {
+ 
+   Widget _buildToolbar() {
+     return OscToolbar(
+-      title: 'Personal Canvas',
++      title: 'OSCortex Embedded Hub',
+       status: _status,
+       trailing: [
+         _SettingsButton(),
+@@ -300,7 +300,7 @@ class _ShellDesktopState extends State<ShellDesktop> {
+     return OscHubDock(
+       segments: [
+         OscHubSegment(
+-          label: 'Canvas Hub',
++          label: 'Setup Hub',
+           active: _activeHub == CoreAppRole.canvas,
+           enabled: canvas != null,
+           onTap: () {
+@@ -378,8 +378,8 @@ class _SettingsButton extends StatelessWidget {
+   }
+ }
+ 
+-// ─── Workspace (main content area with spec cards) ─────────────────────
+-class _Workspace extends StatelessWidget {
++// ─── Workspace (Setup Dashboard wizard) ──────────────────────────────────
++class _Workspace extends StatefulWidget {
+   const _Workspace({
+     required this.apps,
+     required this.error,
+@@ -392,259 +392,312 @@ class _Workspace extends StatelessWidget {
+   final bool loading;
+   final ValueChanged<AppTile> onLaunch;
+ 
++  @override
++  State<_Workspace> createState() => _WorkspaceState();
++}
++
++class _WorkspaceState extends State<_Workspace> {
++  final List<String> _hardwareLogs = [
++    "[INFO] Compositor: Online (1280x800 bpp=32) [OK]",
++    "[INFO] Storage: VirtIO-Blk online (vdisk.img: 8 MiB) [OK]",
++    "[INFO] Input: XHCI USB-HID router online [OK]",
++    "[INFO] Network: VirtIO-Net ready (MAC 52:54:00:12:34:56) [OK]",
++  ];
++  
++  bool _i2cScanning = true;
++  bool _canScanning = false;
++  Timer? _simTimer;
++  int _simStep = 0;
++
++  @override
++  void initState() {
++    super.initState();
++    _simTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
++      if (!mounted) return;
++      setState(() {
++        _simStep++;
++        if (_simStep == 1) {
++          _hardwareLogs.add("[WARN] I2C: Unknown device detected at address 0x48");
++        } else if (_simStep == 2) {
++          _hardwareLogs.add("[INFO] Cortex: Analyzing datasheet for I2C 0x48...");
++        } else if (_simStep == 3) {
++          _hardwareLogs.add("[INFO] Cortex: ADT7410 temperature sensor matched");
++        } else if (_simStep == 4) {
++          _hardwareLogs.add("[INFO] Cortex: Generating CDP-WASM driver code...");
++        } else if (_simStep == 5) {
++          _hardwareLogs.add("[INFO] CDP-WASM: Driver compiled: temp_sensor_0.wasm");
++          _hardwareLogs.add("[INFO] Device: TempSensor_0 registered successfully [Active]");
++          _i2cScanning = false;
++          _canScanning = true;
++        } else if (_simStep == 6) {
++          _hardwareLogs.add("[INFO] CAN: Scanning CAN0 bus at 500 kbps...");
++        } else if (_simStep == 7) {
++          _hardwareLogs.add("[WARN] CAN: Unknown infotainment protocol packets detected");
++        } else if (_simStep == 8) {
++          _hardwareLogs.add("[INFO] Cortex: Mapping packets for Toyota CAN bus...");
++        } else if (_simStep == 9) {
++          _hardwareLogs.add("[INFO] CDP-WASM: Toyota Infotainment driver: can_bus_toyota.wasm");
++          _hardwareLogs.add("[INFO] Device: Infotainment interface mapped [Active]");
++          _canScanning = false;
++          timer.cancel();
++        }
++      });
++    });
++  }
++
++  @override
++  void dispose() {
++    _simTimer?.cancel();
++    super.dispose();
++  }
++
+   @override
+   Widget build(BuildContext context) {
+-    if (loading) {
++    if (widget.loading) {
+       return const Center(
+         child: CircularProgressIndicator(color: OscColors.violetLight),
+       );
+     }
+-    if (error != null) {
++    if (widget.error != null) {
+       return Center(
+-        child: Text(error!, style: const TextStyle(color: OscColors.textMuted)),
++        child: Text(widget.error!, style: const TextStyle(color: OscColors.textMuted)),
+       );
+     }
+ 
+-    return Column(
+-      crossAxisAlignment: CrossAxisAlignment.stretch,
+-      children: [
+-        // Intent Bar
+-        const Padding(
+-          padding: EdgeInsets.fromLTRB(16, 0, 16, 0),
+-          child: OscIntentBar(),
+-        ),
+-        // Scrollable workspace cards
+-        Expanded(
+-          child: ListView(
+-            padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
+-            children: [
+-              // Document Canvas Card
+-              const _DocumentCanvasCard(),
+-              const SizedBox(height: 12),
+-              // Two-column row: Media Player + Knowledge Source
+-              const Row(
+-                crossAxisAlignment: CrossAxisAlignment.start,
+-                children: [
+-                  Expanded(child: _MediaPlayerCard()),
+-                  SizedBox(width: 12),
+-                  Expanded(child: _KnowledgeSourceCard()),
+-                ],
+-              ),
+-              const SizedBox(height: 12),
+-              // Generated Engine View
+-              const _GeneratedEngineCard(),
+-              // Third-party apps grid (if any)
+-              if (apps.isNotEmpty) ...[
+-                const SizedBox(height: 16),
+-                Padding(
+-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+-                  child: OscSectionLabel(
+-                    'INSTALLED APPS',
+-                    small: true,
+-                  ),
+-                ),
+-                const SizedBox(height: 8),
+-                GridView.builder(
+-                  shrinkWrap: true,
+-                  physics: const NeverScrollableScrollPhysics(),
+-                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+-                    maxCrossAxisExtent: 200,
+-                    mainAxisSpacing: 10,
+-                    crossAxisSpacing: 10,
+-                    childAspectRatio: 1.1,
+-                  ),
+-                  itemCount: apps.length,
+-                  itemBuilder: (context, index) {
+-                    final app = apps[index];
+-                    return AppCard(
+-                      app: app,
+-                      onLaunch: () => onLaunch(app),
+-                      accentColor: OscColors.violet,
+-                    );
+-                  },
+-                ),
+-              ],
+-            ],
+-          ),
+-        ),
+-      ],
+-    );
+-  }
+-}
+-
+-// ─── Document Canvas Card ──────────────────────────────────────────────
+-class _DocumentCanvasCard extends StatelessWidget {
+-  const _DocumentCanvasCard();
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return OscCard(
+-      gradient: OscCard.violetGradient,
+-      padding: const EdgeInsets.all(18),
+-      child: Column(
+-        crossAxisAlignment: CrossAxisAlignment.start,
++    return Padding(
++      padding: const EdgeInsets.all(16.0),
++      child: Row(
++        crossAxisAlignment: CrossAxisAlignment.stretch,
+         children: [
+-          Row(
+-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+-            crossAxisAlignment: CrossAxisAlignment.start,
+-            children: [
+-              Column(
+-                crossAxisAlignment: CrossAxisAlignment.start,
+-                children: [
+-                  OscSectionLabel(
+-                    'DOCUMENT CANVAS',
+-                    color: OscColors.violetLight.withValues(alpha: 0.85),
+-                  ),
+-                  const SizedBox(height: 6),
+-                  Text(
+-                    '\u201CProject Proposal.md\u201D',
+-                    style: OscTypography.heading3,
+-                  ),
+-                ],
+-              ),
+-              const OscStatusBadge(
+-                label: 'Auto-saving',
+-                color: OscColors.green,
+-              ),
+-            ],
++          // Left column: QR code & pairing
++          Expanded(
++            flex: 4,
++            child: _buildPairingPanel(context),
+           ),
+-          const SizedBox(height: 14),
+-          Text(
+-            'The transition away from static software models requires a radical '
+-            'inversion of hardware abstraction maps. By structuring intent parsing '
+-            'frameworks at the system core layer, users no longer interact with '
+-            'isolated platforms, but rather text environments that shift dynamically '
+-            'based on temporary workflow requirements\u2026',
+-            style: OscTypography.bodySmall,
++          const SizedBox(width: 16),
++          // Right column: Auto-discovery logs & system info
++          Expanded(
++            flex: 5,
++            child: _buildDiscoveryPanel(),
+           ),
+         ],
+       ),
+     );
+   }
+-}
+ 
+-// ─── Media Player Card ─────────────────────────────────────────────────
+-class _MediaPlayerCard extends StatelessWidget {
+-  const _MediaPlayerCard();
+-
+-  @override
+-  Widget build(BuildContext context) {
++  Widget _buildPairingPanel(BuildContext context) {
+     return OscCard(
++      gradient: OscCard.violetGradient,
++      padding: const EdgeInsets.all(24),
+       child: Column(
+-        crossAxisAlignment: CrossAxisAlignment.start,
++        crossAxisAlignment: CrossAxisAlignment.stretch,
+         children: [
+-          const OscSectionLabel('NOW PLAYING', small: true),
+-          const SizedBox(height: 10),
+-          Row(
+-            crossAxisAlignment: CrossAxisAlignment.start,
+-            children: [
+-              Expanded(
+-                child: Column(
+-                  crossAxisAlignment: CrossAxisAlignment.start,
+-                  children: [
+-                    Text(
+-                      'Ambient Waves',
+-                      style: OscTypography.body.copyWith(
+-                        color: OscColors.textBright,
+-                      ),
+-                    ),
+-                    const SizedBox(height: 3),
+-                    Text(
+-                      'Cortex Generative Radio',
+-                      style: OscTypography.caption.copyWith(
+-                        color: Colors.white.withValues(alpha: 0.35),
+-                      ),
+-                    ),
+-                  ],
+-                ),
++          OscSectionLabel(
++            'OSCORTEX EMBEDDED EDITION',
++            color: OscColors.violetLight.withValues(alpha: 0.85),
++          ),
++          const SizedBox(height: 8),
++          const Text(
++            'Setup & Connection',
++            style: OscTypography.heading3,
++          ),
++          const SizedBox(height: 24),
++          const Center(
++            child: _QrCodeWidget(),
++          ),
++          const SizedBox(height: 24),
++          const Center(
++            child: Text(
++              'Pairing Code: OSC-982-CTX',
++              style: TextStyle(
++                fontSize: 16,
++                fontWeight: FontWeight.bold,
++                letterSpacing: 1.5,
++                color: OscColors.violetLight,
+               ),
+-              const OscWaveform(),
+-            ],
++            ),
++          ),
++          const SizedBox(height: 16),
++          const Divider(color: OscColors.border, height: 1),
++          const SizedBox(height: 16),
++          _buildPairingStatusRow(
++            label: 'WiFi Status',
++            value: 'Connected to AP (OSCortex-Setup)',
++            active: true,
+           ),
+           const SizedBox(height: 12),
+-          Wrap(
+-            spacing: 6,
+-            runSpacing: 4,
+-            children: [
+-              const OscTag(label: 'Local Sync'),
+-              OscTag.violet(label: 'Spatial Audio Active'),
+-            ],
++          _buildPairingStatusRow(
++            label: 'Bridge Server',
++            value: 'Listening on port 50051 (TCP)',
++            active: true,
++          ),
++          const SizedBox(height: 12),
++          _buildPairingStatusRow(
++            label: 'Dashboard Tunnel',
++            value: 'Waiting for developer pair...',
++            active: false,
++          ),
++          const Spacer(),
++          OscButton(
++            label: 'Configure WiFi',
++            onPressed: () {
++              ScaffoldMessenger.of(context).showSnackBar(
++                const SnackBar(content: Text('Scanning for local WiFi access points...')),
++              );
++            },
+           ),
+         ],
+       ),
+     );
+   }
+-}
+ 
+-// ─── Knowledge Source Card ──────────────────────────────────────────────
+-class _KnowledgeSourceCard extends StatelessWidget {
+-  const _KnowledgeSourceCard();
+-
+-  @override
+-  Widget build(BuildContext context) {
+-    return OscCard(
+-      child: Column(
+-        crossAxisAlignment: CrossAxisAlignment.start,
+-        children: [
+-          const OscSectionLabel('KNOWLEDGE SOURCE ENGINE', small: true),
+-          const SizedBox(height: 8),
+-          Text(
+-            'https://en.wikipedia.org/wiki/Operating_system',
+-            style: OscTypography.monoSmall.copyWith(color: OscColors.skyBlue),
+-            overflow: TextOverflow.ellipsis,
++  Widget _buildPairingStatusRow({
++    required String label,
++    required String value,
++    required bool active,
++  }) {
++    return Row(
++      children: [
++        Container(
++          width: 8,
++          height: 8,
++          decoration: BoxDecoration(
++            shape: BoxShape.circle,
++            color: active ? OscColors.green : OscColors.textMuted,
+           ),
+-          const SizedBox(height: 6),
+-          Text(
+-            'Operating Systems Architecture Evolution',
+-            style: OscTypography.bodySmall.copyWith(
+-              fontWeight: FontWeight.w500,
+-              color: OscColors.textBright,
+-            ),
++        ),
++        const SizedBox(width: 8),
++        Text(
++          '$label: ',
++          style: OscTypography.bodySmall.copyWith(
++            fontWeight: FontWeight.bold,
++            color: Colors.white70,
+           ),
+-          const SizedBox(height: 8),
+-          Text(
+-            'An operating system (OS) is system software that manages '
+-            'computer hardware, software resources, and provides common '
+-            'services for computer programs\u2026',
+-            style: TextStyle(
+-              fontSize: 10.5,
+-              height: 1.5,
+-              color: Colors.white.withValues(alpha: 0.35),
++        ),
++        Expanded(
++          child: Text(
++            value,
++            style: OscTypography.bodySmall.copyWith(
++              color: active ? OscColors.textBright : OscColors.textMuted,
+             ),
++            overflow: TextOverflow.ellipsis,
+           ),
+-        ],
+-      ),
++        ),
++      ],
+     );
+   }
+-}
+ 
+-// ─── Generated Engine View Card ────────────────────────────────────────
+-class _GeneratedEngineCard extends StatelessWidget {
+-  const _GeneratedEngineCard();
+-
+-  @override
+-  Widget build(BuildContext context) {
++  Widget _buildDiscoveryPanel() {
+     return OscCard(
+-      activeBorder: true,
+-      gradient: OscCard.liveGradient,
++      padding: const EdgeInsets.all(20),
+       child: Column(
+-        crossAxisAlignment: CrossAxisAlignment.start,
++        crossAxisAlignment: CrossAxisAlignment.stretch,
+         children: [
+           Row(
+             mainAxisAlignment: MainAxisAlignment.spaceBetween,
+             children: [
+-              const OscSectionLabel('GENERATED ENGINE VIEW', small: true),
++              const OscSectionLabel('CORTEX HARDWARE DISCOVERY'),
+               OscStatusBadge(
+-                label: 'Live',
+-                color: OscColors.violetLight,
++                label: 'AI-Healing Active',
++                color: OscColors.green,
+               ),
+             ],
+           ),
+-          const SizedBox(height: 10),
+-          Text(
+-            'Injected general-purpose widget context directly into active '
+-            'space. Render layout optimized natively.',
+-            style: OscTypography.bodySmall,
++          const SizedBox(height: 12),
++          Expanded(
++            child: Container(
++              padding: const EdgeInsets.all(12),
++              decoration: BoxDecoration(
++                color: Colors.black.withValues(alpha: 0.4),
++                borderRadius: BorderRadius.circular(8),
++                border: Border.all(color: OscColors.border),
++              ),
++              child: ListView.builder(
++                itemCount: _hardwareLogs.length,
++                itemBuilder: (context, index) {
++                  final logStr = _hardwareLogs[_hardwareLogs.length - 1 - index];
++                  Color color = Colors.white70;
++                  if (logStr.contains('[WARN]')) {
++                    color = OscColors.violetLight;
++                  } else if (logStr.contains('[ERROR]')) {
++                    color = Colors.redAccent;
++                  } else if (logStr.contains('Active') || logStr.contains('[OK]') || logStr.contains('successfully') || logStr.contains('registered')) {
++                    color = OscColors.green;
++                  }
++                  
++                  return Padding(
++                    padding: const EdgeInsets.only(bottom: 6.0),
++                    child: Text(
++                      logStr,
++                      style: OscTypography.monoSmall.copyWith(color: color),
++                    ),
++                  );
++                },
++              ),
++            ),
++          ),
++          const SizedBox(height: 16),
++          Container(
++            padding: const EdgeInsets.all(12),
++            decoration: BoxDecoration(
++              color: Colors.white.withValues(alpha: 0.02),
++              borderRadius: BorderRadius.circular(8),
++              border: Border.all(color: OscColors.border),
++            ),
++            child: Column(
++              crossAxisAlignment: CrossAxisAlignment.start,
++              children: [
++                const Text(
++                  'Cortex Scan Status',
++                  style: TextStyle(
++                    fontSize: 12,
++                    fontWeight: FontWeight.bold,
++                    color: OscColors.textBright,
++                  ),
++                ),
++                const SizedBox(height: 8),
++                Row(
++                  children: [
++                    if (_i2cScanning) ...[
++                      const SizedBox(
++                        width: 12,
++                        height: 12,
++                        child: CircularProgressIndicator(
++                          strokeWidth: 1.5,
++                          color: OscColors.violetLight,
++                        ),
++                      ),
++                      const SizedBox(width: 8),
++                      const Text(
++                        'Scanning I2C addresses...',
++                        style: TextStyle(fontSize: 11, color: OscColors.textMuted),
++                      ),
++                    ] else if (_canScanning) ...[
++                      const SizedBox(
++                        width: 12,
++                        height: 12,
++                        child: CircularProgressIndicator(
++                          strokeWidth: 1.5,
++                          color: OscColors.violetLight,
++                        ),
++                      ),
++                      const SizedBox(width: 8),
++                      const Text(
++                        'Mapping CAN bus packet structures...',
++                        style: TextStyle(fontSize: 11, color: OscColors.textMuted),
++                      ),
++                    ] else ...[
++                      const Icon(Icons.check_circle_rounded, color: OscColors.green, size: 14),
++                      const SizedBox(width: 8),
++                      const Text(
++                        'All hardware initialized. System ready for hot-push.',
++                        style: TextStyle(fontSize: 11, color: OscColors.green),
++                      ),
++                    ]
++                  ],
++                ),
++              ],
++            ),
+           ),
+         ],
+       ),
+@@ -652,32 +705,85 @@ class _GeneratedEngineCard extends StatelessWidget {
+   }
+ }
+ 
+-// ─── Previews ──────────────────────────────────────────────────────────
++// ─── Stylized QR Code Widget ─────────────────────────────────────────────
++class _QrCodeWidget extends StatelessWidget {
++  const _QrCodeWidget();
+ 
+-@OscPreview(name: 'Document Canvas Card', group: 'Shell Workspace')
+-Widget documentCanvasPreview() {
+-  return const SizedBox(width: 500, child: _DocumentCanvasCard());
+-}
+-
+-@OscPreview(name: 'Media Player Card', group: 'Shell Workspace')
+-Widget mediaPlayerPreview() {
+-  return const SizedBox(width: 300, child: _MediaPlayerCard());
+-}
++  @override
++  Widget build(BuildContext context) {
++    final grid = [
++      [1,1,1,1,1,1,1,0,1,0,1,1,0,1,1,1,1,1,1,1],
++      [1,0,0,0,0,0,1,0,0,1,0,0,0,1,0,0,0,0,0,1],
++      [1,0,1,1,1,0,1,0,1,0,1,1,0,1,0,1,1,1,0,1],
++      [1,0,1,1,1,0,1,0,1,1,0,0,0,1,0,1,1,1,0,1],
++      [1,0,1,1,1,0,1,0,0,0,1,0,1,1,0,1,1,1,0,1],
++      [1,0,0,0,0,0,1,0,1,1,0,1,0,1,0,0,0,0,0,1],
++      [1,1,1,1,1,1,1,0,1,0,1,0,0,1,1,1,1,1,1,1],
++      [0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0],
++      [1,1,0,1,0,1,0,1,1,0,0,0,1,1,0,1,0,1,1,0],
++      [0,0,1,0,0,1,1,0,1,1,1,0,1,0,0,1,1,0,0,1],
++      [1,0,1,1,0,0,0,1,0,0,1,1,0,1,1,0,1,0,1,0],
++      [0,0,0,1,1,1,0,1,1,0,1,0,0,0,1,1,1,0,1,1],
++      [0,0,0,0,0,0,0,0,1,1,0,1,1,1,0,0,0,0,1,1],
++      [1,1,1,1,1,1,1,0,0,1,0,0,1,1,0,1,0,1,0,0],
++      [1,0,0,0,0,0,1,0,1,0,1,1,0,0,1,1,0,0,1,1],
++      [1,0,1,1,1,0,1,0,0,1,1,0,1,0,1,0,1,1,0,0],
++      [1,0,1,1,1,0,1,0,1,0,0,1,0,1,0,1,0,0,1,1],
++      [1,0,1,1,1,0,1,0,0,1,1,1,0,0,1,1,1,0,0,1],
++      [1,0,0,0,0,0,1,0,1,1,0,0,1,0,1,0,1,0,1,1],
++      [1,1,1,1,1,1,1,0,1,0,1,1,1,1,0,1,0,1,0,1]
++    ];
+ 
+-@OscPreview(name: 'Knowledge Source Card', group: 'Shell Workspace')
+-Widget knowledgeSourcePreview() {
+-  return const SizedBox(width: 300, child: _KnowledgeSourceCard());
++    return Container(
++      padding: const EdgeInsets.all(12),
++      decoration: BoxDecoration(
++        color: Colors.white,
++        borderRadius: BorderRadius.circular(12),
++        boxShadow: [
++          BoxShadow(
++            color: Colors.black.withValues(alpha: 0.2),
++            blurRadius: 10,
++            spreadRadius: 2,
++          ),
++        ],
++      ),
++      child: SizedBox(
++        width: 160,
++        height: 160,
++        child: GridView.builder(
++          physics: const NeverScrollableScrollPhysics(),
++          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
++            crossAxisCount: grid.length,
++          ),
++          itemCount: grid.length * grid.length,
++          itemBuilder: (context, index) {
++            final r = index ~/ grid.length;
++            final c = index % grid.length;
++            final isActive = grid[r][c] == 1;
++            return Container(
++              color: isActive ? Colors.black : Colors.white,
++            );
++          },
++        ),
++      ),
++    );
++  }
+ }
+ 
+-@OscPreview(name: 'Generated Engine Card', group: 'Shell Workspace')
+-Widget generatedEnginePreview() {
+-  return const SizedBox(width: 500, child: _GeneratedEngineCard());
++// ─── Previews ──────────────────────────────────────────────────────────
++@OscPreview(name: 'Stylized QR Code', group: 'Setup Dashboard')
++Widget qrCodePreview() {
++  return const Padding(
++    padding: EdgeInsets.all(24),
++    child: _QrCodeWidget(),
++  );
+ }
+ 
+-@OscPreview(name: 'Settings Button', group: 'Shell Chrome')
++@OscPreview(name: 'Settings Button', group: 'Setup Chrome')
+ Widget settingsButtonPreview() {
+   return Padding(
+     padding: const EdgeInsets.all(16),
+     child: _SettingsButton(),
+   );
+ }
++
+diff --git a/kernel/src/arch/x86_64/idt.rs b/kernel/src/arch/x86_64/idt.rs
+index c192db3..3003cb5 100644
+--- a/kernel/src/arch/x86_64/idt.rs
++++ b/kernel/src/arch/x86_64/idt.rs
+@@ -268,16 +268,19 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
+             frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15
+         );
+         if frame.rsp != 0 {
+-            let mut slots = [0u64; 8];
++            let mut slots = [0u64; 32];
+             unsafe {
+-                for i in 0..8 {
++                for i in 0..32 {
+                     let p = (frame.rsp as *const u64).add(i);
+                     slots[i] = core::ptr::read_volatile(p);
+                 }
+             }
+             log::error!(
+-                "[PageFault] stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x}",
+-                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]
++                "[PageFault] stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x} +64={:#x} +72={:#x} +80={:#x} +88={:#x} +96={:#x} +104={:#x} +112={:#x} +120={:#x} +128={:#x} +136={:#x} +144={:#x} +152={:#x} +160={:#x} +168={:#x} +176={:#x} +184={:#x} +192={:#x} +200={:#x} +208={:#x} +216={:#x} +224={:#x} +232={:#x} +240={:#x} +248={:#x}",
++                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7],
++                slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15],
++                slots[16], slots[17], slots[18], slots[19], slots[20], slots[21], slots[22], slots[23],
++                slots[24], slots[25], slots[26], slots[27], slots[28], slots[29], slots[30], slots[31]
+             );
+         }
+         // For ip=0 (NULL call), try to disassemble the bytes just before
+diff --git a/kernel/src/logger.rs b/kernel/src/logger.rs
+index e93cb38..44d494d 100644
+--- a/kernel/src/logger.rs
++++ b/kernel/src/logger.rs
+@@ -27,11 +27,11 @@ impl Log for KernelLogger {
+ 
+ /// Tiny stack-allocated write buffer for log formatting (no heap needed).
+ struct FmtBuf {
+-    buf: [u8; 512],
++    buf: [u8; 2048],
+     len: usize,
+ }
+ impl FmtBuf {
+-    fn new() -> Self { Self { buf: [0u8; 512], len: 0 } }
++    fn new() -> Self { Self { buf: [0u8; 2048], len: 0 } }
+     fn as_str(&self) -> &str {
+         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("(fmt err)")
+     }
+diff --git a/kernel/src/mm/frame_allocator.rs b/kernel/src/mm/frame_allocator.rs
+index 34cf044..2c9bedf 100644
+--- a/kernel/src/mm/frame_allocator.rs
++++ b/kernel/src/mm/frame_allocator.rs
+@@ -99,8 +99,12 @@ impl FrameBitmap {
+     fn free(&mut self, phys: u64) {
+         let frame = (phys / FRAME_SIZE as u64) as usize;
+         if frame < MAX_FRAMES {
+-            self.bits[frame / 64] |= 1 << (frame % 64);
+-            self.used = self.used.saturating_sub(1);
++            let mask = 1u64 << (frame % 64);
++            let idx = frame / 64;
++            if (self.bits[idx] & mask) == 0 {
++                self.bits[idx] |= mask;
++                self.used = self.used.saturating_sub(1);
++            }
+         }
+     }
+ }
+diff --git a/kernel/src/mm/paging.rs b/kernel/src/mm/paging.rs
+index 48bcddb..4b59398 100644
+--- a/kernel/src/mm/paging.rs
++++ b/kernel/src/mm/paging.rs
+@@ -237,6 +237,33 @@ mod x86_64_impl {
+         }
+     }
+ 
++    pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
++        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
++        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
++        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
++        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
++        let present  = PageFlags::PRESENT.bits();
++
++        unsafe {
++            let pml4 = phys_to_virt(pml4_phys) as *const u64;
++            let pml4e = pml4.add(pml4_idx).read_volatile();
++            if pml4e & present == 0 { return None; }
++            let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *const u64;
++            let pdpte = pdpt.add(pdpt_idx).read_volatile();
++            if pdpte & present == 0 { return None; }
++            let pd = phys_to_virt(pdpte & PHYS_MASK) as *const u64;
++            let pde = pd.add(pd_idx).read_volatile();
++            if pde & present == 0 { return None; }
++            let pt = phys_to_virt(pde & PHYS_MASK) as *const u64;
++            let pte = pt.add(pt_idx).read_volatile();
++            if pte & present == 0 { return None; }
++            let phys = pte & PHYS_MASK;
++            let writable = (pte & PageFlags::WRITABLE.bits()) != 0;
++            let exec = (pte & PageFlags::NO_EXECUTE.bits()) == 0;
++            Some((phys, writable, exec))
++        }
++    }
++
+     pub unsafe fn update_user_page_flags(
+         pml4_phys: u64,
+         virt: u64,
+@@ -412,10 +439,37 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
+ 
+ /// Handle a demand-page fault. Returns `true` if the fault was resolved.
+ pub fn demand_page(cr2: u64, error: u64) -> bool {
+-    // Only handle not-present faults (bit 0 = 0).
+-    // Ignore write-protection violations (bit 1 = 1).
+     if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
+ 
++    // Read current CR3 to get the active PML4.
++    let cr3_phys: u64;
++    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
++    let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
++
++    // Check if the fault address is in the mirroring range [0x1_0000_0000, 0x3_0000_0000)
++    let page_va = cr2 & !0xFFF;
++    if page_va >= 0x1_0000_0000 && page_va < 0x3_0000_0000 {
++        let mirrored_va = page_va - 0x1_0000_0000;
++        
++        // Translate the mirrored page to get its physical frame and flags.
++        let mut target = translate_user_page_flags(cr3_phys, mirrored_va);
++        
++        // If the mirrored page is not mapped, try to demand-page it first.
++        if target.is_none() {
++            if demand_page(mirrored_va, error) {
++                target = translate_user_page_flags(cr3_phys, mirrored_va);
++            }
++        }
++        
++        if let Some((phys, writable, exec)) = target {
++            if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, writable, exec) } {
++                log::error!("[demand_page] mirrored map failed at {:#x}: {}", page_va, e);
++                return false;
++            }
++            return true;
++        }
++    }
++
+     // Valid user-space VA range: 0x100000 – canonical limit (below kernel half).
+     // Exclude the trampoline pages at 0x7FFF_E000 (only 2GB mark — but user
+     // space extends to 128TB in x86_64). Reject anything at or above canonical
+@@ -510,6 +564,15 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+     { let _ = (pml4_phys, virt); None }
+ }
+ 
++/// Walk a user PML4 and return the physical frame mapped at `virt` along with
++/// its writable and executable flags.
++pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
++    #[cfg(target_arch = "x86_64")]
++    { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
++    #[cfg(not(target_arch = "x86_64"))]
++    { let _ = (pml4_phys, virt); None }
++}
++
+ /// Free all frames in a user PML4 and the PML4 itself.
+ pub fn free_user_pml4(pml4_phys: u64) {
+     #[cfg(target_arch = "x86_64")]
+diff --git a/kernel/src/process/dl.rs b/kernel/src/process/dl.rs
+index 9ff928c..e11fc14 100644
+--- a/kernel/src/process/dl.rs
++++ b/kernel/src/process/dl.rs
+@@ -64,10 +64,13 @@ const STB_WEAK:   u8 = 2;
+ const SHN_UNDEF:  u16 = 0;
+ 
+ /// Virtual address of the first library slot in each process.
+-const LIB_VA_BASE:   u64 = 0x0100_0000; // 16 MiB
++const LIB_VA_BASE:   u64 = 0x1_4000_0000; // 5 GiB
++/// Base address for anonymous memory mappings.
++const ANON_VA_BASE:  u64 = 0x1_1000_0000; // 4.25 GiB
+ /// Minimum VA bump stride between consecutive libraries.
+ const LIB_VA_STRIDE: u64 = 0x0100_0000; // 16 MiB per slot
+ 
++
+ const MAX_LIBS: usize = 16;
+ 
+ // ── ELF64 on-disk structures ───────────────────────────────────────────────────
+@@ -199,12 +202,9 @@ const MAX_AS_SLOTS: usize = 64;
+ struct LibTable {
+     entries:     Vec<LoadedLib>,
+     next_handle: u32,
+-    /// Per-address-space bump VA for the next dynamic mapping (libraries + mmap).
+-    /// Keyed by `pml4_phys` so that threads sharing an address space also share
+-    /// the cursor — otherwise each thread would re-bump from `LIB_VA_BASE` and
+-    /// silently overwrite its siblings' heap mappings in the shared PML4.
+-    /// Fixed-size linear table: (pml4_phys, next_va). `pml4_phys == 0` ⇒ free.
+-    as_slots:    [(u64, u64); MAX_AS_SLOTS],
++    /// Per-address-space bump VAs for dynamic loading and anonymous mappings.
++    /// Format: (pml4_phys, next_lib_va, next_anon_va). `pml4_phys == 0` => free.
++    as_slots:    [(u64, u64, u64); MAX_AS_SLOTS],
+ }
+ 
+ impl LibTable {
+@@ -212,30 +212,61 @@ impl LibTable {
+         Self {
+             entries:     Vec::new(),
+             next_handle: 1,
+-            as_slots:    [(0, 0); MAX_AS_SLOTS],
++            as_slots:    [(0, 0, 0); MAX_AS_SLOTS],
+         }
+     }
+ 
+-    fn bump_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
++    fn bump_lib_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
+         let aligned = (size + LIB_VA_STRIDE - 1) / LIB_VA_STRIDE * LIB_VA_STRIDE;
++        log::info!("[DL] bump_lib_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
+         // Find existing slot for this address space.
+         for slot in self.as_slots.iter_mut() {
+             if slot.0 == pml4_phys {
+                 let base = slot.1;
+                 slot.1 = base + aligned;
++                log::info!("[DL] bump_lib_va: existing slot base={:#x} new_next={:#x}", base, slot.1);
+                 return base;
+             }
+         }
+         // Allocate a new slot.
+         for slot in self.as_slots.iter_mut() {
+             if slot.0 == 0 {
+-                *slot = (pml4_phys, LIB_VA_BASE + aligned);
++                *slot = (pml4_phys, LIB_VA_BASE + aligned, ANON_VA_BASE);
++                log::info!("[DL] bump_lib_va: new slot base={:#x} next_lib={:#x}", LIB_VA_BASE, slot.1);
+                 return LIB_VA_BASE;
+             }
+         }
+-        // Fallback: should not happen with MAX_AS_SLOTS=64. Reuse slot 0.
++        // Fallback: should not happen
+         let base = self.as_slots[0].1;
+         self.as_slots[0].1 = base + aligned;
++        log::info!("[DL] bump_lib_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].1);
++        base
++    }
++
++    fn bump_anon_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
++        let aligned = (size + 4095) / 4096 * 4096;
++        log::info!("[DL] bump_anon_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
++        // Find existing slot for this address space.
++        for slot in self.as_slots.iter_mut() {
++            if slot.0 == pml4_phys {
++                let base = slot.2;
++                slot.2 = base + aligned;
++                log::info!("[DL] bump_anon_va: existing slot base={:#x} new_next={:#x}", base, slot.2);
++                return base;
++            }
++        }
++        // Allocate a new slot.
++        for slot in self.as_slots.iter_mut() {
++            if slot.0 == 0 {
++                *slot = (pml4_phys, LIB_VA_BASE, ANON_VA_BASE + aligned);
++                log::info!("[DL] bump_anon_va: new slot base={:#x} next_anon={:#x}", ANON_VA_BASE, slot.2);
++                return ANON_VA_BASE;
++            }
++        }
++        // Fallback: should not happen
++        let base = self.as_slots[0].2;
++        self.as_slots[0].2 = base + aligned;
++        log::info!("[DL] bump_anon_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].2);
+         base
+     }
+ }
+@@ -418,15 +449,23 @@ fn pt_load_span(bytes: &[u8], hdr: &Elf64Hdr) -> u64 {
+     let ph_num  = hdr.e_phnum as usize;
+     let ph_size = hdr.e_phentsize as usize;
+     let mut max_end = 0u64;
++    log::info!("[DL] pt_load_span: ph_off={} ph_num={} ph_size={}", ph_off, ph_num, ph_size);
+     for i in 0..ph_num {
+         let ph: Elf64Phdr = match read_pod(bytes, ph_off + i * ph_size) {
+             Some(p) => p,
+             None    => break,
+         };
+-        if ph.p_type != PT_LOAD { continue; }
+-        let end = ph.p_vaddr.saturating_add(ph.p_memsz);
++        let p_type = ph.p_type;
++        let p_flags = ph.p_flags;
++        let p_offset = ph.p_offset;
++        let p_vaddr = ph.p_vaddr;
++        let p_memsz = ph.p_memsz;
++        log::info!("[DL] ph[{}]: type={} flags={} offset={:#x} vaddr={:#x} memsz={:#x}", i, p_type, p_flags, p_offset, p_vaddr, p_memsz);
++        if p_type != PT_LOAD { continue; }
++        let end = p_vaddr.saturating_add(p_memsz);
+         if end > max_end { max_end = end; }
+     }
++    log::info!("[DL] pt_load_span: max_end={:#x}", max_end);
+     max_end
+ }
+ 
+@@ -456,7 +495,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
+     // from LIB_VA_BASE and silently overwrite each other's mappings).
+     let _ = pid;
+     let span      = pt_load_span(elf_bytes, &hdr);
+-    let load_base = LIBS.lock().bump_va(pml4_phys, span);
++    let load_base = LIBS.lock().bump_lib_va(pml4_phys, span);
+ 
+     // ── Map PT_LOAD segments ──────────────────────────────────────────────
+     let ph_off  = hdr.e_phoff as usize;
+@@ -477,6 +516,8 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
+         let writable  = (ph.p_flags & PF_W) != 0;
+         let exec      = (ph.p_flags & PF_X) != 0;
+ 
++        let copy_limit = if filesz == ph.p_memsz as usize { npages * 4096 } else { page_off + filesz };
++
+         for p in 0..npages {
+             let page_phys = frame_allocator::alloc_frame().ok_or("OOM: dl segment")?;
+             let hhdm_ptr  = (page_phys + frame_allocator::hhdm_offset()) as *mut u8;
+@@ -487,7 +528,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
+             let page_start = p * 4096; // offset from seg_va
+             let page_end   = page_start + 4096;
+             let data_start = page_start.max(page_off);
+-            let data_end   = page_end.min(page_off + filesz);
++            let data_end   = page_end.min(copy_limit);
+             if data_start < data_end {
+                 let dst_off  = data_start - page_start;
+                 let src_off  = file_off + (data_start - page_off);
+@@ -899,14 +940,14 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
+                 "[mmap_anon] hint {:#x} pages={} overlaps existing mapping; reallocating",
+                 hint_va, pages
+             );
+-            LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
++            LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64)
+         }
+     } else {
+         // Bump-allocate, but skip over any already-mapped ranges. This
+         // prevents the TLS/stack allocator from clobbering a region that
+         // was previously mmap'd by userspace (e.g. a Dart heap chunk that
+         // sits at the same VA the bump cursor would return next).
+-        let mut candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
++        let mut candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
+         for _ in 0..64 {
+             let mut clear = true;
+             for p in 0..pages {
+@@ -922,7 +963,7 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
+             if clear { break; }
+             log::warn!("[mmap_anon] bump candidate {:#x} pages={} conflicts; advancing",
+                 candidate, pages);
+-            candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
++            candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
+         }
+         candidate
+     };
+diff --git a/kernel/src/syscall/dispatch.rs b/kernel/src/syscall/dispatch.rs
+index cb2cc54..cbaf47f 100644
+--- a/kernel/src/syscall/dispatch.rs
++++ b/kernel/src/syscall/dispatch.rs
+@@ -193,7 +193,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
+             // as MAP_FIXED, which clobbers libflutter pages when Dart's heap
+             // allocator passes hints that overlap. Force hint=0 unless the
+             // caller explicitly asked for MAP_FIXED.
+-            let hint = if is_fixed { arg0 } else { 0 };
++            let hint = arg0;
+             let va = sys_mmap(hint, arg1, effective_prot);
+             if va < 0 { return va; }
+             if file_backed {
+diff --git a/kernel/src/syscall/handlers/engine.rs b/kernel/src/syscall/handlers/engine.rs
+index b321205..aba6314 100644
+--- a/kernel/src/syscall/handlers/engine.rs
++++ b/kernel/src/syscall/handlers/engine.rs
+@@ -107,6 +107,13 @@ pub(crate) fn sys_dl_get_init_array(handle: u64, out_init_fn: u64, out_array_va:
+ }
+ 
+ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
++    if size >= 0x8000_0000 {
++        // Mock success for large VM cage/heap reservations (typically 4 GiB).
++        // We return a fixed base address (0x1_0000_0000) that sits at the base
++        // of our shifted user address space.
++        log::warn!("[sys_mmap] Mocking large virtual reservation size={:#x} prot={} -> 0x1_0000_0000", size, prot);
++        return 0x1_0000_0000;
++    }
+     if size == 0 || size > 0x1000_0000 {
+         return -22; // EINVAL, max 256 MiB
+     }
+@@ -151,8 +158,18 @@ pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
+     while curr_va < end_va {
+         unsafe {
+             if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+-                // If the range contains unmapped areas, mprotect on POSIX returns ENOMEM (-12)
+-                return -12;
++                // If it fails because the page is not mapped, allocate and map it on-demand
++                // (especially important for mocked large reservations like the 4GB pointer cage).
++                if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
++                    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
++                    core::ptr::write_bytes(hhdm_va, 0, 4096);
++                    if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
++                        crate::mm::frame_allocator::free_frame(phys);
++                        return -12;
++                    }
++                } else {
++                    return -12; // ENOMEM
++                }
+             }
+         }
+         curr_va += 4096;
+diff --git a/scripts/build-iso.sh b/scripts/build-iso.sh
+index 3edd9cd..3219b25 100755
+--- a/scripts/build-iso.sh
++++ b/scripts/build-iso.sh
+@@ -70,8 +70,8 @@ fi
+ echo "[0.3/5] Compiling system shell to AOT ELF (libapp.so)..."
+ DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
+ FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
+-SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
+-GEN_SNAP="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
++SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
++GEN_SNAP="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64-profile/gen_snapshot_x64"
+ PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
+ APP_MAIN="$APP_DIR/lib/main.dart"
+ AOT_DILL="$APP_DIR/build/app_aot.dill"
+@@ -103,6 +103,7 @@ if [ ! -f "$LIBAPP_SO_DEST" ]; then
+     echo "ERROR: gen_snapshot_x64 failed — libapp.so not produced" >&2
+     exit 1
+ fi
++python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO_DEST"
+ echo "[0.3/5] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes"
+ 
+ echo "[0.35/5] Building core system apps into /Applications..."
+@@ -127,7 +128,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
+     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
+     mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
+ 
+-    for f in kernel_blob.bin vm_snapshot_data isolate_snapshot_data; do
++    for f in kernel_blob.bin; do
+         if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
+             echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
+             exit 1
+@@ -142,7 +143,15 @@ if [ -d "$APP_ASSETS_DIR" ]; then
+     rm -f \
+         "$ROOT/initramfs/system/flutter/kernel_blob.bin" \
+         "$ROOT/initramfs/system/flutter/vm_snapshot_data" \
+-        "$ROOT/initramfs/system/flutter/isolate_snapshot_data"
++        "$ROOT/initramfs/system/flutter/isolate_snapshot_data" \
++        "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data" \
++        "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data" \
++        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/vm_snapshot_data" \
++        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/isolate_snapshot_data" \
++        "$ROOT/initramfs/Applications/Files.app/flutter_assets/vm_snapshot_data" \
++        "$ROOT/initramfs/Applications/Files.app/flutter_assets/isolate_snapshot_data" \
++        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/vm_snapshot_data" \
++        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/isolate_snapshot_data"
+ 
+     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
+         if [ -f "$APP_ASSETS_DIR/$f" ]; then
+@@ -186,8 +195,6 @@ REQUIRED_FILES=(
+     "$ROOT/initramfs/Applications/Files.app/Files.osx"
+     "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
+     "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+-    "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
+-    "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
+     "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+     "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+     "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
+@@ -216,7 +223,7 @@ rm -rf "$ISO_ROOT"
+ mkdir -p "$ISO_ROOT/boot/limine"
+ mkdir -p "$ISO_ROOT/EFI/BOOT"
+ 
+-cp "$KERNEL_ELF" "$ISO_ROOT/boot/kernel"
++cat "$KERNEL_ELF" > "$ISO_ROOT/boot/kernel"
+ 
+ cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"
+ cp "$LIMINE_DIR/limine-bios.sys"    "$ISO_ROOT/boot/limine/"
+@@ -239,7 +246,7 @@ verbose: yes
+ EOF
+ 
+ STAGED_ENGINE_SO="$ROOT/initramfs/system/lib/libflutter_engine.so"
+-cp "$STAGED_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
++cat "$STAGED_ENGINE_SO" > "$ISO_ROOT/boot/libflutter_engine.so"
+ echo "[2/5] Staged libflutter_engine.so ($(du -sh "$STAGED_ENGINE_SO" | cut -f1)) as Limine module"
+ 
+ cp "$ISO_ROOT/boot/limine/limine.conf" "$ISO_ROOT/limine.conf"
+diff --git a/tools/build-flutter-osx.sh b/tools/build-flutter-osx.sh
+index a3b63a0..ba0edb0 100755
+--- a/tools/build-flutter-osx.sh
++++ b/tools/build-flutter-osx.sh
+@@ -18,8 +18,8 @@ FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
+ FLUTTER_HOME="${FLUTTER_HOME:-/opt/homebrew/share/flutter}"
+ DARTAOT="$FLUTTER_HOME/bin/cache/dart-sdk/bin/dartaotruntime"
+ FRONTEND_SERVER="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
+-SDK_ROOT_PRODUCT="$FLUTTER_HOME/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
+-GEN_SNAP="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
++SDK_ROOT_PRODUCT="$FLUTTER_HOME/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
++GEN_SNAP="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64-profile/gen_snapshot_x64"
+ 
+ PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
+ APP_MAIN="$APP_DIR/lib/main.dart"
+@@ -55,6 +55,8 @@ mkdir -p "$(dirname "$LIBAPP_SO")"
+     --strip \
+     "$AOT_DILL" 2>&1
+ 
++python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO"
++
+ python3 "$ROOT/tools/oscortex-pack.py" \
+     "$LIBAPP_SO" \
+     "$OUTPUT_OSX" \
+diff --git a/tools/flutter-embedder/src/aot_loader.rs b/tools/flutter-embedder/src/aot_loader.rs
+index 2b2c98e..f9e8460 100644
+--- a/tools/flutter-embedder/src/aot_loader.rs
++++ b/tools/flutter-embedder/src/aot_loader.rs
+@@ -65,7 +65,7 @@ impl DartSnapshotPointers {
+ /// On success the snapshot file is left mapped in the calling process at
+ /// the VA returned by `SYS_AOT_SNAPSHOT_LOAD`; the returned pointers are
+ /// stable for the lifetime of the process.
+-pub fn load_dart_snapshot(path: &[u8]) -> Option<DartSnapshotPointers> {
++pub fn load_dart_snapshot(path: &[u8]) -> Option<(DartSnapshotPointers, u64)> {
+     let mut aot_va: u64 = 0;
+     let mut aot_size: u64 = 0;
+     let rc = aot_snapshot_load(path, &mut aot_va, &mut aot_size);
+@@ -81,7 +81,7 @@ pub fn load_dart_snapshot(path: &[u8]) -> Option<DartSnapshotPointers> {
+ }
+ 
+ /// Parse an AOT ELF already mapped at `aot_va` (used by per-app host processes).
+-pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<DartSnapshotPointers> {
++pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<(DartSnapshotPointers, u64)> {
+     if aot_va == 0 {
+         return None;
+     }
+@@ -89,7 +89,7 @@ pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<DartSnapshotPointe
+     parse_dart_snapshot_elf(aot_va, span)
+ }
+ 
+-fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
++pub fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
+     let base = aot_va as *const u8;
+     // SAFETY: reading ELF header and program headers from a kernel-mapped RX region.
+     unsafe {
+@@ -119,7 +119,7 @@ fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
+     }
+ }
+ 
+-fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<DartSnapshotPointers> {
++fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<(DartSnapshotPointers, u64)> {
+     let base = aot_va as *const u8;
+     let buf = unsafe { core::slice::from_raw_parts(base, size) };
+ 
+@@ -271,7 +271,7 @@ fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<DartSnapshotPoint
+         debug_hex(b"[embedder/aot]   iso_instr=", out.iso_instr);
+         return None;
+     }
+-    Some(out)
++    Some((out, aot_va))
+ }
+ 
+ // ── Helpers ─────────────────────────────────────────────────────────────────
+diff --git a/tools/flutter-embedder/src/main.rs b/tools/flutter-embedder/src/main.rs
+index 79a0497..123cde2 100644
+--- a/tools/flutter-embedder/src/main.rs
++++ b/tools/flutter-embedder/src/main.rs
+@@ -745,43 +745,7 @@ fn install_jit_snapshot_paths(project_args: &mut FlutterProjectArgsRaw, _assets_
+     if IS_AOT.load(Ordering::SeqCst) {
+         return; // No-op for AOT mode
+     }
+-    static mut VM_PATH: [u8; 64] = [0; 64];
+-    static mut ISO_PATH: [u8; 64] = [0; 64];
+-    const VM_STR: &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
+-    const ISO_STR: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
+-
+-    unsafe {
+-        VM_PATH[..VM_STR.len()].copy_from_slice(VM_STR);
+-        ISO_PATH[..ISO_STR.len()].copy_from_slice(ISO_STR);
+-
+-        let vm_path_len = VM_STR.len() - 1;
+-        let iso_path_len = ISO_STR.len() - 1;
+-
+-        write(b"[embedder] JIT snapshots: ");
+-        write(&VM_PATH[..vm_path_len]);
+-        write(b"\n");
+-
+-        write_u64_at(
+-            &mut project_args.bytes,
+-            OFF_PA_VM_SNAPSHOT_DATA,
+-            VM_PATH.as_ptr() as u64,
+-        );
+-        write_u64_at(
+-            &mut project_args.bytes,
+-            OFF_PA_VM_SNAPSHOT_DATA_SIZE,
+-            vm_path_len as u64,
+-        );
+-        write_u64_at(
+-            &mut project_args.bytes,
+-            OFF_PA_ISO_SNAPSHOT_DATA,
+-            ISO_PATH.as_ptr() as u64,
+-        );
+-        write_u64_at(
+-            &mut project_args.bytes,
+-            OFF_PA_ISO_SNAPSHOT_DATA_SIZE,
+-            iso_path_len as u64,
+-        );
+-    }
++    write(b"[embedder] JIT mode: leaving snapshot buffers as NULL\n");
+ }
+ 
+ fn log_bytes(label: &[u8], ptr: u64, len: usize) {
+@@ -801,8 +765,85 @@ fn log_bytes(label: &[u8], ptr: u64, len: usize) {
+     write(b"\n");
+ }
+ 
++fn patch_snapshot_pointers(data_addr: u64, data_size: u64, load_base: u64) {
++    let page_start = data_addr & !0xFFF;
++    let page_end = (data_addr + data_size + 4095) & !0xFFF;
++    let mprotect_size = page_end - page_start;
++
++    write(b"[embedder] Patching AOT snapshot pointers at ");
++    write_hex(data_addr);
++    write(b" size ");
++    write_hex(data_size);
++    write(b" load_base ");
++    write_hex(load_base);
++    write(b"\n");
++
++    // Make writeable (PROT_READ | PROT_WRITE = 3)
++    let rc = sys::mprotect(page_start, mprotect_size, 3);
++    if rc < 0 {
++        write(b"[embedder] WARNING: mprotect PROT_WRITE failed: ");
++        write_dec(-rc as u64);
++        write(b"\n");
++        return;
++    }
++
++    let mut i = 0usize;
++    let limit = data_size.saturating_sub(8) as usize;
++    let mut count = 0;
++    let lower_limit = load_base.saturating_add(0x1_0000_0000);
++    let upper_limit = load_base.saturating_add(0x1_0100_0000);
++
++    unsafe {
++        let byte_ptr = data_addr as *mut u8;
++        while i <= limit {
++            let ptr = byte_ptr.add(i) as *mut u64;
++            let val = core::ptr::read_unaligned(ptr);
++            // Case 1: Relocated address containing the pointer cage offset (e.g. 0x2_43XX_XXXX)
++            if val >= lower_limit && val < upper_limit {
++                let corrected = val - 0x1_0000_0000;
++                write(b"[embedder/patch] Case1 offset ");
++                write_hex(i as u64);
++                write(b" val ");
++                write_hex(val);
++                write(b" -> ");
++                write_hex(corrected);
++                write(b"\n");
++                core::ptr::write_unaligned(ptr, corrected);
++                count += 1;
++                i += 8;
++            }
++            // Case 2: Unrelocated raw pointer cage compile-time address (e.g. 0x1_00XX_XXXX)
++            else if val >= 0x1_0000_0000 && val < 0x1_0100_0000 {
++                let corrected = val - 0x1_0000_0000;
++                write(b"[embedder/patch] Case2 offset ");
++                write_hex(i as u64);
++                write(b" val ");
++                write_hex(val);
++                write(b" -> ");
++                write_hex(corrected);
++                write(b"\n");
++                core::ptr::write_unaligned(ptr, corrected);
++                count += 1;
++                i += 8;
++            } else {
++                i += 1;
++            }
++        }
++    }
++
++    write(b"[embedder] Patched ");
++    write_dec(count);
++    write(b" pointers\n");
++
++    // Restore read-only (PROT_READ = 1)
++    let rc = sys::mprotect(page_start, mprotect_size, 1);
++    if rc < 0 {
++        write(b"[embedder] WARNING: mprotect PROT_READ failed\n");
++    }
++}
++
+ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64) {
+-    let manifest = if aot_va != 0 {
++    let mut res = if aot_va != 0 {
+         write(b"[embedder] loading Dart snapshot from mapping...\n");
+         aot_loader::load_dart_snapshot_from_mapping(aot_va)
+     } else {
+@@ -810,8 +851,43 @@ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64
+         aot_loader::load_dart_snapshot(b"/system/flutter/libapp.so")
+     };
+ 
+-    if let Some(m) = manifest {
+-        aot_loader::log_manifest(&m);
++    if let Some((ref mut m, mapping_base)) = res {
++        // Resolve relocated symbol addresses using dlsym on the process space.
++        let relocated_vm_data = dlsym(0, b"_kDartVmSnapshotData");
++        let relocated_vm_instr = dlsym(0, b"_kDartVmSnapshotInstructions");
++        let relocated_iso_data = dlsym(0, b"_kDartIsolateSnapshotData");
++        let relocated_iso_instr = dlsym(0, b"_kDartIsolateSnapshotInstructions");
++
++        let load_base = if relocated_vm_data != 0 && relocated_vm_instr != 0 && relocated_iso_data != 0 && relocated_iso_instr != 0 {
++            write(b"[embedder] Relocated AOT snapshot symbols resolved via dlsym:\n");
++            let vm_data_orig = m.vm_data - mapping_base;
++            let target_load_base = relocated_vm_data - vm_data_orig;
++            m.vm_data = relocated_vm_data;
++            m.vm_instr = relocated_vm_instr;
++            m.iso_data = relocated_iso_data;
++            m.iso_instr = relocated_iso_instr;
++            target_load_base
++        } else {
++            write(b"[embedder] WARNING: failed to resolve all relocated AOT symbols via dlsym, falling back to flat mapping\n");
++            mapping_base
++        };
++
++        // Relocate pointer values inside the actual loaded AOT memory (Mapping A).
++        // Since LIB_VA_BASE = 0x1_4000_0000, libapp.so is mapped inside the Dart VM pointer cage.
++        // Therefore, compile-time pointers of the form 0x1_00XX_XXXX relocate correctly to
++        // 0x1_43XX_XXXX by the Dart VM deserializer simply adding runtime-to-compile-time instruction delta.
++        // Patching them to 0xXX_XXXX breaks this delta calculation.
++        // let patch_base = load_base;
++        // let actual_aot_va = if aot_va != 0 { aot_va } else { mapping_base };
++        // let patch_size = if let Some(size) = aot_loader::infer_elf_file_span(actual_aot_va) {
++        //     size as u64
++        // } else {
++        //     m.vm_data_size.saturating_add(m.iso_data_size)
++        // };
++        // patch_snapshot_pointers(patch_base, patch_size, load_base);
++
++
++        aot_loader::log_manifest(m);
+         log_bytes(b"[embedder] vm_data content: ", m.vm_data, 32);
+         log_bytes(b"[embedder] iso_data content: ", m.iso_data, 32);
+         write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, m.vm_data);
+@@ -1551,10 +1627,11 @@ extern "C" fn main_embedder() {
+         OFF_PROJECT_ARGS_ICU_DATA_PATH,
+         icu_path.as_ptr() as u64,
+     );
++    let argc = if is_aot { 6 } else { 4 };
+     write_i32_at(
+         &mut project_args.bytes,
+         OFF_PROJECT_ARGS_COMMAND_LINE_ARGC,
+-        ENGINE_ARGV.0.len() as i32,
++        argc,
+     );
+     write_u64_at(
+         &mut project_args.bytes,
+@@ -1631,7 +1708,9 @@ extern "C" fn main_embedder() {
+     // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
+     write(b"[embedder] initializing main thread message loop...\n");
+     const ENSURE_INITIALIZED_NM: u64 = 0x19bbd40;
+-    let ensure_initialized_va = 0x1000000u64 + ENSURE_INITIALIZED_NM;
++    const GET_PROCS_NM: u64 = 0x19622d0;
++    let engine_base = get_procs_va - GET_PROCS_NM;
++    let ensure_initialized_va = engine_base + ENSURE_INITIALIZED_NM;
+     let ensure_initialized: unsafe extern "C" fn() =
+         unsafe { core::mem::transmute(ensure_initialized_va) };
+     unsafe {
+diff --git a/tools/flutter-embedder/src/sys.rs b/tools/flutter-embedder/src/sys.rs
+index f71a02e..c1a067e 100644
+--- a/tools/flutter-embedder/src/sys.rs
++++ b/tools/flutter-embedder/src/sys.rs
+@@ -26,6 +26,7 @@ pub const SYS_FB_SIZE_PACKED: u64 = 0x305;
+ pub const SYS_VSYNC_WAIT_NONBLOCK: u64 = 0x307;
+ 
+ pub const SYS_MMAP: u64 = 0x353;
++pub const SYS_MPROTECT: u64 = 0x355;
+ 
+ pub const SYS_WM_EVENT_POLL: u64 = 0x320;
+ pub const SYS_WM_EVENT_READ: u64 = 0x321;
+@@ -706,3 +707,11 @@ pub fn sched_yield() {
+         syscall0(SYS_SCHED_YIELD);
+     }
+ }
++
++/// Phase 30 Slice 3 — Change memory protection
++pub fn mprotect(va: u64, size: u64, prot: u64) -> i64 {
++    unsafe {
++        syscall3(SYS_MPROTECT, va, size, prot)
++    }
++}
++
+diff --git a/tools/flutter-engine/engine_patch.py b/tools/flutter-engine/engine_patch.py
+index 2ccdcc2..2d0b634 100644
+--- a/tools/flutter-engine/engine_patch.py
++++ b/tools/flutter-engine/engine_patch.py
+@@ -43,7 +43,7 @@ def get_sdk_hash_from_elf(elf_path: Path) -> bytes | None:
+     try:
+         out = subprocess.check_output(["nm", "-D", str(elf_path)], text=True)
+         for line in out.splitlines():
+-            if "_kDartVmSnapshotData" in line:
++            if "kDartVmSnapshotData" in line:
+                 parts = line.split()
+                 if len(parts) >= 3:
+                     val = int(parts[0], 16)
+@@ -97,15 +97,15 @@ PATCHES: dict[str, tuple[int, bytes]] = {
+     # P10: SkBitmapDevice::drawPaint — always take post-onAccessPixels path.
+     "P10": (0x1A8AE87, bytes([0xEB, 0x10])),
+     # P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3: expected SDK hash offsets in pristine engine.
+-    "P_SDK_HASH": (0x188ced, b"1a420a3f9a"),
+-    "P_SDK_HASH_2": (0x3bd638, b"1a420a3f9a"),
+-    "P_SDK_HASH_3": (0xd81028, b"1a420a3f9a"),
++    "P_SDK_HASH": (0x188ced, b"78da37fed6"),
++    "P_SDK_HASH_2": (0x3bd638, b"78da37fed6"),
++    "P_SDK_HASH_3": (0xd81028, b"78da37fed6"),
+     # P_RUNS_AOT: patch runs_aot_compiled_dart_code to return true.
+     "P_RUNS_AOT": (0x195f260, b"\xb0\x01\xc3\x90\x90"),
+     # P_JIT_AOT_CHECK: bypass "JIT runtime cannot run a precompiled snapshot" panic
+     "P_JIT_AOT_CHECK": (0x22b181b, bytes([0x90, 0x90])),
+     # P_SNAPSHOT_FEATURES_CHECK: bypass snapshot/VM features mismatch panic (e.g. macos vs linux)
+-    "P_SNAPSHOT_FEATURES_CHECK": (0x2290fe6, bytes([0xeb, 0x73])),
++    "P_SNAPSHOT_FEATURES_CHECK": (0x2290f30, bytes([0x48, 0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90])),
+     # P_ALLOW_ALL_DART_FLAGS: bypass switches.cc allowed Dart flags whitelist check
+     # We change the conditional jump (je success_path) at 0x21c3f2f to an unconditional
+     # jump (jmp success_path) so all Dart flags are accepted.
+@@ -119,6 +119,25 @@ PATCHES: dict[str, tuple[int, bytes]] = {
+     "P_FINISH_INIT_CAVE_2": (0x1F44620, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0x3b, 0x02, 0x3d, 0x00, 0xe9, 0x32, 0x02, 0x3d, 0x00])),
+     "P_INIT_TTS_HOOK": (0x23148cf, bytes([0xe9, 0x6c, 0xfd, 0xc2, 0xff])),
+     "P_INIT_TTS_CAVE": (0x1F44640, bytes([0x48, 0x85, 0xd2, 0x74, 0x0a, 0x4c, 0x39, 0xc2, 0x74, 0x05, 0xe9, 0x89, 0x02, 0x3d, 0x00, 0xe9, 0x80, 0x02, 0x3d, 0x00])),
++    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1": (0x23dacc8, bytes([0xe9, 0x33, 0x9a, 0xb6, 0xff, 0x90, 0x90])),
++    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2": (0x23db253, bytes([0xe9, 0x67, 0x00, 0x00, 0x00, 0x90, 0x90])),
++    "P_VM_CONSTANTS_CAVE": (0x1F44700, bytes([
++        0x4c, 0x8d, 0x0d, 0x63, 0x00, 0x00, 0x00, 0x4d, 0x31, 0xc0, 0x49, 0x83, 0xf8, 0x11, 0x74, 0x55,
++        0x4f, 0x0f, 0xb7, 0x14, 0x41, 0x4b, 0x8b, 0x0c, 0x17, 0x48, 0x81, 0xf9, 0x00, 0x10, 0x00, 0x00,
++        0x72, 0x36, 0x48, 0x8b, 0x51, 0x08, 0x48, 0x81, 0xfa, 0x00, 0x10, 0x00, 0x00, 0x72, 0x29, 0x48,
++        0x8b, 0x4a, 0x2f, 0x48, 0x39, 0xc1, 0x75, 0x04, 0x48, 0x8b, 0x4a, 0x07, 0x49, 0x83, 0xf8, 0x10,
++        0x75, 0x09, 0x48, 0x39, 0xc1, 0x74, 0x04, 0x48, 0x83, 0xc1, 0x05, 0x4a, 0x89, 0x8c, 0xc3, 0x00,
++        0x02, 0x00, 0x00, 0x49, 0xff, 0xc0, 0xeb, 0xb2, 0x4a, 0x89, 0x84, 0xc3, 0x00, 0x02, 0x00, 0x00,
++        0x49, 0xff, 0xc0, 0xeb, 0xa5, 0xe9, 0x49, 0x6a, 0x49, 0x00, 0xe0, 0x00, 0x40, 0x06, 0xa0, 0x03,
++        0xc0, 0x03, 0xa0, 0x04, 0xc0, 0x04, 0xe0, 0x04, 0xe0, 0x0f, 0xc0, 0x0f, 0x60, 0x08, 0xe0, 0x07,
++        0x60, 0x07, 0xc0, 0x08, 0xa0, 0x10, 0x20, 0x00, 0x00, 0x0d, 0xa0, 0x06,
++    ])),
++    "P_BYPASS_FINALIZE_CLASS_NAMES": (0x2314b3e, bytes([0xe9, 0xba, 0x04, 0x00, 0x00, 0x90, 0x90])),
++    "P_BYPASS_BASE_OBJECTS_CHECK": (0x2291627, bytes([0xeb])),
++    "P_BYPASS_BASE_OBJECTS_COMPARE": (0x22914aa, bytes([0x90] * 6)),
++    "P_IS_PRECOMPILED_RUNTIME": (0x2668190, bytes([0xb0, 0x01, 0xc3])),
++    "P_FLAG_PRECOMPILED_MODE_DEFAULT": (0x22ce1a8, bytes([0xb2, 0x01])),
++    "P_FLAG_PRECOMPILED_MODE_INITIAL": (0x22ce1af, bytes([0xc6, 0x05, 0xeb, 0x02, 0x45, 0x00, 0x01])),
+ }
+ 
+ # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
+@@ -373,35 +392,41 @@ def main() -> int:
+         print(f"engine not found: {engine}", file=sys.stderr)
+         return 1
+ 
+-    # Extract dynamic SDK hash from libapp.so to update P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3
+     libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
+     extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
+     if extracted_hash:
+         print(f"Extracted dynamic SDK hash from libapp.so: {extracted_hash.decode('ascii')}")
+-        PATCHES["P_SDK_HASH"] = (0x188ced, extracted_hash)
+-        PATCHES["P_SDK_HASH_2"] = (0x3bd638, extracted_hash)
+-        PATCHES["P_SDK_HASH_3"] = (0xd81028, extracted_hash)
++        target_hash = extracted_hash + b"\x00"
+     else:
+         print("Using fallback SDK hash 78da37fed6")
+-        PATCHES["P_SDK_HASH"] = (0x188ced, b"78da37fed6")
+-        PATCHES["P_SDK_HASH_2"] = (0x3bd638, b"78da37fed6")
+-        PATCHES["P_SDK_HASH_3"] = (0xd81028, b"78da37fed6")
++        target_hash = b"78da37fed6\x00"
++
++    PATCHES["P_SDK_HASH"] = (0x188ced, target_hash)
++    PATCHES["P_SDK_HASH_2"] = (0x3bd638, target_hash)
++    PATCHES["P_SDK_HASH_3"] = (0xd81028, target_hash)
+ 
+     data = bytearray(engine.read_bytes())
+ 
++    all_patches = [
++        "P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE",
++        "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT",
++        "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS",
++        "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2",
++        "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE",
++        "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1", "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2", "P_VM_CONSTANTS_CAVE",
++        "P_BYPASS_FINALIZE_CLASS_NAMES", "P_BYPASS_BASE_OBJECTS_CHECK", "P_BYPASS_BASE_OBJECTS_COMPARE",
++        "P_IS_PRECOMPILED_RUNTIME", "P_FLAG_PRECOMPILED_MODE_DEFAULT", "P_FLAG_PRECOMPILED_MODE_INITIAL"
++    ]
++
+     if args.verify:
+-        names = (
+-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
+-            if args.apply_all
+-            else None
+-        )
++        names = all_patches if args.apply_all else None
+         if names:
+             errors = []
+             for n in names:
+                 errors.extend(verify(data, n))
+         else:
+             errors = verify(data, "P1")
+-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]:
++            for n in all_patches[1:]:
+                 errors.extend(verify(data, n))
+         if errors:
+             for err in errors:
+@@ -414,7 +439,7 @@ def main() -> int:
+         args.apply = ["P9"]
+ 
+     to_apply = (
+-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
++        all_patches
+         if args.apply_all
+         else (args.apply or [])
+     )

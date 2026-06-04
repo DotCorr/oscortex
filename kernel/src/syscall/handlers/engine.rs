@@ -43,7 +43,7 @@ pub(crate) fn sys_dlopen(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
             None => return -2, // ENOENT
         }
     };
-    match crate::process::dl::dlopen(pid, pml4_phys, elf) {
+    match crate::process::dl::dlopen(pid, pml4_phys, elf, path.as_bytes()) {
         Ok(h)  => h as i64,
         Err(e) => {
             log::warn!("[syscall] dlopen '{}' failed: {}", path, e);
@@ -83,6 +83,36 @@ pub(crate) fn sys_dlclose(handle: u64) -> i64 {
     0
 }
 
+pub(crate) fn sys_dladdr(addr: u64, info_ptr: u64) -> i64 {
+    let pid = crate::process::current_pid();
+    log::info!("[sys_dladdr] pid={} addr={:#x} info_ptr={:#x}", pid, addr, info_ptr);
+    match crate::process::dl::dladdr(pid, addr) {
+        Some((path, load_base)) => {
+            let path_str = core::str::from_utf8(&path).unwrap_or("");
+            let fname_va = if path_str.contains("libflutter_engine") {
+                crate::process::posix_trampolines::SYSDATA_VA + 3922
+            } else if path_str.contains("libapp") {
+                crate::process::posix_trampolines::SYSDATA_VA + 3960
+            } else {
+                crate::process::posix_trampolines::SYSDATA_VA + 3990
+            };
+
+            log::info!("[sys_dladdr] FOUND load_base={:#x} path='{}' fname_va={:#x}", load_base, path_str, fname_va);
+            unsafe {
+                core::ptr::write_unaligned((info_ptr + 0) as *mut u64, fname_va);
+                core::ptr::write_unaligned((info_ptr + 8) as *mut u64, load_base);
+                core::ptr::write_unaligned((info_ptr + 16) as *mut u64, 0); // sname
+                core::ptr::write_unaligned((info_ptr + 24) as *mut u64, 0); // saddr
+            }
+            1 // Success (non-zero)
+        }
+        None => {
+            log::info!("[sys_dladdr] NOT FOUND");
+            0 // Failure (not found)
+        }
+    }
+}
+
 /// Return init function info for a dynamically loaded library so the embedder
 /// can call C++ constructors from user space.
 ///
@@ -107,7 +137,16 @@ pub(crate) fn sys_dl_get_init_array(handle: u64, out_init_fn: u64, out_array_va:
 }
 
 pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
+    log::warn!("[sys_mmap] hint_va={:#x} size={:#x} prot={}", hint_va, size, prot);
+    if size >= 0x8000_0000 {
+        // Mock success for large VM cage/heap reservations (typically 4 GiB).
+        // We return 0x8000_0000 (2 GiB) so that aligning up to 4 GiB yields exactly
+        // 0x1_0000_0000 as the pointer cage base.
+        log::warn!("[sys_mmap] Mocking large virtual reservation size={:#x} prot={} -> 0x8000_0000", size, prot);
+        return 0x8000_0000;
+    }
     if size == 0 || size > 0x1000_0000 {
+        log::warn!("[sys_mmap] Rejecting size={:#x} (max 256 MiB)", size);
         return -22; // EINVAL, max 256 MiB
     }
     let pid = crate::process::current_pid();
@@ -130,7 +169,46 @@ pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
         Some(ctx) => ctx.pml4_phys,
         None => return -9, // EBADF
     };
-    crate::mm::paging::unmap_user_range(pml4_phys, va, size);
+
+    let start = va & !0xFFF;
+    let end = (va + size + 4095) & !0xFFF;
+
+    let mut curr_va = start;
+    while curr_va < end {
+        let is_mirrored = curr_va < 0x3_0000_0000 && (curr_va % 0x1_0000_0000) >= 0x10_0000;
+        if is_mirrored {
+            let base = curr_va % 0x1_0000_0000;
+            let alias1 = base + 0x1_0000_0000;
+            let alias2 = base + 0x2_0000_0000;
+
+            let mut phys_to_free = None;
+            unsafe {
+                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, base) {
+                    phys_to_free = Some(phys);
+                }
+                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, alias1) {
+                    if phys_to_free.is_none() {
+                        phys_to_free = Some(phys);
+                    }
+                }
+                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, alias2) {
+                    if phys_to_free.is_none() {
+                        phys_to_free = Some(phys);
+                    }
+                }
+                if let Some(phys) = phys_to_free {
+                    crate::mm::frame_allocator::free_frame(phys);
+                }
+            }
+        } else {
+            unsafe {
+                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, curr_va) {
+                    crate::mm::frame_allocator::free_frame(phys);
+                }
+            }
+        }
+        curr_va += 4096;
+    }
     0
 }
 
@@ -149,10 +227,70 @@ pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
 
     let mut curr_va = start_va;
     while curr_va < end_va {
-        unsafe {
-            if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
-                // If the range contains unmapped areas, mprotect on POSIX returns ENOMEM (-12)
-                return -12;
+        let is_mirrored = curr_va < 0x3_0000_0000 && (curr_va % 0x1_0000_0000) >= 0x10_0000;
+        if is_mirrored {
+            let base = curr_va % 0x1_0000_0000;
+            let alias1 = base + 0x1_0000_0000;
+            let alias2 = base + 0x2_0000_0000;
+
+            let mut phys_frame = crate::mm::paging::translate_user_page(pml4_phys, base)
+                .or_else(|| crate::mm::paging::translate_user_page(pml4_phys, alias1))
+                .or_else(|| crate::mm::paging::translate_user_page(pml4_phys, alias2));
+
+            if phys_frame.is_none() {
+                if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
+                    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+                    unsafe { core::ptr::write_bytes(hhdm_va, 0, 4096); }
+                    phys_frame = Some(phys);
+                } else {
+                    return -12; // ENOMEM
+                }
+            }
+
+            let phys = phys_frame.unwrap();
+
+            // Map/update curr_va
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+                    if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
+                        return -12;
+                    }
+                }
+            }
+            // Map/update base (so demand_page has a target for translation)
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, base, writable, exec).is_err() {
+                    if crate::mm::paging::map_user_page_with_flags(pml4_phys, base, phys, writable, exec).is_err() {
+                        return -12;
+                    }
+                }
+            }
+            // Update alias1 if already mapped
+            if crate::mm::paging::translate_user_page(pml4_phys, alias1).is_some() {
+                unsafe {
+                    let _ = crate::mm::paging::update_user_page(pml4_phys, alias1, writable, exec);
+                }
+            }
+            // Update alias2 if already mapped
+            if crate::mm::paging::translate_user_page(pml4_phys, alias2).is_some() {
+                unsafe {
+                    let _ = crate::mm::paging::update_user_page(pml4_phys, alias2, writable, exec);
+                }
+            }
+        } else {
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+                    if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
+                        let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+                        core::ptr::write_bytes(hhdm_va, 0, 4096);
+                        if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
+                            crate::mm::frame_allocator::free_frame(phys);
+                            return -12;
+                        }
+                    } else {
+                        return -12; // ENOMEM
+                    }
+                }
             }
         }
         curr_va += 4096;

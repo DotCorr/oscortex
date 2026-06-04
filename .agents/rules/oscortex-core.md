@@ -12,6 +12,7 @@ Read **docs/arch.txt**, **docs/hardware.txt**, **docs/ci-cd.txt**, and project s
 - `.agents/skills/oscortex-kernel-tests/SKILL.md` (driver unit + QEMU integration tests)
 - `.agents/skills/oscortex-ci-cd/SKILL.md` (branching, PRs, CI, release to main)
 - `.agents/skills/codebase-audit-cleanup/SKILL.md`
+- `.agents/skills/frontend-design/SKILL.md` (creative, premium frontend layouts and web interface designs)
 
 ## Architecture
 

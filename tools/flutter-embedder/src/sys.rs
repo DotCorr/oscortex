@@ -26,6 +26,7 @@ pub const SYS_FB_SIZE_PACKED: u64 = 0x305;
 pub const SYS_VSYNC_WAIT_NONBLOCK: u64 = 0x307;
 
 pub const SYS_MMAP: u64 = 0x353;
+pub const SYS_MPROTECT: u64 = 0x355;
 
 pub const SYS_WM_EVENT_POLL: u64 = 0x320;
 pub const SYS_WM_EVENT_READ: u64 = 0x321;
@@ -706,3 +707,11 @@ pub fn sched_yield() {
         syscall0(SYS_SCHED_YIELD);
     }
 }
+
+/// Phase 30 Slice 3 — Change memory protection
+pub fn mprotect(va: u64, size: u64, prot: u64) -> i64 {
+    unsafe {
+        syscall3(SYS_MPROTECT, va, size, prot)
+    }
+}
+

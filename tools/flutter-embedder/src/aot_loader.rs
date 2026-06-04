@@ -65,7 +65,7 @@ impl DartSnapshotPointers {
 /// On success the snapshot file is left mapped in the calling process at
 /// the VA returned by `SYS_AOT_SNAPSHOT_LOAD`; the returned pointers are
 /// stable for the lifetime of the process.
-pub fn load_dart_snapshot(path: &[u8]) -> Option<DartSnapshotPointers> {
+pub fn load_dart_snapshot(path: &[u8]) -> Option<(DartSnapshotPointers, u64)> {
     let mut aot_va: u64 = 0;
     let mut aot_size: u64 = 0;
     let rc = aot_snapshot_load(path, &mut aot_va, &mut aot_size);
@@ -81,7 +81,7 @@ pub fn load_dart_snapshot(path: &[u8]) -> Option<DartSnapshotPointers> {
 }
 
 /// Parse an AOT ELF already mapped at `aot_va` (used by per-app host processes).
-pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<DartSnapshotPointers> {
+pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<(DartSnapshotPointers, u64)> {
     if aot_va == 0 {
         return None;
     }
@@ -89,7 +89,7 @@ pub fn load_dart_snapshot_from_mapping(aot_va: u64) -> Option<DartSnapshotPointe
     parse_dart_snapshot_elf(aot_va, span)
 }
 
-fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
+pub fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
     let base = aot_va as *const u8;
     // SAFETY: reading ELF header and program headers from a kernel-mapped RX region.
     unsafe {
@@ -119,7 +119,7 @@ fn infer_elf_file_span(aot_va: u64) -> Option<usize> {
     }
 }
 
-fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<DartSnapshotPointers> {
+fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<(DartSnapshotPointers, u64)> {
     let base = aot_va as *const u8;
     let buf = unsafe { core::slice::from_raw_parts(base, size) };
 
@@ -271,7 +271,7 @@ fn parse_dart_snapshot_elf(aot_va: u64, size: usize) -> Option<DartSnapshotPoint
         debug_hex(b"[embedder/aot]   iso_instr=", out.iso_instr);
         return None;
     }
-    Some(out)
+    Some((out, aot_va))
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────

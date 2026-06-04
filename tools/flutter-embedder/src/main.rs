@@ -801,6 +801,185 @@ fn log_bytes(label: &[u8], ptr: u64, len: usize) {
     write(b"\n");
 }
 
+fn pre_scan_snapshot_for_instr_bases(
+    data_addr: u64,
+    data_size: u64,
+    load_base: u64,
+    vm_instr_off: u64,
+    iso_instr_off: u64,
+    engine_instr_off: u64,
+    min_b_vm: &mut u64,
+    min_b_iso: &mut u64,
+    min_b_engine: &mut u64,
+) {
+    let mut i = 0usize;
+    let limit_u64 = data_size.saturating_sub(8) as usize;
+    let limit_u32 = data_size.saturating_sub(4) as usize;
+    let lower_limit = load_base.saturating_add(0x1_4000_0000);
+    let upper_limit = load_base.saturating_add(0x1_5000_0000);
+
+    unsafe {
+        let byte_ptr = data_addr as *const u8;
+        while i <= limit_u32 {
+            if i % 8 == 0 && i <= limit_u64 {
+                let ptr_u64 = byte_ptr.add(i) as *const u64;
+                let val_u64 = core::ptr::read_unaligned(ptr_u64);
+                // Case 1: Relocated address
+                if val_u64 >= lower_limit && val_u64 < upper_limit {
+                    let c = val_u64.saturating_sub(load_base).saturating_add(0x1_4000_0000);
+                    if c >= 0x1_4500_0000 && c < 0x1_4700_0000 {
+                        let b = c.saturating_sub(vm_instr_off);
+                        if b < *min_b_vm {
+                            *min_b_vm = b;
+                        }
+                    } else if c >= 0x1_4700_0000 && c < 0x1_4d00_0000 {
+                        let b = c.saturating_sub(iso_instr_off);
+                        if b < *min_b_iso {
+                            *min_b_iso = b;
+                        }
+                    } else if c >= 0x1_4d00_0000 && c < 0x1_5000_0000 {
+                        let b = c.saturating_sub(engine_instr_off);
+                        if b < *min_b_engine {
+                            *min_b_engine = b;
+                        }
+                    }
+                }
+                // Case 2: Unrelocated raw pointer
+                else if val_u64 >= 0x1_4000_0000 && val_u64 < 0x1_5000_0000 {
+                    let c = val_u64;
+                    if c >= 0x1_4500_0000 && c < 0x1_4700_0000 {
+                        let b = c.saturating_sub(vm_instr_off);
+                        if b < *min_b_vm {
+                            *min_b_vm = b;
+                        }
+                    } else if c >= 0x1_4700_0000 && c < 0x1_4d00_0000 {
+                        let b = c.saturating_sub(iso_instr_off);
+                        if b < *min_b_iso {
+                            *min_b_iso = b;
+                        }
+                    } else if c >= 0x1_4d00_0000 && c < 0x1_5000_0000 {
+                        let b = c.saturating_sub(engine_instr_off);
+                        if b < *min_b_engine {
+                            *min_b_engine = b;
+                        }
+                    }
+                }
+            }
+
+            if i % 4 == 0 {
+                let ptr_u32 = byte_ptr.add(i) as *const u32;
+                let val_u32 = core::ptr::read_unaligned(ptr_u32) as u64;
+                if val_u32 >= 0x2000_0000 && val_u32 < 0x2800_0000 {
+                    let c = 0x1_0000_0000 + (val_u32 << 1);
+                    if c >= 0x1_4500_0000 && c < 0x1_4700_0000 {
+                        let b = c.saturating_sub(vm_instr_off);
+                        if b < *min_b_vm {
+                            *min_b_vm = b;
+                        }
+                    } else if c >= 0x1_4700_0000 && c < 0x1_4d00_0000 {
+                        let b = c.saturating_sub(iso_instr_off);
+                        if b < *min_b_iso {
+                            *min_b_iso = b;
+                        }
+                    } else if c >= 0x1_4d00_0000 && c < 0x1_5000_0000 {
+                        let b = c.saturating_sub(engine_instr_off);
+                        if b < *min_b_engine {
+                            *min_b_engine = b;
+                        }
+                    }
+                }
+            }
+
+            i += 4;
+        }
+    }
+}
+
+fn patch_snapshot_pointers(
+    data_addr: u64,
+    data_size: u64,
+    load_base: u64,
+    m: &aot_loader::DartSnapshotPointers,
+    vm_data_c_start: u64,
+    vm_data_c_end: u64,
+    iso_data_c_start: u64,
+    iso_data_c_end: u64,
+    vm_instr_c_start: u64,
+    vm_instr_c_end: u64,
+    iso_instr_c_start: u64,
+    iso_instr_c_end: u64,
+    engine_instr_c_base: u64,
+    engine_load_base: u64,
+    original_prot: u64,
+) {
+    let page_start = data_addr & !0xFFF;
+    let page_end = (data_addr + data_size + 4095) & !0xFFF;
+    let mprotect_size = page_end - page_start;
+
+    write(b"[embedder] Patching AOT snapshot pointers at ");
+    write_hex(data_addr);
+    write(b" size ");
+    write_hex(data_size);
+    write(b" load_base ");
+    write_hex(load_base);
+    write(b"\n");
+
+    // Make writeable (PROT_READ | PROT_WRITE = 3)
+    let rc = sys::mprotect(page_start, mprotect_size, 3);
+    if rc < 0 {
+        write(b"[embedder] WARNING: mprotect PROT_WRITE failed: ");
+        write_dec(-rc as u64);
+        write(b"\n");
+        return;
+    }
+
+    #[derive(Clone, Copy)]
+    enum Segment {
+        VmInstr,
+        IsoInstr,
+    }
+
+    let get_segment = |c: u64| -> Option<Segment> {
+        if c >= vm_instr_c_start && c < vm_instr_c_end {
+            Some(Segment::VmInstr)
+        } else if c >= iso_instr_c_start && c < iso_instr_c_end {
+            Some(Segment::IsoInstr)
+        } else {
+            None
+        }
+    };
+
+    let mut count = 0;
+    let mut i = 256usize;
+    let limit_u64 = data_size.saturating_sub(8) as usize;
+
+    unsafe {
+        let byte_ptr = data_addr as *mut u8;
+        while i <= limit_u64 {
+            // Unrelocated 64-bit absolute pointer (base 0)
+            let ptr_u64 = byte_ptr.add(i) as *mut u64;
+            let val_u64 = core::ptr::read_unaligned(ptr_u64);
+            if let Some(seg) = get_segment(val_u64) {
+                let (runtime_start_s, c_start_s) = match seg {
+                    Segment::VmInstr => (m.vm_instr, vm_instr_c_start),
+                    Segment::IsoInstr => (m.iso_instr, iso_instr_c_start),
+                };
+                let corrected = runtime_start_s.wrapping_add(val_u64.wrapping_sub(c_start_s));
+                core::ptr::write_unaligned(ptr_u64, corrected);
+                count += 1;
+            }
+            i += 8;
+        }
+    }
+
+    // Restore to original protection
+    let _ = sys::mprotect(page_start, mprotect_size, original_prot);
+
+    write(b"[embedder/patch] Patched pointers count: ");
+    write_dec(count);
+    write(b"\n");
+}
+
 fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64) {
     let manifest = if aot_va != 0 {
         write(b"[embedder] loading Dart snapshot from mapping...\n");
@@ -810,7 +989,68 @@ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64
         aot_loader::load_dart_snapshot(b"/system/flutter/libapp.so")
     };
 
-    if let Some(m) = manifest {
+    if let Some((mut m, mapping_base)) = manifest {
+        let relocated_vm_data = dlsym(0, b"_kDartVmSnapshotData");
+        let relocated_vm_instr = dlsym(0, b"_kDartVmSnapshotInstructions");
+        let relocated_iso_data = dlsym(0, b"_kDartIsolateSnapshotData");
+        let relocated_iso_instr = dlsym(0, b"_kDartIsolateSnapshotInstructions");
+
+        let load_base = if relocated_vm_data != 0 && relocated_vm_instr != 0 && relocated_iso_data != 0 && relocated_iso_instr != 0 {
+            write(b"[embedder] Relocated AOT snapshot symbols resolved via dlsym:\n");
+            let vm_data_orig = m.vm_data - mapping_base;
+            let target_load_base = relocated_vm_data - vm_data_orig;
+            m.vm_data = relocated_vm_data;
+            m.vm_instr = relocated_vm_instr;
+            m.iso_data = relocated_iso_data;
+            m.iso_instr = relocated_iso_instr;
+            target_load_base
+        } else {
+            write(b"[embedder] WARNING: failed to resolve all relocated AOT symbols via dlsym, falling back to flat mapping\n");
+            mapping_base
+        };
+
+        let vm_data_off = m.vm_data.saturating_sub(load_base);
+        let vm_instr_off = m.vm_instr.saturating_sub(load_base);
+        let iso_data_off = m.iso_data.saturating_sub(load_base);
+        let iso_instr_off = m.iso_instr.saturating_sub(load_base);
+
+        let vm_instr_c_base = 0;
+        let iso_instr_c_base = 0;
+        let engine_instr_c_base = 0;
+
+        write(b"[embedder] Resolved dynamic instruction bases:\n");
+        write(b"  vm_instr_c_base: ");
+        write_hex(vm_instr_c_base);
+        write(b"\n  iso_instr_c_base: ");
+        write_hex(iso_instr_c_base);
+        write(b"\n  engine_instr_c_base: ");
+        write_hex(engine_instr_c_base);
+        write(b"\n");
+
+        let vm_data_c_start = vm_data_off;
+        let vm_data_c_end = vm_data_c_start + m.vm_data_size;
+
+        let iso_data_c_start = iso_data_off;
+        let iso_data_c_end = iso_data_c_start + m.iso_data_size;
+
+        let vm_instr_c_start = vm_instr_c_base + vm_instr_off;
+        let vm_instr_c_end = vm_instr_c_start + m.vm_instr_size;
+
+        let iso_instr_c_start = iso_instr_c_base + iso_instr_off;
+        let iso_instr_c_end = iso_instr_c_start + m.iso_instr_size;
+
+        let runs_aot_va_global = dlsym(0, b"FlutterEngineRunsAOTCompiledDartCode");
+        let engine_load_base = if runs_aot_va_global != 0 {
+            runs_aot_va_global - 0x1960260
+        } else {
+            0x4_8000_0000
+        };
+
+        // patch_snapshot_pointers is completely disabled because the snapshot data does not contain absolute pointers to be patched,
+        // and manual patching causes false-positive corruptions in the serialized object stream.
+
+        // Patching engine's own segments is disabled to avoid corrupting static constants/instructions.
+
         aot_loader::log_manifest(&m);
         log_bytes(b"[embedder] vm_data content: ", m.vm_data, 32);
         log_bytes(b"[embedder] iso_data content: ", m.iso_data, 32);
@@ -1447,6 +1687,11 @@ extern "C" fn main_embedder() {
 
     // Verify engine compilation mode: AOT vs JIT
     let runs_aot_va = dlsym(handle, b"FlutterEngineRunsAOTCompiledDartCode");
+    let engine_load_base = if runs_aot_va != 0 {
+        runs_aot_va - 0x1960260
+    } else {
+        0x4_8000_0000
+    };
     write(b"[embedder] FlutterEngineRunsAOTCompiledDartCode VA: ");
     write_hex(runs_aot_va);
     write(b"\n");
@@ -1631,7 +1876,7 @@ extern "C" fn main_embedder() {
     // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
     write(b"[embedder] initializing main thread message loop...\n");
     const ENSURE_INITIALIZED_NM: u64 = 0x19bbd40;
-    let ensure_initialized_va = 0x1000000u64 + ENSURE_INITIALIZED_NM;
+    let ensure_initialized_va = engine_load_base + ENSURE_INITIALIZED_NM;
     let ensure_initialized: unsafe extern "C" fn() =
         unsafe { core::mem::transmute(ensure_initialized_va) };
     unsafe {

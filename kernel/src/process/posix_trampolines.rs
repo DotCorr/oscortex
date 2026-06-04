@@ -901,6 +901,16 @@ fn map_sysdata_page(pml4_phys: u64) -> Result<(), &'static str> {
     page[3920] = b'C';
     page[3921] = 0;
 
+    // Write static library names for dladdr at offset 3922
+    let path_flutter = b"/system/lib/libflutter_engine.so\0";
+    page[3922..3922 + path_flutter.len()].copy_from_slice(path_flutter);
+
+    let path_app = b"/system/flutter/libapp.so\0";
+    page[3960..3960 + path_app.len()].copy_from_slice(path_app);
+
+    let path_fallback = b"/system/lib/unknown.so\0";
+    page[3990..3990 + path_fallback.len()].copy_from_slice(path_fallback);
+
     // Map as read-write (data page, not executable). errno and other mutable
     // fields (SD_ERRNO etc.) are written directly by user code via pointers.
     unsafe {

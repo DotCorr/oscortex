@@ -537,9 +537,40 @@ pub fn check_timerfds_and_wake_try() {
         epoll_wake_try(fd);
     }
 
-    // Timed pthread_cond wait expiry is handled inside
-    // sys_pthread_cond_wait_timeout when the thread is scheduled (matches the
-    // working run-visible.log profile — no kernel-side inject/expire).
+    // Proactively expire any Waiting cond-waiter whose timeout has fired.
+    // This is critical: if the scheduler never picks the blocked thread
+    // (because it prefers higher-priority siblings), the thread can never
+    // reach the in-syscall timeout check. The timer ISR (this function) MUST
+    // drive the expiry to un-block the thread.
+    {
+        // Single lock acquisition: collect + transition atomically.
+        let expired: alloc::vec::Vec<(u32, u64, u64)> = {
+            let mut cws = match COND_WAIT_STATE.try_lock() {
+                Some(c) => c,
+                None => return, // contention — retry next tick
+            };
+            let mut exps = alloc::vec::Vec::new();
+            for (&pid, st) in cws.iter_mut() {
+                if let CondWaitState::Waiting { timeout_ns, mutex, cond, .. } = *st {
+                    if timeout_ns != 0 && now >= timeout_ns {
+                        // Atomically transition to AcquiringMutex inside the lock.
+                        *st = CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                        exps.push((pid, mutex, cond));
+                    }
+                }
+            }
+            exps
+        };
+        for (pid, mutex, cond) in expired {
+            super::futex_waiter_remove(cond, pid);
+            static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
+            let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                log::warn!("[cond-expire] #{} timer-ISR expired pid={} mutex={:#x}", n, pid, mutex);
+            }
+            crate::process::wake_process(pid);
+        }
+    }
 
     // Finish at most one timed-out AcquiringMutex waiter per tick (mutex free).
     {
@@ -796,7 +827,7 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
         1 | 3 => { // ADD or MOD
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 8) as *const u64) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -888,10 +919,10 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     );
                 }
                 // Report EPOLLIN; leave pending for the read() call to drain.
-                let slot = events_out + (count as u64) * 16;
+                let slot = events_out + (count as u64) * 12;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -912,20 +943,20 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                         eventfd_count
                     );
                 }
-                let slot = events_out + (count as u64) * 16;
+                let slot = events_out + (count as u64) * 12;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
                 }
                 count += 1;
                 continue;
             }
             // Check pipe readability for non-timerfd fds.
             if pipe_readable_for_fd(entry.fd) {
-                let slot = events_out + (count as u64) * 16;
+                let slot = events_out + (count as u64) * 12;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 8) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -1060,7 +1091,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             let n = EPOLL_72_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             if n < 4 && events_out != 0 {
                 let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
-                let data = unsafe { core::ptr::read_unaligned((events_out + 8) as *const u64) };
+                let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                 log::warn!(
                     "[epoll72-ready-fast] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
                     n,
@@ -1158,7 +1189,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 let n = EPOLL_72_READY_LOOP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 if n < 4 && events_out != 0 {
                     let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
-                    let data = unsafe { core::ptr::read_unaligned((events_out + 8) as *const u64) };
+                    let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                     log::warn!(
                         "[epoll72-ready-loop] #{} pid={} epfd={} ready={} ev={:#x} data={:#x}",
                         n,

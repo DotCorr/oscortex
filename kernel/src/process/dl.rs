@@ -64,9 +64,12 @@ const STB_WEAK:   u8 = 2;
 const SHN_UNDEF:  u16 = 0;
 
 /// Virtual address of the first library slot in each process.
-const LIB_VA_BASE:   u64 = 0x0100_0000; // 16 MiB
+const LIB_VA_BASE:   u64 = 0x1_4000_0000; // 5 GiB
+/// Base address for anonymous memory mappings.
+const ANON_VA_BASE:  u64 = 0x1_1000_0000; // 4.25 GiB
 /// Minimum VA bump stride between consecutive libraries.
 const LIB_VA_STRIDE: u64 = 0x0100_0000; // 16 MiB per slot
+
 
 const MAX_LIBS: usize = 16;
 
@@ -189,6 +192,8 @@ struct LoadedLib {
     init_array_va:  u64,
     /// Number of entries in the init array.
     init_array_len: usize,
+    path:           Vec<u8>,
+    size:           u64,
 }
 
 // ── Global library table ───────────────────────────────────────────────────────
@@ -199,12 +204,9 @@ const MAX_AS_SLOTS: usize = 64;
 struct LibTable {
     entries:     Vec<LoadedLib>,
     next_handle: u32,
-    /// Per-address-space bump VA for the next dynamic mapping (libraries + mmap).
-    /// Keyed by `pml4_phys` so that threads sharing an address space also share
-    /// the cursor — otherwise each thread would re-bump from `LIB_VA_BASE` and
-    /// silently overwrite its siblings' heap mappings in the shared PML4.
-    /// Fixed-size linear table: (pml4_phys, next_va). `pml4_phys == 0` ⇒ free.
-    as_slots:    [(u64, u64); MAX_AS_SLOTS],
+    /// Per-address-space bump VAs for dynamic loading and anonymous mappings.
+    /// Format: (pml4_phys, next_lib_va, next_anon_va). `pml4_phys == 0` => free.
+    as_slots:    [(u64, u64, u64); MAX_AS_SLOTS],
 }
 
 impl LibTable {
@@ -212,30 +214,61 @@ impl LibTable {
         Self {
             entries:     Vec::new(),
             next_handle: 1,
-            as_slots:    [(0, 0); MAX_AS_SLOTS],
+            as_slots:    [(0, 0, 0); MAX_AS_SLOTS],
         }
     }
 
-    fn bump_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
+    fn bump_lib_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
         let aligned = (size + LIB_VA_STRIDE - 1) / LIB_VA_STRIDE * LIB_VA_STRIDE;
+        log::info!("[DL] bump_lib_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
         // Find existing slot for this address space.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == pml4_phys {
                 let base = slot.1;
                 slot.1 = base + aligned;
+                log::info!("[DL] bump_lib_va: existing slot base={:#x} new_next={:#x}", base, slot.1);
                 return base;
             }
         }
         // Allocate a new slot.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == 0 {
-                *slot = (pml4_phys, LIB_VA_BASE + aligned);
+                *slot = (pml4_phys, LIB_VA_BASE + aligned, ANON_VA_BASE);
+                log::info!("[DL] bump_lib_va: new slot base={:#x} next_lib={:#x}", LIB_VA_BASE, slot.1);
                 return LIB_VA_BASE;
             }
         }
-        // Fallback: should not happen with MAX_AS_SLOTS=64. Reuse slot 0.
+        // Fallback: should not happen
         let base = self.as_slots[0].1;
         self.as_slots[0].1 = base + aligned;
+        log::info!("[DL] bump_lib_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].1);
+        base
+    }
+
+    fn bump_anon_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
+        let aligned = (size + 4095) / 4096 * 4096;
+        log::info!("[DL] bump_anon_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
+        // Find existing slot for this address space.
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == pml4_phys {
+                let base = slot.2;
+                slot.2 = base + aligned;
+                log::info!("[DL] bump_anon_va: existing slot base={:#x} new_next={:#x}", base, slot.2);
+                return base;
+            }
+        }
+        // Allocate a new slot.
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == 0 {
+                *slot = (pml4_phys, LIB_VA_BASE, ANON_VA_BASE + aligned);
+                log::info!("[DL] bump_anon_va: new slot base={:#x} next_anon={:#x}", ANON_VA_BASE, slot.2);
+                return ANON_VA_BASE;
+            }
+        }
+        // Fallback: should not happen
+        let base = self.as_slots[0].2;
+        self.as_slots[0].2 = base + aligned;
+        log::info!("[DL] bump_anon_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].2);
         base
     }
 }
@@ -418,15 +451,23 @@ fn pt_load_span(bytes: &[u8], hdr: &Elf64Hdr) -> u64 {
     let ph_num  = hdr.e_phnum as usize;
     let ph_size = hdr.e_phentsize as usize;
     let mut max_end = 0u64;
+    log::info!("[DL] pt_load_span: ph_off={} ph_num={} ph_size={}", ph_off, ph_num, ph_size);
     for i in 0..ph_num {
         let ph: Elf64Phdr = match read_pod(bytes, ph_off + i * ph_size) {
             Some(p) => p,
             None    => break,
         };
-        if ph.p_type != PT_LOAD { continue; }
-        let end = ph.p_vaddr.saturating_add(ph.p_memsz);
+        let p_type = ph.p_type;
+        let p_flags = ph.p_flags;
+        let p_offset = ph.p_offset;
+        let p_vaddr = ph.p_vaddr;
+        let p_memsz = ph.p_memsz;
+        log::info!("[DL] ph[{}]: type={} flags={} offset={:#x} vaddr={:#x} memsz={:#x}", i, p_type, p_flags, p_offset, p_vaddr, p_memsz);
+        if p_type != PT_LOAD { continue; }
+        let end = p_vaddr.saturating_add(p_memsz);
         if end > max_end { max_end = end; }
     }
+    log::info!("[DL] pt_load_span: max_end={:#x}", max_end);
     max_end
 }
 
@@ -441,7 +482,7 @@ fn pt_load_span(bytes: &[u8], hdr: &Elf64Hdr) -> u64 {
 /// 5. Harvests all `STB_GLOBAL`/`STB_WEAK` exports for [`dlsym`].
 ///
 /// Returns a positive library handle on success or `Err(&str)`.
-pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'static str> {
+pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result<u32, &'static str> {
     // ── Validate ELF header ───────────────────────────────────────────────
     let hdr: Elf64Hdr = read_pod(elf_bytes, 0).ok_or("ELF too short")?;
     if hdr.e_ident[0..4] != ELF_MAGIC { return Err("not an ELF"); }
@@ -456,7 +497,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
     // from LIB_VA_BASE and silently overwrite each other's mappings).
     let _ = pid;
     let span      = pt_load_span(elf_bytes, &hdr);
-    let load_base = LIBS.lock().bump_va(pml4_phys, span);
+    let load_base = LIBS.lock().bump_lib_va(pml4_phys, span);
 
     // ── Map PT_LOAD segments ──────────────────────────────────────────────
     let ph_off  = hdr.e_phoff as usize;
@@ -477,6 +518,8 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         let writable  = (ph.p_flags & PF_W) != 0;
         let exec      = (ph.p_flags & PF_X) != 0;
 
+        let copy_limit = if filesz == ph.p_memsz as usize { npages * 4096 } else { page_off + filesz };
+
         for p in 0..npages {
             let page_phys = frame_allocator::alloc_frame().ok_or("OOM: dl segment")?;
             let hhdm_ptr  = (page_phys + frame_allocator::hhdm_offset()) as *mut u8;
@@ -487,7 +530,7 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
             let page_start = p * 4096; // offset from seg_va
             let page_end   = page_start + 4096;
             let data_start = page_start.max(page_off);
-            let data_end   = page_end.min(page_off + filesz);
+            let data_end   = page_end.min(copy_limit);
             if data_start < data_end {
                 let dst_off  = data_start - page_start;
                 let src_off  = file_off + (data_start - page_off);
@@ -512,6 +555,36 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
                     exec,
                 )?;
             }
+        }
+    }
+
+    // ── Map any unmapped gap pages within the library span ───────────────
+    {
+        let span_pages = (span + 4095) / 4096;
+        let mut gap_mapped = 0;
+        for p in 0..span_pages {
+            let va = load_base + p * 4096;
+            if paging::translate_user_page(pml4_phys, va).is_none() {
+                if let Some(page_phys) = frame_allocator::alloc_frame() {
+                    let hhdm_ptr = (page_phys + frame_allocator::hhdm_offset()) as *mut u8;
+                    unsafe { core::ptr::write_bytes(hhdm_ptr, 0, 4096); }
+                    unsafe {
+                        paging::map_user_page_with_flags(
+                            pml4_phys,
+                            va,
+                            page_phys,
+                            false, // writable
+                            false, // exec
+                        )?;
+                    }
+                    gap_mapped += 1;
+                } else {
+                    return Err("OOM: gap page allocation");
+                }
+            }
+        }
+        if gap_mapped > 0 {
+            log::info!("[DL] Mapped {} gap page(s) within library span of size {:#x}", gap_mapped, span);
         }
     }
 
@@ -592,6 +665,8 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
         t.entries.push(LoadedLib {
             pid, handle: h, load_base, exports,
             init_fn_va, init_array_va, init_array_len,
+            path: path.to_vec(),
+            size: span,
         });
         h
     };
@@ -787,6 +862,44 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8]) -> Result<u32, &'stati
                 log::warn!("[DL] Patch5 SKIPPED: bytes @ {:#x} do not match expected call insn", va);
             }
         }
+
+        // Patch 7: Fix PageFault at ImageReader::GetInstructionsAt due to 32-bit offset overflow
+        //   Target Offset: 0x22cfe60
+        //   Expected Bytes:    [0x48, 0x8b, 0x47, 0x08, 0x89, 0xf1, 0x48, 0x01, 0xc8, 0x48, 0xff, 0xc0]
+        {
+            const TARGET_VA: u64 = 0x22cfe60;
+            let va = load_base + TARGET_VA;
+            // Verify the bytes before overwriting (safety guard).
+            let hhdm = crate::mm::frame_allocator::hhdm_offset();
+            let mut matches = true;
+            const EXPECTED: [u8; 12] = [0x48, 0x8B, 0x47, 0x08, 0x89, 0xF1, 0x48, 0x01, 0xC8, 0x48, 0xFF, 0xC0];
+            for i in 0..12 {
+                if let Some(pp) = crate::mm::paging::translate_user_page(pml4_phys, va + i) {
+                    let off = ((va + i) & 0xFFF) as usize;
+                    let b = unsafe { *((pp + hhdm + off as u64) as *const u8) };
+                    if b != EXPECTED[i as usize] { matches = false; break; }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+            if matches {
+                const REPLACEMENT: [u8; 14] = [
+                    0x48, 0x8B, 0x47, 0x08, // mov rax, qword ptr [rdi + 8]
+                    0x48, 0x63, 0xCE,       // movsxd rcx, esi
+                    0x48, 0x01, 0xC8,       // add rax, rcx
+                    0x48, 0xFF, 0xC0,       // inc rax
+                    0xC3,                   // ret
+                ];
+                if write_va(va, &REPLACEMENT) {
+                    log::info!("[DL] Patch7 ImageReader::GetInstructionsAt @ {:#x} -> inline sign-extension patch applied", va);
+                } else {
+                    log::warn!("[DL] Patch7 FAILED: write inline patch @ {:#x}", va);
+                }
+            } else {
+                log::warn!("[DL] Patch7 SKIPPED: bytes @ {:#x} do not match expected instructions", va);
+            }
+        }
     }
 
     log::info!("[DL] pid={} dlopen base={:#x} handle={} exports={}", pid, load_base, handle, export_count);
@@ -899,14 +1012,14 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
                 "[mmap_anon] hint {:#x} pages={} overlaps existing mapping; reallocating",
                 hint_va, pages
             );
-            LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64)
+            LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64)
         }
     } else {
         // Bump-allocate, but skip over any already-mapped ranges. This
         // prevents the TLS/stack allocator from clobbering a region that
         // was previously mmap'd by userspace (e.g. a Dart heap chunk that
         // sits at the same VA the bump cursor would return next).
-        let mut candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
+        let mut candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
         for _ in 0..64 {
             let mut clear = true;
             for p in 0..pages {
@@ -922,7 +1035,7 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
             if clear { break; }
             log::warn!("[mmap_anon] bump candidate {:#x} pages={} conflicts; advancing",
                 candidate, pages);
-            candidate = LIBS.lock().bump_va(pml4_phys, (pages * 4096) as u64);
+            candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
         }
         candidate
     };
@@ -949,5 +1062,20 @@ fn sym_name_eq(a: &[u8], b: &[u8]) -> bool {
     let a_clean = if a.starts_with(b"_") { &a[1..] } else { a };
     let b_clean = if b.starts_with(b"_") { &b[1..] } else { b };
     a_clean == b_clean
+}
+
+/// Resolve the library info for a given user-space address.
+///
+/// Returns `(path, load_base)` if `addr` falls within any loaded library's span.
+pub fn dladdr(pid: u32, addr: u64) -> Option<(Vec<u8>, u64)> {
+    let leader_pid = crate::process::get_group_leader(pid);
+    let t = LIBS.lock();
+    for lib in &t.entries {
+        let lib_leader = crate::process::get_group_leader(lib.pid);
+        if lib_leader == leader_pid && addr >= lib.load_base && addr < lib.load_base + lib.size {
+            return Some((lib.path.clone(), lib.load_base));
+        }
+    }
+    None
 }
 

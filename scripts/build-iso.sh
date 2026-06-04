@@ -70,8 +70,8 @@ fi
 echo "[0.3/5] Compiling system shell to AOT ELF (libapp.so)..."
 DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
 FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
-SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
-GEN_SNAP="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
+SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
+GEN_SNAP="$ROOT/tools/flutter-engine/linux-x64/gen_snapshot"
 PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
 APP_MAIN="$APP_DIR/lib/main.dart"
 AOT_DILL="$APP_DIR/build/app_aot.dill"
@@ -92,10 +92,15 @@ if [ ! -f "$AOT_DILL" ]; then
 fi
 
 mkdir -p "$ROOT/initramfs/system/flutter"
-"$GEN_SNAP" \
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    ubuntu:22.04 \
+    "$GEN_SNAP" \
     --deterministic \
     --snapshot_kind=app-aot-elf \
     --elf="$LIBAPP_SO_DEST" \
+    --dedup_instructions \
     --strip \
     "$AOT_DILL" 2>&1
 
@@ -103,6 +108,7 @@ if [ ! -f "$LIBAPP_SO_DEST" ]; then
     echo "ERROR: gen_snapshot_x64 failed — libapp.so not produced" >&2
     exit 1
 fi
+python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO_DEST"
 echo "[0.3/5] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes"
 
 echo "[0.35/5] Building core system apps into /Applications..."
@@ -127,7 +133,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
     mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
 
-    for f in kernel_blob.bin vm_snapshot_data isolate_snapshot_data; do
+    for f in kernel_blob.bin; do
         if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
             echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
             exit 1
@@ -142,7 +148,15 @@ if [ -d "$APP_ASSETS_DIR" ]; then
     rm -f \
         "$ROOT/initramfs/system/flutter/kernel_blob.bin" \
         "$ROOT/initramfs/system/flutter/vm_snapshot_data" \
-        "$ROOT/initramfs/system/flutter/isolate_snapshot_data"
+        "$ROOT/initramfs/system/flutter/isolate_snapshot_data" \
+        "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/isolate_snapshot_data"
 
     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
         if [ -f "$APP_ASSETS_DIR/$f" ]; then
@@ -186,8 +200,6 @@ REQUIRED_FILES=(
     "$ROOT/initramfs/Applications/Files.app/Files.osx"
     "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
     "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
-    "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
-    "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
     "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
     "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
     "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
@@ -216,7 +228,7 @@ rm -rf "$ISO_ROOT"
 mkdir -p "$ISO_ROOT/boot/limine"
 mkdir -p "$ISO_ROOT/EFI/BOOT"
 
-cp "$KERNEL_ELF" "$ISO_ROOT/boot/kernel"
+cat "$KERNEL_ELF" > "$ISO_ROOT/boot/kernel"
 
 cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"
 cp "$LIMINE_DIR/limine-bios.sys"    "$ISO_ROOT/boot/limine/"
@@ -239,7 +251,7 @@ verbose: yes
 EOF
 
 STAGED_ENGINE_SO="$ROOT/initramfs/system/lib/libflutter_engine.so"
-cp "$STAGED_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
+cat "$STAGED_ENGINE_SO" > "$ISO_ROOT/boot/libflutter_engine.so"
 echo "[2/5] Staged libflutter_engine.so ($(du -sh "$STAGED_ENGINE_SO" | cut -f1)) as Limine module"
 
 cp "$ISO_ROOT/boot/limine/limine.conf" "$ISO_ROOT/limine.conf"

@@ -237,6 +237,33 @@ mod x86_64_impl {
         }
     }
 
+    pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
+        let present  = PageFlags::PRESENT.bits();
+
+        unsafe {
+            let pml4 = phys_to_virt(pml4_phys) as *const u64;
+            let pml4e = pml4.add(pml4_idx).read_volatile();
+            if pml4e & present == 0 { return None; }
+            let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *const u64;
+            let pdpte = pdpt.add(pdpt_idx).read_volatile();
+            if pdpte & present == 0 { return None; }
+            let pd = phys_to_virt(pdpte & PHYS_MASK) as *const u64;
+            let pde = pd.add(pd_idx).read_volatile();
+            if pde & present == 0 { return None; }
+            let pt = phys_to_virt(pde & PHYS_MASK) as *const u64;
+            let pte = pt.add(pt_idx).read_volatile();
+            if pte & present == 0 { return None; }
+            let phys = pte & PHYS_MASK;
+            let writable = (pte & PageFlags::WRITABLE.bits()) != 0;
+            let exec = (pte & PageFlags::NO_EXECUTE.bits()) == 0;
+            Some((phys, writable, exec))
+        }
+    }
+
     pub unsafe fn update_user_page_flags(
         pml4_phys: u64,
         virt: u64,
@@ -412,46 +439,32 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
 
 /// Handle a demand-page fault. Returns `true` if the fault was resolved.
 pub fn demand_page(cr2: u64, error: u64) -> bool {
-    // Only handle not-present faults (bit 0 = 0).
-    // Ignore write-protection violations (bit 1 = 1).
     if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
-
-    // Valid user-space VA range: 0x100000 – canonical limit (below kernel half).
-    // Exclude the trampoline pages at 0x7FFF_E000 (only 2GB mark — but user
-    // space extends to 128TB in x86_64). Reject anything at or above canonical
-    // kernel boundary (0xFFFF_8000_0000_0000) and below 1MB.
-    let page_va = cr2 & !0xFFF;
-    if page_va < 0x10_0000 || page_va >= 0x0000_8000_0000_0000 { return false; }
-    // Exclude the trampoline and sysdata pages.
-    if page_va == 0x7FFF_C000 || page_va == 0x7FFF_E000 || page_va == 0x7FFF_F000 { return false; }
-
-    // Allocate a zero physical frame and map it into the current PML4.
-    let phys = match crate::mm::frame_allocator::alloc_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[demand_page] OOM: cannot satisfy fault at {:#x}", cr2);
-            return false;
-        }
-    };
-
-    // Zero the frame via HHDM.
-    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
-    unsafe { core::ptr::write_bytes(hhdm_va, 0, 4096); }
 
     // Read current CR3 to get the active PML4.
     let cr3_phys: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
     let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
 
-    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE;
-    let _ = flags;
-    if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) } {
-        log::error!("[demand_page] map failed at {:#x}: {}", page_va, e);
-        crate::mm::frame_allocator::free_frame(phys);
-        return false;
+    // Check if the fault address is in the mirroring range [0x1_0000_0000, 0x3_0000_0000)
+    let page_va = cr2 & !0xFFF;
+    if page_va >= 0x1_0000_0000 && page_va < 0x3_0000_0000 {
+        let mirrored_va = page_va - 0x1_0000_0000;
+        
+        // Translate the mirrored page to get its physical frame and flags.
+        let target = translate_user_page_flags(cr3_phys, mirrored_va);
+        
+        if let Some((phys, writable, exec)) = target {
+            if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, writable, exec) } {
+                log::error!("[demand_page] mirrored map failed at {:#x}: {}", page_va, e);
+                return false;
+            }
+            return true;
+        }
     }
 
-    true
+    // Reject all other page faults outside the mirrored range.
+    false
 }
 
 // ── User address space helpers ────────────────────────────────────────────────
@@ -506,6 +519,15 @@ pub unsafe fn map_user_page_with_flags(
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (pml4_phys, virt); None }
+}
+
+/// Walk a user PML4 and return the physical frame mapped at `virt` along with
+/// its writable and executable flags.
+pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+    #[cfg(target_arch = "x86_64")]
+    { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = (pml4_phys, virt); None }
 }

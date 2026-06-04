@@ -18,8 +18,8 @@ FLUTTER_BIN="${FLUTTER_BIN:-flutter}"
 FLUTTER_HOME="${FLUTTER_HOME:-/opt/homebrew/share/flutter}"
 DARTAOT="$FLUTTER_HOME/bin/cache/dart-sdk/bin/dartaotruntime"
 FRONTEND_SERVER="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
-SDK_ROOT_PRODUCT="$FLUTTER_HOME/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
-GEN_SNAP="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
+SDK_ROOT_PRODUCT="$FLUTTER_HOME/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
+GEN_SNAP="$ROOT/tools/flutter-engine/linux-x64/gen_snapshot"
 
 PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
 APP_MAIN="$APP_DIR/lib/main.dart"
@@ -48,12 +48,19 @@ if [ ! -f "$AOT_DILL" ]; then
 fi
 
 mkdir -p "$(dirname "$LIBAPP_SO")"
-"$GEN_SNAP" \
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    ubuntu:22.04 \
+    "$GEN_SNAP" \
     --deterministic \
     --snapshot_kind=app-aot-elf \
     --elf="$LIBAPP_SO" \
+    --dedup_instructions \
     --strip \
     "$AOT_DILL" 2>&1
+
+python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO"
 
 python3 "$ROOT/tools/oscortex-pack.py" \
     "$LIBAPP_SO" \

@@ -236,7 +236,7 @@ class _ShellDesktopState extends State<ShellDesktop> {
 
   Widget _buildToolbar() {
     return OscToolbar(
-      title: 'Personal Canvas',
+      title: 'OSCortex Embedded Hub',
       status: _status,
       trailing: [
         _SettingsButton(),
@@ -300,7 +300,7 @@ class _ShellDesktopState extends State<ShellDesktop> {
     return OscHubDock(
       segments: [
         OscHubSegment(
-          label: 'Canvas Hub',
+          label: 'Setup Hub',
           active: _activeHub == CoreAppRole.canvas,
           enabled: canvas != null,
           onTap: () {
@@ -378,8 +378,8 @@ class _SettingsButton extends StatelessWidget {
   }
 }
 
-// ─── Workspace (main content area with spec cards) ─────────────────────
-class _Workspace extends StatelessWidget {
+// ─── Workspace (Setup Dashboard wizard) ──────────────────────────────────
+class _Workspace extends StatefulWidget {
   const _Workspace({
     required this.apps,
     required this.error,
@@ -393,223 +393,310 @@ class _Workspace extends StatelessWidget {
   final ValueChanged<AppTile> onLaunch;
 
   @override
+  State<_Workspace> createState() => _WorkspaceState();
+}
+
+class _WorkspaceState extends State<_Workspace> {
+  final List<String> _hardwareLogs = [
+    "[INFO] Compositor: Online (1280x800 bpp=32) [OK]",
+    "[INFO] Storage: VirtIO-Blk online (vdisk.img: 8 MiB) [OK]",
+    "[INFO] Input: XHCI USB-HID router online [OK]",
+    "[INFO] Network: VirtIO-Net ready (MAC 52:54:00:12:34:56) [OK]",
+  ];
+  
+  bool _i2cScanning = true;
+  bool _canScanning = false;
+  Timer? _simTimer;
+  int _simStep = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _simTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      if (!mounted) return;
+      setState(() {
+        _simStep++;
+        if (_simStep == 1) {
+          _hardwareLogs.add("[WARN] I2C: Unknown device detected at address 0x48");
+        } else if (_simStep == 2) {
+          _hardwareLogs.add("[INFO] Cortex: Analyzing datasheet for I2C 0x48...");
+        } else if (_simStep == 3) {
+          _hardwareLogs.add("[INFO] Cortex: ADT7410 temperature sensor matched");
+        } else if (_simStep == 4) {
+          _hardwareLogs.add("[INFO] Cortex: Generating CDP-WASM driver code...");
+        } else if (_simStep == 5) {
+          _hardwareLogs.add("[INFO] CDP-WASM: Driver compiled: temp_sensor_0.wasm");
+          _hardwareLogs.add("[INFO] Device: TempSensor_0 registered successfully [Active]");
+          _i2cScanning = false;
+          _canScanning = true;
+        } else if (_simStep == 6) {
+          _hardwareLogs.add("[INFO] CAN: Scanning CAN0 bus at 500 kbps...");
+        } else if (_simStep == 7) {
+          _hardwareLogs.add("[WARN] CAN: Unknown infotainment protocol packets detected");
+        } else if (_simStep == 8) {
+          _hardwareLogs.add("[INFO] Cortex: Mapping packets for Toyota CAN bus...");
+        } else if (_simStep == 9) {
+          _hardwareLogs.add("[INFO] CDP-WASM: Toyota Infotainment driver: can_bus_toyota.wasm");
+          _hardwareLogs.add("[INFO] Device: Infotainment interface mapped [Active]");
+          _canScanning = false;
+          timer.cancel();
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _simTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    if (loading) {
+    if (widget.loading) {
       return const Center(
         child: CircularProgressIndicator(color: OscColors.violetLight),
       );
     }
-    if (error != null) {
+    if (widget.error != null) {
       return Center(
-        child: Text(error!, style: const TextStyle(color: OscColors.textMuted)),
+        child: Text(widget.error!, style: const TextStyle(color: OscColors.textMuted)),
       );
     }
 
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        // Intent Bar
-        const Padding(
-          padding: EdgeInsets.fromLTRB(16, 0, 16, 0),
-          child: OscIntentBar(),
-        ),
-        // Scrollable workspace cards
-        Expanded(
-          child: ListView(
-            padding: const EdgeInsets.fromLTRB(14, 8, 14, 14),
-            children: [
-              // Document Canvas Card
-              const _DocumentCanvasCard(),
-              const SizedBox(height: 12),
-              // Two-column row: Media Player + Knowledge Source
-              const Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Expanded(child: _MediaPlayerCard()),
-                  SizedBox(width: 12),
-                  Expanded(child: _KnowledgeSourceCard()),
-                ],
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Left column: QR code & pairing
+          Expanded(
+            flex: 4,
+            child: _buildPairingPanel(context),
+          ),
+          const SizedBox(width: 16),
+          // Right column: Auto-discovery logs & system info
+          Expanded(
+            flex: 5,
+            child: _buildDiscoveryPanel(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPairingPanel(BuildContext context) {
+    return OscCard(
+      gradient: OscCard.violetGradient,
+      padding: const EdgeInsets.all(24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          OscSectionLabel(
+            'OSCORTEX EMBEDDED EDITION',
+            color: OscColors.violetLight.withValues(alpha: 0.85),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Setup & Connection',
+            style: OscTypography.heading3,
+          ),
+          const SizedBox(height: 24),
+          const Center(
+            child: _QrCodeWidget(),
+          ),
+          const SizedBox(height: 24),
+          const Center(
+            child: Text(
+              'Pairing Code: OSC-982-CTX',
+              style: TextStyle(
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 1.5,
+                color: OscColors.violetLight,
               ),
-              const SizedBox(height: 12),
-              // Generated Engine View
-              const _GeneratedEngineCard(),
-              // Third-party apps grid (if any)
-              if (apps.isNotEmpty) ...[
-                const SizedBox(height: 16),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
-                  child: OscSectionLabel(
-                    'INSTALLED APPS',
-                    small: true,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                GridView.builder(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                    maxCrossAxisExtent: 200,
-                    mainAxisSpacing: 10,
-                    crossAxisSpacing: 10,
-                    childAspectRatio: 1.1,
-                  ),
-                  itemCount: apps.length,
-                  itemBuilder: (context, index) {
-                    final app = apps[index];
-                    return AppCard(
-                      app: app,
-                      onLaunch: () => onLaunch(app),
-                      accentColor: OscColors.violet,
-                    );
-                  },
-                ),
-              ],
-            ],
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Divider(color: OscColors.border, height: 1),
+          const SizedBox(height: 16),
+          _buildPairingStatusRow(
+            label: 'WiFi Status',
+            value: 'Connected to AP (OSCortex-Setup)',
+            active: true,
+          ),
+          const SizedBox(height: 12),
+          _buildPairingStatusRow(
+            label: 'Bridge Server',
+            value: 'Listening on port 50051 (TCP)',
+            active: true,
+          ),
+          const SizedBox(height: 12),
+          _buildPairingStatusRow(
+            label: 'Dashboard Tunnel',
+            value: 'Waiting for developer pair...',
+            active: false,
+          ),
+          const Spacer(),
+          OscButton(
+            label: 'Configure WiFi',
+            onPressed: () {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Scanning for local WiFi access points...')),
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPairingStatusRow({
+    required String label,
+    required String value,
+    required bool active,
+  }) {
+    return Row(
+      children: [
+        Container(
+          width: 8,
+          height: 8,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: active ? OscColors.green : OscColors.textMuted,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          '$label: ',
+          style: OscTypography.bodySmall.copyWith(
+            fontWeight: FontWeight.bold,
+            color: Colors.white70,
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: OscTypography.bodySmall.copyWith(
+              color: active ? OscColors.textBright : OscColors.textMuted,
+            ),
+            overflow: TextOverflow.ellipsis,
           ),
         ),
       ],
     );
   }
-}
 
-// ─── Document Canvas Card ──────────────────────────────────────────────
-class _DocumentCanvasCard extends StatelessWidget {
-  const _DocumentCanvasCard();
-
-  @override
-  Widget build(BuildContext context) {
+  Widget _buildDiscoveryPanel() {
     return OscCard(
-      gradient: OscCard.violetGradient,
-      padding: const EdgeInsets.all(18),
+      padding: const EdgeInsets.all(20),
       child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  OscSectionLabel(
-                    'DOCUMENT CANVAS',
-                    color: OscColors.violetLight.withValues(alpha: 0.85),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '\u201CProject Proposal.md\u201D',
-                    style: OscTypography.heading3,
-                  ),
-                ],
-              ),
-              const OscStatusBadge(
-                label: 'Auto-saving',
+              const OscSectionLabel('CORTEX HARDWARE DISCOVERY'),
+              OscStatusBadge(
+                label: 'AI-Healing Active',
                 color: OscColors.green,
               ),
             ],
           ),
-          const SizedBox(height: 14),
-          Text(
-            'The transition away from static software models requires a radical '
-            'inversion of hardware abstraction maps. By structuring intent parsing '
-            'frameworks at the system core layer, users no longer interact with '
-            'isolated platforms, but rather text environments that shift dynamically '
-            'based on temporary workflow requirements\u2026',
-            style: OscTypography.bodySmall,
+          const SizedBox(height: 12),
+          Expanded(
+            child: Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: OscColors.border),
+              ),
+              child: ListView.builder(
+                itemCount: _hardwareLogs.length,
+                itemBuilder: (context, index) {
+                  final logStr = _hardwareLogs[_hardwareLogs.length - 1 - index];
+                  Color color = Colors.white70;
+                  if (logStr.contains('[WARN]')) {
+                    color = OscColors.violetLight;
+                  } else if (logStr.contains('[ERROR]')) {
+                    color = Colors.redAccent;
+                  } else if (logStr.contains('Active') || logStr.contains('[OK]') || logStr.contains('successfully') || logStr.contains('registered')) {
+                    color = OscColors.green;
+                  }
+                  
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 6.0),
+                    child: Text(
+                      logStr,
+                      style: OscTypography.monoSmall.copyWith(color: color),
+                    ),
+                  );
+                },
+              ),
+            ),
           ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─── Media Player Card ─────────────────────────────────────────────────
-class _MediaPlayerCard extends StatelessWidget {
-  const _MediaPlayerCard();
-
-  @override
-  Widget build(BuildContext context) {
-    return OscCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const OscSectionLabel('NOW PLAYING', small: true),
-          const SizedBox(height: 10),
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+          const SizedBox(height: 16),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.02),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: OscColors.border),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Cortex Scan Status',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    color: OscColors.textBright,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
                   children: [
-                    Text(
-                      'Ambient Waves',
-                      style: OscTypography.body.copyWith(
-                        color: OscColors.textBright,
+                    if (_i2cScanning) ...[
+                      const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: OscColors.violetLight,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 3),
-                    Text(
-                      'Cortex Generative Radio',
-                      style: OscTypography.caption.copyWith(
-                        color: Colors.white.withValues(alpha: 0.35),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Scanning I2C addresses...',
+                        style: TextStyle(fontSize: 11, color: OscColors.textMuted),
                       ),
-                    ),
+                    ] else if (_canScanning) ...[
+                      const SizedBox(
+                        width: 12,
+                        height: 12,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 1.5,
+                          color: OscColors.violetLight,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'Mapping CAN bus packet structures...',
+                        style: TextStyle(fontSize: 11, color: OscColors.textMuted),
+                      ),
+                    ] else ...[
+                      const Icon(Icons.check_circle_rounded, color: OscColors.green, size: 14),
+                      const SizedBox(width: 8),
+                      const Text(
+                        'All hardware initialized. System ready for hot-push.',
+                        style: TextStyle(fontSize: 11, color: OscColors.green),
+                      ),
+                    ]
                   ],
                 ),
-              ),
-              const OscWaveform(),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Wrap(
-            spacing: 6,
-            runSpacing: 4,
-            children: [
-              const OscTag(label: 'Local Sync'),
-              OscTag.violet(label: 'Spatial Audio Active'),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─── Knowledge Source Card ──────────────────────────────────────────────
-class _KnowledgeSourceCard extends StatelessWidget {
-  const _KnowledgeSourceCard();
-
-  @override
-  Widget build(BuildContext context) {
-    return OscCard(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const OscSectionLabel('KNOWLEDGE SOURCE ENGINE', small: true),
-          const SizedBox(height: 8),
-          Text(
-            'https://en.wikipedia.org/wiki/Operating_system',
-            style: OscTypography.monoSmall.copyWith(color: OscColors.skyBlue),
-            overflow: TextOverflow.ellipsis,
-          ),
-          const SizedBox(height: 6),
-          Text(
-            'Operating Systems Architecture Evolution',
-            style: OscTypography.bodySmall.copyWith(
-              fontWeight: FontWeight.w500,
-              color: OscColors.textBright,
-            ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'An operating system (OS) is system software that manages '
-            'computer hardware, software resources, and provides common '
-            'services for computer programs\u2026',
-            style: TextStyle(
-              fontSize: 10.5,
-              height: 1.5,
-              color: Colors.white.withValues(alpha: 0.35),
+              ],
             ),
           ),
         ],
@@ -618,66 +705,85 @@ class _KnowledgeSourceCard extends StatelessWidget {
   }
 }
 
-// ─── Generated Engine View Card ────────────────────────────────────────
-class _GeneratedEngineCard extends StatelessWidget {
-  const _GeneratedEngineCard();
+// ─── Stylized QR Code Widget ─────────────────────────────────────────────
+class _QrCodeWidget extends StatelessWidget {
+  const _QrCodeWidget();
 
   @override
   Widget build(BuildContext context) {
-    return OscCard(
-      activeBorder: true,
-      gradient: OscCard.liveGradient,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              const OscSectionLabel('GENERATED ENGINE VIEW', small: true),
-              OscStatusBadge(
-                label: 'Live',
-                color: OscColors.violetLight,
-              ),
-            ],
-          ),
-          const SizedBox(height: 10),
-          Text(
-            'Injected general-purpose widget context directly into active '
-            'space. Render layout optimized natively.',
-            style: OscTypography.bodySmall,
+    final grid = [
+      [1,1,1,1,1,1,1,0,1,0,1,1,0,1,1,1,1,1,1,1],
+      [1,0,0,0,0,0,1,0,0,1,0,0,0,1,0,0,0,0,0,1],
+      [1,0,1,1,1,0,1,0,1,0,1,1,0,1,0,1,1,1,0,1],
+      [1,0,1,1,1,0,1,0,1,1,0,0,0,1,0,1,1,1,0,1],
+      [1,0,1,1,1,0,1,0,0,0,1,0,1,1,0,1,1,1,0,1],
+      [1,0,0,0,0,0,1,0,1,1,0,1,0,1,0,0,0,0,0,1],
+      [1,1,1,1,1,1,1,0,1,0,1,0,0,1,1,1,1,1,1,1],
+      [0,0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0,0,0,0],
+      [1,1,0,1,0,1,0,1,1,0,0,0,1,1,0,1,0,1,1,0],
+      [0,0,1,0,0,1,1,0,1,1,1,0,1,0,0,1,1,0,0,1],
+      [1,0,1,1,0,0,0,1,0,0,1,1,0,1,1,0,1,0,1,0],
+      [0,0,0,1,1,1,0,1,1,0,1,0,0,0,1,1,1,0,1,1],
+      [0,0,0,0,0,0,0,0,1,1,0,1,1,1,0,0,0,0,1,1],
+      [1,1,1,1,1,1,1,0,0,1,0,0,1,1,0,1,0,1,0,0],
+      [1,0,0,0,0,0,1,0,1,0,1,1,0,0,1,1,0,0,1,1],
+      [1,0,1,1,1,0,1,0,0,1,1,0,1,0,1,0,1,1,0,0],
+      [1,0,1,1,1,0,1,0,1,0,0,1,0,1,0,1,0,0,1,1],
+      [1,0,1,1,1,0,1,0,0,1,1,1,0,0,1,1,1,0,0,1],
+      [1,0,0,0,0,0,1,0,1,1,0,0,1,0,1,0,1,0,1,1],
+      [1,1,1,1,1,1,1,0,1,0,1,1,1,1,0,1,0,1,0,1]
+    ];
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.2),
+            blurRadius: 10,
+            spreadRadius: 2,
           ),
         ],
+      ),
+      child: SizedBox(
+        width: 160,
+        height: 160,
+        child: GridView.builder(
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: grid.length,
+          ),
+          itemCount: grid.length * grid.length,
+          itemBuilder: (context, index) {
+            final r = index ~/ grid.length;
+            final c = index % grid.length;
+            final isActive = grid[r][c] == 1;
+            return Container(
+              color: isActive ? Colors.black : Colors.white,
+            );
+          },
+        ),
       ),
     );
   }
 }
 
 // ─── Previews ──────────────────────────────────────────────────────────
-
-@OscPreview(name: 'Document Canvas Card', group: 'Shell Workspace')
-Widget documentCanvasPreview() {
-  return const SizedBox(width: 500, child: _DocumentCanvasCard());
+@OscPreview(name: 'Stylized QR Code', group: 'Setup Dashboard')
+Widget qrCodePreview() {
+  return const Padding(
+    padding: EdgeInsets.all(24),
+    child: _QrCodeWidget(),
+  );
 }
 
-@OscPreview(name: 'Media Player Card', group: 'Shell Workspace')
-Widget mediaPlayerPreview() {
-  return const SizedBox(width: 300, child: _MediaPlayerCard());
-}
-
-@OscPreview(name: 'Knowledge Source Card', group: 'Shell Workspace')
-Widget knowledgeSourcePreview() {
-  return const SizedBox(width: 300, child: _KnowledgeSourceCard());
-}
-
-@OscPreview(name: 'Generated Engine Card', group: 'Shell Workspace')
-Widget generatedEnginePreview() {
-  return const SizedBox(width: 500, child: _GeneratedEngineCard());
-}
-
-@OscPreview(name: 'Settings Button', group: 'Shell Chrome')
+@OscPreview(name: 'Settings Button', group: 'Setup Chrome')
 Widget settingsButtonPreview() {
   return Padding(
     padding: const EdgeInsets.all(16),
     child: _SettingsButton(),
   );
 }
+

@@ -99,8 +99,12 @@ impl FrameBitmap {
     fn free(&mut self, phys: u64) {
         let frame = (phys / FRAME_SIZE as u64) as usize;
         if frame < MAX_FRAMES {
-            self.bits[frame / 64] |= 1 << (frame % 64);
-            self.used = self.used.saturating_sub(1);
+            let mask = 1u64 << (frame % 64);
+            let idx = frame / 64;
+            if (self.bits[idx] & mask) == 0 {
+                self.bits[idx] |= mask;
+                self.used = self.used.saturating_sub(1);
+            }
         }
     }
 }

@@ -423,7 +423,7 @@ pub fn map_aot_into_process(app_id: u32, pid: u32) -> Result<(u64, u64), i64> {
     };
 
     // Load the AOT ELF and register it globally in the dynamic linker's LIBS table.
-    let handle = match crate::process::dl::dlopen(pid, pml4_phys, &aot_data) {
+    let handle = match crate::process::dl::dlopen(pid, pml4_phys, &aot_data, b"/system/flutter/libapp.so") {
         Ok(h) => h,
         Err(e) => {
             log::warn!("[APP] dlopen app AOT failed: {}", e);

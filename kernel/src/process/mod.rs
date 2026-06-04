@@ -45,7 +45,7 @@ pub const USER_ELF_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 
 /// User stack top (grows downward; bottom = TOP − STACK_SIZE).
 pub const USER_STACK_TOP:  u64  = 0x0000_7FFF_FFFF_0000;
-pub const USER_STACK_SIZE: usize = 64 * 1024; // 64 KiB
+pub const USER_STACK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const XSTATE_SIZE: usize = 4096;
 

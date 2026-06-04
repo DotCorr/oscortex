@@ -27,11 +27,11 @@ impl Log for KernelLogger {
 
 /// Tiny stack-allocated write buffer for log formatting (no heap needed).
 struct FmtBuf {
-    buf: [u8; 512],
+    buf: [u8; 2048],
     len: usize,
 }
 impl FmtBuf {
-    fn new() -> Self { Self { buf: [0u8; 512], len: 0 } }
+    fn new() -> Self { Self { buf: [0u8; 2048], len: 0 } }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("(fmt err)")
     }

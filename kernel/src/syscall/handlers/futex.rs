@@ -145,6 +145,34 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                 let bridged = futex_wake_waiters(addr, bridge_wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);
+                    // Bump the target condvar's seq so the woken thread sees
+                    // `cur_seq != seq` and exits cond_wait instead of re-sleeping.
+                    // Without this, bridge wakes are spurious and the thread goes
+                    // right back to sleep because its saved seq == current seq.
+                    //
+                    // Also update glibc pthread_cond_t __wakeup_seq (at addr+16)
+                    // so threads using glibc's pthread_cond_wait see a proper
+                    // signal and exit their re-check loop.
+                    if addr >= 0x1000 && addr < 0x0000_8000_0000_0000 {
+                        let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
+                        if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
+                            // Custom condvar seq bump (our protocol)
+                            let atom = unsafe { &*(addr as *const core::sync::atomic::AtomicU32) };
+                            atom.fetch_add(1, core::sync::atomic::Ordering::Release);
+                            // glibc __wakeup_seq at addr+16 (u64, glibc 2.17 NPTL layout)
+                            // glibc __broadcast_seq at addr+40 (u32)
+                            if addr + 48 < 0x0000_8000_0000_0000 {
+                                if crate::mm::paging::translate_user_page(cur_cr3, (addr+16) & !0xfff).is_some() {
+                                    let wakeup_ptr = (addr + 16) as *mut u64;
+                                    unsafe { *wakeup_ptr = (*wakeup_ptr).wrapping_add(1); }
+                                    let bcast_ptr = (addr + 40) as *mut u32;
+                                    unsafe { *bcast_ptr = (*bcast_ptr).wrapping_add(1); }
+                                    // Also wake glibc's futex word at addr+4
+                                    let _ = futex_wake_waiters(addr + 4, bridge_wake_count);
+                                }
+                            }
+                        }
+                    }
                     static COND_BRIDGE_SIB_LOG: core::sync::atomic::AtomicU32 =
                         core::sync::atomic::AtomicU32::new(0);
                     let n = COND_BRIDGE_SIB_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -626,7 +654,11 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
     }
 
     let spawn = |entry_fn: u64, arg: u64, stack_size: u64| -> Result<u32, i64> {
-        let sz = if stack_size == 0 { 65536 } else { stack_size as usize };
+        let sz = if stack_size == 0 {
+            1024 * 1024 // 1 MiB default
+        } else {
+            (stack_size as usize).max(512 * 1024) // 512 KiB minimum
+        };
         crate::process::spawn_thread(parent_pid, entry_fn, arg, sz).map_err(|_| -12)
     };
 

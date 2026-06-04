@@ -43,7 +43,7 @@ def get_sdk_hash_from_elf(elf_path: Path) -> bytes | None:
     try:
         out = subprocess.check_output(["nm", "-D", str(elf_path)], text=True)
         for line in out.splitlines():
-            if "_kDartVmSnapshotData" in line:
+            if "kDartVmSnapshotData" in line:
                 parts = line.split()
                 if len(parts) >= 3:
                     val = int(parts[0], 16)
@@ -97,15 +97,15 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     # P10: SkBitmapDevice::drawPaint — always take post-onAccessPixels path.
     "P10": (0x1A8AE87, bytes([0xEB, 0x10])),
     # P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3: expected SDK hash offsets in pristine engine.
-    "P_SDK_HASH": (0x188ced, b"1a420a3f9a"),
-    "P_SDK_HASH_2": (0x3bd638, b"1a420a3f9a"),
-    "P_SDK_HASH_3": (0xd81028, b"1a420a3f9a"),
+    "P_SDK_HASH": (0x188ced, b"78da37fed6"),
+    "P_SDK_HASH_2": (0x3bd638, b"78da37fed6"),
+    "P_SDK_HASH_3": (0xd81028, b"78da37fed6"),
     # P_RUNS_AOT: patch runs_aot_compiled_dart_code to return true.
     "P_RUNS_AOT": (0x195f260, b"\xb0\x01\xc3\x90\x90"),
     # P_JIT_AOT_CHECK: bypass "JIT runtime cannot run a precompiled snapshot" panic
     "P_JIT_AOT_CHECK": (0x22b181b, bytes([0x90, 0x90])),
     # P_SNAPSHOT_FEATURES_CHECK: bypass snapshot/VM features mismatch panic (e.g. macos vs linux)
-    "P_SNAPSHOT_FEATURES_CHECK": (0x2290fe6, bytes([0xeb, 0x73])),
+    "P_SNAPSHOT_FEATURES_CHECK": (0x2290f30, bytes([0x48, 0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90])),
     # P_ALLOW_ALL_DART_FLAGS: bypass switches.cc allowed Dart flags whitelist check
     # We change the conditional jump (je success_path) at 0x21c3f2f to an unconditional
     # jump (jmp success_path) so all Dart flags are accepted.
@@ -119,6 +119,30 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     "P_FINISH_INIT_CAVE_2": (0x1F44620, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0x3b, 0x02, 0x3d, 0x00, 0xe9, 0x32, 0x02, 0x3d, 0x00])),
     "P_INIT_TTS_HOOK": (0x23148cf, bytes([0xe9, 0x6c, 0xfd, 0xc2, 0xff])),
     "P_INIT_TTS_CAVE": (0x1F44640, bytes([0x48, 0x85, 0xd2, 0x74, 0x0a, 0x4c, 0x39, 0xc2, 0x74, 0x05, 0xe9, 0x89, 0x02, 0x3d, 0x00, 0xe9, 0x80, 0x02, 0x3d, 0x00])),
+    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1": (0x23dacc8, bytes([0xe9, 0x33, 0x9a, 0xb6, 0xff, 0x90, 0x90])),
+    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2": (0x23db253, bytes([0xe9, 0x67, 0x00, 0x00, 0x00, 0x90, 0x90])),
+    "P_VM_CONSTANTS_CAVE": (0x1F44700, bytes([
+        0x4c, 0x8d, 0x0d, 0x63, 0x00, 0x00, 0x00, 0x4d, 0x31, 0xc0, 0x49, 0x83, 0xf8, 0x11, 0x74, 0x55,
+        0x4f, 0x0f, 0xb7, 0x14, 0x41, 0x4b, 0x8b, 0x0c, 0x17, 0x48, 0x81, 0xf9, 0x00, 0x10, 0x00, 0x00,
+        0x72, 0x36, 0x48, 0x8b, 0x51, 0x08, 0x48, 0x81, 0xfa, 0x00, 0x10, 0x00, 0x00, 0x72, 0x29, 0x48,
+        0x8b, 0x4a, 0x2f, 0x48, 0x39, 0xc1, 0x75, 0x04, 0x48, 0x8b, 0x4a, 0x07, 0x49, 0x83, 0xf8, 0x10,
+        0x75, 0x09, 0x48, 0x39, 0xc1, 0x74, 0x04, 0x48, 0x83, 0xc1, 0x05, 0x4a, 0x89, 0x8c, 0xc3, 0x00,
+        0x02, 0x00, 0x00, 0x49, 0xff, 0xc0, 0xeb, 0xb2, 0x4a, 0x89, 0x84, 0xc3, 0x00, 0x02, 0x00, 0x00,
+        0x49, 0xff, 0xc0, 0xeb, 0xa5, 0xe9, 0x49, 0x6a, 0x49, 0x00, 0xe0, 0x00, 0x40, 0x06, 0xa0, 0x03,
+        0xc0, 0x03, 0xa0, 0x04, 0xc0, 0x04, 0xe0, 0x04, 0xe0, 0x0f, 0xc0, 0x0f, 0x60, 0x08, 0xe0, 0x07,
+        0x60, 0x07, 0xc0, 0x08, 0xa0, 0x10, 0x20, 0x00, 0x00, 0x0d, 0xa0, 0x06,
+    ])),
+    "P_BYPASS_FINALIZE_CLASS_NAMES": (0x2314b3e, bytes([0xe9, 0xba, 0x04, 0x00, 0x00, 0x90, 0x90])),
+    "P_BYPASS_BASE_OBJECTS_CHECK": (0x2291627, bytes([0xeb])),
+    "P_BYPASS_BASE_OBJECTS_COMPARE": (0x22914aa, bytes([0x90] * 6)),
+    "P_IS_PRECOMPILED_RUNTIME": (0x2668190, bytes([0xb0, 0x01, 0xc3])),
+    "P_FLAG_PRECOMPILED_MODE_DEFAULT": (0x22ce1a8, bytes([0xb2, 0x01])),
+    "P_FLAG_PRECOMPILED_MODE_INITIAL": (0x22ce1af, bytes([0xc6, 0x05, 0xeb, 0x02, 0x45, 0x00, 0x01])),
+    "P_BYPASS_VM_SERVICE_TASK": (0x23ca510, bytes([0xc3, 0x90, 0x90, 0x90, 0x90])),
+    "P_BYPASS_SERVICE_ISOLATE_RUN": (0x23c9eb0, bytes([0xc3, 0x90, 0x90, 0x90, 0x90])),
+    "P_READFILL_OBJPOOL": (0x2298fbd, bytes.fromhex("498b45004989442427") + b"\x90" * 111),
+    "P_READFILL_STACKMAPS": (0x2299235, bytes.fromhex("498b45004989442457") + b"\x90" * 119),
+    "P_READ_INSTRUCTIONS": (0x2291070, bytes.fromhex("4156535541574889f34989fe498b7648e868000000498976484889c6498b7e58e8cbdd03004889432f498b7648e8b6000000498976488983ab000000498b7648e838000000498976484889c6498b7e58e89bdd03004889436f4989c7498b7648e883000000498976484889df4c89fe4889c2415f5d5b415ee9734e0b000fb60648ffc684c078410fb60e48ffc689cac1e20709d084c978380fb60e48ffc689cac1e20e09d084c9782f0fb60e48ffc689cac1e21509d084c978260fb60e48ffc689cac1e21c09d0c32dc00000004898c32d006000004898c32d000030004898c32d000000184898c30fb60648ffc684c078410fb60e48ffc689cac1e20709d084c978380fb60e48ffc689cac1e20e09d084c9782f0fb60e48ffc689cac1e21509d084c978260fb60e48ffc689cac1e21c09d0c32d800000004898c32d004000004898c32d000020004898c32d000000104898c3") + b"\x90" * 157),
 }
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
@@ -373,35 +397,43 @@ def main() -> int:
         print(f"engine not found: {engine}", file=sys.stderr)
         return 1
 
-    # Extract dynamic SDK hash from libapp.so to update P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3
     libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
     extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
     if extracted_hash:
         print(f"Extracted dynamic SDK hash from libapp.so: {extracted_hash.decode('ascii')}")
-        PATCHES["P_SDK_HASH"] = (0x188ced, extracted_hash)
-        PATCHES["P_SDK_HASH_2"] = (0x3bd638, extracted_hash)
-        PATCHES["P_SDK_HASH_3"] = (0xd81028, extracted_hash)
+        target_hash = extracted_hash + b"\x00"
     else:
         print("Using fallback SDK hash 78da37fed6")
-        PATCHES["P_SDK_HASH"] = (0x188ced, b"78da37fed6")
-        PATCHES["P_SDK_HASH_2"] = (0x3bd638, b"78da37fed6")
-        PATCHES["P_SDK_HASH_3"] = (0xd81028, b"78da37fed6")
+        target_hash = b"78da37fed6\x00"
+
+    PATCHES["P_SDK_HASH"] = (0x188ced, target_hash)
+    PATCHES["P_SDK_HASH_2"] = (0x3bd638, target_hash)
+    PATCHES["P_SDK_HASH_3"] = (0xd81028, target_hash)
 
     data = bytearray(engine.read_bytes())
 
+    all_patches = [
+        "P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE",
+        "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT",
+        "P_JIT_AOT_CHECK", "P_ALLOW_ALL_DART_FLAGS",
+        "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2",
+        "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE",
+        "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1", "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2", "P_VM_CONSTANTS_CAVE",
+        "P_BYPASS_FINALIZE_CLASS_NAMES", "P_BYPASS_BASE_OBJECTS_CHECK", "P_BYPASS_BASE_OBJECTS_COMPARE",
+        "P_IS_PRECOMPILED_RUNTIME", "P_FLAG_PRECOMPILED_MODE_DEFAULT", "P_FLAG_PRECOMPILED_MODE_INITIAL",
+        "P_BYPASS_VM_SERVICE_TASK",
+        "P_BYPASS_SERVICE_ISOLATE_RUN",
+    ]
+
     if args.verify:
-        names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
-            if args.apply_all
-            else None
-        )
+        names = all_patches if args.apply_all else None
         if names:
             errors = []
             for n in names:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]:
+            for n in all_patches[1:]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -414,7 +446,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE", "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT", "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS", "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2", "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE"]
+        all_patches
         if args.apply_all
         else (args.apply or [])
     )

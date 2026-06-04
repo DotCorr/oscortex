@@ -227,6 +227,8 @@ pub fn sys_free(ptr: u64) -> i64 {
         let mut free = MALLOC_FREE.lock();
         free.push(block);
         coalesce_free_blocks(&mut free);
+    } else {
+        log::warn!("[free] ptr={:#x} not found in MALLOC_ALLOCS", ptr);
     }
     0
 }
@@ -251,23 +253,35 @@ pub fn sys_realloc(ptr: u64, size: u64) -> i64 {
         return 0;
     }
     let (_, pml4) = pid_and_pml4();
-    let old_size = MALLOC_ALLOCS
-        .lock()
-        .get(&(pml4, ptr))
-        .map(|block| block.size)
-        .unwrap_or_else(|| if ptr >= 16 { unsafe { *((ptr - 16) as *const u64) } } else { 0 });
+    let in_allocs = MALLOC_ALLOCS.lock().get(&(pml4, ptr)).map(|block| block.size);
+    let old_size = in_allocs.unwrap_or_else(|| {
+        if ptr >= 16 {
+            let val = unsafe { *((ptr - 16) as *const u64) };
+            log::warn!("[realloc] ptr={:#x} not in MALLOC_ALLOCS; read size={:#x} from header", ptr, val);
+            val
+        } else {
+            0
+        }
+    });
+
+    log::info!("[realloc] ptr={:#x} size={:#x} old_size={:#x} (in_allocs={:?})", ptr, size, old_size, in_allocs);
+
     if old_size >= size {
         return ptr as i64;
     } // already big enough
     let new_ptr = sys_malloc(size);
-    if new_ptr == 0 || ptr == 0 {
-        return new_ptr;
+    if new_ptr == 0 {
+        return 0;
     }
     // Copy old data.
     let copy_len = old_size.min(size) as usize;
-    unsafe {
-        core::ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, copy_len);
+    if copy_len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(ptr as *const u8, new_ptr as *mut u8, copy_len);
+        }
     }
+    // Free the old pointer.
+    sys_free(ptr);
     new_ptr
 }
 
@@ -790,7 +804,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
     }
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
     let pid = crate::process::current_pid();
-    let trace_startup_mutex = matches!(mutex, 0x371ef70 | 0x39b000018);
+    let trace_startup_mutex = matches!(mutex, 0x371ef70 | 0x14371ef70 | 0x39b000018);
     // Targeted trace for the mutex that pid=3 holds across epoll_wait, blocking pid=2/8/9.
     if mutex == 0x394000018 {
         static MUTEX394_LOCK_LOG: core::sync::atomic::AtomicU32 =
@@ -1197,6 +1211,32 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
     };
 
     if state.is_none() {
+        // Check for a pre-delivered (lost-wakeup-guard) signal before blocking.
+        // If cond_signal/cond_broadcast fired before this wait was entered, we
+        // recorded it in COND_PENDING_SIGNALS. Consume it and return immediately.
+        {
+            let mut pending = super::COND_PENDING_SIGNALS.lock();
+            if let Some(count) = pending.get_mut(&cond) {
+                if *count > 0 {
+                    *count -= 1;
+                    if *count == 0 { pending.remove(&cond); }
+                    drop(pending);
+                    static PENDING_CONSUME_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = PENDING_CONSUME_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        log::warn!(
+                            "[cond-pending-consume] #{} pid={} cond={:#x} mutex={:#x} — returning immediately",
+                            n, pid, cond, mutex
+                        );
+                    }
+                    // Re-acquire the mutex (which cond_wait semantically releases then re-acquires).
+                    // We never released it (returning early), so just return 0.
+                    return 0;
+                }
+            }
+        }
+
         // First time: register waiter, then unlock mutex and enter Waiting state.
         let seq = atom.load(Ordering::Acquire);
         if pid != 0 {
@@ -1212,6 +1252,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
         super::COND_WAIT_STATE.lock().insert(pid, next_state);
         state = Some(next_state);
     }
+
 
     // Now process the state machine
     loop {
@@ -1432,7 +1473,13 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
                 );
             }
         }
+        // If nobody was woken directly on this condvar, record a pending signal.
+        // Record even when bridged > 0 — bridge wakes may be spurious.
+        let mut pending = super::COND_PENDING_SIGNALS.lock();
+        let entry = pending.entry(cond).or_insert(0);
+        *entry = entry.saturating_add(1).min(8);
     }
+
     static COND_SIGNAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let k = COND_SIGNAL_LOG.fetch_add(1, Ordering::Relaxed);
     if k < 64 || k % 256 == 0 {
@@ -1479,6 +1526,40 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
     let atom = unsafe { &*(cond as *const core::sync::atomic::AtomicU32) };
     let old_seq = atom.fetch_add(1, Ordering::Release);
     let n = super::futex_wake_waiters(cond, i32::MAX as u32);
+
+    // Glibc compat: if no direct waiters on our custom futex, also wake glibc's
+    // internal pthread_cond_t __futex field (at cond+4) and bump __wakeup_seq
+    // (at cond+16). This handles cross-protocol signals where thread-8 uses the
+    // OSCortex custom condvar ABI but thread-1 waits via glibc pthread_cond_wait.
+    let mut glibc_woke = 0u32;
+    if n == 0 && cond >= 0x1000 && cond + 24 < 0x0000_8000_0000_0000 {
+        // Safely read the glibc __futex field (u32 at cond+4).
+        let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
+        let glibc_futex_addr = cond + 4;
+        if crate::mm::paging::translate_user_page(cur_cr3, glibc_futex_addr & !0xfff).is_some() {
+            // Increment glibc __wakeup_seq (u64 at cond+16).
+            let wakeup_seq_ptr = (cond + 16) as *mut u64;
+            unsafe { *wakeup_seq_ptr = (*wakeup_seq_ptr).wrapping_add(1); }
+            // Also increment glibc __broadcast_seq (u32 at cond+40) for broadcast.
+            let bcast_seq_ptr = (cond + 40) as *mut u32;
+            unsafe { *bcast_seq_ptr = (*bcast_seq_ptr).wrapping_add(1); }
+            // Wake any threads blocked on glibc's internal futex word.
+            glibc_woke = super::futex_wake_waiters(glibc_futex_addr, i32::MAX as u32) as u32;
+            if glibc_woke > 0 {
+                static GLIBC_COND_WAKE_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let g = GLIBC_COND_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
+                if g < 16 {
+                    log::warn!(
+                        "[cond-glibc-wake] #{} pid={} cond={:#x} glibc_futex={:#x} woke={}",
+                        g, pid, cond, glibc_futex_addr, glibc_woke
+                    );
+                }
+            }
+        }
+    }
+    let n = if glibc_woke > 0 { glibc_woke as i64 } else { n };
+
     let mut bridged = 0u32;
     let engine_host = ENGINE_HOST_PID.load(Ordering::Acquire);
     let mut skip_bridge = false;
@@ -1562,6 +1643,17 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
     cond_broadcast_loop_handoff(pid, cond, n, bridged);
+
+    // Lost-wakeup guard: if nobody was woken directly on this condvar, record a
+    // pending signal so the next cond_wait on this condvar returns immediately.
+    // We record even when bridged > 0 because bridge wakes may be spurious —
+    // the intended waiter (thread 1) might not be at the bridge target yet.
+    // Cap at 8 pending to prevent unbounded growth from broadcast storms.
+    if n == 0 && cond >= 0x1000 {
+        let mut pending = super::COND_PENDING_SIGNALS.lock();
+        let entry = pending.entry(cond).or_insert(0);
+        *entry = entry.saturating_add(1).min(8);
+    }
 
     static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
@@ -2496,12 +2588,20 @@ fn format_into(buf: u64, size: u64, fmt_ptr: u64, mut next_int: impl FnMut() -> 
             return 0;
         }
         if crate::mm::paging::translate_user_page(cur_cr3, p & !0xfff).is_none() {
-            return 0;
+            if !crate::mm::paging::demand_page(p & !0xfff, 0) {
+                return 0;
+            }
         }
         let mut n = 0usize;
         unsafe {
             let pp = p as *const u8;
             while n < out.len() {
+                let cur_va = (p + n as u64) & !0xfff;
+                if crate::mm::paging::translate_user_page(cur_cr3, cur_va).is_none() {
+                    if !crate::mm::paging::demand_page(cur_va, 0) {
+                        break;
+                    }
+                }
                 let c = *pp.add(n);
                 if c == 0 {
                     break;
@@ -2689,11 +2789,12 @@ pub fn sys_snprintf(
     let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
     let safe_qword = |off: u64| -> u64 {
         let addr = user_rsp.wrapping_add(off);
-        if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
-            unsafe { core::ptr::read_volatile(addr as *const u64) }
-        } else {
-            0
+        if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_none() {
+            if !crate::mm::paging::demand_page(addr & !0xfff, 0) {
+                return 0;
+            }
         }
+        unsafe { core::ptr::read_volatile(addr as *const u64) }
     };
     let fourth_vararg = safe_qword(8);
     let fifth_vararg = safe_qword(16);

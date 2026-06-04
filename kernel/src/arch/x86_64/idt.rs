@@ -237,7 +237,7 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
         static RESOLVED_PF_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = RESOLVED_PF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 64 {
+        if n < 2048 {
             log::warn!(
                 "[PageFault-resolved] #{} pid={} addr={:#x} err={:#x} ip={:#x} sp={:#x}",
                 n,
@@ -268,16 +268,19 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
             frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15
         );
         if frame.rsp != 0 {
-            let mut slots = [0u64; 8];
+            let mut slots = [0u64; 32];
             unsafe {
-                for i in 0..8 {
+                for i in 0..32 {
                     let p = (frame.rsp as *const u64).add(i);
                     slots[i] = core::ptr::read_volatile(p);
                 }
             }
             log::error!(
-                "[PageFault] stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x}",
-                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]
+                "[PageFault] stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x} +64={:#x} +72={:#x} +80={:#x} +88={:#x} +96={:#x} +104={:#x} +112={:#x} +120={:#x} +128={:#x} +136={:#x} +144={:#x} +152={:#x} +160={:#x} +168={:#x} +176={:#x} +184={:#x} +192={:#x} +200={:#x} +208={:#x} +216={:#x} +224={:#x} +232={:#x} +240={:#x} +248={:#x}",
+                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7],
+                slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15],
+                slots[16], slots[17], slots[18], slots[19], slots[20], slots[21], slots[22], slots[23],
+                slots[24], slots[25], slots[26], slots[27], slots[28], slots[29], slots[30], slots[31]
             );
         }
         // For ip=0 (NULL call), try to disassemble the bytes just before
