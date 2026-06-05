@@ -36,6 +36,7 @@ iso_root/boot/limine/
 .DS_Store
 *.swp
 *.swo
+*.bak
 qemu-current*.log
 qemu-log.txt
 serial.log
