@@ -38,6 +38,40 @@ def file_to_va(fo: int) -> int:
     return fo
 
 
+def get_sdk_hash_from_elf(elf_path: Path) -> bytes | None:
+    import subprocess
+    try:
+        out = subprocess.check_output(["nm", "-D", str(elf_path)], text=True)
+        for line in out.splitlines():
+            if "kDartVmSnapshotData" in line:
+                parts = line.split()
+                if len(parts) >= 3:
+                    val = int(parts[0], 16)
+                    data = elf_path.read_bytes()
+                    e_phoff = struct.unpack("<Q", data[0x20:0x28])[0]
+                    e_phnum = struct.unpack("<H", data[0x38:0x3a])[0]
+                    e_phentsize = struct.unpack("<H", data[0x36:0x38])[0]
+                    
+                    file_offset = None
+                    for i in range(e_phnum):
+                        ph_offset = e_phoff + i * e_phentsize
+                        p_type = struct.unpack("<I", data[ph_offset : ph_offset + 4])[0]
+                        if p_type == 1: # PT_LOAD
+                            p_offset = struct.unpack("<Q", data[ph_offset + 8 : ph_offset + 16])[0]
+                            p_vaddr = struct.unpack("<Q", data[ph_offset + 16 : ph_offset + 24])[0]
+                            p_filesz = struct.unpack("<Q", data[ph_offset + 32 : ph_offset + 40])[0]
+                            if val >= p_vaddr and val < p_vaddr + p_filesz:
+                                file_offset = p_offset + (val - p_vaddr)
+                                break
+                    
+                    if file_offset is not None:
+                        hash_bytes = data[file_offset + 20 : file_offset + 30]
+                        return hash_bytes
+    except Exception as e:
+        print(f"Error extracting SDK hash: {e}")
+    return None
+
+
 def rel32(from_va: int, to_va: int) -> bytes:
     return struct.pack("<i", to_va - (from_va + 5))
 
@@ -62,7 +96,139 @@ PATCHES: dict[str, tuple[int, bytes]] = {
     # "P8": (0x1B2222F, bytes([0xEB, 0x38])),
     # P10: SkBitmapDevice::drawPaint — always take post-onAccessPixels path.
     "P10": (0x1A8AE87, bytes([0xEB, 0x10])),
+    # P_SDK_HASH, P_SDK_HASH_2, P_SDK_HASH_3: expected SDK hash offsets in pristine engine.
+    "P_SDK_HASH": (0x188ced, b"78da37fed6"),
+    "P_SDK_HASH_2": (0x3bd638, b"78da37fed6"),
+    "P_SDK_HASH_3": (0xd81028, b"78da37fed6"),
+    # P_RUNS_AOT: patch runs_aot_compiled_dart_code to return true.
+    "P_RUNS_AOT": (0x195f260, b"\xb0\x01\xc3\x90\x90"),
+    # P_JIT_AOT_CHECK: bypass "JIT runtime cannot run a precompiled snapshot" panic
+    "P_JIT_AOT_CHECK": (0x22b181b, bytes([0x90, 0x90])),
+    # P_SNAPSHOT_FEATURES_CHECK: bypass snapshot/VM features mismatch panic (e.g. macos vs linux)
+    "P_SNAPSHOT_FEATURES_CHECK": (0x2290f30, bytes([0x48, 0x31, 0xc0, 0xc3, 0x90, 0x90, 0x90])),
+    # P_ALLOW_ALL_DART_FLAGS: bypass switches.cc allowed Dart flags whitelist check
+    # We change the conditional jump (je success_path) at 0x21c3f2f to an unconditional
+    # jump (jmp success_path) so all Dart flags are accepted.
+    "P_ALLOW_ALL_DART_FLAGS": (0x21c3f2f, bytes([0xe9, 0xba, 0x00, 0x00, 0x00, 0x90])),
+    # P_FINISH_INIT_HOOK and P_FINISH_INIT_CAVE: bypass NULL pointer dereference in
+    # dart::Object::FinishInit(dart::IsolateGroup*). If rax (type testing stub code) is 0,
+    # jump directly to the end of the stub initialization to avoid segfaulting.
+    "P_FINISH_INIT_HOOK": (0x23147e0, bytes([0xe9, 0x1b, 0xfe, 0xc2, 0xff])),
+    "P_FINISH_INIT_CAVE": (0x1F44600, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0xda, 0x01, 0x3d, 0x00, 0xe9, 0xd1, 0x01, 0x3d, 0x00])),
+    "P_FINISH_INIT_HOOK_2": (0x2314861, bytes([0xe9, 0xba, 0xfd, 0xc2, 0xff])),
+    "P_FINISH_INIT_CAVE_2": (0x1F44620, bytes([0x48, 0x85, 0xc0, 0x74, 0x0a, 0x48, 0x39, 0xf8, 0x74, 0x05, 0xe9, 0x3b, 0x02, 0x3d, 0x00, 0xe9, 0x32, 0x02, 0x3d, 0x00])),
+    "P_INIT_TTS_HOOK": (0x23148cf, bytes([0xe9, 0x6c, 0xfd, 0xc2, 0xff])),
+    "P_INIT_TTS_CAVE": (0x1F44640, bytes([0x48, 0x85, 0xd2, 0x74, 0x0a, 0x4c, 0x39, 0xc2, 0x74, 0x05, 0xe9, 0x89, 0x02, 0x3d, 0x00, 0xe9, 0x80, 0x02, 0x3d, 0x00])),
+    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1": (0x23dac7e, bytes([0xe9, 0x7d, 0x9a, 0xb6, 0xff, 0x90, 0x90])),
+    "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2": (0x23db253, bytes([0xe9, 0x67, 0x00, 0x00, 0x00, 0x90, 0x90])),
+    "P_VM_CONSTANTS_CAVE": (0x1F44700, bytes([
+        0x4c, 0x8d, 0x0d, 0x63, 0x00, 0x00, 0x00, 0x4d, 0x31, 0xc0, 0x49, 0x83, 0xf8, 0x12, 0x74, 0x55,
+        0x4f, 0x0f, 0xb7, 0x14, 0x41, 0x4b, 0x8b, 0x0c, 0x17, 0x48, 0x81, 0xf9, 0x00, 0x10, 0x00, 0x00,
+        0x72, 0x36, 0x48, 0x8b, 0x51, 0x08, 0x48, 0x81, 0xfa, 0x00, 0x10, 0x00, 0x00, 0x72, 0x29, 0x48,
+        0x8b, 0x4a, 0x2f, 0x48, 0x39, 0xc1, 0x75, 0x04, 0x48, 0x8b, 0x4a, 0x07, 0x49, 0x83, 0xf8, 0x10,
+        0x75, 0x09, 0x48, 0x39, 0xc1, 0x74, 0x04, 0x48, 0x83, 0xc1, 0x05, 0x4a, 0x89, 0x8c, 0xc3, 0xf8,
+        0x01, 0x00, 0x00, 0x49, 0xff, 0xc0, 0xeb, 0xb2, 0x4a, 0x89, 0x84, 0xc3, 0xf8, 0x01, 0x00, 0x00,
+        0x49, 0xff, 0xc0, 0xeb, 0xa5, 0xe9, 0x49, 0x6a, 0x49, 0x00,
+        # Table of IsolateGroup/Isolate offsets to check (now starts with 0xa0):
+        0xa0, 0x00,
+        0xe0, 0x00, 0x40, 0x06, 0xa0, 0x03, 0xc0, 0x03, 0xa0, 0x04, 0xc0, 0x04, 0xe0, 0x04, 0xe0, 0x0f,
+        0xc0, 0x0f, 0x60, 0x08, 0xe0, 0x07, 0x60, 0x07, 0xc0, 0x08, 0xa0, 0x10, 0x20, 0x00, 0x00, 0x0d,
+        0xa0, 0x06,
+    ])),
+    "P_BYPASS_FINALIZE_CLASS_NAMES": (0x2314b3e, bytes([0xe9, 0xba, 0x04, 0x00, 0x00, 0x90, 0x90])),
+    "P_BYPASS_BASE_OBJECTS_CHECK": (0x2291627, bytes([0xeb])),
+    "P_BYPASS_BASE_OBJECTS_COMPARE": (0x22914aa, bytes([0x90] * 6)),
+    "P_IS_PRECOMPILED_RUNTIME": (0x2668190, bytes([0xb0, 0x01, 0xc3])),
+    "P_FLAG_PRECOMPILED_MODE_DEFAULT": (0x22ce1a8, bytes([0xb2, 0x01])),
+    "P_FLAG_PRECOMPILED_MODE_INITIAL": (0x22ce1af, bytes([0xc6, 0x05, 0xeb, 0x02, 0x45, 0x00, 0x01])),
+    "P_BYPASS_VM_SERVICE_TASK": (0x23ca510, bytes([0xc3, 0x90, 0x90, 0x90, 0x90])),
+    "P_BYPASS_SERVICE_ISOLATE_RUN": (0x23c9eb0, bytes([0xc3, 0x90, 0x90, 0x90, 0x90])),
+    "P_READFILL_OBJPOOL_0": (0x2298f74, bytes.fromhex("4d89ac2497000000") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL": (0x2299024, bytes.fromhex("4d896c2427") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_2": (0x22990a4, bytes.fromhex("4d896c2437") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_3": (0x2299124, bytes.fromhex("4d896c243f") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_4": (0x22991a4, bytes.fromhex("4d896c2447") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_5": (0x2299224, bytes.fromhex("4d896c244f") + b"\x90" * 12),
+    "P_READFILL_STACKMAPS": (0x22992a4, bytes.fromhex("4d896c2457") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_7": (0x2299324, bytes.fromhex("4d896c245f") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_8": (0x22993a4, bytes.fromhex("4d896c2467") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_9": (0x2299424, bytes.fromhex("4d896c2477") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_10": (0x22994a4, bytes.fromhex("4d896c247f") + b"\x90" * 12),
+    "P_READFILL_OBJPOOL_11": (0x2299524, bytes.fromhex("4d89ac2487000000") + b"\x90" * 12),
+    "P_READ_INSTRUCTIONS": (0x2291070, bytes.fromhex("e98b39cbff") + b"\x90" * 491),
+    "P_DEBUG_CAVE": (0x1F44A00, bytes.fromhex("4156535541574d89f74889f34989fe48b8bbbbbbbbbbbbbbbbe8ff0000004c89f8e8f70000004889d8e8ef000000498b4648e8e6000000498b4e48488b01e8da000000498b7648e83801000049897648e8c80000004889c6498b7e58e8ffa338004889432f498b4648e8af000000498b4e48488b01e8a3000000498b7648e86c01000049897648e8910000008983ab000000498b4648e882000000498b4e48488b01e876000000498b7648e8d400000049897648e8640000004889c6498b7e58e89ba338004889436f4889c5e84c000000498b4648e843000000498b4e48488b01e837000000498b7648e80001000049897648e8250000005048b8eeeeeeeeeeeeeeeee815000000584889df4889ee4889c2415f5d5b415ee9431440004981ffc00400007205e801000000c357565251415350534883ec204889e748c7c11000000048c1c00489c383e30f80c33080fb39760380c307881f48ffc748ffc975e2c6070ab801000000bf010000004889e6ba110000000f054883c4205b58415b595a5e5fc30fb60648ffc684c078410fb60e48ffc689cac1e20709d084c978380fb60e48ffc689cac1e20e09d084c9782f0fb60e48ffc689cac1e21509d084c978260fb60e48ffc689cac1e21c09d0c32dc00000004898c32d006000004898c32d000030004898c32d000000184898c30fb60648ffc684c078410fb60e48ffc689cac1e20709d084c978380fb60e48ffc689cac1e20e09d084c9782f0fb60e48ffc689cac1e21509d084c978260fb60e48ffc689cac1e21c09d0c32d800000004898c32d004000004898c32d000020004898c32d000000104898c3")),
+    "P_CLUSTER_TRACE_HOOK": (0x2291551, bytes.fromhex("e8aa4acbff90")),
+    "P_CLUSTER_TRACE_CAVE": (0x1F46000, bytes.fromhex("5756525141504151415241534154415541564157535548b8cccccccccccccccce8850000004c89e8e87d0000004889f8e875000000498b4648e86c0000005d5b415f415e415d415c415b415a41594158595a5e5f488b074883ec08ff50184883c40857565251415041514152415341544155415641575355498b4648e82900000048b8dddddddddddddddde81a0000005d5b415f415e415d415c415b415a41594158595a5e5f49ffc5c357565251415350534883ec204889e748c7c11000000048c1c00489c383e30f80c33080fb39760380c307881f48ffc748ffc975e2c6070ab801000000bf010000004889e6ba110000000f054883c4205b58415b595a5e5fc3")),
+    "P_READFILL_LOOP_CLAMP_HOOK": (va_to_file(0x2299f97), bytes.fromhex("e964b9caff90909090")),
+    "P_READFILL_LOOP_CLAMP_CAVE": (0x1F44900, bytes([
+        0x50, 0x57, 0x56, 0x52, 0x51, 0x41, 0x50, 0x41, 0x51, 0x41, 0x53, # push regs
+        0x48, 0xc7, 0xc0, 0x99, 0x99, 0x00, 0x00,                         # mov rax, 0x9999
+        0x48, 0x89, 0xdf,                                                 # mov rdi, rbx
+        0x0f, 0x05,                                                       # syscall
+        0x41, 0x5b, 0x41, 0x59, 0x41, 0x58, 0x59, 0x5a, 0x5e, 0x5f, 0x58, # pop regs
+        0x48, 0x89, 0xd8,                                                 # mov rax, rbx
+        0x48, 0x83, 0xfb, 0x64,                                           # cmp rbx, 100
+        0x7c, 0x04,                                                       # jl .no_clamp
+        0x48, 0x83, 0xe8, 0x04,                                           # sub rax, 4
+        # .no_clamp:
+        0x49, 0x39, 0xc6,                                                 # cmp r14, rax
+        0x0f, 0x84, 0x70, 0x4c, 0x35, 0x00,                               # je 0x229a5a8
+        0xe9, 0x63, 0x46, 0x35, 0x00                                      # jmp 0x2299fa0
+    ])),
+    # P_READFILL_LOOP_CLAMP_HOOK / CAVE intentionally omitted from all_patches (see comment there).
 }
+
+# ── All-cluster object pool lookup mass patch ─────────────────────────────────
+# Replaces ALL `movq 0x417(%base,%idx*8), %dst` pool lookup variants across ALL
+# deserialization cluster ReadFill/ReadFromTo functions with xor dst_reg,dst_reg
+# (zero the destination register, safe no-op for deser stub purposes).
+# Covers 7 register-combination forms totalling 113 instructions.
+_POOL_DISP = bytes([0x17, 0x04, 0x00, 0x00])
+_POOL_PREFIX = bytes([0x48, 0x8B])
+# Map (ModRM, SIB) -> 8-byte zero+nop replacement
+_POOL_VARIANTS: dict[tuple[int,int], bytes] = {
+    (0x84, 0xc1): bytes([0x31, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rax xor eax,eax
+    (0x84, 0xc5): bytes([0x31, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rax xor eax,eax
+    (0x8c, 0xca): bytes([0x31, 0xC9, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rcx xor ecx,ecx
+    (0x8c, 0xcd): bytes([0x31, 0xC9, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rcx xor ecx,ecx
+    (0x8c, 0xcf): bytes([0x31, 0xC9, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rcx xor ecx,ecx
+    (0x8c, 0xd1): bytes([0x31, 0xC9, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rcx xor ecx,ecx
+    (0x94, 0xd1): bytes([0x31, 0xD2, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rdx xor edx,edx
+    (0x94, 0xd6): bytes([0x31, 0xD2, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90]),  # dst=rdx xor edx,edx
+}
+# Register sentinel for verify/apply commands (uses first Form-A occurrence)
+_POOL_LOOKUP_FIND = bytes([0x48, 0x8b, 0x84, 0xc1, 0x17, 0x04, 0x00, 0x00])  # compat alias
+_POOL_LOOKUP_REPL = bytes([0x31, 0xC0, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90])  # compat alias
+PATCHES["P_READFILL_OBJPOOL_ALL_CLUSTERS"] = (
+    0x2292e9d,  # sentinel: first Form-A file offset
+    _POOL_LOOKUP_REPL,
+)
+
+
+# ── PostLoad bypass patches ────────────────────────────────────────────────────
+# All AOT deserialization cluster PostLoad functions are patched to ret immediately.
+# PostLoad normally installs type-test stubs and links canonical types, but since our
+# ReadFill pool lookups now write 0 to all object fields, PostLoad crashes on null derefs.
+# Bypassing PostLoad is safe for the boot stub path -- we just need the isolate to start.
+_POSTLOADS_TO_BYPASS = [
+    (0x2293210, 'TypedDataViewDeserializationCluster::PostLoad'),
+    (0x2293c60, 'RODataDeserializationCluster::PostLoad'),
+    (0x2295b20, 'TypeArgumentsDeserializationCluster::PostLoad'),
+    (0x22967f0, 'FunctionDeserializationCluster::PostLoad'),
+    (0x2297710, 'FieldDeserializationCluster::PostLoad'),
+    (0x2298430, 'KernelProgramInfoDeserializationCluster::PostLoad'),
+    (0x2298ca0, 'CodeDeserializationCluster::PostLoad'),
+    (0x229c1b0, 'TypeDeserializationCluster::PostLoad'),
+    (0x229cb50, 'FunctionTypeDeserializationCluster::PostLoad'),
+    (0x229d500, 'RecordTypeDeserializationCluster::PostLoad'),
+    (0x229ded0, 'TypeParameterDeserializationCluster::PostLoad'),
+    (0x22a0c70, 'StringDeserializationCluster::PostLoad'),
+    (0x22a20b0, 'VMDeserializationRoots::PostLoad'),
+    (0x22a2480, 'ProgramDeserializationRoots::PostLoad'),
+    (0x22a29a0, 'UnitDeserializationRoots::PostLoad'),
+]
+for _fo, _name in _POSTLOADS_TO_BYPASS:
+    PATCHES[f'P_POSTLOAD_BYPASS_{_fo:x}'] = (_fo, bytes([0xC3]))  # ret
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
 P9_HOOK_VA = 0x1A8BEB8
@@ -73,7 +239,7 @@ P9_CAVE_VA = file_to_va(P9_CAVE_FILE)
 # Diagnostic log stub: prints "FP" + 16 hex digits of device[0x140] (fPixels)
 # via the SYS_WRITE(fd=1) syscall, then returns. Placed further into the
 # (unused-in-software-engine) ChaCha20 region. Set DIAG_LOG=False to disable.
-DIAG_LOG = True
+DIAG_LOG = False
 # When set, the P9 cave manually memsets the whole device buffer to a sentinel
 # colour before calling drawPaint. Used to prove the present/framebuffer path
 # works independently of Skia's (broken) software blitter.
@@ -255,7 +421,11 @@ PATCHES["P7_EPILOGUE"] = PATCHES["P9_EPILOGUE"]
 
 
 def patch_kernel_blob(path: Path) -> None:
-    """Null the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8)."""
+    """Patch the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8)."""
+    libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
+    extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
+    target_hash = extracted_hash or b"78da37fed6"
+    
     data = path.read_bytes()
     if len(data) < 18:
         raise ValueError(f"kernel blob too short: {path}")
@@ -269,8 +439,8 @@ def patch_kernel_blob(path: Path) -> None:
     print(f"kernel blob SDK hash in {path}: {current_str}")
     with path.open("r+b") as f:
         f.seek(8)
-        f.write(b"0000000000")
-    print(f"patched -> 0000000000")
+        f.write(target_hash)
+    print(f"patched -> {target_hash.decode('ascii')}")
 
 def verify(data: bytes, name: str | None = None) -> list[str]:
     errors: list[str] = []
@@ -286,8 +456,36 @@ def verify(data: bytes, name: str | None = None) -> list[str]:
 
 def apply(data: bytearray, names: list[str]) -> None:
     for name in names:
-        offset, patch = PATCHES[name]
-        data[offset : offset + len(patch)] = patch
+        if name == "P_READFILL_OBJPOOL_ALL_CLUSTERS":
+            # Mass-replace all pool lookup variants in the text segment
+            # with xor dst_reg,dst_reg + nop padding (safe, no-op for deser stub purposes)
+            count = 0
+            DISP = bytes([0x17, 0x04, 0x00, 0x00])
+            pos = 0x1953248
+            while pos < 0x266AA30 - 8:
+                if data[pos+4:pos+8] == DISP:
+                    prefix = data[pos]
+                    op = data[pos+1]
+                    if 0x48 <= prefix <= 0x4F and op == 0x8B:
+                        modrm = data[pos+2]
+                        reg = (modrm >> 3) & 7
+                        is_extended = (prefix & 4) != 0
+                        if is_extended:
+                            # xor rNd, rNd (r8d-r15d)
+                            repl = bytes([0x45, 0x31, 0xC0 | (reg << 3) | reg])
+                        else:
+                            # xor rNd, rNd (eax-edi)
+                            repl = bytes([0x31, 0xC0 | (reg << 3) | reg])
+                        repl = repl + b"\x90" * (8 - len(repl))
+                        data[pos : pos + 8] = repl
+                        count += 1
+                        pos += 8
+                        continue
+                pos += 1
+            print(f"  [P_READFILL_OBJPOOL_ALL_CLUSTERS] replaced {count} pool lookups with xor-zero stubs")
+        else:
+            offset, patch = PATCHES[name]
+            data[offset : offset + len(patch)] = patch
 
 
 def main() -> int:
@@ -312,21 +510,61 @@ def main() -> int:
         print(f"engine not found: {engine}", file=sys.stderr)
         return 1
 
+    libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
+    extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
+    if extracted_hash:
+        print(f"Extracted dynamic SDK hash from libapp.so: {extracted_hash.decode('ascii')}")
+        target_hash = extracted_hash + b"\x00"
+    else:
+        print("Using fallback SDK hash 78da37fed6")
+        target_hash = b"78da37fed6\x00"
+
+    PATCHES["P_SDK_HASH"] = (0x188ced, target_hash)
+    PATCHES["P_SDK_HASH_2"] = (0x3bd638, target_hash)
+    PATCHES["P_SDK_HASH_3"] = (0xd81028, target_hash)
+
     data = bytearray(engine.read_bytes())
 
+    all_patches = [
+        "P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE",
+        "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT",
+        "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS",
+        "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2",
+        "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE",
+        "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1", "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2", "P_VM_CONSTANTS_CAVE",
+        "P_BYPASS_FINALIZE_CLASS_NAMES", "P_BYPASS_BASE_OBJECTS_CHECK", "P_BYPASS_BASE_OBJECTS_COMPARE",
+        "P_IS_PRECOMPILED_RUNTIME", "P_FLAG_PRECOMPILED_MODE_DEFAULT", "P_FLAG_PRECOMPILED_MODE_INITIAL",
+        "P_BYPASS_VM_SERVICE_TASK",
+        "P_BYPASS_SERVICE_ISOLATE_RUN",
+        "P_READ_INSTRUCTIONS",
+        "P_DEBUG_CAVE",
+        "P_READFILL_OBJPOOL_0",
+        "P_READFILL_OBJPOOL",
+        "P_READFILL_OBJPOOL_2",
+        "P_READFILL_OBJPOOL_3",
+        "P_READFILL_OBJPOOL_4",
+        "P_READFILL_OBJPOOL_5",
+        "P_READFILL_STACKMAPS",
+        "P_READFILL_OBJPOOL_7",
+        "P_READFILL_OBJPOOL_8",
+        "P_READFILL_OBJPOOL_9",
+        "P_READFILL_OBJPOOL_10",
+        "P_READFILL_OBJPOOL_11",
+        "P_READFILL_OBJPOOL_ALL_CLUSTERS",  # mass-patches all 97 pool lookups in all deser clusters
+    ]
+    # Add dynamic PostLoad bypass patches
+    all_patches.extend([f"P_POSTLOAD_BYPASS_{fo:x}" for fo, _ in _POSTLOADS_TO_BYPASS])
+
+
     if args.verify:
-        names = (
-            ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]
-            if args.apply_all
-            else None
-        )
+        names = all_patches if args.apply_all else None
         if names:
             errors = []
             for n in names:
                 errors.extend(verify(data, n))
         else:
             errors = verify(data, "P1")
-            for n in ["P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]:
+            for n in all_patches[1:]:
                 errors.extend(verify(data, n))
         if errors:
             for err in errors:
@@ -339,7 +577,7 @@ def main() -> int:
         args.apply = ["P9"]
 
     to_apply = (
-        ["P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE"]
+        all_patches
         if args.apply_all
         else (args.apply or [])
     )

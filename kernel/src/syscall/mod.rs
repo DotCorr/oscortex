@@ -96,7 +96,7 @@ mod trace;
 mod wait;
 
 pub use dispatch::{dispatch_fast, dispatch_legacy};
-pub use poll::{check_timerfds_and_wake, coop_target_ready, cooperative_sched_target, cooperative_yield_for_cond_resched, cooperative_yield_to, force_wake_all_task_runners, monotonic_ns, prefer_embedder_if_baton_due, KICK_REQUESTED, acqmutex_waiter_for};
+pub use poll::{check_timerfds_and_wake, check_timerfds_and_wake_try, coop_target_ready, cooperative_sched_target, cooperative_yield_for_cond_resched, cooperative_yield_to, force_wake_all_task_runners, monotonic_ns, prefer_embedder_if_baton_due, KICK_REQUESTED, acqmutex_waiter_for};
 pub use trace::{debug_dump_sync_states, dump_event_state, dump_recent_syscalls, dump_user_backtrace, init};
 
 // Flat re-exports for `posix` and legacy `super::` call sites.
@@ -105,8 +105,8 @@ pub(crate) use handlers::{
 };
 pub(crate) use tables::{MAX_OPEN_FILES, OPEN_FILES, PIPES};
 pub(crate) use state::{
-    CondWaitState, COND_WAIT_STATE, ENGINE_HOST_PID, ENGINE_LIBRARY_PATH, ENGINE_PROC_TABLE_PTR,
+    CondWaitState, COND_PENDING_SIGNALS, COND_WAIT_STATE, ENGINE_HOST_PID, ENGINE_LIBRARY_PATH, ENGINE_PROC_TABLE_PTR,
     FS_BOOTSTRAP_LOGGED, WM_WAITER_DEADLINE, WM_WAITER_PID,
 };
 pub(crate) use trace::{POSTEXIT_TRACE_ACTIVE, POSTEXIT_TRACE_COUNT, POSTEXIT_TRACE_LIMIT};
-pub(crate) use wait::{futex_waiter_add, futex_waiter_present, futex_waiter_remove};
+pub(crate) use wait::{futex_waiter_add, futex_waiter_for, futex_waiter_present, futex_waiter_remove};

@@ -30,67 +30,74 @@ const EFER_MSR:  u32 = 0xC000_0080;
 /// SYSRET64 GDT base: STAR[63:48]. CS = base+16|3, SS = base+8|3.
 const USER_SYSRET_BASE: u64 = 0x18;
 
-// ── Per-BSP kernel syscall stack (8 KiB, 16-byte aligned) ────────────────────
+// ── Per-CPU kernel syscall scratch and stack tables ──────────────────────────
 
-/// Dedicated kernel stack for syscall handlers.
-/// Single-CPU kernel — no per-CPU replication needed yet.
+const MAX_CPUS: usize = 64;
+
+#[repr(C)]
+pub struct CpuScratch {
+    pub syscall_user_rsp: u64,  // offset 0
+    pub syscall_user_rip: u64,  // offset 8
+    pub syscall_user_r9: u64,   // offset 16
+    pub syscall_stack_top: u64, // offset 24
+    pub user_rdi: u64,          // offset 32
+    pub user_rsi: u64,          // offset 40
+    pub user_rdx: u64,          // offset 48
+    pub user_r10: u64,          // offset 56
+    pub user_r8: u64,           // offset 64
+    pub user_rbx: u64,          // offset 72
+    pub user_rbp: u64,          // offset 80
+    pub user_r12: u64,          // offset 88
+    pub user_r13: u64,          // offset 96
+    pub user_r14: u64,          // offset 104
+    pub user_r15: u64,          // offset 112
+    pub cpu_id: u64,            // offset 120
+}
+
 #[repr(C, align(16))]
 struct SyscallStack([u8; 8192]);
 
-static mut SYSCALL_KERNEL_STACK: SyscallStack = SyscallStack([0; 8192]);
-
-/// Cached pointer to the TOP of `SYSCALL_KERNEL_STACK` (set once in `init()`).
-/// Stored as a plain u64 so naked_asm can load it with a single `mov rsp, [..]`.
-static mut SYSCALL_STACK_TOP: u64 = 0;
-static mut ACTIVE_SYSCALL_STACK_TOP: u64 = 0;
-
-/// Scratch slot to save user RSP across the syscall handler.
-/// Single-CPU only — safe because SYSCALL cannot nest with itself.
-static mut SYSCALL_USER_RSP: u64 = 0;
-
-/// Scratch slot to save user RIP (RCX at SYSCALL entry) — used by clone(2).
-static mut SYSCALL_USER_RIP: u64 = 0;
-
-/// Scratch slot to save user R9 (6th SysV arg, often the 3rd vararg of a
-/// 3-fixed-arg variadic such as snprintf). The shuffle in `syscall_entry`
-/// overwrites r9 with the linux a4, so we stash it here first.
-static mut SYSCALL_USER_R9: u64 = 0;
-
-// ── Full user GPR snapshot captured at SYSCALL entry ──────────────────────────
-//
-// SysV ABI requires callee-saved regs (rbx, rbp, r12, r13, r14, r15) to be
-// preserved across a function call. The trampoline that invokes SYSCALL is
-// such a call from the C++ caller's perspective, so the kernel MUST hand
-// these registers back unchanged on SYSRET — and, critically, must do so
-// even after a voluntary yield (e.g. futex_wait) that re-enters user mode
-// through `enter_user_by_pid_noreturn`. Argument registers (rdi/rsi/rdx/r10/
-// r8/r9) are caller-saved by ABI but a parked thread that resumes from a
-// yield still expects them to hold the values they had at the SYSCALL
-// instant (the syscall's post-return state is `rax=retval`, all other regs
-// unchanged from the SYSCALL point).
-//
-// We stash all of them at SYSCALL entry so a yield handler can snapshot the
-// full user GPR set into the process's `UserRegs` before context-switching.
-static mut SYSCALL_USER_RBX: u64 = 0;
-static mut SYSCALL_USER_RBP: u64 = 0;
-static mut SYSCALL_USER_R12: u64 = 0;
-static mut SYSCALL_USER_R13: u64 = 0;
-static mut SYSCALL_USER_R14: u64 = 0;
-static mut SYSCALL_USER_R15: u64 = 0;
-static mut SYSCALL_USER_RDI: u64 = 0;
-static mut SYSCALL_USER_RSI: u64 = 0;
-static mut SYSCALL_USER_RDX: u64 = 0;
-static mut SYSCALL_USER_R10: u64 = 0;
-static mut SYSCALL_USER_R8:  u64 = 0;
+static mut SYSCALL_KERNEL_STACKS: [SyscallStack; MAX_CPUS] = [const { SyscallStack([0; 8192]) }; MAX_CPUS];
+static mut SYSCALL_STACK_TOPS: [u64; MAX_CPUS] = [0; MAX_CPUS];
+pub static mut CPU_SCRATCHES: [CpuScratch; MAX_CPUS] = [const { CpuScratch {
+    syscall_user_rsp: 0,
+    syscall_user_rip: 0,
+    syscall_user_r9: 0,
+    syscall_stack_top: 0,
+    user_rdi: 0,
+    user_rsi: 0,
+    user_rdx: 0,
+    user_r10: 0,
+    user_r8: 0,
+    user_rbx: 0,
+    user_rbp: 0,
+    user_r12: 0,
+    user_r13: 0,
+    user_r14: 0,
+    user_r15: 0,
+    cpu_id: 0,
+} }; MAX_CPUS];
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+#[inline(always)]
+pub fn current_cpu_id() -> u32 {
+    crate::arch::x86_64::smp::current_cpu_id()
+}
+
 pub fn init() {
     unsafe {
-        // Cache the kernel syscall stack top once.
-        SYSCALL_STACK_TOP =
-            SYSCALL_KERNEL_STACK.0.as_ptr().add(8192) as u64;
-        ACTIVE_SYSCALL_STACK_TOP = SYSCALL_STACK_TOP;
+        for i in 0..MAX_CPUS {
+            SYSCALL_STACK_TOPS[i] =
+                SYSCALL_KERNEL_STACKS[i].0.as_ptr().add(8192) as u64;
+            CPU_SCRATCHES[i].syscall_stack_top = SYSCALL_STACK_TOPS[i];
+            CPU_SCRATCHES[i].cpu_id = i as u64;
+        }
+
+        // Setup GS base MSRs for CPU 0 (BSP).
+        let ptr = core::ptr::addr_of_mut!(CPU_SCRATCHES[0]) as u64;
+        wrmsr(0xC000_0101, ptr); // IA32_GS_BASE
+        wrmsr(0xC000_0102, ptr); // IA32_KERNEL_GS_BASE
 
         // Enable SYSCALL/SYSRET via EFER.SCE bit.
         let efer: u64;
@@ -111,10 +118,31 @@ pub fn init() {
     log::info!("[Syscall] SYSCALL/SYSRET initialised (STAR base={:#x})", USER_SYSRET_BASE);
 }
 
+pub fn init_ap(cpu_idx: u32) {
+    unsafe {
+        let ptr = core::ptr::addr_of_mut!(CPU_SCRATCHES[cpu_idx as usize]) as u64;
+        wrmsr(0xC000_0101, ptr); // IA32_GS_BASE
+        wrmsr(0xC000_0102, ptr); // IA32_KERNEL_GS_BASE
+
+        // Enable SYSCALL/SYSRET via EFER.SCE bit.
+        let efer: u64;
+        asm!("rdmsr", in("ecx") EFER_MSR, out("eax") efer, out("edx") _, options(nomem, nostack));
+        wrmsr(EFER_MSR, efer | 1); // SCE = 1
+
+        let star = (USER_SYSRET_BASE << 48) | ((KERNEL_CS as u64) << 32);
+        wrmsr(STAR_MSR, star);
+
+        wrmsr(LSTAR_MSR, syscall_entry as *const () as u64);
+        wrmsr(FMASK_MSR, 0x200);
+    }
+    log::info!("[Syscall] AP cpu={} SYSCALL/SYSRET initialised", cpu_idx);
+}
+
 pub fn set_active_stack_top(stack_top: u64) {
     unsafe {
-        ACTIVE_SYSCALL_STACK_TOP = if stack_top == 0 {
-            SYSCALL_STACK_TOP
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        CPU_SCRATCHES[cpu_idx as usize].syscall_stack_top = if stack_top == 0 {
+            SYSCALL_STACK_TOPS[cpu_idx as usize]
         } else {
             stack_top
         };
@@ -123,22 +151,34 @@ pub fn set_active_stack_top(stack_top: u64) {
 
 /// Return the user RSP that was live when the current syscall was entered.
 pub fn user_rsp() -> u64 {
-    unsafe { SYSCALL_USER_RSP }
+    unsafe {
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        CPU_SCRATCHES[cpu_idx as usize].syscall_user_rsp
+    }
 }
 
 /// Return the user RIP (return address) that was live when the current syscall was entered.
 pub fn user_rip() -> u64 {
-    unsafe { SYSCALL_USER_RIP }
+    unsafe {
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        CPU_SCRATCHES[cpu_idx as usize].syscall_user_rip
+    }
 }
 
 /// Return user R9 captured at SYSCALL entry (before the dispatch shuffle).
 pub fn user_r9() -> u64 {
-    unsafe { SYSCALL_USER_R9 }
+    unsafe {
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        CPU_SCRATCHES[cpu_idx as usize].syscall_user_r9
+    }
 }
 
 /// Return user RBP captured at SYSCALL entry.
 pub fn user_rbp() -> u64 {
-    unsafe { SYSCALL_USER_RBP }
+    unsafe {
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        CPU_SCRATCHES[cpu_idx as usize].user_rbp
+    }
 }
 
 /// Snapshot of all general-purpose user registers captured at SYSCALL entry.
@@ -153,19 +193,21 @@ pub struct UserGprSnapshot {
 /// Read the full user GPR snapshot stashed by `syscall_entry`.
 pub fn user_gprs() -> UserGprSnapshot {
     unsafe {
+        let cpu_idx = crate::arch::x86_64::smp::this_cpu().cpu_id;
+        let s = &CPU_SCRATCHES[cpu_idx as usize];
         UserGprSnapshot {
-            rdi: SYSCALL_USER_RDI,
-            rsi: SYSCALL_USER_RSI,
-            rdx: SYSCALL_USER_RDX,
-            r10: SYSCALL_USER_R10,
-            r8:  SYSCALL_USER_R8,
-            r9:  SYSCALL_USER_R9,
-            rbx: SYSCALL_USER_RBX,
-            rbp: SYSCALL_USER_RBP,
-            r12: SYSCALL_USER_R12,
-            r13: SYSCALL_USER_R13,
-            r14: SYSCALL_USER_R14,
-            r15: SYSCALL_USER_R15,
+            rdi: s.user_rdi,
+            rsi: s.user_rsi,
+            rdx: s.user_rdx,
+            r10: s.user_r10,
+            r8:  s.user_r8,
+            r9:  s.syscall_user_r9,
+            rbx: s.user_rbx,
+            rbp: s.user_rbp,
+            r12: s.user_r12,
+            r13: s.user_r13,
+            r14: s.user_r14,
+            r15: s.user_r15,
         }
     }
 }
@@ -191,25 +233,24 @@ pub fn user_gprs() -> UserGprSnapshot {
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // ── 1. Switch to kernel stack ─────────────────────────────────────
-        "mov [{user_rsp}], rsp",          // save user RSP
-        "mov [{user_rip}], rcx",          // save user RIP (RCX = return addr from SYSCALL)
-        "mov [{user_r9}], r9",            // save user R9 (often 3rd vararg)
-        // Snapshot the rest of the user GPR set so yield handlers can
-        // capture the complete register state. rcx/r11/rax are NOT saved
-        // here: rcx is the saved user RIP, r11 the saved user RFLAGS, and
-        // rax the syscall number (the syscall return value goes in rax).
-        "mov [{user_rdi}], rdi",
-        "mov [{user_rsi}], rsi",
-        "mov [{user_rdx}], rdx",
-        "mov [{user_r10}], r10",
-        "mov [{user_r8}],  r8",
-        "mov [{user_rbx}], rbx",
-        "mov [{user_rbp}], rbp",
-        "mov [{user_r12}], r12",
-        "mov [{user_r13}], r13",
-        "mov [{user_r14}], r14",
-        "mov [{user_r15}], r15",
-        "mov rsp, [{kstack_top}]",        // load kernel syscall stack top
+        "swapgs",
+        "mov gs:[0], rsp",                // save user RSP (offset 0)
+        "mov gs:[8], rcx",                // save user RIP (offset 8)
+        "mov gs:[16], r9",                // save user R9 (offset 16)
+        
+        "mov gs:[32], rdi",               // user_rdi
+        "mov gs:[40], rsi",               // user_rsi
+        "mov gs:[48], rdx",               // user_rdx
+        "mov gs:[56], r10",               // user_r10
+        "mov gs:[64], r8",                // user_r8
+        "mov gs:[72], rbx",               // user_rbx
+        "mov gs:[80], rbp",               // user_rbp
+        "mov gs:[88], r12",               // user_r12
+        "mov gs:[96], r13",               // user_r13
+        "mov gs:[104], r14",              // user_r14
+        "mov gs:[112], r15",              // user_r15
+        
+        "mov rsp, gs:[24]",               // load active syscall stack top (offset 24)
 
         // ── 2. Save user RIP, RFLAGS, and all caller-saved arg regs ───────
         // The Linux syscall ABI guarantees that only rax/rcx/r11 change
@@ -248,25 +289,11 @@ unsafe extern "C" fn syscall_entry() {
         "pop rdi",
         "pop r11",                        // user RFLAGS
         "pop rcx",                        // user RIP
-        "mov rsp, [{user_rsp}]",          // restore user RSP
+        "mov rsp, gs:[0]",                // restore user RSP
+        "swapgs",
         "sysretq",
 
         dispatch   = sym crate::syscall::dispatch_fast,
-        user_rsp   = sym SYSCALL_USER_RSP,
-        user_rip   = sym SYSCALL_USER_RIP,
-        user_r9    = sym SYSCALL_USER_R9,
-        user_rdi   = sym SYSCALL_USER_RDI,
-        user_rsi   = sym SYSCALL_USER_RSI,
-        user_rdx   = sym SYSCALL_USER_RDX,
-        user_r10   = sym SYSCALL_USER_R10,
-        user_r8    = sym SYSCALL_USER_R8,
-        user_rbx   = sym SYSCALL_USER_RBX,
-        user_rbp   = sym SYSCALL_USER_RBP,
-        user_r12   = sym SYSCALL_USER_R12,
-        user_r13   = sym SYSCALL_USER_R13,
-        user_r14   = sym SYSCALL_USER_R14,
-        user_r15   = sym SYSCALL_USER_R15,
-        kstack_top = sym ACTIVE_SYSCALL_STACK_TOP,
     )
 }
 

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "kernel",
     "tools/xtask",
+    "tools/pkg-server",
     "tests/kernel",
 ]
 

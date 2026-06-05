@@ -11,95 +11,98 @@ use core::arch::asm;
 
 // ── Syscall number constants (mirrors kernel/src/embedder/abi.rs) ─────────────
 
-pub const SYS_WRITE:                    u64 = 1;
-pub const SYS_READ:                     u64 = 0;
-pub const SYS_CLOSE:                    u64 = 3;
-pub const SYS_OPENAT:                   u64 = 257;
-pub const SYS_GETPID:                   u64 = 39;
-pub const SYS_EXIT:                     u64 = 60;
+pub const SYS_WRITE: u64 = 1;
+pub const SYS_READ: u64 = 0;
+pub const SYS_CLOSE: u64 = 3;
+pub const SYS_OPENAT: u64 = 257;
+pub const SYS_GETPID: u64 = 39;
+pub const SYS_EXIT: u64 = 60;
 
-pub const SYS_SURFACE_CREATE:           u64 = 0x300;
-pub const SYS_SURFACE_UPLOAD_RGBA32:    u64 = 0x303;
-pub const SYS_SURFACE_DESTROY:          u64 = 0x302;
-pub const SYS_SURFACE_FLIP:             u64 = 0x312;
-pub const SYS_FB_SIZE_PACKED:           u64 = 0x305;
-pub const SYS_VSYNC_WAIT_NONBLOCK:      u64 = 0x307;
+pub const SYS_SURFACE_CREATE: u64 = 0x300;
+pub const SYS_SURFACE_UPLOAD_RGBA32: u64 = 0x303;
+pub const SYS_SURFACE_DESTROY: u64 = 0x302;
+pub const SYS_SURFACE_FLIP: u64 = 0x312;
+pub const SYS_FB_SIZE_PACKED: u64 = 0x305;
+pub const SYS_VSYNC_WAIT_NONBLOCK: u64 = 0x307;
 
-pub const SYS_MMAP:                     u64 = 0x353;
+pub const SYS_MMAP: u64 = 0x353;
+pub const SYS_MPROTECT: u64 = 0x355;
 
-pub const SYS_WM_EVENT_POLL:            u64 = 0x320;
-pub const SYS_WM_EVENT_READ:            u64 = 0x321;
-pub const SYS_WM_EVENT_WAIT:            u64 = 0x323;
-pub const SYS_FB_MAP:                   u64 = 0x377;
-pub const SYS_WM_NEXT_EVENT:            u64 = 0x378;
-pub const SYS_SURFACE_FULLSCREEN:       u64 = 0x381;
+pub const SYS_WM_EVENT_POLL: u64 = 0x320;
+pub const SYS_WM_EVENT_READ: u64 = 0x321;
+pub const SYS_WM_EVENT_INJECT: u64 = 0x322;
+pub const SYS_WM_EVENT_WAIT: u64 = 0x323;
+pub const SYS_SCHED_YIELD: u64 = 0x390;
+pub const SYS_FB_MAP: u64 = 0x377;
+pub const SYS_WM_NEXT_EVENT: u64 = 0x378;
+pub const SYS_SURFACE_FULLSCREEN: u64 = 0x381;
 
-pub const SYS_ENGINE_HOST_REGISTER:     u64 = 0x345;
+pub const SYS_ENGINE_HOST_REGISTER: u64 = 0x345;
 pub const SYS_ENGINE_LIBRARY_PATH_READ: u64 = 0x347;
 
-pub const SYS_DLOPEN:                   u64 = 0x350;
-pub const SYS_DLSYM:                    u64 = 0x351;
-pub const SYS_DLCLOSE:                  u64 = 0x352;
+pub const SYS_DLOPEN: u64 = 0x350;
+pub const SYS_DLSYM: u64 = 0x351;
+pub const SYS_DLCLOSE: u64 = 0x352;
 
-pub const SYS_ENGINE_PROCTABLE_SET:     u64 = 0x356;
+pub const SYS_ENGINE_PROCTABLE_SET: u64 = 0x356;
 pub const SYS_ENGINE_PROCTABLE_PTR_GET: u64 = 0x357;
-pub const SYS_ENGINE_VSYNC_BATON_POST:  u64 = 0x358;
-pub const SYS_GPU_SUBMIT:               u64 = 0x359;
-pub const SYS_THREAD_CREATE:            u64 = 0x35A;
-pub const SYS_THREAD_EXIT:              u64 = 0x35B;
-pub const SYS_THREAD_JOIN:              u64 = 0x35C;
+pub const SYS_ENGINE_VSYNC_BATON_POST: u64 = 0x358;
+pub const SYS_GPU_SUBMIT: u64 = 0x359;
+pub const SYS_THREAD_CREATE: u64 = 0x35A;
+pub const SYS_THREAD_EXIT: u64 = 0x35B;
+pub const SYS_THREAD_JOIN: u64 = 0x35C;
 
-pub const SYS_PLATFORM_MSG_POST:        u64 = 0x360;
-pub const SYS_PLATFORM_MSG_RECV:        u64 = 0x361;
-pub const SYS_PLATFORM_MSG_REPLY:       u64 = 0x362;
-pub const SYS_PLATFORM_MSG_ACK:         u64 = 0x363;
-pub const SYS_GPU_SUBMIT_STRIDED:       u64 = 0x364;
-pub const SYS_VSYNC_SET_HZ:             u64 = 0x365; // Phase 33-A
-pub const SYS_AOT_SNAPSHOT_LOAD:        u64 = 0x366; // Phase 34-C
-// Phase 35 — Dart isolate lifecycle
-pub const SYS_ISOLATE_SPAWN:            u64 = 0x367;
-pub const SYS_ISOLATE_KILL:             u64 = 0x368;
-pub const SYS_ISOLATE_CTRL:             u64 = 0x369;
+pub const SYS_PLATFORM_MSG_POST: u64 = 0x360;
+pub const SYS_PLATFORM_MSG_RECV: u64 = 0x361;
+pub const SYS_PLATFORM_MSG_REPLY: u64 = 0x362;
+pub const SYS_PLATFORM_MSG_ACK: u64 = 0x363;
+pub const SYS_GPU_SUBMIT_STRIDED: u64 = 0x364;
+pub const SYS_VSYNC_SET_HZ: u64 = 0x365; // Phase 33-A
+pub const SYS_AOT_SNAPSHOT_LOAD: u64 = 0x366; // Phase 34-C
+                                              // Phase 35 — Dart isolate lifecycle
+pub const SYS_ISOLATE_SPAWN: u64 = 0x367;
+pub const SYS_ISOLATE_KILL: u64 = 0x368;
+pub const SYS_ISOLATE_CTRL: u64 = 0x369;
 // Phase 36 — Dart isolate message passing
-pub const SYS_ISOLATE_MSG_SEND:         u64 = 0x36A;
-pub const SYS_ISOLATE_MSG_RECV:         u64 = 0x36B;
-pub const SYS_ISOLATE_MSG_PENDING:      u64 = 0x36C;
+pub const SYS_ISOLATE_MSG_SEND: u64 = 0x36A;
+pub const SYS_ISOLATE_MSG_RECV: u64 = 0x36B;
+pub const SYS_ISOLATE_MSG_PENDING: u64 = 0x36C;
 
 // ── WM event kinds ────────────────────────────────────────────────────────────
 
-pub const EV_VSYNC:        u32 = 1;
-pub const EV_POINTER:      u32 = 2;
-pub const EV_KEY:          u32 = 3;
-pub const EV_APP:          u32 = 4;
-pub const EV_FOCUS:        u32 = 5;
+pub const EV_VSYNC: u32 = 1;
+pub const EV_POINTER: u32 = 2;
+pub const EV_KEY: u32 = 3;
+pub const EV_APP: u32 = 4;
+pub const EV_FOCUS: u32 = 5;
 pub const EV_PLATFORM_MSG: u32 = 6;
-pub const EV_ISOLATE:      u32 = 7; // Phase 35
-pub const EV_ISOLATE_MSG:  u32 = 8; // Phase 36
-// Isolate state values (carried in WmEvent.flags on EV_ISOLATE events).
+pub const EV_ISOLATE: u32 = 7; // Phase 35
+pub const EV_ISOLATE_MSG: u32 = 8; // Phase 36
+                                   // Isolate state values (carried in WmEvent.flags on EV_ISOLATE events).
 pub const ISOLATE_RUNNING: u32 = 1;
-pub const ISOLATE_PAUSED:  u32 = 2;
-pub const ISOLATE_DEAD:    u32 = 3;
+pub const ISOLATE_PAUSED: u32 = 2;
+pub const ISOLATE_DEAD: u32 = 3;
 
 // ── WM event structure (matches kernel's WmEvent repr(C)) ────────────────────
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct WmEvent {
-    pub seq:   u64,
-    pub kind:  u32,
+    pub seq: u64,
+    pub kind: u32,
     pub flags: u32,
-    pub a:     u64,
-    pub b:     u64,
+    pub a: u64,
+    pub b: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct FbInfo {
-    pub addr:   u64,
-    pub width:  u32,
+    pub addr: u64,
+    pub width: u32,
     pub height: u32,
-    pub pitch:  u32,
-    pub bpp:    u32,
+    pub pitch: u32,
+    pub bpp: u32,
 }
 
 pub const WM_EVENT_SIZE: usize = core::mem::size_of::<WmEvent>();
@@ -202,7 +205,14 @@ pub fn read(fd: i64, buf: &mut [u8]) -> i64 {
     if fd < 0 {
         return -1;
     }
-    unsafe { syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+    unsafe {
+        syscall3(
+            SYS_READ,
+            fd as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
 }
 
 pub fn close(fd: i64) -> i64 {
@@ -247,9 +257,11 @@ pub fn engine_host_register() -> i64 {
 /// Returns the number of bytes written.
 pub fn engine_library_path_read(buf: &mut [u8]) -> i64 {
     unsafe {
-        syscall2(SYS_ENGINE_LIBRARY_PATH_READ,
+        syscall2(
+            SYS_ENGINE_LIBRARY_PATH_READ,
             buf.as_mut_ptr() as u64,
-            buf.len() as u64)
+            buf.len() as u64,
+        )
     }
 }
 
@@ -257,10 +269,12 @@ pub fn engine_library_path_read(buf: &mut [u8]) -> i64 {
 /// Returns a positive handle on success or a negative errno.
 pub fn dlopen(path: &[u8], flags: u32) -> i64 {
     unsafe {
-        syscall3(SYS_DLOPEN,
+        syscall3(
+            SYS_DLOPEN,
             path.as_ptr() as u64,
             path.len() as u64,
-            flags as u64)
+            flags as u64,
+        )
     }
 }
 
@@ -268,12 +282,18 @@ pub fn dlopen(path: &[u8], flags: u32) -> i64 {
 /// Returns the VA in this process's address space, or 0 if not found.
 pub fn dlsym(handle: u32, name: &[u8]) -> u64 {
     let ret = unsafe {
-        syscall3(SYS_DLSYM,
+        syscall3(
+            SYS_DLSYM,
             handle as u64,
             name.as_ptr() as u64,
-            name.len() as u64)
+            name.len() as u64,
+        )
     };
-    if ret <= 0 { 0 } else { ret as u64 }
+    if ret <= 0 {
+        0
+    } else {
+        ret as u64
+    }
 }
 
 /// Close a library handle.
@@ -289,17 +309,17 @@ pub const SYS_DL_GET_INIT_ARRAY: u64 = 0x382;
 /// Any of the out-pointers may be null to skip that field.
 pub fn dl_get_init_array(
     handle: u32,
-    out_init_fn:  *mut u64,
+    out_init_fn: *mut u64,
     out_array_va: *mut u64,
-    out_count:    *mut u64,
+    out_count: *mut u64,
 ) -> i64 {
     unsafe {
         syscall4(
             SYS_DL_GET_INIT_ARRAY,
             handle as u64,
-            out_init_fn  as u64,
+            out_init_fn as u64,
             out_array_va as u64,
-            out_count    as u64,
+            out_count as u64,
         )
     }
 }
@@ -318,7 +338,11 @@ pub fn surface_destroy(surface_id: u32) -> i64 {
 /// Returns `(width << 32) | height` for the physical framebuffer.
 pub fn fb_size_packed() -> u64 {
     let ret = unsafe { syscall0(SYS_FB_SIZE_PACKED) };
-    if ret < 0 { 0 } else { ret as u64 }
+    if ret < 0 {
+        0
+    } else {
+        ret as u64
+    }
 }
 
 pub fn fb_map(info: &mut FbInfo) -> i64 {
@@ -328,20 +352,24 @@ pub fn fb_map(info: &mut FbInfo) -> i64 {
 /// Upload tightly-packed RGBA32 pixels and present the surface immediately.
 pub fn gpu_submit(surface_id: u32, pixels: &[u8]) -> i64 {
     unsafe {
-        syscall3(SYS_GPU_SUBMIT,
+        syscall3(
+            SYS_GPU_SUBMIT,
             surface_id as u64,
             pixels.as_ptr() as u64,
-            pixels.len() as u64)
+            pixels.len() as u64,
+        )
     }
 }
 
 /// Stride-aware GPU submit. `row_bytes = 0` means tight-packed.
 pub fn gpu_submit_strided(surface_id: u32, pixels: &[u8], row_bytes: usize) -> i64 {
     unsafe {
-        syscall3(SYS_GPU_SUBMIT_STRIDED,
+        syscall3(
+            SYS_GPU_SUBMIT_STRIDED,
             surface_id as u64,
             pixels.as_ptr() as u64,
-            row_bytes as u64)
+            row_bytes as u64,
+        )
     }
 }
 
@@ -364,9 +392,11 @@ pub fn thread_create(entry: unsafe extern "C" fn(*mut ()), arg: *mut ()) -> i64 
 /// Returns 1 if an event was written to `ev`, 0 if queue empty.
 pub fn wm_event_poll(ev: &mut WmEvent) -> i64 {
     unsafe {
-        syscall2(SYS_WM_EVENT_POLL,
+        syscall2(
+            SYS_WM_EVENT_POLL,
             ev as *mut WmEvent as u64,
-            WM_EVENT_SIZE as u64)
+            WM_EVENT_SIZE as u64,
+        )
     }
 }
 
@@ -374,22 +404,30 @@ pub fn wm_event_poll(ev: &mut WmEvent) -> i64 {
 /// Uses SYS_WM_EVENT_WAIT with a timeout of `timeout_ms` ms; 0 = no timeout.
 pub fn wm_event_wait(ev: &mut WmEvent, timeout_ms: u64) -> i64 {
     unsafe {
-        syscall3(SYS_WM_EVENT_WAIT,
+        syscall3(
+            SYS_WM_EVENT_WAIT,
             ev as *mut WmEvent as u64,
             WM_EVENT_SIZE as u64,
-            timeout_ms)
+            timeout_ms,
+        )
     }
+}
+
+pub fn wm_event_inject(kind: u32, arg1: u64, arg2: u64) -> i64 {
+    unsafe { syscall3(SYS_WM_EVENT_INJECT, kind as u64, arg1, arg2) }
 }
 
 /// Post a platform-channel message.
 /// Returns the u64 sequence number cast to i64, or a negative errno.
 pub fn platform_msg_post(channel: &[u8], payload: &[u8]) -> i64 {
     unsafe {
-        syscall4(SYS_PLATFORM_MSG_POST,
+        syscall4(
+            SYS_PLATFORM_MSG_POST,
             channel.as_ptr() as u64,
             channel.len() as u64,
             payload.as_ptr() as u64,
-            payload.len() as u64)
+            payload.len() as u64,
+        )
     }
 }
 
@@ -397,29 +435,35 @@ pub fn platform_msg_post(channel: &[u8], payload: &[u8]) -> i64 {
 /// Returns bytes written, or 0 if none pending.
 pub fn platform_msg_recv(buf: &mut [u8]) -> i64 {
     unsafe {
-        syscall2(SYS_PLATFORM_MSG_RECV,
+        syscall2(
+            SYS_PLATFORM_MSG_RECV,
             buf.as_mut_ptr() as u64,
-            buf.len() as u64)
+            buf.len() as u64,
+        )
     }
 }
 
 /// Reply to a platform-channel message identified by `seq`.
 pub fn platform_msg_reply(seq: u64, data: &[u8]) -> i64 {
     unsafe {
-        syscall3(SYS_PLATFORM_MSG_REPLY,
+        syscall3(
+            SYS_PLATFORM_MSG_REPLY,
             seq,
             data.as_ptr() as u64,
-            data.len() as u64)
+            data.len() as u64,
+        )
     }
 }
 
 /// Collect the reply for `seq` into `buf`.  Returns bytes written or 0.
 pub fn platform_msg_ack(seq: u64, buf: &mut [u8]) -> i64 {
     unsafe {
-        syscall3(SYS_PLATFORM_MSG_ACK,
+        syscall3(
+            SYS_PLATFORM_MSG_ACK,
             seq,
             buf.as_mut_ptr() as u64,
-            buf.len() as u64)
+            buf.len() as u64,
+        )
     }
 }
 
@@ -450,9 +494,9 @@ pub fn aot_snapshot_load(path: &[u8], out_va: &mut u64, out_size: &mut u64) -> i
     unsafe {
         syscall4(
             SYS_AOT_SNAPSHOT_LOAD,
-            path.as_ptr()  as u64,
-            effective_len  as u64,
-            out_va   as *mut u64 as u64,
+            path.as_ptr() as u64,
+            effective_len as u64,
+            out_va as *mut u64 as u64,
             out_size as *mut u64 as u64,
         )
     }
@@ -465,7 +509,15 @@ pub fn aot_snapshot_load(path: &[u8], out_va: &mut u64, out_size: &mut u64) -> i
 /// `stack_size` of 0 uses the kernel default (128 KiB).
 /// Returns the new isolate ID (>0) or a negative errno.
 pub fn isolate_spawn(aot_va: u64, aot_size: u64, entry_offset: u64, stack_size: u64) -> i64 {
-    unsafe { syscall4(SYS_ISOLATE_SPAWN, aot_va, aot_size, entry_offset, stack_size) }
+    unsafe {
+        syscall4(
+            SYS_ISOLATE_SPAWN,
+            aot_va,
+            aot_size,
+            entry_offset,
+            stack_size,
+        )
+    }
 }
 
 /// Phase 35 — Kill a live isolate by its ID.
@@ -485,9 +537,9 @@ pub fn isolate_ctrl(id: u32, op: u32) -> i64 {
 
 // ── App registry + VFS (shell) ───────────────────────────────────────────────
 
-pub const SYS_APP_INSTALL:   u64 = 0x36F;
-pub const SYS_APP_LIST:      u64 = 0x370;
-pub const SYS_APP_LAUNCH:    u64 = 0x371;
+pub const SYS_APP_INSTALL: u64 = 0x36F;
+pub const SYS_APP_LIST: u64 = 0x370;
+pub const SYS_APP_LAUNCH: u64 = 0x371;
 pub const SYS_APP_UNINSTALL: u64 = 0x372;
 pub const SYS_VFS_READ:      u64 = 0x37A;
 pub const SYS_VFS_STAT:      u64 = 0x37C;
@@ -504,9 +556,7 @@ pub fn app_install(bundle: &[u8], id_out: &mut u32) -> i64 {
 }
 
 pub fn app_list(buf: &mut [u8]) -> i64 {
-    unsafe {
-        syscall2(SYS_APP_LIST, buf.as_mut_ptr() as u64, buf.len() as u64)
-    }
+    unsafe { syscall2(SYS_APP_LIST, buf.as_mut_ptr() as u64, buf.len() as u64) }
 }
 
 pub fn app_launch(app_id: u32) -> i64 {
@@ -595,7 +645,14 @@ pub fn isolate_msg_pending(isolate_id: u32) -> i64 {
 
 /// Phase 61 — Allocate anonymous read-write pages via mmap(hint=0, size, prot=3).
 pub fn mmap_anon(size: usize) -> u64 {
-    unsafe { syscall3(SYS_MMAP, 0, size as u64, 3 /* PROT_READ|PROT_WRITE */) as u64 }
+    let ret = unsafe {
+        syscall3(SYS_MMAP, 0, size as u64, 3 /* PROT_READ|PROT_WRITE */)
+    };
+    if ret <= 0 {
+        0
+    } else {
+        ret as u64
+    }
 }
 
 /// Phase 61 — Create a fullscreen compositor surface (replaces direct FB map).
@@ -626,9 +683,21 @@ pub fn wm_next_event(ev: &mut WmEvent) -> i64 {
     unsafe { syscall1(SYS_WM_NEXT_EVENT, ev as *mut WmEvent as u64) }
 }
 
-/// Yield the CPU by doing a short blocking event wait (timeout=1 ms).
+/// Yield the CPU to the next runnable process via the kernel cooperative
+/// scheduler (syscall 0x390).  This MUST NOT touch the WM event queue: the
+/// previous implementation used `wm_event_wait(1ms)` which popped and discarded
+/// a WM event on every yield, silently eating pointer/key input before the main
+/// loop's EV_POINTER handler could process it (clicks never reached Flutter).
 pub fn sched_yield() {
-    let mut ev = WmEvent::default();
-    wm_event_wait(&mut ev, 1);
+    unsafe {
+        syscall0(SYS_SCHED_YIELD);
+    }
+}
+
+/// Phase 30 Slice 3 — Change memory protection
+pub fn mprotect(va: u64, size: u64, prot: u64) -> i64 {
+    unsafe {
+        syscall3(SYS_MPROTECT, va, size, prot)
+    }
 }
 

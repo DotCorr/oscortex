@@ -43,7 +43,7 @@ pub(crate) fn sys_dlopen(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
             None => return -2, // ENOENT
         }
     };
-    match crate::process::dl::dlopen(pid, pml4_phys, elf) {
+    match crate::process::dl::dlopen(pid, pml4_phys, elf, path.as_bytes()) {
         Ok(h)  => h as i64,
         Err(e) => {
             log::warn!("[syscall] dlopen '{}' failed: {}", path, e);
@@ -68,16 +68,49 @@ pub(crate) fn sys_dlsym(handle: u64, name_ptr: u64, name_len: u64) -> i64 {
         Some(b) => b,
         None => return 0, // not found
     };
-    match crate::process::dl::dlsym(handle as u32, name) {
+    let name_str = core::str::from_utf8(name).unwrap_or("");
+    let res = match crate::process::dl::dlsym(handle as u32, name) {
         Some(addr) => addr as i64,
         None       => 0, // POSIX: NULL (0) means not found
-    }
+    };
+    log::info!("[dlsym] pid={} handle={} query='{}' res={:#x}", crate::process::current_pid(), handle, name_str, res);
+    res
 }
 
 pub(crate) fn sys_dlclose(handle: u64) -> i64 {
     let pid = crate::process::current_pid();
     crate::process::dl::dlclose(handle as u32, pid);
     0
+}
+
+pub(crate) fn sys_dladdr(addr: u64, info_ptr: u64) -> i64 {
+    let pid = crate::process::current_pid();
+    log::info!("[sys_dladdr] pid={} addr={:#x} info_ptr={:#x}", pid, addr, info_ptr);
+    match crate::process::dl::dladdr(pid, addr) {
+        Some((path, load_base)) => {
+            let path_str = core::str::from_utf8(&path).unwrap_or("");
+            let fname_va = if path_str.contains("libflutter_engine") {
+                crate::process::posix_trampolines::SYSDATA_VA + 3922
+            } else if path_str.contains("libapp") {
+                crate::process::posix_trampolines::SYSDATA_VA + 3960
+            } else {
+                crate::process::posix_trampolines::SYSDATA_VA + 3990
+            };
+
+            log::info!("[sys_dladdr] FOUND load_base={:#x} path='{}' fname_va={:#x}", load_base, path_str, fname_va);
+            unsafe {
+                core::ptr::write_unaligned((info_ptr + 0) as *mut u64, fname_va);
+                core::ptr::write_unaligned((info_ptr + 8) as *mut u64, load_base);
+                core::ptr::write_unaligned((info_ptr + 16) as *mut u64, 0); // sname
+                core::ptr::write_unaligned((info_ptr + 24) as *mut u64, 0); // saddr
+            }
+            1 // Success (non-zero)
+        }
+        None => {
+            log::info!("[sys_dladdr] NOT FOUND");
+            0 // Failure (not found)
+        }
+    }
 }
 
 /// Return init function info for a dynamically loaded library so the embedder
@@ -104,7 +137,16 @@ pub(crate) fn sys_dl_get_init_array(handle: u64, out_init_fn: u64, out_array_va:
 }
 
 pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
+    log::warn!("[sys_mmap] hint_va={:#x} size={:#x} prot={}", hint_va, size, prot);
+    if size >= 0x8000_0000 {
+        // Mock success for large VM cage/heap reservations (typically 4 GiB).
+        // We return 0x8000_0000 (2 GiB) so that aligning up to 4 GiB yields exactly
+        // 0x1_0000_0000 as the pointer cage base.
+        log::warn!("[sys_mmap] Mocking large virtual reservation size={:#x} prot={} -> 0x8000_0000", size, prot);
+        return 0x8000_0000;
+    }
     if size == 0 || size > 0x1000_0000 {
+        log::warn!("[sys_mmap] Rejecting size={:#x} (max 256 MiB)", size);
         return -22; // EINVAL, max 256 MiB
     }
     let pid = crate::process::current_pid();
@@ -119,17 +161,17 @@ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
     if va == u64::MAX { -12 } else { va as i64 } // ENOMEM or success
 }
 
-pub(crate) fn sys_munmap(_va: u64, _size: u64) -> i64 {
-    // Stub — frames remain mapped until process exit.
-    // Full unmapping requires reverse page-table mappings (future milestone).
+pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
+    log::warn!("[sys_munmap] Mocking munmap as no-op: va={:#x} size={:#x}", va, size);
     0
 }
 
 pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
     if size == 0 { return 0; }
+    let pid = crate::process::current_pid();
+    log::warn!("[sys_mprotect] pid={} va={:#x} size={:#x} prot={:#x}", pid, va, size, prot);
     let start_va = va & !0xFFF;
     let end_va = (va + size + 4095) & !0xFFF;
-    let pid = crate::process::current_pid();
     if pid == 0 { return -1; } // EPERM
     let pml4_phys = match crate::process::get_user_context(pid) {
         Some(ctx) => ctx.pml4_phys,
@@ -140,10 +182,70 @@ pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
 
     let mut curr_va = start_va;
     while curr_va < end_va {
-        unsafe {
-            if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
-                // If the range contains unmapped areas, mprotect on POSIX returns ENOMEM (-12)
-                return -12;
+        let is_mirrored = curr_va < 0x3_0000_0000 && (curr_va % 0x1_0000_0000) >= 0x10_0000;
+        if is_mirrored {
+            let base = curr_va % 0x1_0000_0000;
+            let alias1 = base + 0x1_0000_0000;
+            let alias2 = base + 0x2_0000_0000;
+
+            let mut phys_frame = crate::mm::paging::translate_user_page(pml4_phys, base)
+                .or_else(|| crate::mm::paging::translate_user_page(pml4_phys, alias1))
+                .or_else(|| crate::mm::paging::translate_user_page(pml4_phys, alias2));
+
+            if phys_frame.is_none() {
+                if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
+                    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+                    unsafe { core::ptr::write_bytes(hhdm_va, 0, 4096); }
+                    phys_frame = Some(phys);
+                } else {
+                    return -12; // ENOMEM
+                }
+            }
+
+            let phys = phys_frame.unwrap();
+
+            // Map/update curr_va
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+                    if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
+                        return -12;
+                    }
+                }
+            }
+            // Map/update base (so demand_page has a target for translation)
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, base, writable, exec).is_err() {
+                    if crate::mm::paging::map_user_page_with_flags(pml4_phys, base, phys, writable, exec).is_err() {
+                        return -12;
+                    }
+                }
+            }
+            // Update alias1 if already mapped
+            if crate::mm::paging::translate_user_page(pml4_phys, alias1).is_some() {
+                unsafe {
+                    let _ = crate::mm::paging::update_user_page(pml4_phys, alias1, writable, exec);
+                }
+            }
+            // Update alias2 if already mapped
+            if crate::mm::paging::translate_user_page(pml4_phys, alias2).is_some() {
+                unsafe {
+                    let _ = crate::mm::paging::update_user_page(pml4_phys, alias2, writable, exec);
+                }
+            }
+        } else {
+            unsafe {
+                if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
+                    if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
+                        let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+                        core::ptr::write_bytes(hhdm_va, 0, 4096);
+                        if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
+                            crate::mm::frame_allocator::free_frame(phys);
+                            return -12;
+                        }
+                    } else {
+                        return -12; // ENOMEM
+                    }
+                }
             }
         }
         curr_va += 4096;
@@ -377,7 +479,7 @@ pub(crate) fn sys_gpu_submit_strided(surface_id: u64, pixel_ptr: u64, row_bytes:
         Ok(()) => {
             static GPU_SUBMIT_LOG: AtomicU32 = AtomicU32::new(0);
             let n = GPU_SUBMIT_LOG.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n % 60 == 0 {
+            if n < 4 {
                 let sample = if bytes.len() >= 4 {
                     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
                 } else {
@@ -638,6 +740,66 @@ pub(crate) fn sys_app_launch(app_id: u64, flags: u64) -> i64 {
 /// Uninstall an installed app by `app_id`.
 pub(crate) fn sys_app_uninstall(app_id: u64) -> i64 {
     if crate::app_registry::uninstall(app_id as u32) { 0 } else { -2 } // ENOENT
+}
+
+// ── On-demand package delivery ───────────────────────────────────────────────
+
+/// Resolve a package by name — fetch on demand if not cached.
+/// `arg0` = name_ptr, `arg1` = name_len.
+/// Returns app_id on success, or negative errno.
+pub(crate) fn sys_pkg_resolve(name_ptr: u64, name_len: u64) -> i64 {
+    let name = match unsafe { read_user_bytes(name_ptr, name_len as usize) } {
+        Some(b) => b,
+        None => return -14, // EFAULT
+    };
+    match crate::pkg::resolver::resolve(name) {
+        Ok(app_id) => app_id as i64,
+        Err(crate::pkg::resolver::ResolveError::NotFound) => -2,    // ENOENT
+        Err(crate::pkg::resolver::ResolveError::NoCatalog) => -2,   // ENOENT
+        Err(crate::pkg::resolver::ResolveError::FetchFailed) => -5, // EIO
+        Err(crate::pkg::resolver::ResolveError::HashMismatch) => -22, // EINVAL
+        Err(crate::pkg::resolver::ResolveError::InstallFailed) => -12, // ENOMEM
+        Err(crate::pkg::resolver::ResolveError::CacheFull) => -28,  // ENOSPC
+    }
+}
+
+/// Serialise the package catalog into a user buffer.
+/// Each entry is 128 bytes (PkgManifest).
+/// If buf_ptr=0, returns the count of available packages.
+pub(crate) fn sys_pkg_catalog(buf_ptr: u64, buf_len: u64) -> i64 {
+    let catalog = crate::pkg::resolver::catalog();
+    if buf_ptr == 0 || buf_len == 0 {
+        return catalog.len() as i64;
+    }
+    let buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr as *mut u8, buf_len as usize) };
+    let entry_size = crate::pkg::manifest::MANIFEST_SIZE;
+    let mut written = 0usize;
+    for entry in catalog.iter() {
+        if written + entry_size > buf.len() { break; }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                entry as *const crate::pkg::manifest::PkgManifest as *const u8,
+                entry_size,
+            )
+        };
+        buf[written..written + entry_size].copy_from_slice(bytes);
+        written += entry_size;
+    }
+    catalog.len() as i64
+}
+
+/// Set the package server IP and port.
+/// `arg0` = ip_packed_be (big-endian u32), `arg1` = port.
+pub(crate) fn sys_pkg_set_server(ip: u64, port: u64) -> i64 {
+    crate::pkg::resolver::set_server(ip as u32, port as u16);
+    // Refresh catalog from the new server.
+    let _ = crate::pkg::resolver::refresh_catalog();
+    0
+}
+
+/// Evict a cached package by app_id.
+pub(crate) fn sys_pkg_evict(app_id: u64) -> i64 {
+    if crate::pkg::cache::remove(app_id as u32) { 0 } else { -2 } // ENOENT
 }
 
 // ── Phase 39 — Named port IPC namespace ──────────────────────────────────────

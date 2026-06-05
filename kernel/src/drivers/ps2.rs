@@ -136,6 +136,12 @@ static MOUSE_IDX: AtomicU8 = AtomicU8::new(0);
 static CURSOR_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(32);
 static CURSOR_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(32);
 
+/// Current mouse button click state.
+static CURSOR_BUTTONS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// TSC cycle of the last mouse activity (movement or click).
+static LAST_ACTIVITY_TSC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 // ── E0-prefix tracking for extended keyboard scancodes ───────────────────────
 
 static KBD_E0: AtomicBool = AtomicBool::new(false);
@@ -143,12 +149,34 @@ static KBD_E0: AtomicBool = AtomicBool::new(false);
 // ── Public IRQ entry points ───────────────────────────────────────────────────
 
 /// Return the current absolute cursor position (x, y) in screen pixels.
-/// Updated by mouse IRQ; starts at (32, 32).
 pub fn cursor_pos() -> (i32, i32) {
     (
         CURSOR_X.load(Ordering::Relaxed),
         CURSOR_Y.load(Ordering::Relaxed),
     )
+}
+
+/// Return the current mouse button state.
+pub fn cursor_buttons() -> u32 {
+    CURSOR_BUTTONS.load(Ordering::Relaxed)
+}
+
+/// Return the TSC cycle of the last mouse activity.
+pub fn last_activity_tsc() -> u64 {
+    LAST_ACTIVITY_TSC.load(Ordering::Relaxed)
+}
+
+/// Update cursor position (poll path + IRQ path share the same atomics).
+pub fn set_cursor_pos(x: i32, y: i32) {
+    CURSOR_X.store(x, Ordering::Relaxed);
+    CURSOR_Y.store(y, Ordering::Relaxed);
+    LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
+}
+
+/// Update cursor button state.
+pub fn set_cursor_buttons(buttons: u32) {
+    CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
+    LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
 }
 
 /// Called from IDT vector 0x21 (PS/2 keyboard IRQ1).
@@ -228,8 +256,24 @@ fn handle_mouse_byte(byte: u8) {
     if (p0 & 0xC0) != 0 { return; }
 
     // Sign-extend delta bytes using the sign bits in the flags byte.
-    let dx: i32 = if p0 & 0x10 != 0 { (p1 as i8) as i32 } else { p1 as i32 };
-    let dy: i32 = if p0 & 0x20 != 0 { (p2 as i8) as i32 } else { p2 as i32 };
+    let raw_dx: i32 = if p0 & 0x10 != 0 { (p1 as i8) as i32 } else { p1 as i32 };
+    let raw_dy: i32 = if p0 & 0x20 != 0 { (p2 as i8) as i32 } else { p2 as i32 };
+
+    // Lightweight acceleration curve tuned for QEMU PS/2 packets.
+    // Small deltas stay precise; medium/large movement gets amplified.
+    let accel = |d: i32| -> i32 {
+        let a = d.abs();
+        let gain = if a >= 8 {
+            3
+        } else if a >= 4 {
+            2
+        } else {
+            1
+        };
+        d.saturating_mul(gain)
+    };
+    let dx = accel(raw_dx);
+    let dy = accel(raw_dy);
 
     // Get framebuffer bounds.
     let (max_w, max_h) = crate::drivers::fb::size_px()
@@ -251,6 +295,9 @@ fn handle_mouse_byte(byte: u8) {
     });
 
     let buttons = (p0 & 0x07) as u32;
+    CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
+    LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
+    crate::compositor::invalidate();
     crate::wm::push_pointer(x, y, buttons);
 }
 
@@ -311,6 +358,7 @@ pub fn init() {
         let mut devs: u8 = 0x01; // keyboard always assumed present
         devs |= 0x02;            // mouse assumed present (enabled above)
         PS2_DEVICES.store(devs, Ordering::Release);
+        LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
         PS2_READY.store(true, Ordering::Release);
     }
 
@@ -357,4 +405,3 @@ pub fn device_info_packed(n: u32) -> u32 {
     }
     0
 }
-

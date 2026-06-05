@@ -1,0 +1,8 @@
+[package]
+name = "pkg-server"
+version = "0.1.0"
+edition = "2021"
+description = "Serves .osx application bundles over HTTP for on-demand package delivery"
+
+[dependencies]
+sha2 = "0.10"

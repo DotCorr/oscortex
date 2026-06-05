@@ -1,0 +1,255 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                 O S C O R T E X   S E C U R I T Y   M O D E L                 ║
+║                  Isolation & Integrity — updated 2026-06-01                     ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+
+  OVERVIEW
+  ────────
+  OSCortex's security model is built on three principles:
+  1. ISOLATION  — every app runs in its own process (PID + address space)
+  2. INTEGRITY  — every downloaded bundle is SHA-256 verified before execution
+  3. MEDIATION  — all hardware access goes through kernel syscalls (no bypass)
+
+
+  PROCESS ISOLATION
+  ─────────────────
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                         ISOLATION MODEL                             │
+  │                                                                      │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐              │
+  │  │   App A       │  │   App B       │  │   App C       │             │
+  │  │   PID: 3      │  │   PID: 4      │  │   PID: 5      │             │
+  │  │   Own CR3     │  │   Own CR3     │  │   Own CR3     │             │
+  │  │   Own stack   │  │   Own stack   │  │   Own stack   │             │
+  │  │   Own heap    │  │   Own heap    │  │   Own heap    │             │
+  │  │   Ring 3      │  │   Ring 3      │  │   Ring 3      │             │
+  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘              │
+  │         │                  │                  │                       │
+  │  ═══════╧══════════════════╧══════════════════╧═══════════════════  │
+  │                        SYSCALL BOUNDARY                             │
+  │                        (Ring 0 ↔ Ring 3)                            │
+  │  ══════════════════════════════════════════════════════════════════  │
+  │                                                                      │
+  │  ┌──────────────────────────────────────────────────────────────┐   │
+  │  │                      KERNEL (Ring 0)                         │   │
+  │  │                                                              │   │
+  │  │  ● Validates all user pointers (EFAULT on bad access)       │   │
+  │  │  ● No shared memory between processes                       │   │
+  │  │  ● Separate page tables per process (CR3 switch)            │   │
+  │  │  ● TSS provides dedicated kernel stack per process          │   │
+  │  │  ● SYSRET returns to Ring 3 after every syscall             │   │
+  │  └──────────────────────────────────────────────────────────────┘   │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  KEY PROPERTIES:
+  ● App A cannot read App B's memory (different page tables)
+  ● App A crashing does NOT affect App B or the shell
+  ● The init supervisor (PID 1) reaps dead child processes
+  ● No shared libraries between apps (each maps their own engine copy)
+
+
+  SYSCALL BOUNDARY
+  ────────────────
+  All hardware access is mediated through kernel syscalls. There is no
+  ioctl, no /dev, no mmap of device memory. Flutter apps see ONLY:
+
+  ┌────────────────────┬──────────────────────────────────────────┐
+  │  Resource          │  How Apps Access It                      │
+  ├────────────────────┼──────────────────────────────────────────┤
+  │  Display           │  surface_create → gpu_submit → present  │
+  │  Keyboard/Mouse    │  wm_event_poll → wm_event_read          │
+  │  Files             │  vfs_list, vfs_read, vfs_write           │
+  │  Network           │  net_send, net_recv (no raw sockets)     │
+  │  Other apps        │  platform_msg_post (mediated by kernel)  │
+  │  Package server    │  pkg_resolve (kernel does the HTTP)      │
+  │  Hardware          │  ❌ NOT ACCESSIBLE (no MMIO/PCI/DMA)     │
+  └────────────────────┴──────────────────────────────────────────┘
+
+  The kernel validates ALL user-space pointers:
+  ● Check that ptr falls in the process's mapped address range
+  ● Check that len doesn't overflow
+  ● Return -EFAULT (= -14) on any invalid pointer
+  ● Never dereference a user pointer in a tight loop without validation
+
+
+  PACKAGE INTEGRITY
+  ─────────────────
+  Every .osx bundle delivered via on-demand package delivery is verified:
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │  VERIFICATION PIPELINE                                         │
+  │                                                                │
+  │  1. Server serves catalog.bin with SHA-256 hash per package    │
+  │  2. Kernel downloads .osx bundle bytes                         │
+  │  3. SHA-256 hash computed over ENTIRE bundle                   │
+  │  4. Hash compared against catalog entry                        │
+  │                                                                │
+  │  ┌──────────────┐     ┌──────────────┐                        │
+  │  │ Downloaded   │     │ Catalog      │                        │
+  │  │ bytes        │────→│ expected     │                        │
+  │  │ SHA-256      │     │ SHA-256      │                        │
+  │  └──────┬───────┘     └──────┬───────┘                        │
+  │         │                     │                                │
+  │         └────── MATCH? ───────┘                                │
+  │              │            │                                    │
+  │             YES          NO                                    │
+  │              │            │                                    │
+  │         Load into    Return -EINVAL (22)                       │
+  │         app_registry  Log warning                              │
+  │              │        Discard bytes                             │
+  │              ▼                                                 │
+  │         app_id                                                 │
+  └────────────────────────────────────────────────────────────────┘
+
+  IMPLEMENTATION DETAILS:
+  ● Pure Rust SHA-256 (no external crates — audit-friendly)
+  ● Constant-time comparison (hash_eq) — resistant to timing attacks
+  ● Max download size: 8 MiB (prevents memory exhaustion)
+  ● No code is executed from a bundle until verification passes
+
+
+  APP LIFECYCLE SECURITY
+  ──────────────────────
+
+  ┌────────────┬────────────────────────────────────────────────────┐
+  │  State     │  Security Properties                              │
+  ├────────────┼────────────────────────────────────────────────────┤
+  │  Remote    │  Not yet downloaded. Just a name in catalog.      │
+  │  Resolving │  Being downloaded + verified. Not yet executable.  │
+  │  Cached    │  In LRU cache. Executable. Ephemeral.             │
+  │  Pinned    │  System app. Flag 0x01. Cannot be evicted.        │
+  │  Running   │  Own PID, own address space, own surface.         │
+  │  Evicted   │  Memory freed. Must re-download to use.           │
+  └────────────┴────────────────────────────────────────────────────┘
+
+  System apps (shell, files, canvas) CANNOT be evicted by userspace
+  syscalls. The pinned flag is set in the catalog and enforced by the
+  kernel — there's no way for user code to change it.
+
+
+  KERNEL SECURITY
+  ───────────────
+  The kernel itself is built with security in mind:
+
+  ● Written in Rust (no_std) — no C runtime, no libc, no glibc
+  ● Memory safety by default — use-after-free, buffer overflow
+    prevention through Rust's ownership model
+  ● `unsafe` blocks are isolated to:
+    - MMIO register access
+    - Page table manipulation
+    - Context switching
+    - Inline assembly (GDT, IDT, SYSRET)
+  ● No dynamic memory allocation in interrupt handlers
+  ● Ring 0/Ring 3 separation enforced by hardware (x86_64 SYSCALL)
+  ● TSS provides separate kernel stack — user stack never used in Ring 0
+  ● All syscalls go through a single dispatch point (dispatch.rs)
+  ● Unknown syscall numbers return -ENOSYS
+
+
+  AI CORTEX SECURITY
+  ──────────────────
+  The AI subsystem runs as PID 0 in kernel space:
+
+  ● NOT accessible from userspace (no syscall to invoke Cortex)
+  ● Self-healing decisions are kernel-initiated only
+  ● Driver generation is constrained to the CDP WASM format
+  ● Generated drivers run in a sandboxed WASM runtime
+  ● Cortex does not execute arbitrary user-supplied code
+  ● Inference engine operates on kernel-internal state only
+
+
+  NO TRADITIONAL ATTACK SURFACE
+  ─────────────────────────────
+  OSCortex does NOT have:
+
+  ┌──────────────────────┬──────────────────────────────────────────┐
+  │  Missing Surface     │  Why It's a Security Win                 │
+  ├──────────────────────┼──────────────────────────────────────────┤
+  │  Shell / Terminal    │  No command injection, no shell escape   │
+  │  Root user           │  No privilege escalation path            │
+  │  Package manager     │  No apt/yum/brew attack surface          │
+  │  Shared libraries    │  No LD_PRELOAD, no DLL hijacking         │
+  │  /dev filesystem     │  No device node permission exploits      │
+  │  ptrace              │  No process attachment / debugging        │
+  │  /proc/pid/mem       │  No cross-process memory reads           │
+  │  SUID binaries       │  No setuid bit, no permission confusion  │
+  │  Dynamic linking     │  Kernel dlopen only (for Flutter engine) │
+  └──────────────────────┴──────────────────────────────────────────┘
+
+
+  COMPARISON WITH OTHER OS SECURITY MODELS
+  ────────────────────────────────────────
+
+  ┌──────────────────────┬─────────┬─────────┬─────────┬──────────┬──────────┐
+  │  Feature             │ OSCortex│ Linux   │ Fuchsia │ Android  │ iOS      │
+  ├──────────────────────┼─────────┼─────────┼─────────┼──────────┼──────────┤
+  │  Process isolation   │  ✅     │  ✅     │  ✅     │  ✅      │  ✅      │
+  │  Separate page       │  ✅     │  ✅     │  ✅     │  ✅      │  ✅      │
+  │    tables            │         │         │         │          │          │
+  │  No shared memory    │  ✅     │  ❌(shm)│  ✅(*)  │  ❌(bind)│  ❌(XPC) │
+  │  Syscall-only HW     │  ✅     │  ❌(ioctl│  ✅     │  ❌(bind)│  ✅      │
+  │  No root user        │  ✅     │  ❌     │  ✅     │  ❌      │  ✅(*)   │
+  │  Verified bundles    │  ✅     │  ❌(opt)│  ✅     │  ✅      │  ✅      │
+  │  No terminal         │  ✅     │  ❌     │  ✅(*)  │  ❌(adb) │  ✅(*)   │
+  │  Rust kernel         │  ✅     │  ❌(C)  │  ✅(mix)│  ❌(C)   │  ❌(C)   │
+  │  Capability security │  ⏳     │  ❌     │  ✅     │  ✅(perm)│  ✅(ent) │
+  │  Code signing        │  ⏳     │  ❌(opt)│  ✅     │  ✅      │  ✅      │
+  │  Secure boot         │  ⏳     │  ✅(opt)│  ✅     │  ✅      │  ✅      │
+  └──────────────────────┴─────────┴─────────┴─────────┴──────────┴──────────┘
+
+  ✅ = yes   ❌ = no   ⏳ = planned   (*) = with caveats
+
+
+  THREAT MODEL
+  ────────────
+
+  WHAT OSCORTEX PROTECTS AGAINST TODAY:
+  ● Malicious app crashing other apps → process isolation
+  ● Tampered .osx bundles → SHA-256 verification
+  ● App reading kernel memory → Ring 0/3 separation
+  ● App reading another app's memory → separate page tables
+  ● Memory exhaustion from downloads → 8 MiB body limit
+  ● Timing attacks on hash comparison → constant-time compare
+  ● Cache poisoning → hash-based content addressing
+
+  KNOWN GAPS (to be addressed):
+  ● HTTP transport is plaintext → TLS planned
+  ● No code signing → Ed25519 planned
+  ● No per-app permissions → capability model planned
+  ● No secure boot chain → TPM integration planned
+  ● No ASLR → address space randomization planned
+  ● Kernel WASM sandbox not fully hardened → audit needed
+  ● Single-user model → multi-user not yet considered
+
+
+  FUTURE SECURITY ROADMAP
+  ───────────────────────
+
+  ┌────────────────────────────┬──────────────┬───────────────────────┐
+  │  Feature                   │  Priority    │  Approach              │
+  ├────────────────────────────┼──────────────┼───────────────────────┤
+  │  TLS/HTTPS transport       │  High        │  Embedded TLS library  │
+  │  Ed25519 code signing      │  High        │  Sign .osx bundles     │
+  │  TUF repository signing    │  High        │  Signed catalog.bin    │
+  │  Capability-based access   │  Medium      │  Per-app manifests     │
+  │  ASLR                      │  Medium      │  Randomize user VA     │
+  │  Secure boot chain         │  Medium      │  UEFI Secure Boot      │
+  │  Per-app filesystem jail   │  Medium      │  VFS namespace         │
+  │  Network ACLs              │  Low         │  Per-app net rules     │
+  │  Multi-user                │  Low         │  User IDs + auth       │
+  │  TPM integration           │  Low         │  Measured boot         │
+  └────────────────────────────┴──────────────┴───────────────────────┘
+
+
+  FILES REFERENCE
+  ───────────────
+  kernel/src/syscall/dispatch.rs     syscall validation + dispatch
+  kernel/src/process/                process creation, page tables, context switch
+  kernel/src/pkg/sha256.rs           SHA-256 implementation
+  kernel/src/pkg/resolver.rs         bundle verification pipeline
+  kernel/src/embedder/abi.rs         syscall number definitions
+  kernel/src/security/               capability model (future)
+  docs/arch.txt                      overall architecture
+  docs/pkg-delivery.txt              package delivery security details

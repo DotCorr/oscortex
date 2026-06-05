@@ -33,7 +33,7 @@ use crate::mm::{frame_allocator, paging};
 // ── PID to launch via the "user-init" kernel task ─────────────────────────────
 
 /// PID stored here before `schedule_user_launch` spawns the kernel task.
-static PENDING_INIT_PID: AtomicU32 = AtomicU32::new(0);
+static PENDING_INIT_PID: AtomicU32 = AtomicU32::new(1);
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ pub const USER_ELF_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 
 /// User stack top (grows downward; bottom = TOP − STACK_SIZE).
 pub const USER_STACK_TOP:  u64  = 0x0000_7FFF_FFFF_0000;
-pub const USER_STACK_SIZE: usize = 64 * 1024; // 64 KiB
+pub const USER_STACK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const XSTATE_SIZE: usize = 4096;
 
@@ -162,6 +162,8 @@ pub struct Process {
     pub user_stack_base: u64,
     /// Size in bytes of this thread/process's user-space stack.
     pub user_stack_size: u64,
+    /// CPU core index that currently executes this process context (None if idle/blocked).
+    pub current_cpu: Option<u32>,
 }
 
 impl Process {
@@ -193,6 +195,7 @@ impl Process {
             preempted_by_timer: false,
             user_stack_base: 0,
             user_stack_size: 0,
+            current_cpu: None,
         }
     }
 }
@@ -259,15 +262,150 @@ pub(crate) static mut PTABLE: [Process; MAX_PROCS] = {
     // SAFETY: Process::empty() is a const fn, array is zero-initialised.
     [const { Process::empty() }; MAX_PROCS]
 };
-pub(crate) static PTABLE_LOCK: Mutex<()> = Mutex::new(());
+pub struct PTableGuard {
+    is_outer: bool,
+}
+
+pub struct PTableLock {
+    inner: Mutex<()>,
+    holder: AtomicU32,
+}
+
+impl PTableLock {
+    pub const fn new() -> Self {
+        Self {
+            inner: Mutex::new(()),
+            holder: AtomicU32::new(0xFFFF_FFFF),
+        }
+    }
+
+    pub fn lock(&self) -> PTableGuard {
+        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        if self.holder.load(Ordering::Acquire) == my_cpu {
+            unsafe {
+                PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
+            }
+            PTableGuard { is_outer: false }
+        } else {
+            let g = self.inner.lock();
+            self.holder.store(my_cpu, Ordering::Release);
+            unsafe {
+                PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
+                PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
+            }
+            PTableGuard { is_outer: true }
+        }
+    }
+
+    pub fn try_lock(&self) -> Option<PTableGuard> {
+        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        if self.holder.load(Ordering::Acquire) == my_cpu {
+            unsafe {
+                PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
+            }
+            Some(PTableGuard { is_outer: false })
+        } else {
+            if let Some(g) = self.inner.try_lock() {
+                self.holder.store(my_cpu, Ordering::Release);
+                unsafe {
+                    PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
+                    PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
+                }
+                Some(PTableGuard { is_outer: true })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Drop for PTableGuard {
+    fn drop(&mut self) {
+        if self.is_outer {
+            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            unsafe {
+                PTABLE_LOCK_RECURSION[my_cpu as usize] = 0;
+                PTABLE_LOCK.holder.store(0xFFFF_FFFF, Ordering::Release);
+                PTABLE_LOCK_GUARD = None;
+            }
+        } else {
+            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            unsafe {
+                if PTABLE_LOCK_RECURSION[my_cpu as usize] > 0 {
+                    PTABLE_LOCK_RECURSION[my_cpu as usize] -= 1;
+                }
+            }
+        }
+    }
+}
+
+static mut PTABLE_LOCK_GUARD: Option<spin::MutexGuard<'static, ()>> = None;
+static mut PTABLE_LOCK_RECURSION: [u32; 64] = [0; 64];
+
+pub(crate) static PTABLE_LOCK: PTableLock = PTableLock::new();
+
+/// Bitmask of processes with a pending wake-up to be processed lock-free.
+pub static PENDING_WAKES: [AtomicU32; 8] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Safely queue a wake-up for the given PID. Deadlock-free from any context.
+pub fn wake_process(pid: u32) {
+    let idx = idx_of(pid);
+    let word = idx / 32;
+    let bit = idx % 32;
+    if word < 8 {
+        PENDING_WAKES[word].fetch_or(1 << bit, Ordering::SeqCst);
+    }
+    handle_pending_wakes_try();
+}
+
+/// Try to process pending wake-ups if PTABLE_LOCK is not held.
+pub fn handle_pending_wakes_try() {
+    let mut any_pending = false;
+    for word in 0..8 {
+        if PENDING_WAKES[word].load(Ordering::Acquire) != 0 {
+            any_pending = true;
+            break;
+        }
+    }
+    if !any_pending { return; }
+
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let mut should_broadcast = false;
+        for word in 0..8 {
+            let mut active_mask = PENDING_WAKES[word].swap(0, Ordering::SeqCst);
+            while active_mask != 0 {
+                let bit = active_mask.trailing_zeros();
+                active_mask &= !(1 << bit);
+                let idx = word * 32 + bit as usize;
+                let p = unsafe { &mut PTABLE[idx] };
+                if p.pid != 0 && p.state == ProcState::Blocked {
+                    let old_state = p.state;
+                    p.state = ProcState::Running;
+                    if old_state != ProcState::Running {
+                        should_broadcast = true;
+                    }
+                }
+            }
+        }
+        drop(_g);
+        if should_broadcast {
+            crate::arch::smp::broadcast_resched_ipi();
+        }
+    }
+}
 
 /// Next PID to hand out (starts at 1; PID 0 is the kernel).
 static NEXT_PID: AtomicU32 = AtomicU32::new(1);
-/// PID currently bound to the active userspace context on this CPU.
-///
-/// Today this is a global fallback (single active userspace context path).
-/// Per-CPU PID binding comes with full user scheduler integration.
-static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
+// static CURRENT_PID: AtomicU32 = AtomicU32::new(0);
 
 // ── PID helpers ───────────────────────────────────────────────────────────────
 
@@ -401,6 +539,14 @@ pub fn spawn_with_bootstrap(
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base = USER_STACK_TOP - USER_STACK_SIZE as u64;
         p.user_stack_size = USER_STACK_SIZE as u64;
+        p.current_cpu        = None;
+        p.cpu_ticks          = 0;
+        p.slice_left         = 10;
+        p.pending_sigs       = 0;
+        p.sig_mask           = 0;
+        p.sig_handlers       = [0u64; 32];
+        p.errno_to_deliver   = 0;
+        p.preempted_by_timer = false;
     }
 
     log::info!(
@@ -419,6 +565,15 @@ pub fn set_bootstrap_regs(pid: u32, rdi: u64, rsi: u64, rdx: u64) {
         p.regs.rdi = rdi;
         p.regs.rsi = rsi;
         p.regs.rdx = rdx;
+    }
+}
+
+pub fn claim_process_on_cpu(pid: u32, cpu_id: u32) {
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx] };
+    if p.pid == pid {
+        p.current_cpu = Some(cpu_id);
     }
 }
 
@@ -470,9 +625,17 @@ pub fn exit(pid: u32, code: i32) {
     if p.pid != pid || p.state == ProcState::Dead { return; }
 
     // Free the user page tables only for standalone processes — threads share
-    // the parent's PML4 and must never free it.
+    // the parent's PML4 and must never free it. Instead, reclaim the thread's
+    // private user stack and TLS page.
     if !p.is_thread {
         paging::free_user_pml4(p.pml4_phys);
+    } else {
+        if p.user_stack_base != 0 && p.user_stack_size != 0 {
+            paging::unmap_user_range(p.pml4_phys, p.user_stack_base, p.user_stack_size);
+        }
+        if p.fs_base != 0 {
+            paging::unmap_user_range(p.pml4_phys, p.fs_base, 4096);
+        }
     }
     free_syscall_stack(p.syscall_stack_base);
     p.syscall_stack_base = core::ptr::null_mut();
@@ -480,6 +643,7 @@ pub fn exit(pid: u32, code: i32) {
 
     p.state     = ProcState::Zombie(code);
     p.exit_code = code;
+    p.current_cpu = None;
     log::info!("[Process] pid={} exited with code {}", pid, code);
 }
 
@@ -499,12 +663,12 @@ pub fn kill(pid: u32) -> Result<(), &'static str> {
 
 /// Set currently active userspace PID (called by exec/scheduler glue).
 pub fn set_current_pid(pid: u32) {
-    CURRENT_PID.store(pid, Ordering::Release);
+    crate::arch::smp::this_cpu().current_pid.store(pid, Ordering::Release);
 }
 
 /// Get currently active userspace PID.
 pub fn current_pid() -> u32 {
-    CURRENT_PID.load(Ordering::Acquire)
+    crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
 }
 
 /// Wait for `pid` to become zombie, then reap it and return exit code.
@@ -581,6 +745,39 @@ pub fn restore_xstate(pid: u32) {
     unsafe { crate::arch::cpu::restore_xstate_from(ptr) };
 }
 
+/// Safely attempt to claim the given PID for execution on `my_cpu`.
+/// Returns `true` if the process is Running and either unclaimed or already assigned to `my_cpu`.
+pub fn try_claim_cpu_for(pid: u32, my_cpu: u32) -> bool {
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx] };
+    if p.pid == pid && p.state == ProcState::Running {
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return true;
+        }
+    }
+    false
+}
+
+/// Try-lock variant of `try_claim_cpu_for` to avoid ISR deadlocks.
+pub fn try_claim_cpu_for_try(pid: u32, my_cpu: u32) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let idx = idx_of(pid);
+        let p = unsafe { &mut PTABLE[idx] };
+        if p.pid == pid && p.state == ProcState::Running {
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return true;
+            }
+        }
+        false
+    } else {
+        false
+    }
+}
+
+
 /// Round-robin pick of next Running *user* thread that belongs to the same
 /// address space as `current` (i.e. shares its `parent_pid` group), excluding
 /// `current` itself. Returns `None` if no sibling thread is runnable.
@@ -588,9 +785,7 @@ pub fn restore_xstate(pid: u32) {
 /// Used to break user-space spin loops where the leader thread (e.g. pid 1)
 /// is busy-calling pthread primitives while its worker threads (Dart UI /
 /// Raster / IO workers) are technically Running but never get CPU time.
-pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
-    let _g = PTABLE_LOCK.lock();
-
+pub fn next_runnable_sibling_thread_locked(current: u32, my_cpu: u32) -> Option<u32> {
     // Determine the address-space group leader for `current`.
     let group: u32 = {
         let c = unsafe { &PTABLE[idx_of(current)] };
@@ -604,12 +799,26 @@ pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
         let p = unsafe { &PTABLE[idx] };
         if p.pid == 0 || p.pid == current { continue; }
         if p.state != ProcState::Running { continue; }
+        if !(p.current_cpu.is_none() || p.current_cpu == Some(my_cpu)) { continue; }
         // Member of the same address-space group?
         let p_group = get_group_leader_locked(p.pid);
         if p_group != group { continue; }
         // Skip the leader itself when picking a sibling.
         if p.pid == group { continue; }
         return Some(p.pid);
+    }
+    None
+}
+
+pub fn next_runnable_sibling_thread(current: u32) -> Option<u32> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = PTABLE_LOCK.lock();
+    if let Some(sib) = next_runnable_sibling_thread_locked(current, my_cpu) {
+        let p = unsafe { &mut PTABLE[idx_of(sib)] };
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return Some(sib);
+        }
     }
     None
 }
@@ -641,25 +850,26 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
     out
 }
 
-/// Round-robin pick of next runnable process after `current`.
-pub fn next_runnable_pid(current: u32) -> Option<u32> {
-    let _g = PTABLE_LOCK.lock();
-
-    // The embedder event loop must run whenever vsync batons or other WM events
-    // are queued — otherwise Flutter never reaches OnVsync / present_callback.
-    if crate::wm::baton_vsync_queued_for(1) {
-        if current == 1 {
-            // Baton event is in the WM queue — embedder must pop it, not yield to pid=2.
-            return None;
+pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
+    let focus = crate::wm::focus_pid();
+    let input_target = if focus != 0 { focus } else { 1 };
+    if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
+        if current != input_target {
+            let target = unsafe { &mut PTABLE[idx_of(input_target)] };
+            if target.pid == input_target && target.state == ProcState::Running {
+                if target.current_cpu.is_none() || target.current_cpu == Some(my_cpu) {
+                    target.current_cpu = Some(my_cpu);
+                    return Some(input_target);
+                }
+            }
         }
     }
-    if crate::wm::embedder_baton_due() {
-        let embedder = unsafe { &PTABLE[idx_of(1)] };
-        if embedder.pid == 1 {
-            if embedder.state == ProcState::Blocked {
-                crate::process::set_state(1, ProcState::Running);
-            }
-            if embedder.state == ProcState::Running {
+
+    if current != 1 && crate::wm::embedder_baton_due() {
+        let embedder = unsafe { &mut PTABLE[idx_of(1)] };
+        if embedder.pid == 1 && embedder.state == ProcState::Running {
+            if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
+                embedder.current_cpu = Some(my_cpu);
                 return Some(1);
             }
         }
@@ -673,28 +883,38 @@ pub fn next_runnable_pid(current: u32) -> Option<u32> {
     let mut res = None;
     for off in 0..MAX_PROCS {
         let idx = (start + off) % MAX_PROCS;
-        let p = unsafe { &PTABLE[idx] };
+        let p = unsafe { &mut PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
-            if current == 0 || p.pid != current {
-                res = Some(p.pid);
-                break;
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                if current == 0 || p.pid != current {
+                    p.current_cpu = Some(my_cpu);
+                    res = Some(p.pid);
+                    break;
+                }
             }
         }
     }
 
     if res.is_none() && current != 0 {
-        let c = unsafe { &PTABLE[idx_of(current)] };
+        let c = unsafe { &mut PTABLE[idx_of(current)] };
         if c.pid == current && c.state == ProcState::Running {
-            res = Some(current);
+            if c.current_cpu.is_none() || c.current_cpu == Some(my_cpu) {
+                c.current_cpu = Some(my_cpu);
+                res = Some(current);
+            }
         }
     }
 
-    static SCHED_LOG_LIMIT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let l = SCHED_LOG_LIMIT.fetch_add(1, Ordering::Relaxed);
-    if l < 256 || l % 512 == 0 {
-        log::warn!("[sched-debug] next_runnable_pid(curr={}) -> {:?}", current, res);
-    }
     res
+}
+
+pub fn next_runnable_pid(current: u32) -> Option<u32> {
+    if PENDING_INIT_PID.load(Ordering::Acquire) != 0 {
+        return None;
+    }
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = PTABLE_LOCK.lock();
+    next_runnable_pid_locked(current, my_cpu)
 }
 
 /// Snapshot of user execution context used by timer preemption switching.
@@ -837,6 +1057,7 @@ pub fn spawn_thread(
     log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, tls_va, arg);
     unsafe { core::ptr::write_volatile(tls_va as *mut u64, tls_va); }
 
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx_of(tid)] };
@@ -854,6 +1075,7 @@ pub fn spawn_thread(
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base    = stack_va;
         p.user_stack_size    = stack_size as u64;
+        p.current_cpu        = None;
     }
 
     log::info!("[Process] Thread tid={} spawned in pid={} entry={:#x} tls={:#x}",
@@ -875,6 +1097,9 @@ pub fn clone_thread(
     child_rip: u64,
     child_rsp: u64,
 ) -> Result<u32, &'static str> {
+    // Save parent's registers from CPU scratch before reading them from PTABLE.
+    save_full_user_gprs(parent_pid);
+
     let (parent_pml4_phys, owning_pid) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(parent_pid)] };
@@ -913,6 +1138,16 @@ pub fn clone_thread(
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
         p.fs_base            = 0;
+        p.current_cpu        = None;
+        p.cpu_ticks          = 0;
+        p.slice_left         = 10;
+        p.pending_sigs       = 0;
+        p.sig_mask           = 0;
+        p.sig_handlers       = [0u64; 32];
+        p.errno_to_deliver   = 0;
+        p.preempted_by_timer = false;
+        p.user_stack_base    = 0;
+        p.user_stack_size    = 0;
     }
 
     log::info!("[Process] clone_thread tid={} in pid={} rip={:#x}", tid, owning_pid, child_rip);
@@ -933,12 +1168,30 @@ pub fn schedule_user_launch(pid: u32) {
 }
 
 pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let old_pid = current_pid();
+
     let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
          rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
          syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = {
         let _g = PTABLE_LOCK.lock();
+        if old_pid != 0 && old_pid != pid {
+            let old_p = unsafe { &mut PTABLE[idx_of(old_pid)] };
+            if old_p.pid == old_pid && old_p.current_cpu == Some(my_cpu) {
+                old_p.current_cpu = None;
+            }
+        }
         let p = unsafe { &mut PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
+        if let Some(other_cpu) = p.current_cpu {
+            if other_cpu != my_cpu {
+                panic!(
+                    "[Process] enter_user_by_pid_noreturn: PID {} is already running on CPU {}, but CPU {} is trying to enter it!",
+                    pid, other_cpu, my_cpu
+                );
+            }
+        }
+        p.current_cpu = Some(my_cpu);
         let e = p.errno_to_deliver;
         p.errno_to_deliver = 0; // consume it
         let pbt = p.preempted_by_timer;
@@ -952,22 +1205,6 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     };
 
     crate::process::set_current_pid(pid);
-    if pid == 8 || pid == 9 {
-        static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
-        let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
-            log::warn!(
-                "[enter-user-89] #{} pid={} rip={:#x} rsp={:#x} fs={:#x} preempted={} errno={}",
-                n,
-                pid,
-                rip,
-                rsp,
-                fs_base,
-                preempted_by_timer,
-                errno_to_deliver
-            );
-        }
-    }
     crate::arch::syscall::set_active_stack_top(syscall_stack_top);
     crate::process::restore_xstate(pid);
     // Restore this thread's TLS pointer.  Always write the MSR (even with
@@ -1133,6 +1370,168 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     }
 }
 
+pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
+    let context = {
+        let mut g = match PTABLE_LOCK.try_lock() {
+            Some(guard) => guard,
+            None => return false,
+        };
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid != pid {
+            return false;
+        }
+        let e = p.errno_to_deliver;
+        p.errno_to_deliver = 0; // consume it
+        let pbt = p.preempted_by_timer;
+        p.preempted_by_timer = false; // consume the flag
+        let context = (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
+         p.regs.rdi, p.regs.rsi, p.regs.rdx,
+         p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,
+         p.regs.r11, p.regs.r12, p.regs.r13, p.regs.r14, p.regs.r15,
+         p.regs.rcx,
+         p.syscall_stack_top, p.fs_base, e, pbt);
+        drop(g);
+        context
+    };
+
+    let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
+         rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
+         syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = context;
+
+    crate::process::set_current_pid(pid);
+    if pid == 8 || pid == 9 {
+        static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 32 {
+            log::warn!(
+                "[enter-user-89-try] #{} pid={} rip={:#x} rsp={:#x} fs={:#x} preempted={} errno={}",
+                n,
+                pid,
+                rip,
+                rsp,
+                fs_base,
+                preempted_by_timer,
+                errno_to_deliver
+            );
+        }
+    }
+    crate::arch::syscall::set_active_stack_top(syscall_stack_top);
+    crate::process::restore_xstate(pid);
+    crate::arch::cpu::set_fs_base(fs_base);
+
+    // Switch to the user address space.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {cr3}",
+            cr3 = in(reg) pml4_phys,
+            options(nostack, nomem, preserves_flags),
+        );
+    }
+
+    if errno_to_deliver != 0 {
+        unsafe {
+            core::ptr::write_volatile(
+                crate::process::posix_trampolines::SD_ERRNO as *mut u32,
+                errno_to_deliver,
+            );
+        }
+    }
+
+    if preempted_by_timer {
+        let iret_frame: [u64; 20] = [
+            /* 0x00 */ rip,
+            /* 0x08 */ crate::arch::gdt::USER_CS as u64,
+            /* 0x10 */ rflags | 0x200,
+            /* 0x18 */ rsp,
+            /* 0x20 */ crate::arch::gdt::USER_DS as u64,
+            /* 0x28 */ rax,
+            /* 0x30 */ rbx,
+            /* 0x38 */ rcx,
+            /* 0x40 */ rdx,
+            /* 0x48 */ rdi,
+            /* 0x50 */ rsi,
+            /* 0x58 */ rbp,
+            /* 0x60 */ r8,
+            /* 0x68 */ r9,
+            /* 0x70 */ r10,
+            /* 0x78 */ r11,
+            /* 0x80 */ r12,
+            /* 0x88 */ r13,
+            /* 0x90 */ r14,
+            /* 0x98 */ r15,
+        ];
+        unsafe {
+            core::arch::asm!(
+                "push qword ptr [r11 + 0x20]",
+                "push qword ptr [r11 + 0x18]",
+                "push qword ptr [r11 + 0x10]",
+                "push qword ptr [r11 + 0x08]",
+                "push qword ptr [r11 + 0x00]",
+                "mov rax, [r11 + 0x28]",
+                "mov rbx, [r11 + 0x30]",
+                "mov rcx, [r11 + 0x38]",
+                "mov rdx, [r11 + 0x40]",
+                "mov rdi, [r11 + 0x48]",
+                "mov rsi, [r11 + 0x50]",
+                "mov rbp, [r11 + 0x58]",
+                "mov r8,  [r11 + 0x60]",
+                "mov r9,  [r11 + 0x68]",
+                "mov r10, [r11 + 0x70]",
+                "mov r12, [r11 + 0x80]",
+                "mov r13, [r11 + 0x88]",
+                "mov r14, [r11 + 0x90]",
+                "mov r15, [r11 + 0x98]",
+                "mov r11, [r11 + 0x78]",
+                "iretq",
+                in("r11") iret_frame.as_ptr(),
+                options(noreturn),
+            )
+        }
+    }
+
+    let frame: [u64; 16] = [
+        /* 0x00 */ rip,
+        /* 0x08 */ rflags,
+        /* 0x10 */ rsp,
+        /* 0x18 */ rdi,
+        /* 0x20 */ rsi,
+        /* 0x28 */ rdx,
+        /* 0x30 */ rax,
+        /* 0x38 */ rbx,
+        /* 0x40 */ rbp,
+        /* 0x48 */ r8,
+        /* 0x50 */ r9,
+        /* 0x58 */ r10,
+        /* 0x60 */ r12,
+        /* 0x68 */ r13,
+        /* 0x70 */ r14,
+        /* 0x78 */ r15,
+    ];
+    unsafe {
+        core::arch::asm!(
+            "mov rax, [r11 + 0x30]",
+            "mov rdi, [r11 + 0x18]",
+            "mov rsi, [r11 + 0x20]",
+            "mov rdx, [r11 + 0x28]",
+            "mov rbx, [r11 + 0x38]",
+            "mov rbp, [r11 + 0x40]",
+            "mov r8,  [r11 + 0x48]",
+            "mov r9,  [r11 + 0x50]",
+            "mov r10, [r11 + 0x58]",
+            "mov r12, [r11 + 0x60]",
+            "mov r13, [r11 + 0x68]",
+            "mov r14, [r11 + 0x70]",
+            "mov r15, [r11 + 0x78]",
+            "mov rcx, [r11 + 0x00]",
+            "mov rsp, [r11 + 0x10]",
+            "mov r11, [r11 + 0x08]",
+            "sysretq",
+            in("r11") frame.as_ptr(),
+            options(noreturn),
+        )
+    }
+}
+
 /// Kernel-task entry point: loads the user PML4 and SYSRETs to ring-3.
 ///
 /// This function never returns — it ends with `sysretq` which transfers
@@ -1153,6 +1552,15 @@ fn user_launch_task() {
     // saving a corrupt interrupt-stack RSP into our kernel_sp on subsequent
     // preemptions, and prevents the round-robin from ever selecting it again.
     crate::sched::mark_current_zombie();
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.current_cpu = Some(my_cpu);
+        }
+    }
+    PENDING_INIT_PID.store(0, Ordering::Release);
     enter_user_by_pid_noreturn(pid)
 }
 
@@ -1166,60 +1574,130 @@ fn user_launch_task() {
 /// set so the ISR can rewrite the interrupt frame.
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
-pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs)> {
-    // Find the next runnable thread (acquires/releases PTABLE_LOCK internally).
-    let next_pid = next_runnable_pid(cur_pid)?;
-    if next_pid == cur_pid { return None; }
+pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let fs = crate::arch::cpu::get_fs_base();
 
-    // Save the current thread's full context.
-    {
-        let _g = PTABLE_LOCK.lock();
-        let p = unsafe { &mut PTABLE[idx_of(cur_pid)] };
-        if p.pid == cur_pid && p.state == ProcState::Running {
-            p.regs = *cur_regs;
-            p.regs.rflags |= 0x200; // ensure IF=1 on resume
-            p.preempted_by_timer = true;
-        }
+    let _g = PTABLE_LOCK.lock();
+
+    // 1. Find the next runnable thread (under lock)
+    let next_pid = next_runnable_pid_locked(cur_pid, my_cpu)?;
+    if next_pid == cur_pid {
+        return None;
     }
 
-    // Save FPU/XSTATE for the outgoing thread.
-    save_xstate(cur_pid);
+    // 2. Save the current thread's context
+    let p_cur = unsafe { &mut PTABLE[idx_of(cur_pid)] };
+    if p_cur.pid == cur_pid && p_cur.state == ProcState::Running {
+        p_cur.regs = *cur_regs;
+        p_cur.regs.rflags |= 0x200; // ensure IF=1 on resume
+        p_cur.preempted_by_timer = true;
+        p_cur.fs_base = fs;
+        p_cur.current_cpu = None; // Switch away from cur_pid
+    }
 
-    // Load the next thread's register context (acquires/releases PTABLE_LOCK).
-    let next_regs = {
-        let _g = PTABLE_LOCK.lock();
-        let p = unsafe { &PTABLE[idx_of(next_pid)] };
-        if p.pid != next_pid || p.state != ProcState::Running {
-            // Thread vanished between the two lock windows; abort the switch.
-            // cur_pid's preempted_by_timer=true is harmless (see field docs).
+    // Save XSTATE for cur_pid
+    if p_cur.pid == cur_pid {
+        let ptr = p_cur.xstate.0.as_mut_ptr();
+        unsafe { crate::arch::cpu::save_xstate_to(ptr) };
+    }
+
+    // 3. Load the next thread's context
+    let p_next = unsafe { &mut PTABLE[idx_of(next_pid)] };
+    if p_next.pid != next_pid || p_next.state != ProcState::Running {
+        p_cur.current_cpu = Some(my_cpu);
+        return None;
+    }
+
+    p_next.current_cpu = Some(my_cpu);
+    let next_regs = p_next.regs;
+
+    // Restore XSTATE for next_pid
+    let ptr_next = p_next.xstate.0.as_ptr();
+    unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+
+    // Update the per-CPU scheduler state
+    crate::process::set_current_pid(next_pid);
+
+    let stack_top = p_next.syscall_stack_top;
+    let next_fs_base = p_next.fs_base;
+    let pml4_phys = p_next.pml4_phys;
+
+    drop(_g); // Release lock
+
+    // Point the active syscall stack and restore FS base (outside lock)
+    crate::arch::syscall::set_active_stack_top(stack_top);
+    crate::arch::cpu::set_fs_base(next_fs_base);
+
+    Some((next_pid, next_regs, pml4_phys))
+}
+
+/// Try-lock variant of `timer_preempt_switch` to avoid ISR deadlocks.
+pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let fs = crate::arch::cpu::get_fs_base();
+
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        // 1. Find the next runnable thread (under lock)
+        let next_pid = next_runnable_pid_locked(cur_pid, my_cpu)?;
+        if next_pid == cur_pid {
             return None;
         }
-        p.regs
-    };
 
-    // Restore FPU/XSTATE for the incoming thread.
-    restore_xstate(next_pid);
+        // 2. Save the current thread's context
+        let p_cur = unsafe { &mut PTABLE[idx_of(cur_pid)] };
+        if p_cur.pid == cur_pid && p_cur.state == ProcState::Running {
+            p_cur.regs = *cur_regs;
+            p_cur.regs.rflags |= 0x200; // ensure IF=1 on resume
+            p_cur.preempted_by_timer = true;
+            p_cur.fs_base = fs;
+            p_cur.current_cpu = None; // Switch away from cur_pid
+        }
 
-    // Update the per-CPU scheduler state.
-    set_current_pid(next_pid);
+        // Save XSTATE for cur_pid
+        if p_cur.pid == cur_pid {
+            let ptr = p_cur.xstate.0.as_mut_ptr();
+            unsafe { crate::arch::cpu::save_xstate_to(ptr) };
+        }
 
-    // Point the active syscall stack at the new thread's stack so the next
-    // syscall from the new thread uses the right kernel stack.
-    let (stack_top, fs_base) = {
-        let _g = PTABLE_LOCK.lock();
-        let p = unsafe { &PTABLE[idx_of(next_pid)] };
-        (p.syscall_stack_top, p.fs_base)
-    };
-    crate::arch::syscall::set_active_stack_top(stack_top);
-    crate::arch::cpu::set_fs_base(fs_base);
+        // 3. Load the next thread's context
+        let p_next = unsafe { &mut PTABLE[idx_of(next_pid)] };
+        if p_next.pid != next_pid || p_next.state != ProcState::Running {
+            p_cur.current_cpu = Some(my_cpu);
+            return None;
+        }
 
-    Some((next_pid, next_regs))
+        p_next.current_cpu = Some(my_cpu);
+        let next_regs = p_next.regs;
+
+        // Restore XSTATE for next_pid
+        let ptr_next = p_next.xstate.0.as_ptr();
+        unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+
+        // Update the per-CPU scheduler state
+        crate::process::set_current_pid(next_pid);
+
+        let stack_top = p_next.syscall_stack_top;
+        let next_fs_base = p_next.fs_base;
+        let pml4_phys = p_next.pml4_phys;
+
+        drop(_g); // Release lock
+
+        // Point the active syscall stack and restore FS base (outside lock)
+        crate::arch::syscall::set_active_stack_top(stack_top);
+        crate::arch::cpu::set_fs_base(next_fs_base);
+
+        Some((next_pid, next_regs, pml4_phys))
+    } else {
+        None
+    }
 }
 
 /// Save full user context at a SYSCALL boundary before cooperatively yielding
 /// to another process. Marks the thread so timer preemption resumes via IRETQ.
 pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
     save_full_user_gprs(pid);
+    let fs = crate::arch::cpu::get_fs_base();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid {
@@ -1231,11 +1709,13 @@ pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
     p.regs.rcx = rip;
     p.regs.r11 = 0x202;
     p.preempted_by_timer = true;
+    p.fs_base = fs;
 }
 
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
+    let fs = crate::arch::cpu::get_fs_base();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid {
@@ -1244,6 +1724,7 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
         p.preempted_by_timer = false;
+        p.fs_base = fs;
     }
 }
 
@@ -1255,6 +1736,19 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
 /// `this` pointer and locals.
 pub fn save_full_user_gprs(pid: u32) {
     let snap = crate::arch::syscall::user_gprs();
+    if pid == 2 {
+        log::warn!(
+            "[save_full_user_gprs] pid=2 rdi={:#x} rsi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            snap.rdi,
+            snap.rsi,
+            snap.rbx,
+            snap.rbp,
+            snap.r12,
+            snap.r13,
+            snap.r14,
+            snap.r15
+        );
+    }
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid { return; }
@@ -1327,7 +1821,39 @@ pub fn get_saved_rip_rsp(pid: u32) -> Option<(u64, u64)> {
 pub fn set_state(pid: u32, state: ProcState) {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
-    if p.pid == pid { p.state = state; }
+    if p.pid == pid {
+        let old_state = p.state;
+        p.state = state;
+        // Note: CPU occupancy is kept as Some(cpu) even when blocked to prevent
+        // another CPU core from concurrently scheduling this thread while its
+        // kernel execution context is still bound/sleeping on the original CPU.
+        // It is cleared only when the CPU switches to a different userspace PID.
+        if state == ProcState::Running && old_state != ProcState::Running {
+            drop(_g);
+            crate::arch::smp::broadcast_resched_ipi();
+            return;
+        }
+    }
+}
+
+/// Try-lock variant of `set_state` to avoid ISR deadlocks.
+pub fn set_state_try(pid: u32, state: ProcState) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            let old_state = p.state;
+            p.state = state;
+            if state == ProcState::Running && old_state != ProcState::Running {
+                drop(_g);
+                crate::arch::smp::broadcast_resched_ipi();
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    }
 }
 
 /// Dump a compact scheduler snapshot for the main Flutter bring-up threads.
@@ -1368,6 +1894,16 @@ pub fn is_blocked(pid: u32) -> bool {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &PTABLE[idx_of(pid)] };
     p.pid == pid && p.state == ProcState::Blocked
+}
+
+/// Try-lock variant of `is_blocked` to avoid ISR deadlocks.
+pub fn is_blocked_try(pid: u32) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        p.pid == pid && p.state == ProcState::Blocked
+    } else {
+        false
+    }
 }
 
 /// Record which process is waiting for `child_pid` to exit.
@@ -1417,6 +1953,22 @@ pub fn account_tick(pid: u32) -> bool {
     let preempt = p.slice_left == 0;
     if preempt { p.slice_left = 10; } // reset quantum
     preempt
+}
+
+/// Try-lock variant of `account_tick` to avoid ISR deadlocks.
+pub fn account_tick_try(pid: u32) -> Option<bool> {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let idx = idx_of(pid);
+        let p = unsafe { &mut PTABLE[idx] };
+        if p.pid != pid || p.state != ProcState::Running { return Some(false); }
+        p.cpu_ticks += 1;
+        if p.slice_left > 0 { p.slice_left -= 1; }
+        let preempt = p.slice_left == 0;
+        if preempt { p.slice_left = 10; } // reset quantum
+        Some(preempt)
+    } else {
+        None
+    }
 }
 
 /// Return cumulative CPU ticks for a process.
@@ -1481,8 +2033,11 @@ pub fn set_signal_mask(pid: u32, mask: u32) {
 /// The child starts with identical register state; `rax` will be set to 0
 /// in the child by the caller (sys_fork).
 pub fn fork_current() -> Result<u32, &'static str> {
-    let parent_pid = CURRENT_PID.load(Ordering::Relaxed);
+    let parent_pid = current_pid();
     if parent_pid == 0 { return Err("fork from kernel"); }
+
+    // Save parent's registers from CPU scratch before reading them from PTABLE.
+    save_full_user_gprs(parent_pid);
 
     let child_pid = alloc_pid().ok_or("too many processes")?;
     let child_slot = idx_of(child_pid);
@@ -1633,4 +2188,3 @@ pub fn debug_dump_processes() {
         log::info!("==========================");
     }
 }
-

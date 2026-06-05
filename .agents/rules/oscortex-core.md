@@ -1,0 +1,35 @@
+---
+description: OSCortex core rules — target architecture, one path, no duplicate tooling, exclude landing/
+alwaysApply: true
+---
+
+# OSCortex
+
+Read **docs/arch.txt**, **docs/hardware.txt**, **docs/ci-cd.txt**, and project skills before structural work:
+
+- `.agents/skills/oscortex-architecture/SKILL.md`
+- `.agents/skills/oscortex-hardware/SKILL.md` (drivers, display, input, device classes)
+- `.agents/skills/oscortex-kernel-tests/SKILL.md` (driver unit + QEMU integration tests)
+- `.agents/skills/oscortex-ci-cd/SKILL.md` (branching, PRs, CI, release to main)
+- `.agents/skills/codebase-audit-cleanup/SKILL.md`
+- `.agents/skills/frontend-design/SKILL.md` (creative, premium frontend layouts and web interface designs)
+
+## Architecture
+
+- Kernel: hardware, compositor, focus, syscalls.
+- Flutter: shell, WM chrome, apps — **one process per app**, own engine instance.
+- PID 1: thin init/supervisor — not widgets, not all apps in one address space.
+- Apps: runtime install (`.osx`), not ISO reflash from `apps/*`.
+- Hardware: see **docs/hardware.txt** — syscalls only to userspace; one render path; drivers per device class.
+
+## Code rules
+
+- **One canonical path** — on pivot, delete old code/files; no dual boot or render stacks.
+- **Reuse** — extend existing modules; do not duplicate patch/embedder/syscall logic.
+- **Engine patches** — only `tools/flutter-engine/engine_patch.py`.
+- **Exclude** `landing/` unless the user explicitly asks.
+
+## Cleanup triggers
+
+Before large features or when the user mentions bloat/redundancy/pivot: run the codebase-audit-cleanup skill (Phase 1 scan → delete/consolidate → verify harness + build).
+

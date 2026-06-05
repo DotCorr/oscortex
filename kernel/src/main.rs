@@ -40,6 +40,7 @@ mod logger;
 mod mm;
 mod net;
 mod panic;
+mod pkg;
 mod port_ns;
 mod process;
 mod sched;
@@ -149,6 +150,14 @@ pub extern "C" fn kernel_main() -> ! {
     let fb_response = FB_REQUEST.response();
     logger::init(fb_response);
 
+    log::warn!(
+        "[MM::FrameAlloc] capacity stats at boot: total_usable_frames={} ({} MiB), used_at_boot={} ({} MiB)",
+        mm::frame_allocator::frames_total(),
+        (mm::frame_allocator::frames_total() * 4096) / (1024 * 1024),
+        mm::frame_allocator::frames_used(),
+        (mm::frame_allocator::frames_used() * 4096) / (1024 * 1024)
+    );
+
     // Report framebuffer state on serial so we can verify it was found.
     if let Some(ref fbr) = fb_response {
         let fbs = fbr.framebuffers();
@@ -205,6 +214,9 @@ pub extern "C" fn kernel_main() -> ! {
     // ── 7c. Block, serial, and networking ─────────────────────────────────
     drivers::platform::init_block_and_net();
 
+    // ── 7d. On-demand package delivery ────────────────────────────────
+    pkg::init();
+
     // ── 8. AI Cortex ─────────────────────────────────────────────────────
     // The Cortex boots last so every kernel subsystem is available to it.
     cortex::init();
@@ -224,7 +236,6 @@ pub extern "C" fn kernel_main() -> ! {
             };
             match process::spawn_with_bootstrap(elf_bytes, "init", bootstrap) {
                 Ok(pid) => {
-                    process::set_current_pid(pid);
                     process::schedule_user_launch(pid);
                     crate::wm::set_focus_pid(pid);
                     log::info!("[INIT] Spawned shell host as PID {}", pid);

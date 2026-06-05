@@ -215,6 +215,7 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
 pub fn write_str(s: &str) {
     if !FB_READY.load(Ordering::Acquire) { return; }
     if FB_SILENT.load(Ordering::Relaxed) { return; }
+    let _guard = InterruptGuard::new();
     for b in s.bytes() {
         write_byte(b);
     }
@@ -274,6 +275,24 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
     }
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
     unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(color); }
+}
+
+/// Read a single pixel at `(x, y)` from the framebuffer or double buffer.
+/// Returns 0 if not ready or out of bounds.
+pub fn get_pixel(x: u32, y: u32) -> u32 {
+    if !is_ready() { return 0; }
+    let width  = FB_WIDTH.load(Ordering::Relaxed);
+    let height = FB_HEIGHT.load(Ordering::Relaxed);
+    if x >= width || y >= height { return 0; }
+    let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
+    if DOUBLE_BUFFER_ACTIVE.load(Ordering::Relaxed) {
+        let _guard = InterruptGuard::new();
+        if let Some(ref buf) = *DOUBLE_BUFFER.lock() {
+            return buf[y as usize * pitch_px + x as usize];
+        }
+    }
+    let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
+    unsafe { addr.add(y as usize * pitch_px + x as usize).read_volatile() }
 }
 
 pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {

@@ -145,6 +145,34 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                 let bridged = futex_wake_waiters(addr, bridge_wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);
+                    // Bump the target condvar's seq so the woken thread sees
+                    // `cur_seq != seq` and exits cond_wait instead of re-sleeping.
+                    // Without this, bridge wakes are spurious and the thread goes
+                    // right back to sleep because its saved seq == current seq.
+                    //
+                    // Also update glibc pthread_cond_t __wakeup_seq (at addr+16)
+                    // so threads using glibc's pthread_cond_wait see a proper
+                    // signal and exit their re-check loop.
+                    if addr >= 0x1000 && addr < 0x0000_8000_0000_0000 {
+                        let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
+                        if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
+                            // Custom condvar seq bump (our protocol)
+                            let atom = unsafe { &*(addr as *const core::sync::atomic::AtomicU32) };
+                            atom.fetch_add(1, core::sync::atomic::Ordering::Release);
+                            // glibc __wakeup_seq at addr+16 (u64, glibc 2.17 NPTL layout)
+                            // glibc __broadcast_seq at addr+40 (u32)
+                            if addr + 48 < 0x0000_8000_0000_0000 {
+                                if crate::mm::paging::translate_user_page(cur_cr3, (addr+16) & !0xfff).is_some() {
+                                    let wakeup_ptr = (addr + 16) as *mut u64;
+                                    unsafe { *wakeup_ptr = (*wakeup_ptr).wrapping_add(1); }
+                                    let bcast_ptr = (addr + 40) as *mut u32;
+                                    unsafe { *bcast_ptr = (*bcast_ptr).wrapping_add(1); }
+                                    // Also wake glibc's futex word at addr+4
+                                    let _ = futex_wake_waiters(addr + 4, bridge_wake_count);
+                                }
+                            }
+                        }
+                    }
                     static COND_BRIDGE_SIB_LOG: core::sync::atomic::AtomicU32 =
                         core::sync::atomic::AtomicU32::new(0);
                     let n = COND_BRIDGE_SIB_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -213,7 +241,7 @@ pub(crate) fn engine_broadcast_storm_wake(broadcaster: u32, cond: u64) -> u32 {
     if total > 0 {
         static STORM_WAKE_LOG: AtomicU32 = AtomicU32::new(0);
         let n = STORM_WAKE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 64 == 0 {
+        if n < 8 {
             log::warn!(
                 "[engine-bcast-storm] #{} pid={} cond={:#x} storm_wakes={}",
                 n,
@@ -626,7 +654,11 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
     }
 
     let spawn = |entry_fn: u64, arg: u64, stack_size: u64| -> Result<u32, i64> {
-        let sz = if stack_size == 0 { 65536 } else { stack_size as usize };
+        let sz = if stack_size == 0 {
+            1024 * 1024 // 1 MiB default
+        } else {
+            (stack_size as usize).max(512 * 1024) // 512 KiB minimum
+        };
         crate::process::spawn_thread(parent_pid, entry_fn, arg, sz).map_err(|_| -12)
     };
 
@@ -662,13 +694,16 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
             // enough to starve wake-source setup (pipe/timer arming).
             let parent = crate::process::current_pid();
             if parent != 0 && child_pid != parent {
-                let urip = crate::arch::syscall::user_rip();
-                let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(parent, urip, ursp);
-                crate::process::save_full_user_gprs(parent);
-                crate::process::set_rax(parent, 0);
-                crate::process::save_xstate(parent);
-                crate::process::enter_user_by_pid_noreturn(child_pid);
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(parent, urip, ursp);
+                    crate::process::save_full_user_gprs(parent);
+                    crate::process::set_rax(parent, 0);
+                    crate::process::save_xstate(parent);
+                    crate::process::enter_user_by_pid_noreturn(child_pid);
+                }
             }
         }
         r
@@ -684,14 +719,13 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
 /// Exit the current thread (or process if not a thread).
 pub(crate) fn sys_thread_exit(code: u64) -> i64 {
     let pid = crate::process::current_pid();
-    let user_rip = crate::arch::syscall::user_rip();
-    let user_rsp = crate::arch::syscall::user_rsp();
-    log::warn!("[trace] sys_thread_exit pid={} code={:#x} rip={:#x} rsp={:#x}",
-        pid, code, user_rip, user_rsp);
-    // Dump full syscall ring buffer so we can see EVERY syscall this thread
-    // made before exiting — critical for diagnosing the Flutter fml::Thread
-    // start_routine bail-out (only pthread_setname_np visible otherwise).
-    dump_recent_syscalls(SYSCALL_TRACE_DEPTH);
+    if code != 0 {
+        let user_rip = crate::arch::syscall::user_rip();
+        let user_rsp = crate::arch::syscall::user_rsp();
+        log::warn!("[trace] sys_thread_exit pid={} code={:#x} rip={:#x} rsp={:#x}",
+            pid, code, user_rip, user_rsp);
+        dump_recent_syscalls(SYSCALL_TRACE_DEPTH);
+    }
     // Activate post-exit syscall trace window so we can see what pid=1 does
     // after it resumes from pthread_cond_wait.
     POSTEXIT_TRACE_COUNT.store(0, Ordering::Relaxed);

@@ -56,6 +56,7 @@ const SD_CTYPE_LO_TABLE:  u64 = SYSDATA_VA + 848;  // i32[384] = 1536 bytes
 const SD_CTYPE_UP_TABLE:  u64 = SYSDATA_VA + 2384; // i32[384] = 1536 bytes
 // Total: 2384 + 1536 = 3920 bytes < 4096 ✓
 pub const SD_LOCALE_C: u64 = SYSDATA_VA + 3920;
+pub const SD_EMPTY_FC_FONTSET: u64 = SYSDATA_VA + 4032;
 
 // Pointer values written into sysdata page at init time:
 const CTYPE_B_PTR_VAL:  u64 = SD_CTYPE_B_TABLE  + 128 * 2; // &ctype_b_table[128]
@@ -483,6 +484,10 @@ const STUBS: &[(&str, StubKind)] = &[
     /* 342 */ ("longjmp",                    StubKind::Longjmp),
     /* 343 */ ("__longjmp_pad1",             StubKind::Padding),
     /* 344 */ ("__longjmp_pad2",             StubKind::Padding),
+    /* 345 */ ("__oscortex_fallback_stub",   StubKind::RetU32(0)),
+    /* 346 */ ("__oscortex_fallback_stub_nonnull", StubKind::RetU32(0xFC000000)),
+    /* 347 */ ("__oscortex_fallback_stub_true",    StubKind::RetU32(1)),
+    /* 348 */ ("__oscortex_fallback_stub_fcfontset", StubKind::RetAddr(SD_EMPTY_FC_FONTSET)),
 ];
 
 /// Data symbols: resolve to a fixed VA in SYSDATA page (no trampoline needed).
@@ -900,6 +905,22 @@ fn map_sysdata_page(pml4_phys: u64) -> Result<(), &'static str> {
     // Write stable "C" locale string at offset 3920.
     page[3920] = b'C';
     page[3921] = 0;
+
+    // Write static library names for dladdr at offset 3922
+    let path_flutter = b"/system/lib/libflutter_engine.so\0";
+    page[3922..3922 + path_flutter.len()].copy_from_slice(path_flutter);
+
+    let path_app = b"/system/flutter/libapp.so\0";
+    page[3960..3960 + path_app.len()].copy_from_slice(path_app);
+
+    let path_fallback = b"/system/lib/unknown.so\0";
+    page[3990..3990 + path_fallback.len()].copy_from_slice(path_fallback);
+
+    // Write empty FcFontSet at offset 4032.
+    // nfont = 0 (offset 4032), sfont = 0 (offset 4036), fonts = NULL (offset 4040)
+    page[4032..4036].copy_from_slice(&0u32.to_le_bytes());
+    page[4036..4040].copy_from_slice(&0u32.to_le_bytes());
+    page[4040..4048].copy_from_slice(&0u64.to_le_bytes());
 
     // Map as read-write (data page, not executable). errno and other mutable
     // fields (SD_ERRNO etc.) are written directly by user code via pointers.

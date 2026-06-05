@@ -26,23 +26,7 @@ pub fn acqmutex_waiter_for(mutex: u64, exclude: u32) -> Option<u32> {
 }
 
 /// Pick a thread that needs to finish a cond-wait state machine step.
-fn cond_resched_target(exclude: u32) -> Option<u32> {
-    let cws = COND_WAIT_STATE.lock();
-    for (&pid, st) in cws.iter() {
-        if pid == exclude {
-            continue;
-        }
-        if let CondWaitState::AcquiringMutex { .. } = st {
-            if crate::process::is_blocked(pid) {
-                crate::process::set_state(pid, crate::process::ProcState::Running);
-            }
-            if crate::process::get_user_context(pid).is_some() {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
+// (Not used directly anymore, functionality inline in cooperative_yield_to under lock)
 
 fn perform_cooperative_yield(cur: u32, sys_nr: u64, next: u32) -> ! {
     let urip = crate::arch::syscall::user_rip();
@@ -68,23 +52,63 @@ pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
 
     static YIELD_TICK: AtomicU32 = AtomicU32::new(0);
     let tick = YIELD_TICK.fetch_add(1, Ordering::Relaxed);
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
 
-    let next = prefer
-        .filter(|&p| p != cur && crate::process::get_user_context(p).is_some())
-        .or_else(|| cond_resched_target(cur))
-        .or_else(|| {
-            if (tick & 31) == 0 {
-                crate::process::next_runnable_sibling_thread(cur)
-            } else {
+    let next = {
+        let _g = crate::process::PTABLE_LOCK.lock();
+        let next_candidate = prefer
+            .filter(|&p| {
+                if p == cur { return false; }
+                let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(p)] };
+                if slot.pid == p && slot.state == crate::process::ProcState::Running {
+                    if slot.current_cpu.is_none() || slot.current_cpu == Some(my_cpu) {
+                        slot.current_cpu = Some(my_cpu);
+                        return true;
+                    }
+                }
+                false
+            })
+            .or_else(|| {
+                // cond_resched_target_locked
+                let cws = COND_WAIT_STATE.lock();
+                for (&pid, st) in cws.iter() {
+                    if pid == cur { continue; }
+                    if let CondWaitState::AcquiringMutex { .. } = st {
+                        let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+                        if slot.pid == pid {
+                            if slot.state == crate::process::ProcState::Blocked {
+                                slot.state = crate::process::ProcState::Running;
+                                crate::arch::smp::broadcast_resched_ipi();
+                            }
+                            if slot.state == crate::process::ProcState::Running {
+                                if slot.current_cpu.is_none() || slot.current_cpu == Some(my_cpu) {
+                                    slot.current_cpu = Some(my_cpu);
+                                    return Some(pid);
+                                }
+                            }
+                        }
+                    }
+                }
                 None
-            }
-        });
+            })
+            .or_else(|| {
+                if (tick & 31) == 0 {
+                    crate::process::next_runnable_sibling_thread_locked(cur, my_cpu).map(|sib| {
+                        let slot = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(sib)] };
+                        slot.current_cpu = Some(my_cpu);
+                        sib
+                    })
+                } else {
+                    None
+                }
+            });
+        next_candidate
+    };
+
     let Some(next) = next else {
         return;
     };
-    if next == cur || crate::process::get_user_context(next).is_none() {
-        return;
-    }
+
     perform_cooperative_yield(cur, sys_nr, next);
 }
 
@@ -93,50 +117,94 @@ pub fn cooperative_yield_to(cur: u32, sys_nr: u64, prefer: Option<u32>) {
 /// Prefer the embedder when it is blocked in `wm_event_wait`, then core Flutter
 /// runner threads (typically pid 2–7), avoiding Dart worker isolates (8+) that
 /// starve init when given equal round-robin weight.
-pub fn coop_target_ready(pid: u32) -> bool {
+pub fn coop_target_ready_locked(pid: u32, my_cpu: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    if crate::process::is_blocked(pid) {
+    let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+    if p.pid != pid {
+        return false;
+    }
+    if matches!(p.state, crate::process::ProcState::Blocked) {
         let wm = WM_WAITER_PID.load(Ordering::Acquire);
-        if wm == pid {
-            crate::process::set_state(pid, crate::process::ProcState::Running);
+        let focus = crate::wm::focus_pid();
+        let input_target = if focus != 0 { focus } else { 1 };
+        let input_priority_active =
+            crate::wm::flutter_init_ready() && !crate::wm::flutter_bootstrap_spin_active();
+        let input_is_waiting = input_priority_active
+            && input_target != 0
+            && crate::wm::input_pending_for(input_target) > 0;
+        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due();
+        if (wm == pid && has_pending) || (input_is_waiting && pid == input_target) {
+            p.state = crate::process::ProcState::Running;
+            crate::arch::smp::broadcast_resched_ipi();
+        } else if input_is_waiting && pid != input_target {
+            return false;
         }
     }
-    crate::process::get_user_context(pid).is_some()
+    p.state == crate::process::ProcState::Running
+}
+
+pub fn coop_target_ready(pid: u32) -> bool {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    coop_target_ready_locked(pid, my_cpu)
 }
 
 /// When a vsync baton is waiting, always prefer the embedder over engine spins.
 pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
-    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready(1) {
-        Some(1)
-    } else {
-        None
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready_locked(1, my_cpu) {
+        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(1)] };
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return Some(1);
+        }
     }
+    None
 }
 
-pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
+pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
     static COOP_TICK: AtomicU32 = AtomicU32::new(0);
     let tick = COOP_TICK.fetch_add(1, Ordering::Relaxed);
+
+    let focus = crate::wm::focus_pid();
+    let input_target = if focus != 0 { focus } else { 1 };
+    if crate::wm::flutter_init_ready()
+        && !crate::wm::flutter_bootstrap_spin_active()
+        && input_target != 0
+        && input_target != cur
+        && crate::wm::input_pending_for(input_target) > 0
+        && coop_target_ready_locked(input_target, my_cpu)
+    {
+        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(input_target)] };
+        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+            p.current_cpu = Some(my_cpu);
+            return Some(input_target);
+        }
+    }
 
     let wm = WM_WAITER_PID.load(Ordering::Acquire);
     // Embedder must drain WM events (especially vsync batons) promptly.
     if wm != 0 && wm != cur && crate::wm::embedder_baton_due() {
-        if crate::process::is_blocked(wm) {
-            crate::process::set_state(wm, crate::process::ProcState::Running);
-        }
-        if coop_target_ready(wm) {
-            return Some(wm);
+        if coop_target_ready_locked(wm, my_cpu) {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(wm);
+            }
         }
     }
-    // When a vsync baton is queued, always prefer the embedder — even over
+    // When a vsync baton is waiting, always prefer the embedder — even over
     // Flutter runner threads that would otherwise monopolise the CPU.
     if wm != 0 && wm != cur && crate::wm::vsync_baton_pending() {
-        if crate::process::is_blocked(wm) {
-            crate::process::set_state(wm, crate::process::ProcState::Running);
-        }
-        if coop_target_ready(wm) {
-            return Some(wm);
+        if coop_target_ready_locked(wm, my_cpu) {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(wm);
+            }
         }
     }
     // Do not preempt Flutter runner threads (2–7) for baton=0 vsync ticks only.
@@ -144,30 +212,46 @@ pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
         let pending = crate::wm::pending_count_for(wm);
         let wm_due = pending > 0 || (tick & 3) == 0;
         if wm_due {
-            if crate::process::is_blocked(wm) {
-                crate::process::set_state(wm, crate::process::ProcState::Running);
-            }
-            if coop_target_ready(wm) {
-                return Some(wm);
+            if coop_target_ready_locked(wm, my_cpu) {
+                let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
+                if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                    p.current_cpu = Some(my_cpu);
+                    return Some(wm);
+                }
             }
         }
     }
 
     for prefer in [2u32, 3, 4, 7, 1] {
-        if prefer != cur && coop_target_ready(prefer) {
-            return Some(prefer);
-        }
-    }
-
-    if (tick & 31) == 0 {
-        if let Some(sib) = crate::process::next_runnable_sibling_thread(cur) {
-            if sib <= 7 && coop_target_ready(sib) {
-                return Some(sib);
+        let ready = coop_target_ready_locked(prefer, my_cpu);
+        if prefer != cur && ready {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(prefer)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(prefer);
             }
         }
     }
 
-    crate::process::next_runnable_pid(cur)
+    if (tick & 31) == 0 {
+        if let Some(sib) = crate::process::next_runnable_sibling_thread_locked(cur, my_cpu) {
+            if sib <= 7 && coop_target_ready_locked(sib, my_cpu) {
+                let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(sib)] };
+                if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                    p.current_cpu = Some(my_cpu);
+                    return Some(sib);
+                }
+            }
+        }
+    }
+
+    crate::process::next_runnable_pid_locked(cur, my_cpu)
+}
+
+pub fn cooperative_sched_target(cur: u32) -> Option<u32> {
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let _g = crate::process::PTABLE_LOCK.lock();
+    cooperative_sched_target_locked(cur, my_cpu)
 }
 
 // ── Synthetic FD allocator ────────────────────────────────────────────────────
@@ -241,7 +325,36 @@ pub(crate) fn epoll_wake(fd: u32) {
     };
     for pid in pids_to_wake {
         // rax=1 and the fake event were written before yielding.
-        crate::process::set_state(pid, crate::process::ProcState::Running);
+        crate::process::wake_process(pid);
+    }
+}
+
+pub(crate) fn epoll_wake_try(fd: u32) {
+    let watching_epfds: Vec<u32> = {
+        let epoll_tbl = match EPOLL_TABLE.try_lock() {
+            Some(t) => t,
+            None => return,
+        };
+        epoll_tbl.iter()
+            .filter(|(_, entries)| entries.iter().any(|e| e.fd == fd))
+            .map(|(&epfd, _)| epfd)
+            .collect()
+    };
+    if watching_epfds.is_empty() { return; }
+    let pids_to_wake: Vec<u32> = {
+        let mut blocked = match EPOLL_BLOCKED.try_lock() {
+            Some(b) => b,
+            None => return,
+        };
+        let pids: Vec<u32> = blocked.iter()
+            .filter(|(_, &epfd)| watching_epfds.contains(&epfd))
+            .map(|(&pid, _)| pid)
+            .collect();
+        for &pid in &pids { blocked.remove(&pid); }
+        pids
+    };
+    for pid in pids_to_wake {
+        crate::process::wake_process(pid);
     }
 }
 
@@ -329,16 +442,42 @@ fn finish_cond_timedout_return(pid: u32, mutex: u64) {
     if pid == 0 {
         return;
     }
+    // 1. Try to acquire the locks first in a consistent order
+    let mut cws = match COND_WAIT_STATE.try_lock() {
+        Some(c) => c,
+        None => return,
+    };
+    let mut g_ptable = match crate::process::PTABLE_LOCK.try_lock() {
+        Some(g) => g,
+        None => return,
+    };
+
+    // 2. Try to acquire the userspace mutex
     let atom = unsafe { &*(mutex as *const core::sync::atomic::AtomicU32) };
     if atom.compare_exchange(0, 1, Ordering::Acquire, Ordering::Acquire).is_err() {
         return;
     }
-    if let Some((rip, rsp)) = crate::process::get_saved_rip_rsp(pid) {
-        crate::process::save_return_context(pid, rip.wrapping_add(2), rsp);
+
+    // 3. Perform register modifications and state update
+    let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(pid)] };
+    if p.pid == pid {
+        let rip = p.regs.rip;
+        let rsp = p.regs.rsp;
+        let fs = crate::arch::cpu::get_fs_base();
+        p.regs.rip    = rip.wrapping_add(2);
+        p.regs.rsp    = rsp;
+        p.regs.rflags = 0x202;
+        p.preempted_by_timer = false;
+        p.fs_base = fs;
+        p.regs.rax = 110; // ETIMEDOUT
     }
-    crate::process::set_rax(pid, 110);
-    COND_WAIT_STATE.lock().remove(&pid);
-    crate::process::set_state(pid, crate::process::ProcState::Running);
+
+    drop(g_ptable);
+    cws.remove(&pid);
+    drop(cws);
+
+    crate::process::wake_process(pid);
+
     static FINISH_LOG: AtomicU32 = AtomicU32::new(0);
     let n = FINISH_LOG.fetch_add(1, Ordering::Relaxed);
     if n < 16 || n % 64 == 0 {
@@ -369,15 +508,77 @@ pub fn check_timerfds_and_wake() {
     for fd in to_wake {
         epoll_wake(fd);
     }
+}
 
-    // Timed pthread_cond wait expiry is handled inside
-    // sys_pthread_cond_wait_timeout when the thread is scheduled (matches the
-    // working run-visible.log profile — no kernel-side inject/expire).
+pub fn check_timerfds_and_wake_try() {
+    let now = monotonic_ns();
+    let mut to_wake = Vec::new();
+    {
+        let mut tbl = match TIMERFD_TABLE.try_lock() {
+            Some(t) => t,
+            None => return,
+        };
+        for (&fd, t) in tbl.iter_mut() {
+            if t.deadline_ns != 0 && now >= t.deadline_ns {
+                if t.period_ns != 0 {
+                    let elapsed = now.saturating_sub(t.deadline_ns);
+                    let n = 1u64 + elapsed / t.period_ns;
+                    t.deadline_ns = t.deadline_ns.saturating_add(n * t.period_ns);
+                    t.pending = t.pending.saturating_add(n);
+                } else {
+                    t.deadline_ns = 0; // disarm one-shot
+                    t.pending = t.pending.saturating_add(1);
+                }
+                to_wake.push(fd);
+            }
+        }
+    }
+    for fd in to_wake {
+        epoll_wake_try(fd);
+    }
+
+    // Proactively expire any Waiting cond-waiter whose timeout has fired.
+    // This is critical: if the scheduler never picks the blocked thread
+    // (because it prefers higher-priority siblings), the thread can never
+    // reach the in-syscall timeout check. The timer ISR (this function) MUST
+    // drive the expiry to un-block the thread.
+    {
+        // Single lock acquisition: collect + transition atomically.
+        let expired: alloc::vec::Vec<(u32, u64, u64)> = {
+            let mut cws = match COND_WAIT_STATE.try_lock() {
+                Some(c) => c,
+                None => return, // contention — retry next tick
+            };
+            let mut exps = alloc::vec::Vec::new();
+            for (&pid, st) in cws.iter_mut() {
+                if let CondWaitState::Waiting { timeout_ns, mutex, cond, .. } = *st {
+                    if timeout_ns != 0 && now >= timeout_ns {
+                        // Atomically transition to AcquiringMutex inside the lock.
+                        *st = CondWaitState::AcquiringMutex { mutex, timed_out: true };
+                        exps.push((pid, mutex, cond));
+                    }
+                }
+            }
+            exps
+        };
+        for (pid, mutex, cond) in expired {
+            super::futex_waiter_remove(cond, pid);
+            static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
+            let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
+            if n < 32 {
+                log::warn!("[cond-expire] #{} timer-ISR expired pid={} mutex={:#x}", n, pid, mutex);
+            }
+            crate::process::wake_process(pid);
+        }
+    }
 
     // Finish at most one timed-out AcquiringMutex waiter per tick (mutex free).
     {
         let stuck = {
-            let cws = COND_WAIT_STATE.lock();
+            let cws = match COND_WAIT_STATE.try_lock() {
+                Some(c) => c,
+                None => return,
+            };
             cws.iter()
                 .find_map(|(&pid, st)| {
                     if let CondWaitState::AcquiringMutex {
@@ -409,8 +610,8 @@ pub fn check_timerfds_and_wake() {
     let wm_deadline = WM_WAITER_DEADLINE.load(Ordering::Acquire);
     if wm_deadline != 0 && now >= wm_deadline {
         let wm_waiter = WM_WAITER_PID.load(Ordering::Acquire);
-        if wm_waiter != 0 && crate::process::is_blocked(wm_waiter) {
-            crate::process::set_state(wm_waiter, crate::process::ProcState::Running);
+        if wm_waiter != 0 && crate::process::is_blocked_try(wm_waiter) {
+            crate::process::wake_process(wm_waiter);
         }
     }
 }
@@ -500,7 +701,7 @@ pub(crate) fn sys_timerfd_settime_real(fd: u64, flags: u64, new_value: u64, _old
     };
     let raw_bytes = unsafe { core::slice::from_raw_parts(new_value as *const u8, 32) };
     let n = TFD_SETTIME_LOG.load(Ordering::Relaxed);
-    if n < 0 {
+    if n < 32 {
         log::warn!("[tfd-debug] fd={} raw: {:x?}", fd, raw_bytes);
         log::warn!("[tfd-debug] fd={} fields: int_s={} int_ns={} val_s={} val_ns={}", fd, int_s, int_ns, val_s, val_ns);
     }
@@ -641,13 +842,31 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
 
 /// Returns ready events. event slot layout (packed): u32 events; u64 data.
 fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
-    if events_out == 0 || maxevents <= 0 { return 0; }
+    static ECR_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let n = ECR_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 48 {
+        log::warn!("[ec-ready-enter] #{} epfd={} ev_out={:#x} max={}", n, epfd, events_out, maxevents);
+    }
+    if events_out == 0 || maxevents <= 0 {
+        if n < 48 {
+            log::warn!("[ec-ready-exit-early] #{} epfd={}", n, epfd);
+        }
+        return 0;
+    }
     let now = monotonic_ns();
     let mut count: i32 = 0;
-    let tbl = EPOLL_TABLE.lock();
-    let Some(list) = tbl.get(&epfd) else { return 0; };
+    let entries = {
+        let tbl = EPOLL_TABLE.lock();
+        let Some(list) = tbl.get(&epfd) else {
+            if n < 48 {
+                log::warn!("[ec-ready-exit-no-epfd] #{} epfd={}", n, epfd);
+            }
+            return 0;
+        };
+        list.clone()
+    };
     let mut tfd_tbl = TIMERFD_TABLE.lock();
-    for entry in list.iter() {
+    for entry in entries.iter() {
         if count >= maxevents { break; }
         if epfd == 70 && entry.fd == 71 {
             static EPOLL_70_SCAN_LOG: core::sync::atomic::AtomicU32 =
@@ -743,6 +962,9 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
             }
         }
     }
+    if n < 48 {
+        log::warn!("[ec-ready-exit] #{} epfd={} count={}", n, epfd, count);
+    }
     count
 }
 
@@ -760,11 +982,51 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             log::warn!("[epoll_wait] #{} pid={} epfd={} max={} to={}", n, cur, epfd, maxevents, timeout_signed);
         }
     }
+
+    // ── Input de-starve (single-core fairness) ───────────────────────────────
+    // The Flutter engine task-runner threads busy-loop on epoll_wait. On a
+    // single CPU they monopolize the core and never yield to the embedder host
+    // (pid 1 / focus), which is the ONLY consumer of WM pointer/key events — so
+    // queued clicks pile up and never reach Flutter. On EVERY epoll_wait entry
+    // by an engine thread, if the focus consumer has queued input and is
+    // runnable, hand the core straight to it. Gated on flutter_init_ready so it
+    // never fires during engine init (would deadlock RunInitialized). pid 1
+    // re-blocks in wm_event_wait once it has drained, then this engine thread's
+    // epoll_wait is re-executed on resume.
+    let bootstrap_spin_active = crate::wm::flutter_bootstrap_spin_active();
+    if cur != 0 && !bootstrap_spin_active {
+        let focus = crate::wm::focus_pid();
+        let target = if focus != 0 { focus } else { 1 };
+        if target != cur && crate::wm::input_pending_for(target) > 0 {
+            static DESTARVE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let ready_focus = coop_target_ready(target);
+            let d = DESTARVE_LOG.fetch_add(1, Ordering::Relaxed);
+            if d < 60 {
+                log::warn!(
+                    "[destarve-epoll] #{} cur={} focus={} target={} pend={} coop_ready={}",
+                    d, cur, focus, target, crate::wm::input_pending_for(target), ready_focus
+                );
+            }
+            if ready_focus {
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for(target, my_cpu) {
+                    let urip = crate::arch::syscall::user_rip();
+                    let ursp = crate::arch::syscall::user_rsp();
+                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                    crate::process::save_full_user_gprs(cur);
+                    crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
+                    crate::process::save_xstate(cur);
+                    crate::process::enter_user_by_pid_noreturn(target);
+                }
+            }
+        }
+    }
     if epfd == 70 {
         static EPOLL_70_ENTER_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_70_ENTER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 128 {
+        if n < 4 {
             log::warn!(
                 "[epoll70-enter] #{} pid={} to={} rip={:#x}",
                 n,
@@ -778,7 +1040,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         static EPOLL_72_ENTER_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_72_ENTER_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 24 {
+        if n < 4 {
             let watched = {
                 let tbl = EPOLL_TABLE.lock();
                 tbl.get(&(epfd as u32))
@@ -827,7 +1089,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             static EPOLL_72_READY_LOG: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             let n = EPOLL_72_READY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            if n < 24 && events_out != 0 {
+            if n < 4 && events_out != 0 {
                 let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
                 let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                 log::warn!(
@@ -843,8 +1105,54 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
         static EW_FIRE_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
         let n = EW_FIRE_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 32 {
+        if n < 4 {
             log::warn!("[epoll_fire] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
+        }
+        // Fairness de-starve: on a single core the engine threads busy-loop on
+        // epoll_wait (their timerfd is perpetually ready), so the fast path
+        // returns immediately every iteration and NEVER yields. That starves the
+        // WM input consumer (focus pid / embedder host pid 1) which only drains
+        // pointer/key events when scheduled — so clicks never reach Flutter.
+        // ONLY yield when the focus consumer is genuinely runnable right now
+        // (woken by input arrival via push_event_for) — never when it is blocked
+        // on init/cond, otherwise the engine threads would ping-pong forever and
+        // stall boot. Switch straight to focus so it drains input promptly; the
+        // engine re-executes epoll_wait on resume (events still ready).
+        let focus = crate::wm::focus_pid();
+        {
+            static YIELD_GATE_LOG: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let pend = crate::wm::input_pending_for(focus);
+            if pend > 0 && focus != cur {
+                let g = YIELD_GATE_LOG.fetch_add(1, Ordering::Relaxed);
+                if g < 8 {
+                    log::warn!(
+                        "[yield-gate] #{} cur={} focus={} init_ready={} pend={} coop_ready={}",
+                        g, cur, focus,
+                        crate::wm::flutter_init_ready(),
+                        pend,
+                        coop_target_ready(focus)
+                    );
+                }
+            }
+        }
+        if cur != 0
+            && focus != 0
+            && focus != cur
+            && !bootstrap_spin_active
+            && crate::wm::input_pending_for(focus) > 0
+            && coop_target_ready(focus)
+        {
+            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            if crate::process::try_claim_cpu_for(focus, my_cpu) {
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(focus);
+            }
         }
         return ready as i64;
     }
@@ -852,7 +1160,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         static EPOLL_70_EMPTY_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = EPOLL_70_EMPTY_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 128 {
+        if n < 4 {
             log::warn!("[epoll70-empty] #{} pid={} no-ready", n, cur);
         }
     }
@@ -860,13 +1168,26 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
 
     let start = monotonic_ns();
     loop {
+        // Block ourselves on epoll BEFORE checking readiness to prevent lost wakeups
+        {
+            let mut blocked = EPOLL_BLOCKED.lock();
+            blocked.insert(cur as u32, epfd as u32);
+        }
+        crate::process::set_state(cur, crate::process::ProcState::Blocked);
+
         let ready = epoll_collect_ready(epfd as u32, events_out, max);
         if ready > 0 {
+            {
+                let mut blocked = EPOLL_BLOCKED.lock();
+                blocked.remove(&(cur as u32));
+            }
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+
             if epfd == 72 || cur == 8 {
                 static EPOLL_72_READY_LOOP_LOG: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);
                 let n = EPOLL_72_READY_LOOP_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                if n < 24 && events_out != 0 {
+                if n < 4 && events_out != 0 {
                     let ev = unsafe { core::ptr::read_unaligned(events_out as *const u32) };
                     let data = unsafe { core::ptr::read_unaligned((events_out + 4) as *const u64) };
                     log::warn!(
@@ -882,7 +1203,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             }
             static EW_FIRE_LOOP_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let n = EW_FIRE_LOOP_LOG.fetch_add(1, Ordering::Relaxed);
-            if n < 32 {
+            if n < 4 {
                 log::warn!("[epoll_fire_loop] #{} pid={} epfd={} ready={}", n, cur, epfd, ready);
             }
             return ready as i64;
@@ -890,28 +1211,131 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if !infinite {
             let elapsed_ms = (monotonic_ns().saturating_sub(start)) / 1_000_000;
             if elapsed_ms >= timeout_ms {
+                {
+                    let mut blocked = EPOLL_BLOCKED.lock();
+                    blocked.remove(&(cur as u32));
+                }
+                crate::process::set_state(cur, crate::process::ProcState::Running);
                 return 0; // timeout expired
             }
         }
 
-        if cur != 0 {
-            if let Some(next) = cooperative_sched_target(cur) {
-                if next != cur {
-                    // Block ourselves on epoll
+        // Pre-init Flutter runner timers are often re-armed just a few hundred
+        // microseconds into the future. On single-core boots, dropping into the
+        // kernel hlt path here can strand the thread before the next scan. Give
+        // the embedder thread group a short spin window so freshly armed timerfd
+        // deadlines can mature and be observed without relying on IRQ wakeups.
+        if cur >= 2
+            && crate::process::get_group_leader(cur) == 1
+            && crate::wm::flutter_bootstrap_spin_active()
+        {
+            let start_time = monotonic_ns();
+            let spin_until = start_time.saturating_add(2_000_000);
+            let mut iters = 0u64;
+            loop {
+                iters += 1;
+                check_timerfds_and_wake();
+                let ready = epoll_collect_ready(epfd as u32, events_out, max);
+                if ready > 0 {
                     {
                         let mut blocked = EPOLL_BLOCKED.lock();
-                        blocked.insert(cur as u32, epfd as u32);
+                        blocked.remove(&(cur as u32));
                     }
-                    let urip = crate::arch::syscall::user_rip();
-                    let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip, ursp);
-                    crate::process::save_full_user_gprs(cur);
-                    crate::process::set_errno_to_deliver(cur, 4); // EINTR
-                    crate::process::set_rax(cur, (-1i64) as u64);
-                    crate::process::save_xstate(cur);
-                    crate::process::set_state(cur, crate::process::ProcState::Blocked);
-                    crate::process::enter_user_by_pid_noreturn(next);
+                    crate::process::set_state(cur, crate::process::ProcState::Running);
+
+                    static EPOLL_SPIN_READY_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_SPIN_READY_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 32 {
+                        log::warn!(
+                            "[epoll-spin-ready] #{} pid={} epfd={} ready={} init_ready={}",
+                            n,
+                            cur,
+                            epfd,
+                            ready,
+                            crate::wm::flutter_init_ready()
+                        );
+                    }
+                    return ready as i64;
                 }
+                let now = core::hint::black_box(monotonic_ns());
+                if now >= spin_until {
+                    static SPIN_TIMEOUT_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = SPIN_TIMEOUT_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        log::warn!(
+                            "[epoll-spin-timeout] #{} pid={} epfd={} iters={} start={} now={} limit={}",
+                            n, cur, epfd, iters, start_time, now, spin_until
+                        );
+                    }
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        if cur != 0 {
+            let coop_target = cooperative_sched_target(cur);
+            if let Some(next) = coop_target.filter(|&n| n != cur) {
+                if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
+                    static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 48 {
+                        log::warn!(
+                            "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
+                            n,
+                            cur,
+                            epfd,
+                            next,
+                            crate::arch::syscall::user_rip()
+                        );
+                    }
+                }
+                // Re-execute the epoll_wait syscall on resume (do NOT return
+                // -1/EINTR to userspace). Returning EINTR here makes the
+                // Flutter engine retry epoll_wait immediately; if it is woken
+                // before any fd is actually ready it gets EINTR again and
+                // busy-spins, monopolizing the single core and starving the
+                // embedder host (pid 1) input loop. Saving the context at the
+                // syscall instruction (urip - 2) with rax = the epoll_wait
+                // syscall number makes the thread re-enter the kernel on wake
+                // and re-check readiness — returning real events when ready or
+                // blocking again — exactly like sys_wm_event_wait does.
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(next);
+            } else if cur >= 2
+                && crate::process::get_group_leader(cur) == 1
+                && !crate::wm::flutter_init_ready()
+                && crate::process::current_pid() != 1
+            {
+                static EPOLL_INIT_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = EPOLL_INIT_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x} target={:?}",
+                        n,
+                        cur,
+                        epfd,
+                        crate::arch::syscall::user_rip(),
+                        coop_target
+                    );
+                }
+                crate::process::set_state(1, crate::process::ProcState::Running);
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B);
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(1);
             }
         }
 
@@ -921,4 +1345,3 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         }
     }
 }
-

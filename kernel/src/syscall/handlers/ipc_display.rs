@@ -1,8 +1,12 @@
 use super::fd::{read_user_bytes, write_user_bytes};
-use crate::syscall::poll::{check_timerfds_and_wake, force_wake_all_task_runners, monotonic_ns, KICK_REQUESTED};
-use crate::syscall::state::{ENGINE_HOST_PID, ENGINE_LIBRARY_PATH, WM_WAITER_DEADLINE, WM_WAITER_PID};
-use core::sync::atomic::Ordering;
 use crate::embedder::abi as eabi;
+use crate::syscall::poll::{
+    check_timerfds_and_wake, force_wake_all_task_runners, monotonic_ns, KICK_REQUESTED,
+};
+use crate::syscall::state::{
+    ENGINE_HOST_PID, ENGINE_LIBRARY_PATH, WM_WAITER_DEADLINE, WM_WAITER_PID,
+};
+use core::sync::atomic::Ordering;
 
 pub(crate) fn sys_ipc_send(dst_pid: u64, msg_ptr: u64, msg_len: u64) -> i64 {
     let bytes = match unsafe { read_user_bytes(msg_ptr, (msg_len as usize).min(64)) } {
@@ -21,13 +25,11 @@ pub(crate) fn sys_ipc_recv(buf_ptr: u64, buf_len: u64) -> i64 {
     match crate::ipc::recv(pid) {
         Some(msg) => {
             let copy_len = (buf_len as usize).min(msg.len());
-            if buf_ptr == 0 { return -14; }
+            if buf_ptr == 0 {
+                return -14;
+            }
             unsafe {
-                core::ptr::copy_nonoverlapping(
-                    msg.as_ptr(),
-                    buf_ptr as *mut u8,
-                    copy_len,
-                );
+                core::ptr::copy_nonoverlapping(msg.as_ptr(), buf_ptr as *mut u8, copy_len);
             }
             copy_len as i64
         }
@@ -39,7 +41,7 @@ pub(crate) fn sys_surface_create(width: u64, height: u64) -> i64 {
     match crate::compositor::create_surface_for(wm_consumer_pid(), width as u32, height as u32) {
         Ok(id) => id as i64,
         Err("invalid size") => -22, // EINVAL
-        Err(_) => -12,               // ENOMEM/table full
+        Err(_) => -12,              // ENOMEM/table full
     }
 }
 
@@ -49,7 +51,7 @@ pub(crate) fn sys_surface_move(id: u64, packed_xy: u64, z: u64) -> i64 {
     match crate::compositor::move_surface_for(wm_consumer_pid(), id as u32, x, y, z as i32) {
         Ok(()) => 0,
         Err("permission denied") => -1, // EPERM
-        Err(_) => -3, // ESRCH
+        Err(_) => -3,                   // ESRCH
     }
 }
 
@@ -57,7 +59,7 @@ pub(crate) fn sys_surface_destroy(id: u64) -> i64 {
     match crate::compositor::destroy_surface_for(wm_consumer_pid(), id as u32) {
         Ok(()) => 0,
         Err("permission denied") => -1, // EPERM
-        Err(_) => -3, // ESRCH
+        Err(_) => -3,                   // ESRCH
     }
 }
 
@@ -127,7 +129,7 @@ pub(crate) fn sys_surface_z_set(id: u64, z: u64) -> i64 {
     match crate::compositor::surface_z_set_for(wm_consumer_pid(), id as u32, z as i32) {
         Ok(()) => 0,
         Err("permission denied") => -1, // EPERM
-        Err(_) => -3, // ESRCH
+        Err(_) => -3,                   // ESRCH
     }
 }
 
@@ -151,25 +153,32 @@ pub(crate) fn sys_surface_geometry_set(id: u64, xy_packed: u64, wh_packed: u64) 
     let y = (xy_packed as u32) as i32;
     let w = ((wh_packed >> 32) as u32) as u32;
     let h = (wh_packed as u32) as u32;
-    
+
     match crate::compositor::surface_geometry_set_for(wm_consumer_pid(), id as u32, x, y, w, h) {
         Ok(()) => 0,
-        Err("invalid size") => -22, // EINVAL
+        Err("invalid size") => -22,      // EINVAL
         Err("surface too large") => -12, // ENOMEM
-        Err("permission denied") => -1, // EPERM
-        Err(_) => -3, // ESRCH
+        Err("permission denied") => -1,  // EPERM
+        Err(_) => -3,                    // ESRCH
     }
 }
 
 pub(crate) fn sys_surface_visibility_get(id: u64) -> i64 {
     match crate::compositor::surface_visibility_get(id as u32) {
-        Some(visible) => if visible { 1 } else { 0 },
+        Some(visible) => {
+            if visible {
+                1
+            } else {
+                0
+            }
+        }
         None => -3, // ESRCH
     }
 }
 
 pub(crate) fn sys_surface_visibility_set(id: u64, visible: u64) -> i64 {
-    match crate::compositor::surface_visibility_set_for(wm_consumer_pid(), id as u32, visible != 0) {
+    match crate::compositor::surface_visibility_set_for(wm_consumer_pid(), id as u32, visible != 0)
+    {
         Ok(()) => 0,
         Err("permission denied") => -1,
         Err(_) => -3,
@@ -181,7 +190,7 @@ pub(crate) fn sys_surface_clip_set(id: u64, xy_packed: u64, wh_packed: u64) -> i
     let y = (xy_packed as u32) as i32;
     let w = ((wh_packed >> 32) as u32) as u32;
     let h = (wh_packed as u32) as u32;
-    
+
     match crate::compositor::surface_clip_set_for(wm_consumer_pid(), id as u32, x, y, w, h) {
         Ok(()) => 0,
         Err("permission denied") => -1,
@@ -208,7 +217,7 @@ pub(crate) fn sys_surface_damage_get(id: u64) -> i64 {
             ((x as u32 as u64) << 32 | y as u32 as u64) as i64
         }
         Some((_, _, _, _, false)) => -11, // EAGAIN — no pending damage
-        None => -3,                        // ESRCH
+        None => -3,                       // ESRCH
     }
 }
 
@@ -266,13 +275,14 @@ pub(crate) fn sys_app_launch_path(path_ptr: u64, path_len: u64, flags: u64) -> i
     match crate::process::spawn_with_bootstrap(elf, path, bootstrap) {
         Ok(pid) => {
             if rdi == crate::app_registry::HOST_MODE_APP && app_id != 0 {
-                let (aot_va, _) = match crate::app_registry::map_aot_into_process(app_id as u32, pid) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = crate::process::kill(pid);
-                        return e;
-                    }
-                };
+                let (aot_va, _) =
+                    match crate::app_registry::map_aot_into_process(app_id as u32, pid) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = crate::process::kill(pid);
+                            return e;
+                        }
+                    };
                 crate::process::set_bootstrap_regs(pid, rdi, rsi, aot_va);
             }
             crate::wm::push_app_event(pid, eabi::APP_LAUNCH, 0);
@@ -288,8 +298,8 @@ pub(crate) fn sys_app_launch_path(path_ptr: u64, path_len: u64, flags: u64) -> i
 
 pub(crate) fn sys_engine_policy_get() -> i64 {
     // packed: [63:32]=engine target family, [31:0]=loader strategy
-    let packed = ((eabi::ENGINE_TARGET_FLUTTER_3_29 as u64) << 32)
-        | (eabi::ENGINE_LOADER_DYNAMIC as u64);
+    let packed =
+        ((eabi::ENGINE_TARGET_FLUTTER_3_29 as u64) << 32) | (eabi::ENGINE_LOADER_DYNAMIC as u64);
     packed as i64
 }
 
@@ -300,10 +310,11 @@ pub(crate) fn sys_engine_version_packed() -> i64 {
 }
 
 pub(crate) fn sys_engine_host_register(_flags: u64) -> i64 {
-    let pid = crate::process::current_pid();
-    if pid == 0 {
+    let current = crate::process::current_pid();
+    if current == 0 {
         return -1; // EPERM (kernel context cannot be engine host)
     }
+    let pid = crate::process::get_group_leader(current);
     ENGINE_HOST_PID.store(pid, Ordering::Release);
     crate::wm::set_focus_pid(pid);
     pid as i64
@@ -328,7 +339,11 @@ pub(crate) fn sys_engine_library_path_read(dst_ptr: u64, dst_len: u64) -> i64 {
 #[inline(always)]
 pub(crate) fn wm_consumer_pid() -> u32 {
     let pid = crate::process::current_pid();
-    if pid == 0 { 1 } else { pid }
+    if pid == 0 {
+        1
+    } else {
+        crate::process::get_group_leader(pid)
+    }
 }
 
 pub(crate) fn sys_wm_event_poll() -> i64 {
@@ -359,8 +374,12 @@ fn wm_event_copy_to_user(ev_ptr: u64, ev_len: u64, platform_poll_slack: bool) ->
         return -22; // EINVAL
     }
 
-    let ev = match crate::wm::pop_event_for(wm_consumer_pid()) {
-        Some(e) => e,
+    let consumer = wm_consumer_pid();
+    let ev = match crate::wm::pop_event_for(consumer) {
+        Some(e) => {
+            log::warn!("[wm-copy] popped event: kind={} flags={} a={} b={} for consumer={}", e.kind, e.flags, e.a, e.b, consumer);
+            e
+        }
         None => return -11, // EAGAIN
     };
 
@@ -376,10 +395,7 @@ fn wm_event_copy_to_user(ev_ptr: u64, ev_len: u64, platform_poll_slack: bool) ->
     }
 
     let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&ev as *const crate::wm::WmEvent) as *const u8,
-            need,
-        )
+        core::slice::from_raw_parts((&ev as *const crate::wm::WmEvent) as *const u8, need)
     };
     if unsafe { write_user_bytes(ev_ptr, bytes) } {
         need as i64
@@ -446,21 +462,38 @@ pub(crate) fn sys_wm_focus_surface_set(surface_id: u64) -> i64 {
 }
 
 pub(crate) fn sys_wm_focus_mirror_get() -> i64 {
-    if crate::wm::focus_mirror_enabled() { 1 } else { 0 }
+    if crate::wm::focus_mirror_enabled() {
+        1
+    } else {
+        0
+    }
 }
 
 pub(crate) fn sys_wm_focus_mirror_set(enabled: u64) -> i64 {
     let on = enabled != 0;
     crate::wm::set_focus_mirror_enabled(on);
-    if on { 1 } else { 0 }
+    if on {
+        1
+    } else {
+        0
+    }
 }
 
 pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i64 {
     let cur = crate::process::current_pid();
-    if cur == 0 { return -1; }
+    if cur == 0 {
+        return -1;
+    }
 
-    static WM_WAIT_RET_LOG: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(0);
+    // The embedder only calls wm_event_wait once it has finished engine init and
+    // entered its main event loop.  Mark init complete so the cooperative
+    // fairness-yield in epoll_wait is allowed to run (it must stay disabled
+    // during init or it deadlocks the engine threads that drive FlutterEngineRunInitialized).
+    if !crate::wm::flutter_init_ready() {
+        crate::wm::set_flutter_init_ready();
+    }
+
+    static WM_WAIT_RET_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let mut wm_log_ret = |tag: &str, val: i64| {
         let n = WM_WAIT_RET_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if n < 24 {
@@ -527,7 +560,30 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         crate::wm::set_wm_waiter(cur);
         crate::process::set_state(cur, crate::process::ProcState::Blocked);
 
+        static WM_WAIT_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let block_log_n = WM_WAIT_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+        if block_log_n < 32 {
+            log::warn!(
+                "[wm-wait-block] #{} pid={} timeout_ms={} deadline={} pending={} input={} baton_due={} baton_queued={}",
+                block_log_n,
+                cur,
+                timeout_ms,
+                deadline_ns,
+                crate::wm::pending_count_for(cur),
+                crate::wm::input_pending_for(cur),
+                crate::wm::embedder_baton_due(),
+                crate::wm::baton_vsync_queued_for(1)
+            );
+        }
+
+        if block_log_n < 32 {
+            log::warn!("[wm-wait-drain-before] #{} pid={}", block_log_n, cur);
+        }
         let n = wm_wait_drain_event(ev_ptr, ev_len);
+        if block_log_n < 32 {
+            log::warn!("[wm-wait-drain-after] #{} pid={} n={}", block_log_n, cur, n);
+        }
         if n >= 0 {
             crate::wm::set_wm_waiter(0);
             WM_WAITER_PID.store(0, Ordering::Release);
@@ -559,23 +615,60 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         crate::process::save_return_context(cur, urip - 2, ursp);
         crate::process::save_full_user_gprs(cur);
         crate::process::set_rax(cur, eabi::SYS_WM_EVENT_WAIT);
+        if block_log_n < 32 {
+            log::warn!("[wm-wait-xstate-before] #{} pid={}", block_log_n, cur);
+        }
         crate::process::save_xstate(cur);
+        let wait_irq_flags = crate::arch::interrupts_save_and_disable();
+        if block_log_n < 32 {
+            log::warn!("[wm-wait-xstate-after] #{} pid={}", block_log_n, cur);
+        }
+
+        let pending_after_save = crate::wm::pending_count_for(cur);
+        let baton_after_save = crate::wm::baton_vsync_queued_for(1);
+        if block_log_n < 32 {
+            log::warn!(
+                "[wm-wait-post-save] #{} pid={} pending={} baton={}",
+                block_log_n,
+                cur,
+                pending_after_save,
+                baton_after_save
+            );
+        }
+        if pending_after_save > 0 || baton_after_save {
+            if block_log_n < 32 {
+                log::warn!(
+                    "[wm-wait-race] #{} pid={} pending={} baton_queued={} -> redrain",
+                    block_log_n,
+                    cur,
+                    pending_after_save,
+                    baton_after_save
+                );
+            }
+            crate::process::set_state(cur, crate::process::ProcState::Running);
+            crate::arch::interrupts_restore(wait_irq_flags);
+            continue;
+        }
 
         // Cooperatively switch to another runnable process.
-        if !crate::wm::baton_vsync_queued_for(1) {
-            if let Some(next) = crate::process::next_runnable_pid(cur) {
-                if next != cur {
-                    crate::process::enter_user_by_pid_noreturn(next);
-                }
+        let mut next = crate::process::next_runnable_pid(cur);
+        if next.is_none() {
+            let (_fds, woken) = force_wake_all_task_runners("wm-wait-no-runnable");
+            if woken > 0 {
+                next = crate::process::next_runnable_pid(cur);
             }
         }
+        if let Some(next) = next {
+            if next != cur {
+                crate::process::enter_user_by_pid_noreturn(next);
+            }
+        }
+        crate::arch::interrupts_restore(wait_irq_flags);
 
         // Loop-sleep (sti; hlt; cli) as long as we are Blocked.
         // Cooperative yield already happened once above.  Re-yield only every
         // 16th hlt wake so reentrant wm_event_wait can hit eagain-top for
         // platform-recv without the sched ping-pong that starved pid=2 init.
-        static HLT_YIELD_TICK: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
         while crate::process::is_blocked(cur) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -597,11 +690,9 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
                 break;
             }
 
-            if (HLT_YIELD_TICK.fetch_add(1, Ordering::Relaxed) & 15) == 0 {
-                if let Some(next) = crate::process::next_runnable_pid(cur) {
-                    if next != cur {
-                        crate::process::enter_user_by_pid_noreturn(next);
-                    }
+            if let Some(next) = crate::process::next_runnable_pid(cur) {
+                if next != cur {
+                    crate::process::enter_user_by_pid_noreturn(next);
                 }
             }
         }

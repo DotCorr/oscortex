@@ -344,7 +344,12 @@ pub(crate) fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> i64 {
                 ts.pending = 0;
                 drop(tfd_tbl);
                 let pid = crate::process::current_pid();
-                log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
+                static TFD_READ_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = TFD_READ_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if n < 24 {
+                    log::warn!("[tfd-read] pid={} tfd={} count={}", pid, fd, count);
+                }
                 unsafe { core::ptr::write_unaligned(buf_ptr as *mut u64, count); }
                 return 8;
             } else {
@@ -739,6 +744,11 @@ pub(crate) fn sys_exec_wait(path_ptr: u64, path_len: u64) -> i64 {
         Ok(pid) => pid,
         Err(_)  => return -12, // ENOMEM
     };
+
+    // Claim the child process immediately on the current CPU to prevent any
+    // concurrent CPU scheduler from picking it up before we do.
+    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    crate::process::claim_process_on_cpu(child_pid, my_cpu);
 
     // Wire the child back to the parent so sys_exit knows who to wake.
     crate::process::set_child_parent(child_pid, parent_pid);
