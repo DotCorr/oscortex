@@ -552,7 +552,15 @@ static CUSTOM_TASK_RUNNERS: FlutterCustomTaskRunners = FlutterCustomTaskRunners 
     platform_task_runner: &PLATFORM_TASK_RUNNER_DESC,
     render_task_runner: core::ptr::null(),
     thread_priority_setter: 0,
-    ui_task_runner: core::ptr::null(),
+    // Merge the UI task runner onto the platform runner (same identifier=1) so
+    // the engine runs Dart/UI on the platform thread instead of spawning a
+    // worker thread. With ui_task_runner null, the engine never registers a UI
+    // TaskQueueId, so the first Shell::OnPlatformViewScheduleFrame calls
+    // MessageLoopTaskQueues::RegisterTask on an unregistered queue and writes a
+    // DelayedTask into a null TaskQueueEntry (fault at 0x50) — killing pid 1
+    // before any frame is presented. Sharing the platform runner gives the UI
+    // queue a valid, registered entry.
+    ui_task_runner: &PLATFORM_TASK_RUNNER_DESC,
 };
 
 static PRESENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
