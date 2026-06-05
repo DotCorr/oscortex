@@ -262,12 +262,14 @@ impl LibTable {
 
     fn bump_anon_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
         let aligned = (size + 4095) / 4096 * 4096;
-        log::info!("[DL] bump_anon_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
+        let stride = 0x200000;
+        let aligned_stride = (aligned + stride - 1) / stride * stride;
+        log::info!("[DL] bump_anon_va: pml4_phys={:#x} size={:#x} aligned={:#x} stride={:#x}", pml4_phys, size, aligned, aligned_stride);
         // Find existing slot for this address space.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == pml4_phys {
                 let base = slot.2;
-                slot.2 = base + aligned;
+                slot.2 = base + aligned_stride;
                 log::info!("[DL] bump_anon_va: existing slot base={:#x} new_next={:#x}", base, slot.2);
                 return base;
             }
@@ -275,14 +277,14 @@ impl LibTable {
         // Allocate a new slot.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == 0 {
-                *slot = (pml4_phys, LIB_VA_BASE, ANON_VA_BASE + aligned);
+                *slot = (pml4_phys, LIB_VA_BASE, ANON_VA_BASE + aligned_stride);
                 log::info!("[DL] bump_anon_va: new slot base={:#x} next_anon={:#x}", ANON_VA_BASE, slot.2);
                 return ANON_VA_BASE;
             }
         }
         // Fallback: should not happen
         let base = self.as_slots[0].2;
-        self.as_slots[0].2 = base + aligned;
+        self.as_slots[0].2 = base + aligned_stride;
         log::info!("[DL] bump_anon_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].2);
         base
     }

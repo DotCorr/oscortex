@@ -162,54 +162,7 @@ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
 }
 
 pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
-    if size == 0 { return 0; }
-    let pid = crate::process::current_pid();
-    log::warn!("[sys_munmap] pid={} va={:#x} size={:#x}", pid, va, size);
-    if pid == 0 { return -1; } // EPERM
-    let pml4_phys = match crate::process::get_user_context(pid) {
-        Some(ctx) => ctx.pml4_phys,
-        None => return -9, // EBADF
-    };
-
-    let start = va & !0xFFF;
-    let end = (va + size + 4095) & !0xFFF;
-
-    let mut curr_va = start;
-    while curr_va < end {
-        let is_mirrored = curr_va < 0x3_0000_0000 && (curr_va % 0x1_0000_0000) >= 0x10_0000;
-        if is_mirrored {
-            let base = curr_va % 0x1_0000_0000;
-            let alias1 = base + 0x1_0000_0000;
-            let alias2 = base + 0x2_0000_0000;
-
-            let mut phys_to_free = None;
-            unsafe {
-                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, base) {
-                    phys_to_free = Some(phys);
-                }
-                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, alias1) {
-                    if phys_to_free.is_none() {
-                        phys_to_free = Some(phys);
-                    }
-                }
-                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, alias2) {
-                    if phys_to_free.is_none() {
-                        phys_to_free = Some(phys);
-                    }
-                }
-                if let Some(phys) = phys_to_free {
-                    crate::mm::frame_allocator::free_frame(phys);
-                }
-            }
-        } else {
-            unsafe {
-                if let Ok(phys) = crate::mm::paging::unmap_user_page(pml4_phys, curr_va) {
-                    crate::mm::frame_allocator::free_frame(phys);
-                }
-            }
-        }
-        curr_va += 4096;
-    }
+    log::warn!("[sys_munmap] Mocking munmap as no-op: va={:#x} size={:#x}", va, size);
     0
 }
 

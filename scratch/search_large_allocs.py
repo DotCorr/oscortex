@@ -1,18 +1,22 @@
-import sys
-from pathlib import Path
+log_path = "/Users/ghostportal/.gemini/antigravity/brain/0bfac7bf-ff2a-42ca-ba51-3dd2231cc731/.system_generated/tasks/task-940.log"
 
-log_path = Path("/private/tmp/osc_serial.log")
-lines = log_path.read_text().splitlines()
+lines = []
+with open(log_path, "r") as f:
+    lines = f.readlines()
 
-for idx, line in enumerate(lines):
-    if "bump_anon_va" in line:
-        # find size=
-        try:
-            parts = line.split("size=")
-            if len(parts) > 1:
-                sz_str = parts[1].split()[0]
-                sz = int(sz_str, 16)
-                if sz >= 0x1000_0000:
-                    print(f"Line {idx+1}: {line}")
-        except Exception as e:
-            pass
+i = 0
+while i < len(lines):
+    line = lines[i].strip()
+    if "[sys_mmap]" in line:
+        print(line)
+        i += 1
+    elif "[DL] bump_anon_va: pml4_phys=" in line:
+        # Check size
+        if "size=0x1000 " not in line:
+            print(line)
+            # Print the next line if it is existing slot or new slot
+            if i + 1 < len(lines) and "[DL] bump_anon_va:" in lines[i+1]:
+                print(lines[i+1].strip())
+        i += 2
+    else:
+        i += 1

@@ -481,6 +481,19 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
         }
     }
 
+    // Phase 32-C: Demand page anonymous memory in range [0x3_0000_0000, 0x4_0000_0000)
+    if page_va >= 0x3_0000_0000 && page_va < 0x4_0000_0000 {
+        if let Some(phys) = frame_allocator::alloc_frame() {
+            let hhdm = (phys + frame_allocator::hhdm_offset()) as *mut u8;
+            unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
+            if unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) }.is_ok() {
+                return true;
+            } else {
+                frame_allocator::free_frame(phys);
+            }
+        }
+    }
+
     // Reject all other page faults outside the mirrored range.
     false
 }

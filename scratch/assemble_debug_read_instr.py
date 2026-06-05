@@ -89,7 +89,7 @@ def main():
     
     # Store monomorphic_instructions_
     mov [rbx + 0x6f], rax
-    mov r12, rax            # Save monomorphic_instructions in r12 (callee-saved)
+    mov rbp, rax            # Save monomorphic_instructions in rbp (callee-saved)
     call maybe_print # print monomorphic_instructions ptr
     
     # 4. Decode monomorphic_entry_point_pc_offset (unsigned)
@@ -112,7 +112,7 @@ def main():
     
     # Tail call setup
     mov rdi, rbx            # rdi = Code
-    mov rsi, r12            # rsi = monomorphic_instructions
+    mov rsi, rbp            # rsi = monomorphic_instructions
     mov rdx, rax            # rdx = monomorphic_entry_point_pc_offset (3rd argument)
     
     pop r15
