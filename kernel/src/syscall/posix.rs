@@ -2402,24 +2402,33 @@ pub fn sys_fclose(fp: u64) -> i64 {
     if fp == 0 {
         return -1;
     }
+    if fp <= 2 {
+        return 0; // Don't close standard streams via fclose
+    }
     let fd = unsafe { *(fp as *const i64) };
     sys_free(fp);
     crate::syscall::dispatch_fast(3, fd as u64, 0, 0, 0, 0) // sys_close
 }
 
 pub fn sys_fread(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
-    if fp == 0 || buf == 0 {
+    if buf == 0 {
         return 0;
     }
-    let fd = unsafe { *(fp as *const i64) } as u64;
+    let fd = if fp <= 2 {
+        fp
+    } else {
+        unsafe { *(fp as *const i64) as u64 }
+    };
     let total = size * count;
     let r = crate::syscall::dispatch_fast(0, fd, buf, total, 0, 0); // sys_read
     if r <= 0 {
         return 0;
     }
-    // Update pos in FILE struct.
-    unsafe {
-        *((fp + 16) as *mut u64) += r as u64;
+    // Update pos in FILE struct if not a standard stream.
+    if fp > 2 {
+        unsafe {
+            *((fp + 16) as *mut u64) += r as u64;
+        }
     }
     if size == 0 {
         0
@@ -2429,8 +2438,8 @@ pub fn sys_fread(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
 }
 
 pub fn sys_fwrite(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
-    let fd: u64 = if fp == 0 {
-        1
+    let fd: u64 = if fp <= 2 {
+        fp
     } else {
         unsafe { *(fp as *const i64) as u64 }
     };
@@ -2444,8 +2453,8 @@ pub fn sys_fwrite(buf: u64, size: u64, count: u64, fp: u64) -> i64 {
 }
 
 pub fn sys_fseek(fp: u64, offset: i64, whence: i32) -> i64 {
-    if fp == 0 {
-        return -1;
+    if fp <= 2 {
+        return 0; // standard streams cannot be seeked, return success
     }
     let fd = unsafe { *(fp as *const i64) } as u64;
     let new_pos = crate::syscall::dispatch_fast(8, fd, offset as u64, whence as u64, 0, 0);
@@ -2459,18 +2468,22 @@ pub fn sys_fseek(fp: u64, offset: i64, whence: i32) -> i64 {
 }
 
 pub fn sys_ftell(fp: u64) -> i64 {
-    if fp == 0 {
-        return -1;
+    if fp <= 2 {
+        return 0;
     }
     let pos = unsafe { *((fp + 16) as *const u64) };
     pos as i64
 }
 
 pub fn sys_fgets(buf: u64, size: i32, fp: u64) -> i64 {
-    if fp == 0 || buf == 0 || size <= 0 {
+    if buf == 0 || size <= 0 {
         return 0;
     }
-    let fd = unsafe { *(fp as *const i64) } as u64;
+    let fd = if fp <= 2 {
+        fp
+    } else {
+        unsafe { *(fp as *const i64) as u64 }
+    };
     let cap = (size - 1).max(0) as u64;
     // Read byte by byte until newline or EOF.
     let mut n: u64 = 0;
@@ -2499,17 +2512,22 @@ pub fn sys_fgets(buf: u64, size: i32, fp: u64) -> i64 {
 }
 
 pub fn sys_fileno(fp: u64) -> i64 {
-    if fp == 0 {
-        return -1;
+    if fp <= 2 {
+        fp as i64
+    } else {
+        unsafe { *(fp as *const i64) }
     }
-    unsafe { *(fp as *const i64) }
 }
 
 pub fn sys_feof(fp: u64) -> i64 {
     if fp == 0 {
         return 1;
     }
-    let fd = unsafe { *(fp as *const i64) } as usize;
+    let fd = if fp <= 2 {
+        fp as usize
+    } else {
+        unsafe { *(fp as *const i64) as usize }
+    };
     let tbl = super::OPEN_FILES.lock();
     if fd < super::MAX_OPEN_FILES && tbl[fd].used {
         if tbl[fd].offset >= tbl[fd].data.len() as u64 {

@@ -254,11 +254,46 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
     if !resolved {
         let user_mode = (frame.err & 0x4) != 0;
         let pid = crate::process::current_pid();
+        let pml4_phys = crate::process::get_user_context(pid).map(|ctx| ctx.pml4_phys).unwrap_or(0);
+        let trans = if pml4_phys != 0 {
+            crate::mm::paging::translate_user_page_flags(pml4_phys, cr2)
+        } else {
+            None
+        };
         log::error!(
-            "[PageFault] {}: addr={:#x} err={:#x} ip={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x}",
+            "[PageFault] {}: addr={:#x} err={:#x} ip={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x} pml4={:#x} trans={:?}",
             if user_mode { "SIGSEGV" } else { "KERNEL SEGV" },
-            cr2, frame.err, frame.rip, pid, frame.cs, frame.rsp, frame.ss, frame.rflags
+            cr2, frame.err, frame.rip, pid, frame.cs, frame.rsp, frame.ss, frame.rflags, pml4_phys, trans
         );
+        if pml4_phys != 0 {
+            let pml4_idx = ((cr2 >> 39) & 0x1ff) as usize;
+            let pdpt_idx = ((cr2 >> 30) & 0x1ff) as usize;
+            let pd_idx   = ((cr2 >> 21) & 0x1ff) as usize;
+            let pt_idx   = ((cr2 >> 12) & 0x1ff) as usize;
+            let phys_to_virt = |phys: u64| -> u64 {
+                phys.wrapping_add(crate::mm::frame_allocator::hhdm_offset())
+            };
+            unsafe {
+                let pml4 = phys_to_virt(pml4_phys) as *const u64;
+                let pml4e = pml4.add(pml4_idx).read_volatile();
+                log::error!("[PageTableWalk] addr={:#x} pml4_idx={} pml4e={:#x}", cr2, pml4_idx, pml4e);
+                if pml4e & 1 != 0 {
+                    let pdpt = phys_to_virt(pml4e & 0x000f_ffff_ffff_f000) as *const u64;
+                    let pdpte = pdpt.add(pdpt_idx).read_volatile();
+                    log::error!("[PageTableWalk] pdpt_idx={} pdpte={:#x}", pdpt_idx, pdpte);
+                    if pdpte & 1 != 0 {
+                        let pd = phys_to_virt(pdpte & 0x000f_ffff_ffff_f000) as *const u64;
+                        let pde = pd.add(pd_idx).read_volatile();
+                        log::error!("[PageTableWalk] pd_idx={} pde={:#x}", pd_idx, pde);
+                        if pde & 1 != 0 {
+                            let pt = phys_to_virt(pde & 0x000f_ffff_ffff_f000) as *const u64;
+                            let pte = pt.add(pt_idx).read_volatile();
+                            log::error!("[PageTableWalk] pt_idx={} pte={:#x}", pt_idx, pte);
+                        }
+                    }
+                }
+            }
+        }
         log::error!(
             "[PageFault] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
             frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp

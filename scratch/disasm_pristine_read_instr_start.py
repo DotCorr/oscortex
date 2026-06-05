@@ -10,7 +10,7 @@ def main():
     data = engine_path.read_bytes()
     
     start_offset = 0x2291070
-    size = 128
+    size = 350
     chunk = data[start_offset:start_offset+size]
     
     import capstone

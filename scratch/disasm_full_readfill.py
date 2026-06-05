@@ -11,8 +11,8 @@ def main():
     
     # CodeDeserializationCluster::ReadFill starts at VA 0x2299f40 (file offset 0x2298f40)
     # Let's disassemble 1000 bytes starting from there.
-    start_offset = 0x2298f40
-    size = 1000
+    start_offset = 0x2290070
+    size = 150
     chunk = data[start_offset:start_offset+size]
     
     try:

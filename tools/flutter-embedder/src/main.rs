@@ -1049,8 +1049,6 @@ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64
         // patch_snapshot_pointers is completely disabled because the snapshot data does not contain absolute pointers to be patched,
         // and manual patching causes false-positive corruptions in the serialized object stream.
 
-        // Patching engine's own segments is disabled to avoid corrupting static constants/instructions.
-
         aot_loader::log_manifest(&m);
         log_bytes(b"[embedder] vm_data content: ", m.vm_data, 32);
         log_bytes(b"[embedder] iso_data content: ", m.iso_data, 32);
@@ -1582,6 +1580,7 @@ extern "C" fn main_embedder() {
     vsync_set_hz(120);
 
     // 2. Open the engine library.
+    dlopen(b"/system/lib/liboscortex_libc.so", 0);
     let handle = dlopen(ENGINE_LIB_PATH, 0);
     if handle <= 0 {
         write(b"[embedder] dlopen failed for /system/lib/libflutter_engine.so\n");
@@ -1763,10 +1762,9 @@ extern "C" fn main_embedder() {
     static ARG1: &[u8] = b"--enable-impeller=false\0";
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
-    static ARG4: &[u8] = b"--dart-flags=--precompiled_mode\0";
-    static ARG5: &[u8] = b"--precompiled-mode\0";
+    static ARG4: &[u8] = b"--precompiled-mode\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 6]);
+    struct ArgvPtrs([*const u8; 5]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
         ArgvPtrs([
@@ -1775,7 +1773,6 @@ extern "C" fn main_embedder() {
             ARG2.as_ptr(),
             ARG3.as_ptr(),
             ARG4.as_ptr(),
-            ARG5.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
@@ -1875,14 +1872,17 @@ extern "C" fn main_embedder() {
     // Initialize the MessageLoop for the main thread before FlutterEngineInitialize.
     // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
     write(b"[embedder] initializing main thread message loop...\n");
-    const ENSURE_INITIALIZED_NM: u64 = 0x19bbd40;
-    let ensure_initialized_va = engine_load_base + ENSURE_INITIALIZED_NM;
-    let ensure_initialized: unsafe extern "C" fn() =
-        unsafe { core::mem::transmute(ensure_initialized_va) };
-    unsafe {
-        ensure_initialized();
+    let ensure_initialized_va = dlsym(handle, b"_ZN3fml11MessageLoop33EnsureInitializedForCurrentThreadEv");
+    if ensure_initialized_va != 0 {
+        let ensure_initialized: unsafe extern "C" fn() = unsafe { core::mem::transmute(ensure_initialized_va) };
+        unsafe {
+            ensure_initialized();
+        }
+        write(b"[embedder] message loop initialized!\n");
+    } else {
+        write(b"[embedder] ERROR: fml::MessageLoop::EnsureInitializedForCurrentThread not found!\n");
+        exit(-1);
     }
-    write(b"[embedder] message loop initialized!\n");
 
     // 8. Initialize the engine synchronously on the main thread
     write(b"[embedder] calling FlutterEngineInitialize...\n");

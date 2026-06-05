@@ -71,7 +71,7 @@ echo "[0.3/5] Compiling system shell to AOT ELF (libapp.so)..."
 DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
 FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
 SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
-GEN_SNAP="$ROOT/tools/flutter-engine/linux-x64/gen_snapshot"
+GEN_SNAP="$ROOT/scratch/linux-x64/gen_snapshot"
 PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
 APP_MAIN="$APP_DIR/lib/main.dart"
 AOT_DILL="$APP_DIR/build/app_aot.dill"
@@ -175,25 +175,29 @@ else
     exit 1
 fi
 
-echo "[0.5/5] Staging Flutter engine runtime..."
+echo "[0.5/5] Compiling and staging userspace libc helper..."
+mkdir -p "$ROOT/initramfs/system/lib"
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    gcc:12 \
+    gcc -shared -fPIC -ffreestanding -nostdlib -O2 \
+    -o "$ROOT/initramfs/system/lib/liboscortex_libc.so" \
+    "$ROOT/userspace/libc/libc.c"
+
+echo "[0.51/5] Staging Flutter engine runtime..."
 if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
     echo "ERROR: missing Flutter engine binary: $FLUTTER_ENGINE_SO" >&2
     exit 1
 fi
-mkdir -p "$ROOT/initramfs/system/lib"
-unzip -p "$ROOT/tools/flutter-engine/linux-x64-embedder.zip" libflutter_engine.so > "$ROOT/initramfs/system/lib/libflutter_engine.so"
-if [ "${OSC_SKIP_ENGINE_PATCH:-0}" = "1" ]; then
-    echo "[0.5/5] OSC_SKIP_ENGINE_PATCH=1 — staging PRISTINE engine (no P1-P10 patches)"
-else
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" \
-        --engine "$ROOT/initramfs/system/lib/libflutter_engine.so" \
-        --apply-all
-fi
+cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
+echo "[0.51/5] Staging PATCHED profile engine"
 
 REQUIRED_FILES=(
     "$ROOT/initramfs/init"
     "$ROOT/initramfs/bin/oscortex-host"
     "$ROOT/initramfs/system/lib/libflutter_engine.so"
+    "$ROOT/initramfs/system/lib/liboscortex_libc.so"
     "$ROOT/initramfs/system/flutter/icudtl.dat"
     "$ROOT/initramfs/system/flutter/libapp.so"
     "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx"

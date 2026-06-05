@@ -164,6 +164,7 @@ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
 pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
     if size == 0 { return 0; }
     let pid = crate::process::current_pid();
+    log::warn!("[sys_munmap] pid={} va={:#x} size={:#x}", pid, va, size);
     if pid == 0 { return -1; } // EPERM
     let pml4_phys = match crate::process::get_user_context(pid) {
         Some(ctx) => ctx.pml4_phys,
@@ -214,9 +215,10 @@ pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
 
 pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
     if size == 0 { return 0; }
+    let pid = crate::process::current_pid();
+    log::warn!("[sys_mprotect] pid={} va={:#x} size={:#x} prot={:#x}", pid, va, size, prot);
     let start_va = va & !0xFFF;
     let end_va = (va + size + 4095) & !0xFFF;
-    let pid = crate::process::current_pid();
     if pid == 0 { return -1; } // EPERM
     let pml4_phys = match crate::process::get_user_context(pid) {
         Some(ctx) => ctx.pml4_phys,

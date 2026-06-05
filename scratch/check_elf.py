@@ -30,7 +30,11 @@ def check_elf(path):
         p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = struct.unpack('<IIQQQQQQ', phdr_bytes[:56])
         if p_type == 1: # PT_LOAD
             end = p_vaddr + p_memsz
-            print(f"LOAD {i}: p_offset={hex(p_offset)}, p_vaddr={hex(p_vaddr)}, p_memsz={hex(p_memsz)}, end={hex(end)}")
+            flags_str = ""
+            if p_flags & 4: flags_str += "R"
+            if p_flags & 2: flags_str += "W"
+            if p_flags & 1: flags_str += "X"
+            print(f"LOAD {i}: p_offset={hex(p_offset)}, p_vaddr={hex(p_vaddr)}, p_memsz={hex(p_memsz)}, flags={flags_str} ({p_flags})")
 
 print("Checking libflutter_engine.so:")
 check_elf('initramfs/system/lib/libflutter_engine.so')

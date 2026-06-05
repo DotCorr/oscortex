@@ -4,6 +4,9 @@
 //! aarch64 / riscv64: stubs — architecture-specific walkers added in later milestones.
 
 use bitflags::bitflags;
+use spin::Mutex;
+
+pub(crate) static PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Page-table entry flags (shared across architectures) ─────────────────────
 
@@ -207,7 +210,17 @@ mod x86_64_impl {
         let pt_phys = unsafe { ensure_next_table_flags(pd.add(pd_idx), user_flags) }
             .ok_or("OOM: PT")?;
         let pt = phys_to_virt(pt_phys) as *mut u64;
-        unsafe { pt.add(pt_idx).write_volatile((phys & PHYS_MASK) | flags.bits()); }
+        unsafe {
+            pt.add(pt_idx).write_volatile((phys & PHYS_MASK) | flags.bits());
+            let active_cr3 = read_cr3() & PHYS_MASK;
+            if pml4_phys == active_cr3 {
+                invlpg(virt);
+            }
+            if virt >= 0x112670000 && virt <= 0x112690000 {
+                log::warn!("[DEBUG-PAGING] mapped virt={:#x} phys={:#x} in pml4={:#x} pt_entry={:#x}",
+                    virt, phys, pml4_phys, pt.add(pt_idx).read_volatile());
+            }
+        }
         Ok(())
     }
 
@@ -381,6 +394,9 @@ mod x86_64_impl {
         let phys = pte & PHYS_MASK;
         pte_ptr.write_volatile(0);
         invlpg(virt);
+        if virt >= 0x112670000 && virt <= 0x112690000 {
+            log::warn!("[DEBUG-PAGING] unmapped virt={:#x} in pml4={:#x}", virt, pml4_phys);
+        }
         Ok(phys)
     }
 }
@@ -420,6 +436,7 @@ pub fn init(hhdm_offset: u64) {
 /// * `set_hhdm_offset()` must have run before this.
 /// * `virt` and `phys` must be 4-KiB aligned.
 pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_page(virt, phys, flags) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -431,6 +448,7 @@ pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
 /// # Safety
 /// Same preconditions as [`map_page`].
 pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_mmio(phys, virt, size) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -484,6 +502,7 @@ pub fn alloc_user_pml4() -> Option<u64> {
 pub unsafe fn map_user_page(pml4_phys: u64, virt: u64, phys: u64)
     -> Result<(), &'static str>
 {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     return unsafe {
         x86_64_impl::map_page_in(
@@ -503,6 +522,7 @@ pub unsafe fn map_user_page_with_flags(
     pml4_phys: u64, virt: u64, phys: u64,
     writable: bool, exec: bool,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     {
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
@@ -517,6 +537,7 @@ pub unsafe fn map_user_page_with_flags(
 /// Walk a user PML4 and return the physical frame already mapped at `virt`,
 /// or `None` if the page is not yet mapped.
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -526,6 +547,7 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
 /// Walk a user PML4 and return the physical frame mapped at `virt` along with
 /// its writable and executable flags.
 pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -534,6 +556,7 @@ pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool
 
 /// Free all frames in a user PML4 and the PML4 itself.
 pub fn free_user_pml4(pml4_phys: u64) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::free_user_pml4(pml4_phys);
     #[cfg(not(target_arch = "x86_64"))]
@@ -550,6 +573,7 @@ pub unsafe fn update_user_page(
     writable: bool,
     exec: bool,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { x86_64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
@@ -566,6 +590,7 @@ pub unsafe fn update_user_page(
 /// # Safety
 /// `pml4_phys` must be a valid allocated PML4.
 pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { x86_64_impl::unmap_user_page(pml4_phys, virt) }
