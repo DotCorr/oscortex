@@ -995,7 +995,7 @@ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64
         let relocated_iso_data = dlsym(0, b"_kDartIsolateSnapshotData");
         let relocated_iso_instr = dlsym(0, b"_kDartIsolateSnapshotInstructions");
 
-        let load_base = if relocated_vm_data != 0 && relocated_vm_instr != 0 && relocated_iso_data != 0 && relocated_iso_instr != 0 {
+        let load_base = if false {
             write(b"[embedder] Relocated AOT snapshot symbols resolved via dlsym:\n");
             let vm_data_orig = m.vm_data - mapping_base;
             let target_load_base = relocated_vm_data - vm_data_orig;

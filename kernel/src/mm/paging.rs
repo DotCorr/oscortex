@@ -5,6 +5,7 @@
 
 use bitflags::bitflags;
 use spin::Mutex;
+use crate::mm::frame_allocator;
 
 pub(crate) static PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
 

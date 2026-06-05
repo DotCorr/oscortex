@@ -626,9 +626,9 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
         }
     }
 
-    // ── Map any unmapped gap pages within the library span ───────────────
+    // ── Map any unmapped gap pages within the library span + 16 pages padding ──
     {
-        let span_pages = (span + 4095) / 4096;
+        let span_pages = (span + 4095) / 4096 + 16;
         let mut gap_mapped = 0;
         for p in 0..span_pages {
             let va = load_base + p * 4096;
