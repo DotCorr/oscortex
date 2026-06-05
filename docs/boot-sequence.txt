@@ -1,0 +1,295 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                 O S C O R T E X   B O O T   S E Q U E N C E                   ║
+║                    Power-On to Desktop — updated 2026-06-01                     ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+
+  OVERVIEW
+  ────────
+  This document traces every step from power-on to a fully rendered Flutter
+  desktop. Follow along with the serial log (serial.log) to understand
+  exactly what the kernel is doing at each phase.
+
+
+  FULL BOOT TIMELINE
+  ──────────────────
+
+  Time (approx)  CPU   Phase                   Serial Log Marker
+  ─────────────  ───   ─────                   ──────────────────
+     0 ms        BSP   BIOS / UEFI POST        (no serial yet)
+    50 ms        BSP   Limine loads kernel      (no serial yet)
+   100 ms        BSP   kernel_main entry        [kernel] OSCortex booting
+   105 ms        BSP   GDT + IDT               [arch] GDT loaded
+   110 ms        BSP   APIC init               [arch] APIC online
+   115 ms        BSP   Memory manager           [mm] phys allocator ready
+   120 ms        BSP   Page tables              [mm] paging enabled (CR3)
+   125 ms        BSP   Heap allocator           [mm] heap ready
+   130 ms        BSP   Scheduler init           [sched] ready (64 slots)
+   135 ms        AP    AP startup               [smp] AP online
+   140 ms        BSP   Framebuffer              [fb] 1024x768 @ 32bpp
+   145 ms        BSP   UART serial              [uart] COM1 active
+   150 ms        BSP   PS/2 init                [ps2] keyboard + mouse
+   155 ms        BSP   VirtIO-block             [virtio-blk] disk ready
+   160 ms        BSP   NVMe scan                [nvme] controller found
+   165 ms        BSP   XHCI/USB                 [xhci] host controller
+   170 ms        BSP   VirtIO-net               [virtio-net] MAC=...
+   175 ms        BSP   smoltcp init             [net] TCP/IP stack ready
+   180 ms        BSP   DHCP                     [net] DHCP: 10.0.2.15
+   185 ms        BSP   VFS init                 [vfs] initramfs mounted
+   190 ms        BSP   Sysfs mount              [vfs] /sys/ ready
+   195 ms        BSP   AI Cortex init           [cortex] inference engine
+   200 ms        BSP   Cortex context           [cortex] context graph ready
+   205 ms        BSP   Cortex healing           [cortex] self-heal active
+   210 ms        BSP   pkg::init()              [pkg] catalog: N packages
+   220 ms        BSP   Spawn /init              [process] launching PID 1
+   250 ms        BSP   Init spawns shell        [init] spawning shell
+   300 ms        BSP   Flutter dlopen           [dlopen] loading engine
+   500 ms        BSP   DT_INIT_ARRAY            [embedder] constructors
+   800 ms        BSP   Engine run               [embedder] FlutterEngineRun
+  1200 ms        BSP   First frame              [compositor] frame 1
+  1500 ms        BSP   Shell desktop ready      [shell] desktop rendered
+
+
+  DETAILED PHASE BREAKDOWN
+  ────────────────────────
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 1: LIMINE BOOTLOADER                                    │
+  │                                                                 │
+  │  ● Loads kernel ELF from ISO (Limine boot protocol)            │
+  │  ● Loads Flutter engine as Limine module (~95 MB)              │
+  │  ● Provides memory map to kernel                               │
+  │  ● Sets up initial framebuffer                                 │
+  │  ● Jumps to kernel_main                                        │
+  │                                                                 │
+  │  Config: limine.cfg in iso_root/                               │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 2: KERNEL ARCH INIT  (BSP only)                         │
+  │                                                                 │
+  │  ● GDT: flat 64-bit code + data segments                      │
+  │  ● IDT: 256 interrupt vectors                                  │
+  │    - Exceptions (0-31): page fault, GPF, double fault, etc.    │
+  │    - IRQs (32-47): timer, keyboard, mouse, disk, net           │
+  │    - Syscall (128): SYSCALL/SYSRET fast path                   │
+  │  ● APIC: local APIC + IOAPIC for interrupt routing             │
+  │  ● TSS: separate kernel stack for Ring 3 → Ring 0 transitions  │
+  │  ● CPU features: SSE, SSE2 enabled for Flutter engine          │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 3: MEMORY MANAGER                                       │
+  │                                                                 │
+  │  ● Physical frame allocator (bitmap, 4 KiB pages)              │
+  │  ● Virtual memory: 4-level page tables (PML4)                  │
+  │  ● Kernel identity-mapped in upper half                        │
+  │  ● User processes get their own page tables                    │
+  │  ● Kernel heap: linked-list allocator (GlobalAlloc)            │
+  │  ● CR3 write activates paging                                  │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 4: SCHEDULER                                            │
+  │                                                                 │
+  │  ● Round-robin preemptive scheduler                            │
+  │  ● Time quantum: 5 ticks (5 ms at 1 kHz timer)                │
+  │  ● Max 64 task slots                                           │
+  │  ● Context switch: save/restore all GPRs + FPU/SSE state       │
+  │  ● SMP support: BSP + Application Processors (APs)             │
+  │  ● AP startup via INIT-SIPI-SIPI sequence                     │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 5: DEVICE DRIVERS                                       │
+  │                                                                 │
+  │  ┌───────────────┬──────────────────────────────────────┐      │
+  │  │  Driver       │  What It Does                        │      │
+  │  ├───────────────┼──────────────────────────────────────┤      │
+  │  │  Framebuffer  │  Memory-mapped pixel buffer          │      │
+  │  │  UART         │  COM1 serial debug output            │      │
+  │  │  PS/2         │  Keyboard scancodes + mouse packets  │      │
+  │  │  VirtIO-blk   │  Disk I/O (QEMU paravirtualized)    │      │
+  │  │  VirtIO-net   │  Network I/O + MAC address           │      │
+  │  │  NVMe         │  NVMe block device driver            │      │
+  │  │  XHCI         │  USB 3.0 host controller             │      │
+  │  └───────────────┴──────────────────────────────────────┘      │
+  │                                                                 │
+  │  All drivers are kernel-space only. No userspace access.       │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 6: NETWORKING                                           │
+  │                                                                 │
+  │  ● VirtIO-net provides raw Ethernet frames                    │
+  │  ● smoltcp TCP/IP stack (embedded, no_std compatible)          │
+  │  ● DHCP client acquires IP (10.0.2.15 in QEMU user mode)      │
+  │  ● TCP sockets available for pkg/ HTTP client                  │
+  │  ● DNS not yet implemented (use IP addresses directly)         │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 7: VFS (Virtual Filesystem)                             │
+  │                                                                 │
+  │  ┌─────────────┬────────────────────────────────────────┐      │
+  │  │  Mount      │  What                                  │      │
+  │  ├─────────────┼────────────────────────────────────────┤      │
+  │  │  /          │  initramfs (read-only tar archive)     │      │
+  │  │  /sys/      │  sysfs (kernel status endpoints)      │      │
+  │  │  /tmp/      │  ramdisk (writable)                   │      │
+  │  │  /sys/pkg/  │  package cache status                 │      │
+  │  └─────────────┴────────────────────────────────────────┘      │
+  │                                                                 │
+  │  Syscalls: vfs_list (0x379), vfs_read (0x37A),                 │
+  │            vfs_write (0x37B), vfs_stat (0x37C)                 │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 8: AI CORTEX  (PID 0 — kernel space)                   │
+  │                                                                 │
+  │  ● Inference engine initialized                                │
+  │  ● Context graph: tracks system state + anomalies              │
+  │  ● Self-healing: detects driver failures, auto-recovers        │
+  │  ● Driver generation: CDP WASM framework for hot-loadable      │
+  │    portable drivers across CPU architectures                   │
+  │  ● Cortex is NOT accessible from userspace                     │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 9: ON-DEMAND PACKAGE DELIVERY                           │
+  │                                                                 │
+  │  ● pkg::init() called after networking is up                   │
+  │  ● Attempts HTTP GET /catalog.bin from package server          │
+  │  ● If server reachable: loads N packages into catalog          │
+  │  ● If server unreachable: "offline mode" (local apps only)     │
+  │  ● LRU cache initialized with 16 slots                        │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 10: USERSPACE LAUNCH                                    │
+  │                                                                 │
+  │  1. Kernel spawns /init as PID 1 (ELF loader + SYSRET)        │
+  │  2. Init supervisor spawns /bin/oscortex-host (shell mode)     │
+  │  3. oscortex-host calls:                                        │
+  │     ● engine_host_register (0x345) — register with kernel      │
+  │     ● dlopen (0x350) — load libflutter_engine.so (95 MB)       │
+  │     ● dl_get_init_array (0x382) — get C++ constructors         │
+  │     ● Calls each DT_INIT_ARRAY entry                           │
+  │     ● engine_proctable_set (0x356) — set up proc table         │
+  │     ● FlutterEngineRun — starts Flutter event loop              │
+  │  4. Flutter renders first frame                                 │
+  │  5. Compositor blits surface to framebuffer                     │
+  │  6. Shell desktop appears with app catalog                      │
+  └─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  PHASE 11: STEADY STATE                                        │
+  │                                                                 │
+  │  ● Shell renders desktop with local + remote app tiles         │
+  │  ● WM event loop: vsync, pointer, keyboard events              │
+  │  ● Compositor: multi-surface blitting to framebuffer           │
+  │  ● User taps app → app_launch → new oscortex-host process     │
+  │  ● Each app gets its own surface, its own PID                  │
+  │  ● Scheduler round-robins between all PIDs                    │
+  └─────────────────────────────────────────────────────────────────┘
+
+
+  PROCESS TREE AT STEADY STATE
+  ────────────────────────────
+
+  PID 0   Cortex AI (kernel thread — not a real process)
+    │
+  PID 1   /init (supervisor — reaps children)
+    │
+    ├── PID 2   /bin/oscortex-host (shell mode)
+    │           └── Flutter shell — app catalog, dock, workspace
+    │
+    ├── PID 3   /bin/oscortex-host (Files app)
+    │           └── Flutter Files — filesystem browser
+    │
+    ├── PID 4   /bin/oscortex-host (Canvas app)
+    │           └── Flutter Canvas — drawing/notes
+    │
+    └── PID N   /bin/oscortex-host (user app)
+                └── Flutter user app — on-demand or sideloaded
+
+
+  SERIAL LOG READING GUIDE
+  ────────────────────────
+
+  Prefix conventions in serial output:
+
+    [kernel]      core kernel startup
+    [arch]        CPU architecture init (GDT, IDT, APIC)
+    [mm]          memory manager (frames, pages, heap)
+    [sched]       scheduler init and context switches
+    [smp]         multiprocessor startup
+    [fb]          framebuffer driver
+    [uart]        serial port driver
+    [ps2]         PS/2 keyboard/mouse
+    [virtio-blk]  disk driver
+    [virtio-net]  network driver
+    [nvme]        NVMe driver
+    [xhci]        USB host controller
+    [net]         TCP/IP stack (smoltcp)
+    [vfs]         filesystem operations
+    [cortex]      AI subsystem
+    [pkg]         on-demand package delivery
+    [process]     process spawn/exit
+    [init]        PID 1 supervisor
+    [embedder]    Flutter embedder host
+    [dlopen]      dynamic linker
+    [compositor]  surface compositor
+    [shell]       Flutter shell UI
+
+  To watch the boot live:
+    bash run-qemu-debug.sh
+
+  To analyze a recorded boot:
+    tail -f serial.log | grep "\[pkg\]"   # filter by subsystem
+
+
+  HOW TO RUN
+  ──────────
+
+  Quick start:
+    cd /path/to/oscortex
+    bash run-qemu-debug.sh
+
+  Manual QEMU (two terminals):
+
+  Terminal 1:
+    qemu-system-x86_64 -M q35 -smp cpus=2 -m 2G \
+      -drive format=raw,file=oscortex.iso,if=ide \
+      -serial file:serial.log \
+      -device virtio-net-pci,netdev=net0 \
+      -netdev user,id=net0
+
+  Terminal 2:
+    tail -f serial.log
+
+
+  BOOT FAILURES & DEBUGGING
+  ─────────────────────────
+
+  ┌──────────────────────────┬───────────────────────────────────────┐
+  │  Last Serial Message     │  What Happened                        │
+  ├──────────────────────────┼───────────────────────────────────────┤
+  │  (nothing)               │  Limine can't find kernel. Check ISO  │
+  │  [kernel] booting        │  Hang in arch init. Check GDT/IDT     │
+  │  [mm] paging enabled     │  Hang in driver init. Check PCI scan  │
+  │  [process] PID 1         │  Init spawned but shell didn't start  │
+  │  [dlopen] loading engine │  Engine load stalled. Check module    │
+  │  [embedder] constructors │  C++ init failed. Engine ABI mismatch │
+  │  [compositor] frame 1    │  Success! Shell should be visible     │
+  └──────────────────────────┴───────────────────────────────────────┘

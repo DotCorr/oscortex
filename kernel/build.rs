@@ -71,9 +71,12 @@ fn collect_dir(
         if path.is_dir() {
             collect_dir(base, &path, out);
         } else {
-            // Skip .gitkeep markers and hidden files.
+            // Skip .gitkeep markers, hidden files, backup copies, and the
+            // raw Flutter engine module which is handled separately.
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.starts_with('.') { continue; }
+            if fname == "kernel_blob.bin" { continue; }
+            if fname == "libflutter_engine.so" || fname.ends_with(".bak") { continue; }
             println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {
                 Ok(b) => b,

@@ -76,6 +76,8 @@ pub fn init() {
 
         // APIC timer (used by scheduler)
         IDT.entries[0x30].set(apic_timer_entry as *const () as u64, 0, 0);
+        // APIC reschedule IPI
+        IDT.entries[0x40].set(apic_resched_entry as *const () as u64, 0, 0);
         // APIC spurious
         IDT.entries[0xFF].set(apic_spurious_handler as *const () as u64, 0, 0);
 
@@ -235,7 +237,7 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
         static RESOLVED_PF_LOG: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let n = RESOLVED_PF_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if n < 64 {
+        if n < 2048 {
             log::warn!(
                 "[PageFault-resolved] #{} pid={} addr={:#x} err={:#x} ip={:#x} sp={:#x}",
                 n,
@@ -251,56 +253,95 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
 
     if !resolved {
         let user_mode = (frame.err & 0x4) != 0;
-        if user_mode {
-            let pid = crate::process::current_pid();
-            log::error!(
-                "[PageFault] SIGSEGV: addr={:#x} err={:#x} ip={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x}",
-                cr2, frame.err, frame.rip, pid, frame.cs, frame.rsp, frame.ss, frame.rflags
-            );
-            log::error!(
-                "[PageFault] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
-                frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp
-            );
-            log::error!(
-                "[PageFault] regs:  r8={:#x}  r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-                frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15
-            );
-            if frame.rsp != 0 {
-                let mut slots = [0u64; 8];
-                unsafe {
-                    for i in 0..8 {
-                        let p = (frame.rsp as *const u64).add(i);
-                        slots[i] = core::ptr::read_volatile(p);
-                    }
-                }
-                log::error!(
-                    "[PageFault] user stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x}",
-                    slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7]
-                );
-            }
-            // For ip=0 (NULL call), try to disassemble the bytes just before
-            // the return-address pushed on the stack — that's the indirect
-            // call instruction. Print the 12 bytes preceding [rsp] so we can
-            // decode `call *...` and identify the source operand.
-            if frame.rip == 0 && frame.rsp != 0 {
-                unsafe {
-                    let ret_addr = core::ptr::read_volatile(frame.rsp as *const u64);
-                    if ret_addr > 0x10 {
-                        let start = ret_addr - 12;
-                        let mut bytes = [0u8; 12];
-                        for i in 0..12 {
-                            bytes[i] = core::ptr::read_volatile((start + i as u64) as *const u8);
+        let pid = crate::process::current_pid();
+        let pml4_phys = crate::process::get_user_context(pid).map(|ctx| ctx.pml4_phys).unwrap_or(0);
+        let trans = if pml4_phys != 0 {
+            crate::mm::paging::translate_user_page_flags(pml4_phys, cr2)
+        } else {
+            None
+        };
+        log::error!(
+            "[PageFault] {}: addr={:#x} err={:#x} ip={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x} pml4={:#x} trans={:?}",
+            if user_mode { "SIGSEGV" } else { "KERNEL SEGV" },
+            cr2, frame.err, frame.rip, pid, frame.cs, frame.rsp, frame.ss, frame.rflags, pml4_phys, trans
+        );
+        if pml4_phys != 0 {
+            let pml4_idx = ((cr2 >> 39) & 0x1ff) as usize;
+            let pdpt_idx = ((cr2 >> 30) & 0x1ff) as usize;
+            let pd_idx   = ((cr2 >> 21) & 0x1ff) as usize;
+            let pt_idx   = ((cr2 >> 12) & 0x1ff) as usize;
+            let phys_to_virt = |phys: u64| -> u64 {
+                phys.wrapping_add(crate::mm::frame_allocator::hhdm_offset())
+            };
+            unsafe {
+                let pml4 = phys_to_virt(pml4_phys) as *const u64;
+                let pml4e = pml4.add(pml4_idx).read_volatile();
+                log::error!("[PageTableWalk] addr={:#x} pml4_idx={} pml4e={:#x}", cr2, pml4_idx, pml4e);
+                if pml4e & 1 != 0 {
+                    let pdpt = phys_to_virt(pml4e & 0x000f_ffff_ffff_f000) as *const u64;
+                    let pdpte = pdpt.add(pdpt_idx).read_volatile();
+                    log::error!("[PageTableWalk] pdpt_idx={} pdpte={:#x}", pdpt_idx, pdpte);
+                    if pdpte & 1 != 0 {
+                        let pd = phys_to_virt(pdpte & 0x000f_ffff_ffff_f000) as *const u64;
+                        let pde = pd.add(pd_idx).read_volatile();
+                        log::error!("[PageTableWalk] pd_idx={} pde={:#x}", pd_idx, pde);
+                        if pde & 1 != 0 {
+                            let pt = phys_to_virt(pde & 0x000f_ffff_ffff_f000) as *const u64;
+                            let pte = pt.add(pt_idx).read_volatile();
+                            log::error!("[PageTableWalk] pt_idx={} pte={:#x}", pt_idx, pte);
                         }
-                        log::error!(
-                            "[PageFault] callsite @ {:#x}-12 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
-                            ret_addr,
-                            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
-                            bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]
-                        );
                     }
                 }
             }
-            crate::syscall::dump_recent_syscalls(24);
+        }
+        log::error!(
+            "[PageFault] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
+            frame.rax, frame.rbx, frame.rcx, frame.rdx, frame.rsi, frame.rdi, frame.rbp
+        );
+        log::error!(
+            "[PageFault] regs:  r8={:#x}  r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            frame.r8, frame.r9, frame.r10, frame.r11, frame.r12, frame.r13, frame.r14, frame.r15
+        );
+        if frame.rsp != 0 {
+            let mut slots = [0u64; 32];
+            unsafe {
+                for i in 0..32 {
+                    let p = (frame.rsp as *const u64).add(i);
+                    slots[i] = core::ptr::read_volatile(p);
+                }
+            }
+            log::error!(
+                "[PageFault] stack: [rsp]={:#x} +8={:#x} +16={:#x} +24={:#x} +32={:#x} +40={:#x} +48={:#x} +56={:#x} +64={:#x} +72={:#x} +80={:#x} +88={:#x} +96={:#x} +104={:#x} +112={:#x} +120={:#x} +128={:#x} +136={:#x} +144={:#x} +152={:#x} +160={:#x} +168={:#x} +176={:#x} +184={:#x} +192={:#x} +200={:#x} +208={:#x} +216={:#x} +224={:#x} +232={:#x} +240={:#x} +248={:#x}",
+                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], slots[6], slots[7],
+                slots[8], slots[9], slots[10], slots[11], slots[12], slots[13], slots[14], slots[15],
+                slots[16], slots[17], slots[18], slots[19], slots[20], slots[21], slots[22], slots[23],
+                slots[24], slots[25], slots[26], slots[27], slots[28], slots[29], slots[30], slots[31]
+            );
+        }
+        // For ip=0 (NULL call), try to disassemble the bytes just before
+        // the return-address pushed on the stack — that's the indirect
+        // call instruction. Print the 12 bytes preceding [rsp] so we can
+        // decode `call *...` and identify the source operand.
+        if frame.rip == 0 && frame.rsp != 0 {
+            unsafe {
+                let ret_addr = core::ptr::read_volatile(frame.rsp as *const u64);
+                if ret_addr > 0x10 {
+                    let start = ret_addr - 12;
+                    let mut bytes = [0u8; 12];
+                    for i in 0..12 {
+                        bytes[i] = core::ptr::read_volatile((start + i as u64) as *const u8);
+                    }
+                    log::error!(
+                        "[PageFault] callsite @ {:#x}-12 bytes: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                        ret_addr,
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                        bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11]
+                    );
+                }
+            }
+        }
+        crate::syscall::dump_recent_syscalls(24);
+        if user_mode {
             if pid != 0 {
                 crate::process::kill(pid).ok();
             }
@@ -349,6 +390,106 @@ struct TimerTrapFrame {
     rip: u64,
     cs: u64,
     rflags: u64,
+    user_rsp: u64,
+    user_ss: u64,
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn apic_resched_entry() {
+    core::arch::naked_asm!(
+        // Save all GPRs so preemption is transparent to userspace code.
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym apic_resched_handler,
+    );
+}
+
+extern "C" fn apic_resched_handler(frame_ptr: *mut TimerTrapFrame) {
+    let frame = unsafe { &mut *frame_ptr };
+    let preempted_user = (frame.cs & 0x3) == 0x3;
+
+    // EOI first.
+    crate::arch::apic::eoi();
+
+    if preempted_user {
+        let cur = crate::process::current_pid();
+        if cur != 0 {
+            let cur_regs = crate::process::UserRegs {
+                rip: frame.rip,
+                rsp: frame.user_rsp,
+                rflags: frame.rflags,
+                rax: frame.rax,
+                rbx: frame.rbx,
+                rcx: frame.rcx,
+                rdx: frame.rdx,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                rbp: frame.rbp,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+            };
+            if let Some((next_pid, next_regs, pml4_phys)) = crate::process::timer_preempt_switch(cur, &cur_regs) {
+                unsafe {
+                    super::memory::write_cr3(pml4_phys);
+                }
+                frame.r15 = next_regs.r15;
+                frame.r14 = next_regs.r14;
+                frame.r13 = next_regs.r13;
+                frame.r12 = next_regs.r12;
+                frame.r11 = next_regs.r11;
+                frame.r10 = next_regs.r10;
+                frame.r9 = next_regs.r9;
+                frame.r8 = next_regs.r8;
+                frame.rdi = next_regs.rdi;
+                frame.rsi = next_regs.rsi;
+                frame.rbp = next_regs.rbp;
+                frame.rbx = next_regs.rbx;
+                frame.rdx = next_regs.rdx;
+                frame.rcx = next_regs.rcx;
+                frame.rax = next_regs.rax;
+                frame.rip = next_regs.rip;
+                frame.rflags = next_regs.rflags | 0x200;
+                frame.user_rsp = next_regs.rsp;
+            }
+        }
+    }
 }
 
 #[unsafe(naked)]
@@ -393,17 +534,20 @@ unsafe extern "C" fn apic_timer_entry() {
 }
 
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
-    crate::syscall::check_timerfds_and_wake();
+    crate::syscall::check_timerfds_and_wake_try();
+    crate::process::handle_pending_wakes_try();
 
-    // Set a deferred-kick flag every ~500 ms (30 ticks × ~17 ms/tick).
+    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
+
+    // Set a deferred-kick flag every ~500 ms (500 ticks × 1 ms/tick).
     // The flag is consumed in syscall context (sys_pthread_mutex_unlock or
     // sys_wm_event_wait) where spinlock acquisition is safe.  This ISR path
     // only does an atomic store — completely lock-free.
-    {
+    if cpu_id == 0 {
         static TR_KICK_CTR: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let k = TR_KICK_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if k % 30 == 0 {
+        if k % 500 == 0 {
             crate::syscall::KICK_REQUESTED.store(
                 true,
                 core::sync::atomic::Ordering::Release,
@@ -411,14 +555,6 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         }
     }
 
-    static DUMP_COUNTER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let count = DUMP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if count < 10 {
-        log::info!("[APIC TIMER] tick count={}", count);
-    }
-    if count > 0 && count % 500 == 0 {
-        crate::process::debug_dump_processes();
-    }
 
     let frame = unsafe { &mut *frame_ptr };
     let preempted_user = (frame.cs & 0x3) == 0x3;
@@ -427,26 +563,112 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
     // after iretq.
     crate::arch::apic::eoi();
 
-    // Call wm::tick() and compositor::tick() on vsync boundary even when running userspace threads.
-    let vsync = crate::arch::apic::vsync_due();
-    if vsync {
-        crate::wm::tick();
-        crate::compositor::tick();
-        crate::drivers::usb::poll();
-        crate::arch::apic::reset_vsync_last_tsc();
+    if cpu_id == 0 {
+        // Call wm::tick() and compositor::tick() on vsync boundary even when running userspace threads.
+        let vsync = crate::arch::apic::vsync_due();
+        if vsync {
+            crate::wm::tick();
+            crate::compositor::tick();
+            crate::drivers::usb::poll();
+            crate::arch::apic::reset_vsync_last_tsc();
+        }
     }
 
     if preempted_user {
-        // Cooperative `sched_yield` / futex paths handle userspace scheduling.
-        // Timer preemption back into a thread that yielded via SYSRET corrupts
-        // register state during bring-up (see init supervisor + Flutter host).
+        let cur = crate::process::current_pid();
+        let slice_expired = crate::process::account_tick_try(cur).unwrap_or(false);
+
+        let focus = crate::wm::focus_pid();
+        let target = if focus != 0 { focus } else { 1 };
+
+        let should_preempt = slice_expired || (
+            cur != 0
+            && target != 0
+            && cur != target
+            && !crate::wm::flutter_bootstrap_spin_active()
+            && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
+        );
+
+        if should_preempt {
+            let cur_regs = crate::process::UserRegs {
+                rip: frame.rip,
+                rsp: frame.user_rsp,
+                rflags: frame.rflags,
+                rax: frame.rax,
+                rbx: frame.rbx,
+                rcx: frame.rcx,
+                rdx: frame.rdx,
+                rsi: frame.rsi,
+                rdi: frame.rdi,
+                rbp: frame.rbp,
+                r8: frame.r8,
+                r9: frame.r9,
+                r10: frame.r10,
+                r11: frame.r11,
+                r12: frame.r12,
+                r13: frame.r13,
+                r14: frame.r14,
+                r15: frame.r15,
+            };
+            if let Some((next_pid, next_regs, pml4_phys)) = crate::process::timer_preempt_switch_try(cur, &cur_regs) {
+                unsafe {
+                    super::memory::write_cr3(pml4_phys);
+                }
+
+                frame.r15 = next_regs.r15;
+                frame.r14 = next_regs.r14;
+                frame.r13 = next_regs.r13;
+                frame.r12 = next_regs.r12;
+                frame.r11 = next_regs.r11;
+                frame.r10 = next_regs.r10;
+                frame.r9 = next_regs.r9;
+                frame.r8 = next_regs.r8;
+                frame.rdi = next_regs.rdi;
+                frame.rsi = next_regs.rsi;
+                frame.rbp = next_regs.rbp;
+                frame.rbx = next_regs.rbx;
+                frame.rdx = next_regs.rdx;
+                frame.rcx = next_regs.rcx;
+                frame.rax = next_regs.rax;
+                frame.rip = next_regs.rip;
+                frame.rflags = next_regs.rflags | 0x200;
+                frame.user_rsp = next_regs.rsp;
+            }
+        }
         return;
+    }
+
+    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall
+    // hlt loop, queued input can otherwise leave PID 1 runnable-but-unentered.
+    // If the interrupt lands in idle (cur=0), PID 1 is still the safe target
+    // for post-init WM input. If it lands in PID 1's own wm_event_wait loop,
+    // re-entering PID 1 makes it re-execute the syscall and drain the queue.
+    let cur = crate::process::current_pid();
+    let focus = crate::wm::focus_pid();
+    let target = if focus != 0 { focus } else { 1 };
+    if target != 0
+        && crate::wm::flutter_init_ready()
+        && !crate::wm::flutter_bootstrap_spin_active()
+        && (cur == 0 || crate::process::is_blocked_try(cur))
+        && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
+    {
+        if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+
+            if cur != target {
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for_try(target, my_cpu) {
+                    crate::process::enter_user_by_pid_noreturn_try(target);
+                }
+            }
+        }
     }
 
     // Kernel-mode preemption: run cooperative scheduler.
     // Do NOT call sched::tick() while a user thread was running —
     // those are reserved for kernel-idle context only.
-    crate::sched::tick();
+    if crate::arch::x86_64::smp::this_cpu().cpu_id == 0 && crate::process::current_pid() == 0 {
+        crate::sched::tick();
+    }
 }
 
 /// CPU-provided interrupt frame (pushed by hardware).
@@ -458,4 +680,3 @@ pub struct InterruptFrame {
     pub sp:     u64,
     pub ss:     u64,
 }
-

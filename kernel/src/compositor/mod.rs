@@ -12,6 +12,13 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// When `true`, a userspace process owns the framebuffer directly.
 /// `render_frame()` skips the background fill and placeholder blits.
 static FB_BYPASS: AtomicBool = AtomicBool::new(false);
+/// Set when input moves the cursor so we redraw the software pointer overlay.
+static FRAME_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// Request a compositor redraw (e.g. cursor moved but Flutter surface unchanged).
+pub fn invalidate() {
+    FRAME_DIRTY.store(true, Ordering::Release);
+}
 
 /// Set or clear the FB bypass flag.
 pub fn set_fb_bypass(bypass: bool) {
@@ -598,6 +605,88 @@ fn has_visible_content(c: &CompositorState) -> bool {
     false
 }
 
+/// Simple PS/2 pointer overlay (OS cursor — Flutter does not draw one in software mode).
+fn blend_pixel(bg: u32, fg: u32, alpha: u8) -> u32 {
+    if alpha == 255 {
+        return fg;
+    }
+    if alpha == 0 {
+        return bg;
+    }
+    let r_bg = (bg >> 16) & 0xFF;
+    let g_bg = (bg >> 8) & 0xFF;
+    let b_bg = bg & 0xFF;
+
+    let r_fg = (fg >> 16) & 0xFF;
+    let g_fg = (fg >> 8) & 0xFF;
+    let b_fg = fg & 0xFF;
+
+    let a = alpha as u32;
+    let r_out = (r_fg * a + r_bg * (255 - a)) / 255;
+    let g_out = (g_fg * a + g_bg * (255 - a)) / 255;
+    let b_out = (b_fg * a + b_bg * (255 - a)) / 255;
+
+    (r_out << 16) | (g_out << 8) | b_out
+}
+
+/// Circular cursor rendering with active click scaling, custom color, and inactivity auto-fade.
+fn draw_software_cursor() {
+    use core::sync::atomic::Ordering;
+    if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
+        return;
+    }
+
+    // Auto-disappear cursor after 3 seconds of inactivity (6,000,000,000 TSC cycles @ 2GHz)
+    let last_act = crate::drivers::ps2::last_activity_tsc();
+    let now = crate::arch::rdtsc();
+    if now.wrapping_sub(last_act) > 6_000_000_000 {
+        return;
+    }
+
+    let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
+    let buttons = crate::drivers::ps2::cursor_buttons();
+
+    // Determine scale and color based on click/active state
+    let (r, r_glow, color) = if buttons != 0 {
+        (4i32, 8i32, 0x0038BDF8) // Clicked: 8px diameter, cyan accent
+    } else {
+        (6i32, 10i32, 0x00FFFFFF) // Idle: 12px diameter, white
+    };
+
+    if let Some((w, h)) = crate::drivers::fb::size_px() {
+        x = x.clamp(r_glow, w as i32 - 1 - r_glow);
+        y = y.clamp(r_glow, h as i32 - 1 - r_glow);
+    }
+
+    // Draw circular pointer and fading radial glow using integer distance metric
+    for dy in -r_glow..=r_glow {
+        for dx in -r_glow..=r_glow {
+            let dist2 = dx * dx + dy * dy;
+            let px = x + dx;
+            let py = y + dy;
+
+            if px >= 0 && py >= 0 {
+                let px = px as u32;
+                let py = py as u32;
+
+                if dist2 <= r * r {
+                    // Solid central core
+                    crate::drivers::fb::set_pixel(px, py, color);
+                } else if dist2 <= r_glow * r_glow {
+                    // Soft radial shadow/glow
+                    let bg = crate::drivers::fb::get_pixel(px, py);
+                    let t = (r_glow * r_glow) - dist2;
+                    let max_t = (r_glow * r_glow) - (r * r);
+                    let alpha = if max_t > 0 { (t * 80) / max_t } else { 0 } as u8;
+                    let glow_color = if buttons != 0 { 0x0038BDF8 } else { 0x00FFFFFF };
+                    let blended = blend_pixel(bg, glow_color, alpha);
+                    crate::drivers::fb::set_pixel(px, py, blended);
+                }
+            }
+        }
+    }
+}
+
 // ── Phase 32-D: stride-aware GPU blit ─────────────────────────────────────────
 
 /// Stride-aware variant of [`gpu_submit_for`].
@@ -690,8 +779,15 @@ pub fn render_frame() {
     }
 
     if !has_visible_content(&c) {
-        c.frame_counter = c.frame_counter.wrapping_add(1);
-        crate::wm::push_vsync(c.frame_counter);
+        let frame = c.frame_counter.wrapping_add(1);
+        c.frame_counter = frame;
+        drop(c);
+        if let Some((w, h)) = crate::drivers::fb::size_px() {
+            crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
+        }
+        draw_software_cursor();
+        crate::drivers::fb::swap_buffers();
+        crate::wm::push_vsync(frame);
         return;
     }
 
@@ -736,6 +832,7 @@ pub fn render_frame() {
     }
 
     drop(c);
+    draw_software_cursor();
     crate::drivers::fb::swap_buffers();
     let mut c = COMP.lock();
     c.frame_counter = c.frame_counter.wrapping_add(1);
@@ -759,7 +856,7 @@ pub fn tick() {
         None => return,
     };
 
-    let mut dirty = false;
+    let mut dirty = FRAME_DIRTY.swap(false, Ordering::AcqRel);
 
     // 1. Check if any surfaces changed (creation, destruction, moving, resizing, visibility, clip, etc.)
     {

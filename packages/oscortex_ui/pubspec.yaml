@@ -1,0 +1,14 @@
+name: oscortex_ui
+description: >
+  OSCortex Design System — canonical tokens, themed widgets, and animations
+  for all OSCortex userspace Flutter applications.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.0
+  flutter: '>=3.29.0'
+
+dependencies:
+  flutter:
+    sdk: flutter

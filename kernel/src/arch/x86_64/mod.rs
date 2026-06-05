@@ -49,12 +49,12 @@ pub fn early_init() {
 }
 
 /// Per-AP (Application Processor) init — called after BSP completes kernel_main setup.
-pub fn ap_init() {
-    gdt::init_ap();
+pub fn ap_init(cpu_idx: u32) {
+    gdt::init_ap(cpu_idx);
     idt::load();
     apic::init_ap();
     cpu::enable_fpu_simd();
-    syscall::init();
+    syscall::init_ap(cpu_idx);
 }
 
 /// Wake all APs and bring SMP online. Call after heap + logging are ready.

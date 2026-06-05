@@ -289,7 +289,7 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
         log::info!("[USB] XHCI runtime started");
 
         let rt = RUNTIME.as_mut().unwrap();
-        for _ in 0..500_000 {
+        for _ in 0..100 {
             drain_events(rt);
             if try_enumerate(rt) {
                 rt.enumerated = true;

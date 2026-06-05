@@ -1,0 +1,86 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                    O S C O R T E X   M U L T I - A R C H                       ║
+║                     One OS design — multiple CPU backends                        ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+  DECISION
+  ────────
+  OSCortex is ONE operating system. You do NOT rebuild from scratch per CPU.
+  You port the arch/ backend and rebuild per-ISA binaries (kernel, embedder,
+  Flutter engine, gen_snapshot). Shared policy and syscalls stay the same.
+
+
+  LAYER MODEL
+  ───────────
+
+  ┌─────────────────────────────────────────────────────────────┐
+  │  SHARED (same Rust source, all architectures)               │
+  │  compositor · WM · syscalls · app registry · .osx install   │
+  │  VFS · process model · embedder contract · driver policy    │
+  └─────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+   arch/x86_64/         arch/aarch64/         arch/riscv64/
+   boot · paging ·      (stub → real port)    (stub → board port)
+   syscalls · APIC
+         │                    │                    │
+         ▼                    ▼                    ▼
+   x86_64 kernel         aarch64 kernel        riscv64 kernel
+   x86 oscortex-host     ARM oscortex-host     RISC oscortex-host
+   x86 libflutter        ARM libflutter        RISC libflutter
+   x86 .osx bundles      ARM .osx bundles      RISC .osx bundles
+
+
+  WHAT IS SHARED vs PER-ARCH
+  ──────────────────────────
+  Shared          compositor, WM, app registry, syscall ABI, .osx format,
+                  embedder logic, most kernel/src/*, driver class design
+  Per-arch        kernel/src/arch/{x86_64,aarch64,riscv64}/ — boot, MMU,
+                  context switch, timers, interrupt delivery, I/O shims
+  Per-arch        userspace binaries rebuilt for that CPU (oscortex-host,
+                  libflutter_engine.so, gen_snapshot / dartaotruntime)
+  Per-arch        .osx bundles are CPU-specific (AOT libapp.so for that ISA)
+
+
+  NOT “THREE OSes THEN MERGE”
+  ───────────────────────────
+  Wrong: build three independent operating systems, then unify later.
+  Right: implement each arch/ backend against the same shared kernel API
+  (same pattern as Linux arch/x86 vs arch/arm64).
+
+
+  WASM / CDP DRIVERS (separate axis)
+  ──────────────────────────────────
+  Cortex Driver Protocol (WASM) gives portable *drivers* across CPUs.
+  It does NOT replace CPU porting or a per-arch Flutter engine.
+
+
+  BRING-UP ORDER (2026)
+  ─────────────────────
+  1. x86_64  — full boot, Flutter shell, .osx install/launch (Epic A)
+  2. aarch64 — real arch/aarch64 boot, QEMU virt, then native UTM on M1
+  3. riscv64 — when target board is chosen
+
+
+  FLUTTER / APP ARTIFACTS (see docs/arch.txt)
+  ───────────────────────────────────────────
+  Production: profile/release engine + AOT libapp.so inside .osx (per CPU).
+
+  Today on x86 only (temporary boot debt, NOT a product feature):
+    • build-iso.sh runs `flutter build bundle --debug` → JIT snapshot files
+    • Shell loads vm/isolate_snapshot_data via debug libflutter_engine.so
+    • No hot reload: embedder passes --disable-vm-service; every Dart change
+      still requires full build-iso.sh + reboot
+    • libapp.so is built every ISO but used only for demo.osx packing until
+      shell switches to AOT + profile engine (roadmap step 4)
+
+
+  KEY PATHS
+  ─────────
+  kernel/src/arch/mod.rs       arch selection (cfg_if)
+  kernel/src/arch/x86_64/        working x86 backend
+  kernel/src/arch/aarch64/       stub — next port target
+  kernel/src/arch/riscv64/       stub
+  docs/arch.txt                  userspace / process model
+  docs/hardware.txt              drivers and device classes

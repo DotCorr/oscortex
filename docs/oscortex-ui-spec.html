@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=device-width, initial-scale=1.0">
+  <title>OSCortex UI Design Specification (1:1 Mockup)</title>
+  <!-- Load Tailwind CSS via CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Load Google Fonts: Inter (Interface) & JetBrains Mono (Terminal/Code) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  
+  <style>
+    /* System variables matching OSCortex Design System */
+    :root {
+      --bg-dark: #07080b;
+      --canvas-shell-bg: #0b0d12;
+      --border-color: rgba(255, 255, 255, 0.08);
+      --border-color-light: rgba(255, 255, 255, 0.05);
+      --border-color-active: rgba(167, 139, 250, 0.25);
+      --text-main: #d4d4d8;
+      --text-muted: #71717a;
+      --text-dim: #52525b;
+      --accent-violet: #7c3aed;
+      --accent-violet-light: rgba(124, 58, 237, 0.14);
+      --accent-sky-light: rgba(56, 189, 248, 0.08);
+      --signal-green: #10b981;
+    }
+
+    body {
+      background-color: var(--bg-dark);
+      color: var(--text-main);
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .font-mono {
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    /* Ambient glow backing matching dccortex.com landing */
+    .desktop-wrapper {
+      background: 
+        radial-gradient(circle at 50% -20%, rgba(124, 58, 237, 0.18), transparent 50%),
+        radial-gradient(circle at 10% 30%, rgba(56, 189, 248, 0.05), transparent 40%);
+    }
+
+    /* 1:1 Canvas Frame styling */
+    .canvas-frame {
+      transform: perspective(1200px) rotateX(0.5deg);
+      transform-origin: center top;
+      background-color: var(--canvas-shell-bg);
+      box-shadow: 
+        0 48px 120px -24px rgba(0,0,0,0.7),
+        0 0 0 1px rgba(255, 255, 255, 0.06);
+    }
+
+    .canvas-ambient {
+      background:
+        radial-gradient(ellipse 70% 50% at 20% 0%, var(--accent-violet-light), transparent 55%),
+        radial-gradient(ellipse 55% 45% at 85% 15%, var(--accent-sky-light), transparent 50%),
+        radial-gradient(ellipse 80% 60% at 50% 100%, rgba(15, 23, 42, 0.95), transparent 70%);
+    }
+
+    .canvas-intent-bar {
+      background: rgba(255, 255, 255, 0.035);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+    }
+
+    .canvas-surface {
+      border-radius: 0.875rem;
+      border: 1px solid var(--border-color);
+      background: rgba(255, 255, 255, 0.025);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.04),
+        0 8px 24px -12px rgba(0, 0, 0, 0.5);
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .canvas-surface:hover {
+      border-color: rgba(255, 255, 255, 0.12);
+      background: rgba(255, 255, 255, 0.035);
+    }
+
+    .canvas-surface-doc {
+      background:
+        linear-gradient(145deg, rgba(124, 58, 237, 0.05) 0%, transparent 45%),
+        rgba(255, 255, 255, 0.03);
+    }
+
+    .canvas-surface-live {
+      background:
+        linear-gradient(90deg, rgba(124, 58, 237, 0.07) 0%, transparent 60%),
+        rgba(255, 255, 255, 0.025);
+      border-color: var(--border-color-active);
+    }
+
+    .canvas-app-rail {
+      background: rgba(0, 0, 0, 0.2);
+    }
+
+    .canvas-app-rail::before {
+      content: '';
+      position: absolute;
+      top: 2.75rem;
+      bottom: 3.75rem;
+      left: 0;
+      width: 68px;
+      pointer-events: none;
+      background: linear-gradient(to bottom, rgba(11, 13, 18, 0.95), transparent 12%, transparent 88%, rgba(11, 13, 18, 0.9));
+    }
+
+    .canvas-hub-glass {
+      background: rgba(14, 14, 18, 0.7);
+      backdrop-filter: blur(24px) saturate(180%);
+      -webkit-backdrop-filter: blur(24px) saturate(180%);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      box-shadow:
+        0 12px 40px -8px rgba(0, 0, 0, 0.6),
+        0 0 0 1px rgba(255, 255, 255, 0.03),
+        inset 0 1px 0 rgba(255, 255, 255, 0.08),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.3);
+    }
+
+    .canvas-hub-segment {
+      color: rgba(163, 163, 163, 0.85);
+      transition: all 0.2s ease;
+      cursor: pointer;
+    }
+
+    .canvas-hub-segment:hover {
+      color: rgba(250, 250, 250, 0.95);
+      background: rgba(255, 255, 255, 0.04);
+    }
+
+    .canvas-hub-segment-active {
+      background: rgba(255, 255, 255, 0.1);
+      color: rgba(250, 250, 250, 0.98) !important;
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.06),
+        0 1px 2px rgba(0, 0, 0, 0.25);
+    }
+
+    /* Core Micro-Animations */
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.85); }
+    }
+    .anim-pulse-dot {
+      animation: pulse-dot 1.8s ease-in-out infinite;
+    }
+
+    @keyframes caret-blink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0; }
+    }
+    .anim-caret {
+      animation: caret-blink 1s steps(2) infinite;
+    }
+
+    @keyframes wave-bar {
+      0%, 100% { transform: scaleY(0.3); opacity: 0.4; }
+      50% { transform: scaleY(1); opacity: 1; }
+    }
+    .canvas-wave-bar {
+      transform-origin: bottom;
+      animation: wave-bar 1.2s ease-in-out infinite;
+    }
+
+    /* Custom scrollbar matching canvas aesthetics */
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { scrollbar-width: none; }
+
+    /* Specification utility styles */
+    .spec-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: #a1a1aa;
+    }
+    
+    .token-card {
+      background: #0f1115;
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      border-radius: 8px;
+    }
+  </style>
+</head>
+<body class="p-6 md:p-12 min-h-screen flex flex-col items-center justify-start">
+
+  <!-- Floating Spec Banner -->
+  <header class="w-full max-w-5xl mb-8 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 border-b border-zinc-800/80 pb-6">
+    <div>
+      <div class="flex items-center gap-2">
+        <span class="text-xs px-2 py-0.5 rounded bg-violet-600/10 text-violet-400 border border-violet-500/20 font-mono uppercase font-semibold">Workspace spec</span>
+        <span class="text-xs text-zinc-500 font-mono">Ver 1.0.0</span>
+      </div>
+      <h1 class="text-2xl font-bold tracking-tight text-white mt-1">OSCortex Personal Canvas Mockup</h1>
+      <p class="text-xs text-zinc-400 mt-0.5">Standalone interactive design template for frontend & userspace developers.</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <a href="#spec-sheet" class="text-xs font-semibold px-4 py-2 bg-zinc-800 text-zinc-200 hover:bg-zinc-700 transition rounded-lg border border-zinc-700">View Tokens ↓</a>
+      <button onclick="window.print()" class="text-xs font-semibold px-4 py-2 bg-violet-600 text-white hover:bg-violet-700 transition rounded-lg">Print Specs</button>
+    </div>
+  </header>
+
+  <!-- Interactive 1:1 Workspace Sandbox -->
+  <main class="desktop-wrapper w-full max-w-5xl rounded-3xl p-4 md:p-8 flex items-center justify-center border border-zinc-800/50 mb-12">
+    <div class="canvas-frame w-full overflow-hidden rounded-[1.25rem] select-none">
+      
+      <!-- Interactive Screen Shell -->
+      <div class="canvas-shell relative min-h-[460px] md:min-h-[500px] w-full flex flex-col justify-between">
+        
+        <!-- Ambient Screen Glow Overlay -->
+        <div class="canvas-ambient pointer-events-none absolute inset-0"></div>
+
+        <!-- Top Header Chrome -->
+        <header class="relative z-10 flex h-11 items-center justify-between border-b border-white/[0.07] px-4">
+          <div class="flex min-w-0 items-center text-[13px]">
+            <span class="truncate font-medium text-neutral-200">Personal Canvas</span>
+          </div>
+          <div class="flex items-center gap-3">
+            <button
+              type="button"
+              class="flex items-center gap-1.5 rounded-lg border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-[11px] text-neutral-400 hover:bg-white/[0.08] hover:text-white transition"
+              aria-label="Settings"
+            >
+              <!-- Settings Icon -->
+              <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.604.852.997 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+              Settings
+            </button>
+            <span id="canvas-clock" class="tabular-nums text-[12px] text-neutral-500 font-medium">12:40 PM</span>
+          </div>
+        </header>
+
+        <!-- Main Desktop Content Row -->
+        <div class="relative z-10 flex flex-1">
+          
+          <!-- Left-Side App Rail -->
+          <aside class="canvas-app-rail relative hidden w-[68px] shrink-0 flex-col border-r border-white/[0.07] sm:flex justify-between">
+            <div class="no-scrollbar flex flex-col gap-1 px-1.5 py-3">
+              
+              <!-- Note Item (Active) -->
+              <div class="flex flex-col items-center gap-1 rounded-lg px-1 py-1.5 text-center bg-white/[0.06] text-neutral-100 cursor-pointer group hover:bg-white/[0.08] transition">
+                <span class="flex h-7 w-7 items-center justify-center rounded-md border border-violet-500/30 bg-violet-500/15 text-violet-300">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                    <path d="M8 4h8a2 2 0 0 1 2 2v14l-4-2-4 2-4-2-4 2V6a2 2 0 0 1 2-2z" />
+                  </svg>
+                </span>
+                <span class="text-[7.5px] leading-none mt-1 font-medium">Notes</span>
+              </div>
+
+              <!-- Terminal Item -->
+              <div class="flex flex-col items-center gap-1 rounded-lg px-1 py-1.5 text-center text-neutral-500 cursor-pointer hover:bg-white/[0.04] hover:text-neutral-300 transition">
+                <span class="flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.06] bg-white/[0.03]">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                    <path d="m4 7 4 4-4 4M12 17h8" />
+                    <rect x="3" y="4" width="18" height="16" rx="2" />
+                  </svg>
+                </span>
+                <span class="text-[7.5px] leading-none mt-1">Terminal</span>
+              </div>
+
+              <!-- Radio Item -->
+              <div class="flex flex-col items-center gap-1 rounded-lg px-1 py-1.5 text-center text-neutral-500 cursor-pointer hover:bg-white/[0.04] hover:text-neutral-300 transition">
+                <span class="flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.06] bg-white/[0.03]">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                    <circle cx="12" cy="12" r="2" />
+                    <path d="M16 8a6 6 0 0 1 0 8M19 5a10 10 0 0 1 0 14" />
+                  </svg>
+                </span>
+                <span class="text-[7.5px] leading-none mt-1">Radio</span>
+              </div>
+
+              <!-- Monitor Item -->
+              <div class="flex flex-col items-center gap-1 rounded-lg px-1 py-1.5 text-center text-neutral-500 cursor-pointer hover:bg-white/[0.04] hover:text-neutral-300 transition">
+                <span class="flex h-7 w-7 items-center justify-center rounded-md border border-white/[0.06] bg-white/[0.03]">
+                  <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                    <rect x="3" y="4" width="18" height="12" rx="2" />
+                    <path d="M8 20h8M12 16v4" />
+                  </svg>
+                </span>
+                <span class="text-[7.5px] leading-none mt-1">Monitor</span>
+              </div>
+
+            </div>
+
+            <!-- All Apps Action -->
+            <button
+              type="button"
+              class="mx-1.5 mb-3 flex flex-col items-center gap-1 rounded-lg border border-dashed border-white/[0.1] py-1.5 text-neutral-500 hover:border-white/[0.16] hover:bg-white/[0.04] hover:text-neutral-300 transition"
+              aria-label="All applications"
+            >
+              <span class="flex h-7 w-7 items-center justify-center rounded-md bg-white/[0.03]">
+                <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                  <rect x="3" y="3" width="7" height="7" rx="1" />
+                  <rect x="14" y="3" width="7" height="7" rx="1" />
+                  <rect x="3" y="14" width="7" height="7" rx="1" />
+                  <rect x="14" y="14" width="7" height="7" rx="1" />
+                </svg>
+              </span>
+              <span class="text-[7.5px] leading-none mt-1 font-medium">All Apps</span>
+            </button>
+          </aside>
+
+          <!-- Core Workspace Grid (Main Canvas) -->
+          <div class="flex flex-1 flex-col min-w-0">
+            
+            <!-- Intent Input Overlay Bar -->
+            <div class="border-b border-white/[0.06] px-4 py-2.5">
+              <div class="canvas-intent-bar flex items-center gap-2 rounded-xl px-3 py-2">
+                <span class="font-mono text-[13px] text-violet-400 font-semibold">&gt;</span>
+                <span class="truncate font-mono text-[12px] text-neutral-300 sm:text-[13px]">
+                  What are we building today?
+                  <span class="anim-caret ml-0.5 inline-block h-4.5 w-[7px] translate-y-0.5 bg-violet-400" style="vertical-align: middle;"></span>
+                </span>
+              </div>
+            </div>
+
+            <!-- Scrollable Workspace Layout -->
+            <div class="flex-1 flex flex-col gap-3.5 p-3.5 md:p-4 overflow-y-auto no-scrollbar">
+              
+              <!-- Card: Document Canvas -->
+              <article class="canvas-surface canvas-surface-doc p-4 md:p-5">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <p class="font-mono text-[10px] uppercase tracking-[0.14em] text-violet-400 font-semibold">
+                      Document Canvas
+                    </p>
+                    <h3 class="mt-1 text-[15px] font-medium text-white font-semibold">
+                      &ldquo;Project Proposal.md&rdquo;
+                    </h3>
+                  </div>
+                  <span class="flex shrink-0 items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2.5 py-0.5 text-[9px] font-medium text-emerald-400">
+                    <span class="h-1.5 w-1.5 rounded-full bg-emerald-400 anim-pulse-dot"></span>
+                    Auto-saving
+                  </span>
+                </div>
+                <p class="mt-4 text-[12px] leading-[1.75] text-neutral-400 font-normal">
+                  The transition away from static software models requires a radical inversion of
+                  hardware abstraction maps. By structuring intent parsing frameworks at the system
+                  core layer, users no longer interact with isolated platforms, but rather text
+                  environments that shift dynamically based on temporary workflow requirements…
+                </p>
+              </article>
+
+              <!-- Sub-grid: Media Player + Wikipedia Search Engine -->
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+                
+                <!-- Media Player Card -->
+                <article class="canvas-surface p-4 flex flex-col justify-between min-h-[110px]">
+                  <div>
+                    <p class="font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-500 font-semibold">
+                      Now Playing
+                    </p>
+                    <div class="mt-2.5 flex items-center justify-between gap-3">
+                      <div>
+                        <p class="text-[13px] font-medium text-neutral-100">Ambient Waves</p>
+                        <p class="text-[11px] text-zinc-500 mt-0.5">Cortex Generative Radio</p>
+                      </div>
+                      <!-- Waveform Animation -->
+                      <div class="flex h-8 items-end gap-[3px]">
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 10px; animation-delay: 0.1s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 20px; animation-delay: 0.2s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 12px; animation-delay: 0.3s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 24px; animation-delay: 0.4s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 16px; animation-delay: 0.5s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 28px; animation-delay: 0.6s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 18px; animation-delay: 0.7s;"></span>
+                        <span class="canvas-wave-bar w-[3px] rounded-full bg-gradient-to-t from-violet-600 to-violet-300" style="height: 10px; animation-delay: 0.8s;"></span>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="mt-3 flex flex-wrap gap-2">
+                    <span class="rounded-md bg-white/[0.04] border border-white/[0.05] px-2 py-0.5 text-[9px] font-mono text-neutral-400">
+                      Local Sync
+                    </span>
+                    <span class="rounded-md bg-violet-500/10 border border-violet-500/20 px-2 py-0.5 text-[9px] font-mono text-violet-300">
+                      Spatial Audio Active
+                    </span>
+                  </div>
+                </article>
+
+                <!-- Search Index Card -->
+                <article class="canvas-surface p-4 flex flex-col justify-between min-h-[110px]">
+                  <div>
+                    <p class="font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-500 font-semibold">
+                      Knowledge Source Engine
+                    </p>
+                    <p class="mt-2 truncate font-mono text-[10px] text-sky-400">
+                      https://en.wikipedia.org/wiki/Operating_system
+                    </p>
+                    <p class="mt-1 text-[12px] font-medium text-neutral-200">
+                      Operating Systems Architecture Evolution
+                    </p>
+                  </div>
+                  <p class="mt-2 text-[10.5px] leading-relaxed text-zinc-500">
+                    An operating system (OS) is system software that manages computer hardware...
+                  </p>
+                </article>
+
+              </div>
+
+              <!-- Generated System Module (Live Widget View) -->
+              <article class="canvas-surface canvas-surface-live p-4">
+                <div class="flex items-center justify-between gap-2">
+                  <p class="font-mono text-[9px] uppercase tracking-[0.12em] text-zinc-500 font-semibold">
+                    Generated Engine View
+                  </p>
+                  <span class="flex items-center gap-1.5 rounded-md bg-violet-600/10 border border-violet-500/25 px-2 py-0.5 text-[9px] font-medium text-violet-300">
+                    <span class="h-1.5 w-1.5 rounded-full bg-violet-400 anim-pulse-dot"></span>
+                    Live
+                  </span>
+                </div>
+                <p class="mt-2.5 text-[12px] leading-relaxed text-neutral-400">
+                  Injected general-purpose widget context directly into active space. Render layout
+                  optimized natively.
+                </p>
+              </article>
+
+            </div>
+          </div>
+        </div>
+
+        <!-- Floating Hub Dock -->
+        <footer class="relative z-10 flex items-end justify-center px-4 pb-4 pt-2">
+          <nav class="canvas-hub-glass flex items-center gap-0.5 rounded-full p-1.5" aria-label="Canvas hub">
+            <span class="canvas-hub-segment canvas-hub-segment-active rounded-full px-4 py-1.5 text-[11px] sm:text-[12px] font-semibold" onclick="toggleSegment(this)">
+              Canvas Hub
+            </span>
+            <span class="canvas-hub-segment rounded-full px-4 py-1.5 text-[11px] sm:text-[12px] font-medium" onclick="toggleSegment(this)">
+              Files
+            </span>
+            <span class="canvas-hub-segment rounded-full px-4 py-1.5 text-[11px] sm:text-[12px] font-medium" onclick="toggleSegment(this)">
+              Web Link
+            </span>
+          </nav>
+        </footer>
+
+      </div>
+    </div>
+  </main>
+
+  <!-- Interactive Hub Controller -->
+  <script>
+    // Handles clicking segments on the bottom Hub dock bar
+    function toggleSegment(element) {
+      const parent = element.parentNode;
+      const segments = parent.querySelectorAll('.canvas-hub-segment');
+      segments.forEach(s => {
+        s.classList.remove('canvas-hub-segment-active', 'font-semibold');
+        s.classList.add('font-medium');
+      });
+      element.classList.add('canvas-hub-segment-active', 'font-semibold');
+      element.classList.remove('font-medium');
+    }
+
+    // Dynamic Clock script to make the illustration UI feel alive
+    function updateClock() {
+      const clockElement = document.getElementById('canvas-clock');
+      const now = new Date();
+      let hours = now.getHours();
+      const minutes = String(now.getMinutes()).padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12; // convert '0' to '12'
+      clockElement.textContent = `${hours}:${minutes} ${ampm}`;
+    }
+    setInterval(updateClock, 1000);
+    updateClock(); // Initial run
+  </script>
+
+  <!-- Technical Spec Sheet for Designers -->
+  <section id="spec-sheet" class="w-full max-w-5xl">
+    <div class="border border-zinc-800 rounded-2xl bg-zinc-950 p-6 md:p-8">
+      <h2 class="text-lg font-bold text-white mb-6 flex items-center gap-2">
+        <svg class="w-4 h-4 text-violet-400" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+        </svg>
+        Design Specifications & UI Tokens
+      </h2>
+      
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        
+        <!-- Palette Tokens -->
+        <div class="space-y-4">
+          <h3 class="text-xs uppercase tracking-wider text-zinc-500 font-semibold">Color Palette</h3>
+          
+          <div class="grid grid-cols-2 gap-3">
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: #0b0d12;"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Canvas BG</p>
+                <code class="text-[10px] text-zinc-500">#0b0d12</code>
+              </div>
+            </div>
+            
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: rgba(255,255,255,0.025);"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Surface Card</p>
+                <code class="text-[10px] text-zinc-500">rgba(255,255,255,0.025)</code>
+              </div>
+            </div>
+
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: #7c3aed;"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Accent Violet</p>
+                <code class="text-[10px] text-zinc-500">#7c3aed</code>
+              </div>
+            </div>
+
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: rgba(255,255,255,0.08);"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Standard Border</p>
+                <code class="text-[10px] text-zinc-500">rgba(255,255,255,0.08)</code>
+              </div>
+            </div>
+
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: rgba(167, 139, 250, 0.25);"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Active Border</p>
+                <code class="text-[10px] text-zinc-500">rgba(167,139,250,0.25)</code>
+              </div>
+            </div>
+
+            <div class="token-card p-3 flex items-center gap-2.5">
+              <span class="w-6 h-6 rounded border border-zinc-800" style="background-color: #10b981;"></span>
+              <div>
+                <p class="text-xs font-semibold text-zinc-200">Signal Green</p>
+                <code class="text-[10px] text-zinc-500">#10b981</code>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Typography & Layout Tokens -->
+        <div class="space-y-4">
+          <h3 class="text-xs uppercase tracking-wider text-zinc-500 font-semibold">Typography & Structural Tokens</h3>
+          
+          <div class="token-card p-4 space-y-3">
+            <div>
+              <p class="text-xs font-semibold text-zinc-200">Primary Font Family</p>
+              <p class="text-xs text-zinc-400 mt-0.5">Inter, sans-serif <span class="text-zinc-500">(Weights: 300, 400, 500, 600, 700)</span></p>
+            </div>
+            
+            <hr class="border-zinc-800/80">
+            
+            <div>
+              <p class="text-xs font-semibold text-zinc-200">Terminal / Code Family</p>
+              <p class="text-xs text-zinc-400 mt-0.5">JetBrains Mono, monospace <span class="text-zinc-500">(Weights: 400, 500, 600)</span></p>
+            </div>
+
+            <hr class="border-zinc-800/80">
+
+            <div class="flex items-center justify-between text-xs">
+              <div>
+                <p class="font-semibold text-zinc-200">Frame border-radius</p>
+                <p class="text-zinc-500 text-[10px]">Corner curves</p>
+              </div>
+              <span class="spec-badge">1.25rem (20px)</span>
+            </div>
+
+            <div class="flex items-center justify-between text-xs">
+              <div>
+                <p class="font-semibold text-zinc-200">Surface border-radius</p>
+                <p class="text-zinc-500 text-[10px]">Inner module cards</p>
+              </div>
+              <span class="spec-badge">0.875rem (14px)</span>
+            </div>
+            
+            <div class="flex items-center justify-between text-xs">
+              <div>
+                <p class="font-semibold text-zinc-200">Shadow Specs</p>
+                <p class="text-zinc-500 text-[10px]">Atmospheric depth</p>
+              </div>
+              <span class="spec-badge">0 48px 120px -24px rgba(0,0,0,0.7)</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+</body>
+</html>

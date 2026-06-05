@@ -4,6 +4,10 @@
 //! aarch64 / riscv64: stubs — architecture-specific walkers added in later milestones.
 
 use bitflags::bitflags;
+use spin::Mutex;
+use crate::mm::frame_allocator;
+
+pub(crate) static PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
 
 // ─── Page-table entry flags (shared across architectures) ─────────────────────
 
@@ -207,7 +211,17 @@ mod x86_64_impl {
         let pt_phys = unsafe { ensure_next_table_flags(pd.add(pd_idx), user_flags) }
             .ok_or("OOM: PT")?;
         let pt = phys_to_virt(pt_phys) as *mut u64;
-        unsafe { pt.add(pt_idx).write_volatile((phys & PHYS_MASK) | flags.bits()); }
+        unsafe {
+            pt.add(pt_idx).write_volatile((phys & PHYS_MASK) | flags.bits());
+            let active_cr3 = read_cr3() & PHYS_MASK;
+            if pml4_phys == active_cr3 {
+                invlpg(virt);
+            }
+            if virt >= 0x112670000 && virt <= 0x112690000 {
+                log::warn!("[DEBUG-PAGING] mapped virt={:#x} phys={:#x} in pml4={:#x} pt_entry={:#x}",
+                    virt, phys, pml4_phys, pt.add(pt_idx).read_volatile());
+            }
+        }
         Ok(())
     }
 
@@ -234,6 +248,33 @@ mod x86_64_impl {
             let pte = pt.add(pt_idx).read_volatile();
             if pte & present == 0 { return None; }
             Some(pte & PHYS_MASK)
+        }
+    }
+
+    pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
+        let present  = PageFlags::PRESENT.bits();
+
+        unsafe {
+            let pml4 = phys_to_virt(pml4_phys) as *const u64;
+            let pml4e = pml4.add(pml4_idx).read_volatile();
+            if pml4e & present == 0 { return None; }
+            let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *const u64;
+            let pdpte = pdpt.add(pdpt_idx).read_volatile();
+            if pdpte & present == 0 { return None; }
+            let pd = phys_to_virt(pdpte & PHYS_MASK) as *const u64;
+            let pde = pd.add(pd_idx).read_volatile();
+            if pde & present == 0 { return None; }
+            let pt = phys_to_virt(pde & PHYS_MASK) as *const u64;
+            let pte = pt.add(pt_idx).read_volatile();
+            if pte & present == 0 { return None; }
+            let phys = pte & PHYS_MASK;
+            let writable = (pte & PageFlags::WRITABLE.bits()) != 0;
+            let exec = (pte & PageFlags::NO_EXECUTE.bits()) == 0;
+            Some((phys, writable, exec))
         }
     }
 
@@ -328,6 +369,37 @@ mod x86_64_impl {
             Some(phys)
         }
     }
+
+    /// Walk a user PML4 and free a mapped user page.
+    pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+        let pml4_idx = ((virt >> 39) & 0x1ff) as usize;
+        let pdpt_idx = ((virt >> 30) & 0x1ff) as usize;
+        let pd_idx   = ((virt >> 21) & 0x1ff) as usize;
+        let pt_idx   = ((virt >> 12) & 0x1ff) as usize;
+        let present  = PageFlags::PRESENT.bits();
+
+        let pml4 = phys_to_virt(pml4_phys) as *mut u64;
+        let pml4e = pml4.add(pml4_idx).read_volatile();
+        if pml4e & present == 0 { return Err("not present"); }
+        let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *mut u64;
+        let pdpte = pdpt.add(pdpt_idx).read_volatile();
+        if pdpte & present == 0 { return Err("not present"); }
+        let pd = phys_to_virt(pdpte & PHYS_MASK) as *mut u64;
+        let pde = pd.add(pd_idx).read_volatile();
+        if pde & present == 0 { return Err("not present"); }
+        let pt = phys_to_virt(pde & PHYS_MASK) as *mut u64;
+        let pte_ptr = pt.add(pt_idx);
+        let pte = pte_ptr.read_volatile();
+        if pte & present == 0 { return Err("not present"); }
+
+        let phys = pte & PHYS_MASK;
+        pte_ptr.write_volatile(0);
+        invlpg(virt);
+        if virt >= 0x112670000 && virt <= 0x112690000 {
+            log::warn!("[DEBUG-PAGING] unmapped virt={:#x} in pml4={:#x}", virt, pml4_phys);
+        }
+        Ok(phys)
+    }
 }
 
 // ─── Non-x86_64 stubs ─────────────────────────────────────────────────────────
@@ -365,6 +437,7 @@ pub fn init(hhdm_offset: u64) {
 /// * `set_hhdm_offset()` must have run before this.
 /// * `virt` and `phys` must be 4-KiB aligned.
 pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_page(virt, phys, flags) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -376,6 +449,7 @@ pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
 /// # Safety
 /// Same preconditions as [`map_page`].
 pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_mmio(phys, virt, size) }
     #[cfg(not(target_arch = "x86_64"))]
@@ -384,47 +458,60 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
 
 /// Handle a demand-page fault. Returns `true` if the fault was resolved.
 pub fn demand_page(cr2: u64, error: u64) -> bool {
-    // Only handle user-mode not-present faults (bits: present=0, user=1).
-    // Ignore write-protection violations (bit1=1, bit0=1) and kernel faults.
     if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
-    if error & 0x4 == 0 { return false; } // kernel mode fault — do not silently map
-
-    // Valid user-space VA range: 0x100000 – canonical limit (below kernel half).
-    // Exclude the trampoline pages at 0x7FFF_E000 (only 2GB mark — but user
-    // space extends to 128TB in x86_64). Reject anything at or above canonical
-    // kernel boundary (0xFFFF_8000_0000_0000) and below 1MB.
-    let page_va = cr2 & !0xFFF;
-    if page_va < 0x10_0000 || page_va >= 0x0000_8000_0000_0000 { return false; }
-    // Exclude the trampoline and sysdata pages.
-    if page_va == 0x7FFF_C000 || page_va == 0x7FFF_E000 || page_va == 0x7FFF_F000 { return false; }
-
-    // Allocate a zero physical frame and map it into the current PML4.
-    let phys = match crate::mm::frame_allocator::alloc_frame() {
-        Some(f) => f,
-        None => {
-            log::error!("[demand_page] OOM: cannot satisfy fault at {:#x}", cr2);
-            return false;
-        }
-    };
-
-    // Zero the frame via HHDM.
-    let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
-    unsafe { core::ptr::write_bytes(hhdm_va, 0, 4096); }
 
     // Read current CR3 to get the active PML4.
     let cr3_phys: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
     let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
 
-    let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE;
-    let _ = flags;
-    if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) } {
-        log::error!("[demand_page] map failed at {:#x}: {}", page_va, e);
-        crate::mm::frame_allocator::free_frame(phys);
-        return false;
+    let page_va = cr2 & !0xFFF;
+
+    // Check if the page is already mapped (stale TLB entry due to another CPU core mapping it first)
+    if translate_user_page(cr3_phys, page_va).is_some() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) page_va, options(nostack, preserves_flags));
+        }
+        return true;
     }
 
-    true
+    // Check if the fault address is in the mirroring range [0x1_0000_0000, 0x3_0000_0000)
+    if page_va >= 0x1_0000_0000 && page_va < 0x3_0000_0000 {
+        let mirrored_va = page_va - 0x1_0000_0000;
+        
+        // Translate the mirrored page to get its physical frame and flags.
+        let target = translate_user_page_flags(cr3_phys, mirrored_va);
+        
+        if let Some((phys, writable, exec)) = target {
+            if let Err(e) = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, writable, exec) } {
+                log::error!("[demand_page] mirrored map failed at {:#x}: {}", page_va, e);
+                return false;
+            }
+            return true;
+        }
+    }
+
+    // Phase 32-C: Demand page anonymous memory in range [0x3_0000_0000, 0x8_0000_0000)
+    if page_va >= 0x3_0000_0000 && page_va < 0x8_0000_0000 {
+        let frame_opt = frame_allocator::alloc_frame();
+        if let Some(phys) = frame_opt {
+            let hhdm = (phys + frame_allocator::hhdm_offset()) as *mut u8;
+            unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
+            let map_res = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) };
+            if map_res.is_ok() {
+                return true;
+            } else {
+                log::error!("[demand_page] map_user_page_with_flags failed at {:#x}: {:?}", page_va, map_res.err());
+                frame_allocator::free_frame(phys);
+            }
+        } else {
+            log::error!("[demand_page] OOM: alloc_frame returned None for addr {:#x}", page_va);
+        }
+    }
+
+    // Reject all other page faults outside the mirrored range.
+    false
 }
 
 // ── User address space helpers ────────────────────────────────────────────────
@@ -444,6 +531,7 @@ pub fn alloc_user_pml4() -> Option<u64> {
 pub unsafe fn map_user_page(pml4_phys: u64, virt: u64, phys: u64)
     -> Result<(), &'static str>
 {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     return unsafe {
         x86_64_impl::map_page_in(
@@ -463,6 +551,7 @@ pub unsafe fn map_user_page_with_flags(
     pml4_phys: u64, virt: u64, phys: u64,
     writable: bool, exec: bool,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     {
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
@@ -477,14 +566,26 @@ pub unsafe fn map_user_page_with_flags(
 /// Walk a user PML4 and return the physical frame already mapped at `virt`,
 /// or `None` if the page is not yet mapped.
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
     #[cfg(not(target_arch = "x86_64"))]
     { let _ = (pml4_phys, virt); None }
 }
 
+/// Walk a user PML4 and return the physical frame mapped at `virt` along with
+/// its writable and executable flags.
+pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+    let _lock = PAGE_TABLE_LOCK.lock();
+    #[cfg(target_arch = "x86_64")]
+    { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
+    #[cfg(not(target_arch = "x86_64"))]
+    { let _ = (pml4_phys, virt); None }
+}
+
 /// Free all frames in a user PML4 and the PML4 itself.
 pub fn free_user_pml4(pml4_phys: u64) {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::free_user_pml4(pml4_phys);
     #[cfg(not(target_arch = "x86_64"))]
@@ -501,6 +602,7 @@ pub unsafe fn update_user_page(
     writable: bool,
     exec: bool,
 ) -> Result<(), &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { x86_64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
@@ -509,6 +611,37 @@ pub unsafe fn update_user_page(
     {
         let _ = (pml4_phys, virt, writable, exec);
         Ok(())
+    }
+}
+
+/// Unmap a single 4-KiB page in a specific PML4 and return its physical frame.
+///
+/// # Safety
+/// `pml4_phys` must be a valid allocated PML4.
+pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+    let _lock = PAGE_TABLE_LOCK.lock();
+    #[cfg(target_arch = "x86_64")]
+    {
+        unsafe { x86_64_impl::unmap_user_page(pml4_phys, virt) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (pml4_phys, virt);
+        Err("unsupported")
+    }
+}
+
+/// Unmap a range of virtual addresses in a specific PML4 and free their physical frames.
+pub fn unmap_user_range(pml4_phys: u64, start_va: u64, size: u64) {
+    if size == 0 { return; }
+    let start = start_va & !0xFFF;
+    let end = (start_va + size + 4095) & !0xFFF;
+    for virt in (start..end).step_by(4096) {
+        unsafe {
+            if let Ok(phys) = unmap_user_page(pml4_phys, virt) {
+                crate::mm::frame_allocator::free_frame(phys);
+            }
+        }
     }
 }
 

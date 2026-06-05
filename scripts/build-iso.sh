@@ -70,8 +70,8 @@ fi
 echo "[0.3/5] Compiling system shell to AOT ELF (libapp.so)..."
 DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
 FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
-SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk_product/"
-GEN_SNAP="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/gen_snapshot_x64"
+SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
+GEN_SNAP="$ROOT/scratch/linux-x64/gen_snapshot"
 PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
 APP_MAIN="$APP_DIR/lib/main.dart"
 AOT_DILL="$APP_DIR/build/app_aot.dill"
@@ -92,10 +92,15 @@ if [ ! -f "$AOT_DILL" ]; then
 fi
 
 mkdir -p "$ROOT/initramfs/system/flutter"
-"$GEN_SNAP" \
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    ubuntu:22.04 \
+    "$GEN_SNAP" \
     --deterministic \
     --snapshot_kind=app-aot-elf \
     --elf="$LIBAPP_SO_DEST" \
+    --dedup_instructions \
     --strip \
     "$AOT_DILL" 2>&1
 
@@ -103,20 +108,32 @@ if [ ! -f "$LIBAPP_SO_DEST" ]; then
     echo "ERROR: gen_snapshot_x64 failed — libapp.so not produced" >&2
     exit 1
 fi
+python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO_DEST"
 echo "[0.3/5] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes"
 
-echo "[0.35/5] Packing demo .osx seed bundle..."
-mkdir -p "$ROOT/initramfs/system/seed"
-python3 "$ROOT/tools/oscortex-pack.py" \
-    "$LIBAPP_SO_DEST" \
-    "$ROOT/initramfs/system/seed/demo.osx" \
-    --name "Demo"
+echo "[0.35/5] Building core system apps into /Applications..."
+mkdir -p "$ROOT/initramfs/Applications"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_canvas" \
+    "Canvas" \
+    "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx" \
+    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_files" \
+    "Files" \
+    "$ROOT/initramfs/Applications/Files.app/Files.osx" \
+    "$ROOT/initramfs/Applications/Files.app/flutter_assets"
+"$ROOT/tools/build-flutter-osx.sh" \
+    "$ROOT/apps/oscortex_web_link" \
+    "Web Link" \
+    "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx" \
+    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets"
 
 if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
     mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
 
-    for f in kernel_blob.bin vm_snapshot_data isolate_snapshot_data; do
+    for f in kernel_blob.bin; do
         if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
             echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
             exit 1
@@ -124,11 +141,22 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
     done
     python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 
     rm -f \
         "$ROOT/initramfs/system/flutter/kernel_blob.bin" \
         "$ROOT/initramfs/system/flutter/vm_snapshot_data" \
-        "$ROOT/initramfs/system/flutter/isolate_snapshot_data"
+        "$ROOT/initramfs/system/flutter/isolate_snapshot_data" \
+        "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets/isolate_snapshot_data" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/vm_snapshot_data" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/isolate_snapshot_data"
 
     for f in AssetManifest.bin FontManifest.json NOTICES.Z NativeAssetsManifest.json version.json; do
         if [ -f "$APP_ASSETS_DIR/$f" ]; then
@@ -136,7 +164,7 @@ if [ -d "$APP_ASSETS_DIR" ]; then
         fi
     done
 
-    for d in fonts packages shaders; do
+    for d in fonts packages shaders assets; do
         if [ -d "$APP_ASSETS_DIR/$d" ]; then
             rm -rf "$ROOT/initramfs/system/flutter/flutter_assets/$d"
             cp -R "$APP_ASSETS_DIR/$d" "$ROOT/initramfs/system/flutter/flutter_assets/$d"
@@ -147,31 +175,38 @@ else
     exit 1
 fi
 
-echo "[0.5/5] Staging Flutter engine runtime..."
+echo "[0.5/5] Compiling and staging userspace libc helper..."
+mkdir -p "$ROOT/initramfs/system/lib"
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    gcc:12 \
+    gcc -shared -fPIC -ffreestanding -nostdlib -O2 \
+    -o "$ROOT/initramfs/system/lib/liboscortex_libc.so" \
+    "$ROOT/userspace/libc/libc.c"
+
+echo "[0.51/5] Staging Flutter engine runtime..."
 if [ ! -f "$FLUTTER_ENGINE_SO" ]; then
     echo "ERROR: missing Flutter engine binary: $FLUTTER_ENGINE_SO" >&2
     exit 1
 fi
-mkdir -p "$ROOT/initramfs/system/lib"
 cp "$FLUTTER_ENGINE_SO" "$ROOT/initramfs/system/lib/libflutter_engine.so"
-if [ "${OSC_SKIP_ENGINE_PATCH:-0}" = "1" ]; then
-    echo "[0.5/5] OSC_SKIP_ENGINE_PATCH=1 — staging PRISTINE engine (no P1-P10 patches)"
-else
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" \
-        --engine "$ROOT/initramfs/system/lib/libflutter_engine.so" \
-        --apply-all
-fi
+echo "[0.51/5] Staging PATCHED profile engine"
 
 REQUIRED_FILES=(
     "$ROOT/initramfs/init"
     "$ROOT/initramfs/bin/oscortex-host"
     "$ROOT/initramfs/system/lib/libflutter_engine.so"
+    "$ROOT/initramfs/system/lib/liboscortex_libc.so"
     "$ROOT/initramfs/system/flutter/icudtl.dat"
     "$ROOT/initramfs/system/flutter/libapp.so"
-    "$ROOT/initramfs/system/seed/demo.osx"
+    "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx"
+    "$ROOT/initramfs/Applications/Files.app/Files.osx"
+    "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
     "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
-    "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data"
-    "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
+    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+    "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 )
 for req in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$req" ]; then
@@ -181,6 +216,7 @@ for req in "${REQUIRED_FILES[@]}"; do
 done
 
 echo "[1/5] Building kernel ELF..."
+touch "$ROOT/kernel/src/fs/initramfs.rs"
 cd "$ROOT"
 cargo +nightly build \
     --release \
@@ -196,7 +232,7 @@ rm -rf "$ISO_ROOT"
 mkdir -p "$ISO_ROOT/boot/limine"
 mkdir -p "$ISO_ROOT/EFI/BOOT"
 
-cp "$KERNEL_ELF" "$ISO_ROOT/boot/kernel"
+cat "$KERNEL_ELF" > "$ISO_ROOT/boot/kernel"
 
 cp "$LIMINE_DIR/limine-bios-cd.bin" "$ISO_ROOT/boot/limine/"
 cp "$LIMINE_DIR/limine-bios.sys"    "$ISO_ROOT/boot/limine/"
@@ -219,7 +255,7 @@ verbose: yes
 EOF
 
 STAGED_ENGINE_SO="$ROOT/initramfs/system/lib/libflutter_engine.so"
-cp "$STAGED_ENGINE_SO" "$ISO_ROOT/boot/libflutter_engine.so"
+cat "$STAGED_ENGINE_SO" > "$ISO_ROOT/boot/libflutter_engine.so"
 echo "[2/5] Staged libflutter_engine.so ($(du -sh "$STAGED_ENGINE_SO" | cut -f1)) as Limine module"
 
 cp "$ISO_ROOT/boot/limine/limine.conf" "$ISO_ROOT/limine.conf"
@@ -244,8 +280,8 @@ if [[ "${1:-}" == "--run" ]]; then
     qemu-system-x86_64 \
         -cdrom "$OUTPUT" \
         -cpu qemu64,+x2apic \
-        -m 512M \
-        -smp 2 \
+        -m 2G \
+        -smp 1 \
         -serial stdio \
         -display none \
         -no-reboot \

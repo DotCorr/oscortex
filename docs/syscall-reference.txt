@@ -1,0 +1,929 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                  O S C O R T E X   S Y S C A L L   R E F E R E N C E           ║
+║                        Canonical ABI — updated 2026-06-01                       ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+  Source of truth: kernel/src/embedder/abi.rs + kernel/src/syscall/dispatch.rs
+  ABI version:     EMBEDDER_ABI_VERSION = 8
+
+
+  CALLING CONVENTION (x86-64)
+  ───────────────────────────
+  OSCortex uses the SYSCALL instruction with the Linux-style register mapping:
+
+    RAX  ─  syscall number
+    RDI  ─  arg0
+    RSI  ─  arg1
+    RDX  ─  arg2
+    R10  ─  arg3
+    R8   ─  arg4
+    R9   ─  arg5  (used only by Linux mmap; most calls use ≤4 args)
+
+    Return value in RAX:
+      ≥ 0   success (value is call-specific)
+      < 0   negated errno  (e.g. -2 = ENOENT, -11 = EAGAIN, -38 = ENOSYS)
+
+  The kernel saves user RIP and RSP into the process control block on every
+  SYSCALL entry, enabling cooperative scheduling and context restoration.
+
+  If FS base is zero on entry, the kernel bootstraps a per-thread TLS area
+  near the user stack top (rsp − 0x200) automatically.
+
+
+  ERROR CODES
+  ───────────
+  ┌──────────┬────────┬─────────────────────────────────────────────┐
+  │ Constant │ Value  │ Description                                 │
+  ├──────────┼────────┼─────────────────────────────────────────────┤
+  │ EPERM    │  -1    │ Operation not permitted                     │
+  │ ENOENT   │  -2    │ No such file or directory                   │
+  │ ESRCH    │  -3    │ No such process / isolate                   │
+  │ EBADF    │  -9    │ Bad file descriptor / handle                │
+  │ EAGAIN   │ -11    │ Resource temporarily unavailable (try again)│
+  │ ENOMEM   │ -12    │ Out of memory                               │
+  │ EFAULT   │ -14    │ Bad address (invalid user pointer)          │
+  │ ENOSYS   │ -38    │ Syscall not implemented                     │
+  │ ENODATA  │ -61    │ No data available                           │
+  │ EOVERFLOW│ -75    │ Value too large for data type               │
+  │ ENOBUFS  │ -105   │ No buffer space available                   │
+  │ ENOTCONN │ -107   │ Transport endpoint not connected            │
+  │ ETIMEDOUT│ -110   │ Connection timed out                        │
+  └──────────┴────────┴─────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 1. POSIX-COMPATIBLE SYSCALLS  (Linux ABI numbers, 0x00–0xFF range)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  These use standard Linux syscall numbers so unmodified C libraries and the
+  Flutter engine can call them directly via the SYSCALL instruction.
+
+  ┌──────┬──────────────────────┬──────────────────────────────┬──────────────┐
+  │  NR  │ Name                 │ Arguments                    │ Returns      │
+  ├──────┼──────────────────────┼──────────────────────────────┼──────────────┤
+  │    0 │ sys_read             │ fd, buf_ptr, len             │ bytes_read   │
+  │    1 │ sys_write            │ fd, buf_ptr, len             │ bytes_written│
+  │    2 │ sys_open             │ path_ptr, path_len, flags    │ fd           │
+  │    3 │ sys_close            │ fd                           │ 0            │
+  │    4 │ sys_stat             │ path_ptr, stat_ptr           │ 0 / -ENOENT │
+  │    5 │ sys_fstat            │ fd, stat_ptr                 │ 0            │
+  │    6 │ sys_lstat            │ path_ptr, stat_ptr           │ 0 / -ENOENT │
+  │    7 │ poll                 │ fds, nfds, timeout           │ 0 (stub)     │
+  │    8 │ sys_lseek            │ fd, offset, whence           │ new_offset   │
+  │    9 │ sys_mmap             │ addr,len,prot,flags,fd,off   │ va / -ENOMEM │
+  │   10 │ sys_mprotect         │ addr, len, prot              │ 0 (stub)     │
+  │   11 │ sys_munmap           │ addr, len                    │ 0 (stub)     │
+  │   12 │ brk                  │ addr                         │ 0 (stub)     │
+  │   20 │ sys_writev           │ fd, iov_ptr, iov_cnt         │ bytes_written│
+  │   21 │ sys_access           │ path_ptr, mode               │ 0 / -ENOENT │
+  │   39 │ sys_getpid           │ —                            │ pid          │
+  │   56 │ sys_clone            │ flags, stack                 │ tid          │
+  │   57 │ fork                 │ —                            │ -38 (ENOSYS) │
+  │   59 │ sys_exec             │ path_ptr, args_ptr           │ 0            │
+  │   60 │ sys_exit             │ code                         │ ! (no return)│
+  │   61 │ sys_waitpid          │ pid, status_ptr, options     │ pid          │
+  │   62 │ sys_kill             │ pid, signal                  │ 0            │
+  │  158 │ sys_arch_prctl       │ code, addr                   │ 0            │
+  │  186 │ sys_gettid           │ —                            │ tid          │
+  │  202 │ sys_futex            │ uaddr, op, val               │ varies       │
+  │  213 │ epoll_create         │ size                         │ fd           │
+  │  228 │ clock_gettime        │ clock_id, timespec_ptr       │ 0            │
+  │  231 │ exit_group           │ code                         │ ! (no return)│
+  │  232 │ epoll_wait           │ epfd, events, max, timeout   │ count        │
+  │  233 │ epoll_ctl            │ epfd, op, fd, event_ptr      │ 0            │
+  │  257 │ openat               │ dirfd, path, flags, mode     │ fd           │
+  │  262 │ newfstatat           │ dirfd, path, stat, flags     │ 0            │
+  │  269 │ faccessat            │ dirfd, path, mode, flags     │ 0 / -ENOENT │
+  │  281 │ epoll_pwait          │ epfd, events, max, timeout   │ count        │
+  │  283 │ timerfd_create       │ clock_id, flags              │ fd           │
+  │  284 │ eventfd              │ initval, flags               │ fd           │
+  │  286 │ timerfd_settime      │ fd, flags, new_val, old_val  │ 0            │
+  │  290 │ eventfd2             │ initval, flags               │ fd           │
+  │  291 │ epoll_create1        │ flags                        │ fd           │
+  │  293 │ pipe2                │ pipefd_ptr, flags            │ 0            │
+  │  318 │ getrandom            │ buf, len, flags              │ bytes_written│
+  │  192 │ poweroff             │ —                            │ ! (halts)    │
+  └──────┴──────────────────────┴──────────────────────────────┴──────────────┘
+
+  Note: sys_mmap without MAP_FIXED forces hint_va=0. File-backed mmap copies
+  file data into allocated pages. mprotect and munmap are stubs in the current
+  implementation.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 2. IPC  (0x200–0x201)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────┬──────────────────────────────┬───────────────┐
+  │  NR   │ Name             │ Arguments                    │ Returns       │
+  ├───────┼──────────────────┼──────────────────────────────┼───────────────┤
+  │ 0x200 │ ipc_send         │ dst_pid, buf_ptr, buf_len    │ 0             │
+  │ 0x201 │ ipc_recv         │ buf_ptr, buf_len             │ bytes_read    │
+  └───────┴──────────────────┴──────────────────────────────┴───────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 3. COMPOSITOR / SURFACE  (0x300–0x312)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Kernel-managed compositing surfaces. Each surface is a rectangular RGBA32
+  buffer positioned in screen coordinates. The compositor z-sorts all visible
+  surfaces and blits them to the framebuffer on vsync.
+
+  ┌───────┬────────────────────────────┬────────────────────────┬──────────────┐
+  │  NR   │ Name                       │ Arguments              │ Returns      │
+  ├───────┼────────────────────────────┼────────────────────────┼──────────────┤
+  │ 0x300 │ surface_create             │ x_y_packed, w_h_packed │ surface_id   │
+  │ 0x301 │ surface_move               │ surface_id, x, y       │ 0            │
+  │ 0x302 │ surface_destroy            │ surface_id             │ 0            │
+  │ 0x303 │ surface_upload_rgba32      │ surface_id, ptr, len   │ 0            │
+  │ 0x304 │ surface_present            │ surface_id             │ 0            │
+  │ 0x305 │ fb_size_packed             │ —                      │ packed(w,h)  │
+  │ 0x306 │ vsync_counter              │ —                      │ frame_count  │
+  │ 0x307 │ vsync_wait_nonblock        │ last_frame             │ 0 / -EAGAIN  │
+  │ 0x308 │ surface_owner              │ surface_id             │ pid          │
+  │ 0x309 │ surface_z_get              │ surface_id             │ z_order      │
+  │ 0x30A │ surface_z_set              │ surface_id, z          │ 0            │
+  │ 0x30B │ surface_geometry_get       │ surface_id             │ packed(x,y,  │
+  │       │                            │                        │   w,h)       │
+  │ 0x30C │ surface_geometry_set       │ surface_id, x_y, w_h   │ 0            │
+  │ 0x30D │ surface_visibility_get     │ surface_id             │ 0 / 1        │
+  │ 0x30E │ surface_visibility_set     │ surface_id, visible    │ 0            │
+  │ 0x30F │ surface_clip_set           │ surface_id, xy, wh     │ 0            │
+  │ 0x310 │ surface_damage_set         │ surface_id, xy, wh     │ 0            │
+  │ 0x311 │ surface_damage_get         │ surface_id             │ packed       │
+  │ 0x312 │ surface_flip               │ surface_id             │ 0            │
+  └───────┴────────────────────────────┴────────────────────────┴──────────────┘
+
+  Packed encoding for fb_size_packed:  (width << 32) | height
+  Geometry packing:  arg1 = (x << 32) | y,  arg2 = (w << 32) | h
+
+  Typical flow:
+    1. surface_create(pos, size) → id
+    2. surface_upload_rgba32(id, pixels, len)
+    3. surface_present(id)           ← marks dirty, compositor blits on vsync
+    4. Wait for vsync_wait_nonblock or poll EV_VSYNC events
+    5. Repeat 2–4 per frame
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 4. WINDOW MANAGER EVENTS  (0x320–0x336)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬────────────────────────────┬────────────────────────┬──────────────┐
+  │  NR   │ Name                       │ Arguments              │ Returns      │
+  ├───────┼────────────────────────────┼────────────────────────┼──────────────┤
+  │ 0x320 │ wm_event_poll              │ —                      │ count        │
+  │ 0x321 │ wm_event_read              │ buf_ptr, buf_len       │ bytes_read   │
+  │ 0x322 │ wm_event_inject            │ kind, flags, a         │ 0            │
+  │ 0x323 │ wm_event_wait              │ kind, flags, a         │ 0 (blocks)   │
+  │ 0x330 │ embedder_abi_version       │ —                      │ version (8)  │
+  │ 0x331 │ wm_event_size              │ —                      │ sizeof(WmEv) │
+  │ 0x332 │ wm_event_stats             │ —                      │ packed stats │
+  │ 0x333 │ wm_focus_pid_get           │ —                      │ focused pid  │
+  │ 0x334 │ wm_focus_surface_set       │ surface_id             │ 0            │
+  │ 0x335 │ wm_focus_mirror_get        │ —                      │ packed       │
+  │ 0x336 │ wm_focus_mirror_set        │ pid_surface_packed     │ 0            │
+  └───────┴────────────────────────────┴────────────────────────┴──────────────┘
+
+  WmEvent struct (32 bytes, repr C):
+    ┌────────┬───────┬──────────────────────────────────────────┐
+    │ Offset │ Size  │ Field                                    │
+    ├────────┼───────┼──────────────────────────────────────────┤
+    │  0x00  │  8    │ seq:   u64  — monotonic sequence number  │
+    │  0x08  │  4    │ kind:  u32  — event type (see table)     │
+    │  0x0C  │  4    │ flags: u32  — event-specific flags       │
+    │  0x10  │  8    │ a:     u64  — primary payload            │
+    │  0x18  │  8    │ b:     u64  — secondary payload          │
+    └────────┴───────┴──────────────────────────────────────────┘
+
+  WM Event Types:
+    ┌─────┬─────────────────┬────────────────────────────────────────────┐
+    │ ID  │ Constant        │ Description                                │
+    ├─────┼─────────────────┼────────────────────────────────────────────┤
+    │  1  │ EV_VSYNC        │ Vertical sync — new frame ready            │
+    │  2  │ EV_POINTER      │ Pointer/touch: flags=button, a=x, b=y     │
+    │  3  │ EV_KEY          │ Keyboard: flags=scancode, a=pressed(0/1)   │
+    │  4  │ EV_APP          │ App lifecycle (APP_LAUNCH=1, TERMINATE=2,  │
+    │     │                 │   PAUSE=3, RESUME=4 in flags)              │
+    │  5  │ EV_FOCUS        │ Focus change: flags=FOCUS_LOST(1),         │
+    │     │                 │   FOCUS_GAINED(2), FOCUS_MIRROR(3)         │
+    │  6  │ EV_PLATFORM_MSG │ Incoming platform-channel message          │
+    │  7  │ EV_ISOLATE      │ Isolate state change: flags=state          │
+    │     │                 │   (RUNNING=1, PAUSED=2, DEAD=3),           │
+    │     │                 │   a=isolate_id, b=owner_pid                │
+    │  8  │ EV_ISOLATE_MSG  │ Incoming isolate message: flags=0,         │
+    │     │                 │   a=dst_isolate_id, b=message_byte_len     │
+    └─────┴─────────────────┴────────────────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 5. APP / ENGINE  (0x340–0x347)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬────────────────────────────┬────────────────────────┬──────────────┐
+  │  NR   │ Name                       │ Arguments              │ Returns      │
+  ├───────┼────────────────────────────┼────────────────────────┼──────────────┤
+  │ 0x340 │ app_notify                 │ kind, data, extra      │ 0            │
+  │ 0x341 │ proc_surface_count         │ pid                    │ count        │
+  │ 0x342 │ app_launch_path            │ buf_ptr, buf_len, pid  │ bytes_written│
+  │ 0x343 │ engine_policy_get          │ —                      │ flags        │
+  │ 0x344 │ engine_version_packed      │ —                      │ version      │
+  │ 0x345 │ engine_host_register       │ flags                  │ 0            │
+  │ 0x346 │ engine_host_pid_get        │ —                      │ pid          │
+  │ 0x347 │ engine_library_path_read   │ buf_ptr, buf_len       │ bytes_written│
+  └───────┴────────────────────────────┴────────────────────────┴──────────────┘
+
+  Engine policy flags (from engine_policy_get):
+    ENGINE_LOADER_DYNAMIC = 1   (dlopen path)
+    ENGINE_LOADER_STATIC  = 2   (linked-in engine)
+    ENGINE_TARGET_FLUTTER_3_29 = 0x0003_001D
+
+  engine_version_packed returns (major << 16 | minor) of the target engine.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 6. DYNAMIC LINKER  (0x350–0x355)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  In-kernel ELF loader. Used by the Flutter embedder to load
+  libflutter_engine.so at runtime.
+
+  ┌───────┬──────────────────┬───────────────────────────────┬──────────────┐
+  │  NR   │ Name             │ Arguments                     │ Returns      │
+  ├───────┼──────────────────┼───────────────────────────────┼──────────────┤
+  │ 0x350 │ dlopen           │ path_ptr, path_len, flags     │ handle       │
+  │ 0x351 │ dlsym            │ handle, name_ptr, name_len    │ vaddr        │
+  │ 0x352 │ dlclose          │ handle                        │ 0            │
+  │ 0x353 │ mmap             │ hint_va, size, prot           │ va           │
+  │ 0x354 │ munmap           │ va, size                      │ 0 (stub)     │
+  │ 0x355 │ mprotect         │ va, size, prot                │ 0 (stub)     │
+  └───────┴──────────────────┴───────────────────────────────┴──────────────┘
+
+  Note: These are the OSCortex-private mmap/munmap/mprotect variants (0x353–
+  0x355), separate from the Linux-numbered ones (9/10/11). Both route to the
+  same underlying allocator.
+
+  Protection flags for mmap/mprotect:
+    PROT_READ  = 1
+    PROT_WRITE = 2
+    PROT_EXEC  = 4
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 7. FLUTTER ENGINE BRIDGE  (0x356–0x359)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────────┬──────────────────────────┬──────────────┐
+  │  NR   │ Name                     │ Arguments                │ Returns      │
+  ├───────┼──────────────────────────┼──────────────────────────┼──────────────┤
+  │ 0x356 │ engine_proctable_set     │ ptr, size                │ 0            │
+  │ 0x357 │ engine_proctable_ptr_get │ —                        │ ptr          │
+  │ 0x358 │ engine_vsync_baton_post  │ baton                    │ 0            │
+  │ 0x359 │ gpu_submit               │ surface_id, px_ptr, len  │ 0            │
+  └───────┴──────────────────────────┴──────────────────────────┴──────────────┘
+
+  FlutterEngineProcTable (repr C, stored in engine-host address space):
+    ┌────────┬───────┬──────────────────────────────────────────────┐
+    │ Offset │ Size  │ Field                                        │
+    ├────────┼───────┼──────────────────────────────────────────────┤
+    │  0x00  │  8    │ run: u64                                     │
+    │  0x08  │  8    │ shutdown: u64                                 │
+    │  0x10  │  8    │ send_window_metrics: u64                      │
+    │  0x18  │  8    │ send_pointer_event: u64                       │
+    │  0x20  │  8    │ send_key_event: u64                           │
+    │  0x28  │  8    │ on_vsync: u64                                 │
+    │  0x30  │  8    │ schedule_frame: u64                           │
+    │  0x38  │  8    │ send_platform_message: u64                    │
+    │  0x40  │  64   │ _reserved: [u64; 8]                           │
+    └────────┴───────┴──────────────────────────────────────────────┘
+
+  The kernel stores only the struct VA; it does NOT dereference the function
+  pointers. Other processes can query the proc table via
+  engine_proctable_ptr_get to call engine functions in the host's VA space.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 8. THREADING  (0x35A–0x35C)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Shared-address-space threads (same PML4, separate stacks).
+
+  ┌───────┬──────────────────┬───────────────────────────────┬──────────────┐
+  │  NR   │ Name             │ Arguments                     │ Returns      │
+  ├───────┼──────────────────┼───────────────────────────────┼──────────────┤
+  │ 0x35A │ thread_create    │ entry_fn, arg, stack_size, ─  │ tid          │
+  │ 0x35B │ thread_exit      │ code                          │ ! (no return)│
+  │ 0x35C │ thread_join      │ tid                           │ exit_code    │
+  └───────┴──────────────────┴───────────────────────────────┴──────────────┘
+
+  thread_create allocates a new stack, clones the PML4, and starts execution
+  at entry_fn(arg). thread_join blocks until the target thread exits.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 9. PLATFORM CHANNELS  (0x360–0x363)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Bidirectional message passing between Flutter Dart code and kernel/native
+  services. This is how Dart plugins communicate with the OS.
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x360 │ platform_msg_post    │ ch_ptr, ch_len,            │ seq          │
+  │       │                      │ data_ptr, data_len         │              │
+  │ 0x361 │ platform_msg_recv    │ buf_ptr, buf_len           │ bytes_read   │
+  │ 0x362 │ platform_msg_reply   │ seq, data_ptr, data_len    │ 0            │
+  │ 0x363 │ platform_msg_ack     │ seq, buf_ptr, buf_len      │ bytes_read   │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  PLATFORM CHANNEL PROTOCOL
+  ─────────────────────────
+  Platform channels emulate the Flutter platform message API. Dart code calls
+  MethodChannel.invokeMethod → the engine sends a platform message → the
+  kernel queues it as an EV_PLATFORM_MSG event → the embedder reads it →
+  processes → replies.
+
+  Message lifecycle:
+
+    Dart side (sender)                  Native side (receiver)
+    ──────────────────                  ──────────────────────
+    1. platform_msg_post(channel,       2. wm_event_poll() shows EV_PLATFORM_MSG
+       data) → seq                      3. platform_msg_recv(buf) → message bytes
+                                        4. Process the message
+                                        5. platform_msg_reply(seq, response_data)
+    6. platform_msg_ack(seq, buf)
+       → reads the reply
+
+  The sequence number (seq) ties request and response together. Each post
+  returns a unique seq. The receiver MUST reply to every message; the sender
+  blocks on ack until the reply arrives.
+
+  Channel names are UTF-8 strings. Common channels:
+    "flutter/platform"       — system UI (clipboard, haptics, system nav)
+    "flutter/navigation"     — route changes
+    "flutter/textinput"      — IME / keyboard
+    "oscortex/system"        — OSCortex-specific system calls
+    "oscortex/files"         — File manager operations
+    "oscortex/pkg"           — Package manager queries
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 10. GPU / DISPLAY  (0x364–0x365)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x364 │ gpu_submit_strided   │ surface_id, px_ptr,        │ 0            │
+  │       │                      │ row_bytes                  │              │
+  │ 0x365 │ vsync_set_hz         │ hz (1–240)                 │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  gpu_submit_strided is the preferred blit path: the rasterizer writes RGBA32
+  rows with arbitrary stride (row_bytes may include padding). The kernel
+  copies row-by-row into the surface buffer.
+
+  gpu_submit (0x359) is the flat variant: pixel_len must equal w × h × 4.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 11. AOT / ISOLATES  (0x366–0x36C)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x366 │ aot_snapshot_load    │ path_ptr, path_len,        │ 0            │
+  │       │                      │ out_va_ptr, out_size_ptr   │              │
+  │ 0x367 │ isolate_spawn        │ aot_va, aot_size,          │ isolate_id   │
+  │       │                      │ entry_offset, stack_size   │              │
+  │ 0x368 │ isolate_kill         │ isolate_id                 │ 0            │
+  │ 0x369 │ isolate_ctrl         │ isolate_id, op             │ state        │
+  │ 0x36A │ isolate_msg_send     │ dst_id, data_ptr, data_len │ 0            │
+  │ 0x36B │ isolate_msg_recv     │ iso_id, buf_ptr, buf_len   │ bytes_read   │
+  │ 0x36C │ isolate_msg_pending  │ isolate_id                 │ count        │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  isolate_ctrl operations:
+    op=0  get current state   → RUNNING(1) / PAUSED(2) / DEAD(3)
+    op=1  pause the isolate
+    op=2  resume the isolate
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 12. INPUT / APP REGISTRY  (0x36D–0x372)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x36D │ input_dev_count      │ —                          │ device_count │
+  │ 0x36E │ input_dev_info       │ index                      │ packed_info  │
+  │ 0x36F │ app_install          │ bundle_ptr, bundle_len,    │ 0            │
+  │       │                      │ id_out_ptr                 │              │
+  │ 0x370 │ app_list             │ buf_ptr, buf_len           │ app_count    │
+  │ 0x371 │ app_launch           │ app_id, flags              │ host_pid     │
+  │ 0x372 │ app_uninstall        │ app_id                     │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  app_install parses an .osx bundle header (magic "OSCP"), registers the app
+  in the kernel's app_registry, and writes the assigned app_id to id_out_ptr.
+
+  app_launch spawns a new /bin/oscortex-host process for the app, returning
+  the host process PID. The app runs in its own address space.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 13. IPC PORTS  (0x373–0x375)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Named port namespace for service discovery between isolates and processes.
+
+  ┌───────┬──────────────────┬───────────────────────────────┬──────────────┐
+  │  NR   │ Name             │ Arguments                     │ Returns      │
+  ├───────┼──────────────────┼───────────────────────────────┼──────────────┤
+  │ 0x373 │ port_bind        │ name_ptr, name_len, iso_id    │ 0            │
+  │ 0x374 │ port_lookup      │ name_ptr, name_len,           │ 0            │
+  │       │                  │ iso_out_ptr, pid_out_ptr      │              │
+  │ 0x375 │ port_unbind      │ name_ptr, name_len            │ 0            │
+  └───────┴──────────────────┴───────────────────────────────┴──────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 14. USB / FRAMEBUFFER / VFS  (0x376–0x37F)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x376 │ usb_controller_count │ —                          │ count        │
+  │ 0x377 │ fb_map               │ info_out_ptr               │ 0            │
+  │ 0x378 │ wm_next_event        │ event_out_ptr              │ 0 / -EAGAIN  │
+  │ 0x379 │ vfs_list             │ path_ptr,path_len,buf,blen │ bytes_written│
+  │ 0x37A │ vfs_read             │ path_ptr,path_len,buf,blen │ bytes_written│
+  │ 0x37B │ vfs_write            │ path_ptr,path_len,dat,dlen │ 0            │
+  │ 0x37C │ vfs_stat             │ path_ptr,path_len,size_out │ 0 / -ENOENT │
+  │ 0x37D │ net_info             │ buf_ptr, buf_len           │ bytes_written│
+  │ 0x37E │ net_send             │ dst_ip, dst_port, data,len │ 0            │
+  │ 0x37F │ net_recv             │ buf, len, src_ip_out,      │ bytes_read   │
+  │       │                      │ src_port_out               │              │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  VFS operates without file descriptors — paths are passed directly. Backed
+  by initramfs (read-only) and a /tmp ramdisk (read-write via vfs_write).
+
+  fb_map writes a FbInfo struct to info_out_ptr containing framebuffer base
+  address, width, height, stride, and pixel format.
+
+  net_info returns a text string with MAC and IP address information.
+  net_send/net_recv operate over the virtio-net + smoltcp UDP stack.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 15. COMPOSITOR BYPASS  (0x380–0x382)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x380 │ fb_release           │ —                          │ 0            │
+  │ 0x381 │ surface_fullscreen   │ —                          │ surface_id   │
+  │ 0x382 │ dl_get_init_array    │ handle, out_init_fn,       │ 0 / -EBADF  │
+  │       │                      │ out_array_va, out_count    │              │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  fb_release hands the framebuffer back to the compositor after direct access.
+  surface_fullscreen creates a surface that covers the entire screen.
+  dl_get_init_array exposes DT_INIT/DT_INIT_ARRAY from a dlopen'd ELF so the
+  embedder can call C++ global constructors from user space.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 16. SERIAL / BLOCK DEVICE / TCP  (0x383–0x38C)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x383 │ serial_read          │ buf_ptr, buf_len           │ bytes_read   │
+  │ 0x384 │ serial_write         │ buf_ptr, buf_len           │ bytes_written│
+  │ 0x385 │ blk_info             │ info_out_ptr               │ 0            │
+  │ 0x386 │ blk_read             │ sector, count, buf, blen   │ bytes_read   │
+  │ 0x387 │ blk_write            │ sector, count, data, dlen  │ bytes_written│
+  │ 0x388 │ tcp_connect          │ ip_packed, port            │ sock_id      │
+  │ 0x389 │ tcp_write            │ sock_id, data_ptr, data_len│ bytes_written│
+  │ 0x38A │ tcp_read             │ sock_id, buf_ptr, buf_len  │ bytes_read   │
+  │ 0x38B │ tcp_close            │ sock_id                    │ 0            │
+  │ 0x38C │ dhcp_discover        │ —                          │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  Serial: UART 16550 console (COM1). Blocking read/write.
+  Block: virtio-blk device. Sector size = 512 bytes.
+  TCP: smoltcp TCP/IP stack. tcp_connect starts a 3-way handshake.
+  dhcp_discover triggers a DHCP request on the virtio-net interface.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 17. EXT2 FILESYSTEM  (0x38D–0x38F)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x38D │ ext2_mount           │ —                          │ 0            │
+  │ 0x38E │ ext2_ls              │ path_ptr, path_len,        │ bytes_written│
+  │       │                      │ buf_ptr, buf_len           │              │
+  │ 0x38F │ ext2_read            │ path_ptr, path_len,        │ bytes_read   │
+  │       │                      │ buf_ptr, buf_len           │              │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  Read-only ext2 filesystem driver. Reads from virtio-blk.
+  ext2_mount scans for a valid superblock and caches inode tables.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 18. SCHEDULER / FORK / SIGNALS  (0x390–0x395)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x390 │ sched_yield          │ —                          │ 0            │
+  │ 0x391 │ get_cpu_time         │ pid                        │ ns           │
+  │ 0x392 │ fork                 │ —                          │ child_pid    │
+  │ 0x393 │ kill_signal          │ pid, signum                │ 0            │
+  │ 0x394 │ sigaction            │ signum, handler_ptr        │ 0            │
+  │ 0x395 │ sigreturn            │ —                          │ (restores)   │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  NOTE: 0x390–0x393 overlap numerically with pkg_resolve/pkg_catalog/
+  pkg_set_server/pkg_evict in the abi.rs constants. The dispatch table
+  handles this by matching abi.rs constants (which resolve to 0x390) first
+  for the package delivery calls. The scheduler/fork/signal variants here
+  are legacy phase numbers that have been superseded.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 19. PTY / TTY  (0x396–0x399)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x396 │ pty_open             │ flags                      │ pty_fd       │
+  │ 0x397 │ pty_read             │ pty_fd, buf_ptr, buf_len   │ bytes_read   │
+  │ 0x398 │ pty_write            │ pty_fd, buf_ptr, buf_len   │ bytes_written│
+  │ 0x399 │ pty_ioctl            │ pty_fd, request, arg       │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 20. NVMe  (0x39A–0x39C)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x39A │ nvme_info            │ info_out_ptr, buf_len      │ bytes_written│
+  │ 0x39B │ nvme_read            │ lba, count, buf, blen      │ bytes_read   │
+  │ 0x39C │ nvme_write           │ lba, count, data, dlen     │ bytes_written│
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 21. EXEC / WAIT / FUTEX  (0x39D–0x39F)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x39D │ futex                │ uaddr, op, val             │ varies       │
+  │ 0x39E │ exec_wait            │ path_ptr, args_ptr         │ exit_code    │
+  │ 0x39F │ reap_children        │ —                          │ count_reaped │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  exec_wait is a blocking exec: parent sleeps until the child calls sys_exit.
+  reap_children cleans up zombie child processes.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 22. PACKAGE DELIVERY  (0x390–0x393, abi.rs)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Fuchsia-inspired on-demand package resolution. Apps are fetched over HTTP,
+  verified via SHA-256, cached in a 16-slot LRU, and launched in-place.
+
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x390 │ pkg_resolve          │ name_ptr, name_len         │ app_id /     │
+  │       │                      │                            │   -ERRNO     │
+  │ 0x391 │ pkg_catalog          │ buf_ptr, buf_len           │ entry_count  │
+  │ 0x392 │ pkg_set_server       │ ip_packed_be, port         │ 0            │
+  │ 0x393 │ pkg_evict            │ app_id                     │ 0 / -ERRNO   │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  pkg_resolve flow:
+    1. Check LRU cache → hit → return app_id immediately
+    2. Cache miss → HTTP GET /pkg/<sha256>.osx from configured server
+    3. SHA-256 verify downloaded bundle
+    4. app_registry.install → cache.insert → return app_id
+
+  pkg_set_server takes IP as a big-endian u32 (e.g. 10.0.2.2 = 0x0A000202)
+  and port as u16.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 23. POSIX COMPAT SHIM  (0x3A0–0x4B1)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  These syscalls provide POSIX/glibc functions routed through trampoline stubs
+  so that libflutter_engine.so (compiled for Linux) can run on OSCortex
+  without modification. The kernel implements these in posix.rs.
+
+  MEMORY (0x3A0–0x3A8):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x3A0 │ malloc               │ size                       │ ptr          │
+  │ 0x3A1 │ free                 │ ptr                        │ 0            │
+  │ 0x3A2 │ calloc               │ nmemb, size                │ ptr          │
+  │ 0x3A3 │ realloc              │ ptr, size                  │ ptr          │
+  │ 0x3A4 │ aligned_alloc        │ align, size                │ ptr          │
+  │ 0x3A5 │ posix_memalign       │ pptr, align, size          │ 0 / ENOMEM   │
+  │ 0x3A6 │ malloc_usable_size   │ ptr                        │ size         │
+  │ 0x3A7 │ strdup               │ s                          │ ptr          │
+  │ 0x3A8 │ strndup              │ s, n                       │ ptr          │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  STRINGS (0x3B0–0x3CD):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x3B0 │ strlen               │ s                          │ length       │
+  │ 0x3B1 │ memcpy               │ dst, src, n                │ dst          │
+  │ 0x3B2 │ memset               │ dst, val, n                │ dst          │
+  │ 0x3B3 │ memmove              │ dst, src, n                │ dst          │
+  │ 0x3B4 │ memcmp               │ a, b, n                    │ diff         │
+  │ 0x3B5 │ memchr               │ s, c, n                    │ ptr / 0      │
+  │ 0x3B6 │ bzero                │ dst, n                     │ dst          │
+  │ 0x3B7 │ strcmp               │ a, b                       │ diff         │
+  │ 0x3B8 │ strncmp              │ a, b, n                    │ diff         │
+  │ 0x3B9 │ strcpy               │ dst, src                   │ dst          │
+  │ 0x3BA │ strncpy              │ dst, src, n                │ dst          │
+  │ 0x3BB │ strcat               │ dst, src                   │ dst          │
+  │ 0x3BC │ strncat              │ dst, src, n                │ dst          │
+  │ 0x3BD │ strstr               │ haystack, needle           │ ptr / 0      │
+  │ 0x3BE │ strchr               │ s, c                       │ ptr / 0      │
+  │ 0x3BF │ strrchr              │ s, c                       │ ptr / 0      │
+  │ 0x3C0 │ strnlen              │ s, maxlen                  │ length       │
+  │ 0x3C1 │ strcspn              │ s, reject                  │ length       │
+  │ 0x3C2 │ strspn               │ s, accept                  │ length       │
+  │ 0x3C3 │ strtok_r             │ —                          │ 0 (stub)     │
+  │ 0x3C4 │ strcasestr           │ haystack, needle           │ ptr / 0      │
+  │ 0x3C5 │ strtol               │ s, endptr, base            │ value        │
+  │ 0x3C6 │ strtoul              │ s, endptr, base            │ value        │
+  │ 0x3C7 │ strtoll              │ s, endptr, base            │ value        │
+  │ 0x3C8 │ strtoull             │ s, endptr, base            │ value        │
+  │ 0x3C9 │ strtod               │ —                          │ 0 (stub)     │
+  │ 0x3CA │ atoi                 │ s                          │ value        │
+  │ 0x3CB │ qsort                │ —                          │ 0 (stub)     │
+  │ 0x3CC │ rand                 │ —                          │ random value │
+  │ 0x3CD │ srand                │ seed                       │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  THREADING (0x3D0–0x3F7):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x3D0 │ pthread_detach       │ —                          │ 0 (noop)     │
+  │ 0x3D1 │ pthread_self         │ —                          │ pthread_t    │
+  │ 0x3D2 │ pthread_mutex_init   │ mutex_ptr                  │ 0            │
+  │ 0x3D3 │ pthread_mutex_lock   │ mutex_ptr                  │ 0            │
+  │ 0x3D4 │ pthread_mutex_unlock │ mutex_ptr                  │ 0            │
+  │ 0x3D5 │ pthread_mutex_destroy│ —                          │ 0 (noop)     │
+  │ 0x3D6 │ pthread_mutex_trylock│ mutex_ptr                  │ 0 / EBUSY   │
+  │ 0x3D7 │ pthread_once         │ once_ptr, init_fn          │ 0            │
+  │ 0x3D8 │ pthread_key_create   │ key_ptr, destructor        │ 0            │
+  │ 0x3D9 │ pthread_key_delete   │ —                          │ 0 (noop)     │
+  │ 0x3DA │ pthread_setspecific  │ key, value                 │ 0            │
+  │ 0x3DB │ pthread_getspecific  │ key                        │ value        │
+  │ 0x3DC │ pthread_cond_init    │ cond_ptr                   │ 0            │
+  │ 0x3DD │ pthread_cond_wait    │ cond_ptr, mutex_ptr        │ 0            │
+  │ 0x3DE │ pthread_cond_signal  │ cond_ptr                   │ 0            │
+  │ 0x3DF │ pthread_cond_broadcast│ cond_ptr                  │ 0            │
+  │ 0x3E0 │ pthread_cond_destroy │ —                          │ 0 (noop)     │
+  │ 0x3E1 │ pthread_cond_timed…  │ cond, mutex, abstime       │ 0/ETIMEDOUT │
+  │ 0x3E2 │ rwlock_rdlock        │ rwlock_ptr                 │ 0            │
+  │ 0x3E3 │ rwlock_wrlock        │ rwlock_ptr                 │ 0            │
+  │ 0x3E4 │ rwlock_unlock        │ rwlock_ptr                 │ 0            │
+  │ 0x3E5 │ rwlock_init          │ rwlock_ptr                 │ 0            │
+  │ 0x3E6 │ rwlock_destroy       │ —                          │ 0 (noop)     │
+  │ 0x3E7 │ pthread_attr_init    │ attr_ptr                   │ 0            │
+  │ 0x3E8 │ pthread_attr_destroy │ attr_ptr                   │ 0            │
+  │ 0x3E9 │ pthread_attr_set…sz  │ attr_ptr, stacksize        │ 0            │
+  │ 0x3EA │ pthread_attr_set…det │ attr_ptr, detachstate      │ 0            │
+  │ 0x3EB │ pthread_attr_getstack│ attr_ptr, base_out, sz_out │ 0            │
+  │ 0x3F2 │ pthread_sigmask      │ —                          │ 0 (noop)     │
+  │ 0x3F4 │ pthread_setname_np   │ thread, name_ptr           │ 0            │
+  │ 0x3F6 │ pthread_getattr_np   │ thread, attr_ptr           │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  SEMAPHORES (0x3F8–0x3FC):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x3F8 │ sem_init             │ sem_ptr, pshared, value    │ 0            │
+  │ 0x3F9 │ sem_destroy          │ —                          │ 0 (noop)     │
+  │ 0x3FA │ sem_wait             │ sem_ptr                    │ 0            │
+  │ 0x3FB │ sem_trywait          │ sem_ptr                    │ 0 / -EAGAIN  │
+  │ 0x3FC │ sem_post             │ sem_ptr                    │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  SYSTEM (0x400–0x41D):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x400 │ abort                │ —                          │ ! (no return)│
+  │ 0x401 │ getpagesize          │ —                          │ 4096         │
+  │ 0x402 │ sysconf              │ name                       │ value        │
+  │ 0x403 │ nanosleep            │ req_ptr, rem_ptr           │ 0            │
+  │ 0x404 │ gettimeofday         │ tv_ptr, tz_ptr             │ 0            │
+  │ 0x405 │ clock_gettime        │ clock_id, timespec_ptr     │ 0            │
+  │ 0x406 │ time                 │ time_ptr                   │ epoch_secs   │
+  │ 0x408 │ getrusage            │ who, usage_ptr             │ 0            │
+  │ 0x409 │ getcwd               │ buf_ptr, size              │ ptr          │
+  │ 0x40A │ gethostname          │ buf_ptr, len               │ 0            │
+  │ 0x40E │ uname                │ buf_ptr                    │ 0            │
+  │ 0x40F │ strerror             │ errnum                     │ str_ptr      │
+  │ 0x410 │ strerror_r           │ errnum, buf_ptr, buflen    │ 0            │
+  │ 0x415 │ getenv               │ name_ptr, name_len         │ value_ptr/0  │
+  │ 0x416 │ setlocale            │ category, locale_ptr       │ ptr          │
+  │ 0x417 │ uselocale            │ locale                     │ old_locale   │
+  │ 0x418 │ newlocale            │ mask, locale_ptr, base     │ locale       │
+  │ 0x419 │ freelocale           │ locale                     │ 0            │
+  │ 0x41D │ __cxa_atexit         │ —                          │ 0 (noop)     │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  FILE I/O (0x420–0x45D):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x420 │ open64               │ path_ptr,path_len,flags,md │ fd           │
+  │ 0x421 │ lseek64              │ fd, offset, whence         │ new_offset   │
+  │ 0x422 │ fopen64              │ path_ptr,path_len,mode,─   │ FILE*        │
+  │ 0x423 │ fclose               │ FILE*                      │ 0            │
+  │ 0x424 │ fread                │ buf, elem_size, count, fp  │ items_read   │
+  │ 0x425 │ fwrite               │ buf, elem_size, count, fp  │ items_written│
+  │ 0x426 │ fseek                │ FILE*, offset, whence      │ 0            │
+  │ 0x427 │ ftell                │ FILE*                      │ position     │
+  │ 0x428 │ feof                 │ FILE*                      │ 0/1          │
+  │ 0x429 │ ferror               │ FILE*                      │ 0            │
+  │ 0x42A │ fflush               │ FILE*                      │ 0            │
+  │ 0x42B │ fgets                │ buf, size, FILE*           │ ptr / 0      │
+  │ 0x432 │ fprintf              │ FILE*, fmt, args…          │ chars_written│
+  │ 0x434 │ snprintf             │ buf, size, fmt, args…      │ chars_written│
+  │ 0x435 │ vsnprintf            │ buf, size, fmt, va_list    │ chars_written│
+  │ 0x437 │ printf               │ fmt, args                  │ chars_written│
+  │ 0x438 │ puts                 │ s                          │ 0            │
+  │ 0x439 │ perror               │ s                          │ 0            │
+  │ 0x43E │ fileno               │ FILE*                      │ fd           │
+  │ 0x441 │ stat                 │ path_ptr, ─, stat_ptr      │ 0 / -ENOENT │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  EPOLL/POLL/INOTIFY (0x478–0x482):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x478 │ epoll_create         │ size                       │ fd           │
+  │ 0x479 │ epoll_create1        │ flags                      │ fd           │
+  │ 0x47A │ epoll_ctl            │ epfd, op, fd, event_ptr    │ 0            │
+  │ 0x47B │ epoll_wait           │ epfd, events, max, timeout │ count        │
+  │ 0x47C │ inotify_init1        │ flags                      │ fd           │
+  │ 0x47D │ inotify_add_watch    │ fd, path, mask             │ 1            │
+  │ 0x47F │ timerfd_create       │ clock_id, flags            │ fd           │
+  │ 0x480 │ timerfd_settime      │ fd, flags, new, old        │ 0            │
+  │ 0x481 │ poll                 │ fds, nfds, timeout         │ 0 (stub)     │
+  │ 0x482 │ ioctl                │ fd, request, arg           │ 0 (stub)     │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  GNU EMULATED TLS (0x4B0–0x4B1):
+  ┌───────┬──────────────────────┬────────────────────────────┬──────────────┐
+  │  NR   │ Name                 │ Arguments                  │ Returns      │
+  ├───────┼──────────────────────┼────────────────────────────┼──────────────┤
+  │ 0x4B0 │ __emutls_get_address │ obj_ptr                    │ tls_va       │
+  │ 0x4B1 │ __emutls_register_…  │ obj, size, align, templ    │ 0            │
+  └───────┴──────────────────────┴────────────────────────────┴──────────────┘
+
+  LIBM (range defined in posix_trampolines.rs):
+  Trigonometric, exponential, and rounding functions (sin, cos, tan, asin,
+  acos, atan, atan2, exp, log, pow, sqrt, ceil, floor, round, fmod, etc.)
+  are routed as syscalls but handled on the fast path before the main dispatch
+  table. They never switch tasks or touch I/O.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ 24. CORTEX PID-0 API  (0x1000–0x100F)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Reserved for Cortex kernel-internal PID-0 orchestration. Dispatched to
+  crate::cortex::pid0::dispatch(). Not available to userspace processes.
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ SYSCALL NUMBER MAP (VISUAL OVERVIEW)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  0x000─0x13E   Linux POSIX (read/write/open/mmap/futex/getrandom/…)
+  0x0C0         Power off
+  0x200─0x201   Basic IPC (send/recv)
+  0x300─0x312   Compositor surfaces
+  0x320─0x336   WM events & focus
+  0x340─0x347   App/engine management
+  0x350─0x355   Dynamic linker (dlopen/dlsym/mmap)
+  0x356─0x359   Flutter engine bridge (proctable, gpu_submit)
+  0x35A─0x35C   Threading (create/exit/join)
+  0x360─0x363   Platform channels
+  0x364─0x365   GPU strided blit, vsync rate
+  0x366─0x36C   AOT snapshots & Dart isolates
+  0x36D─0x372   Input devices & app registry
+  0x373─0x375   Named IPC ports
+  0x376─0x37F   USB, framebuffer, VFS, networking
+  0x380─0x382   Compositor bypass, dl_get_init_array
+  0x383─0x384   Serial (UART 16550)
+  0x385─0x387   Block device (virtio-blk)
+  0x388─0x38C   TCP/IP (smoltcp) + DHCP
+  0x38D─0x38F   ext2 filesystem (read-only)
+  0x390─0x393   Package delivery (abi.rs) / Scheduler+fork (legacy)
+  0x394─0x395   Signals
+  0x396─0x399   PTY/TTY
+  0x39A─0x39C   NVMe
+  0x39D         Futex (alternate entry)
+  0x39E─0x39F   exec_wait, reap_children
+  0x3A0─0x4B1   POSIX compat shim (memory, strings, pthreads, I/O)
+  0x1000─0x100F Cortex PID-0 internal
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ INLINE SYSCALL EXAMPLE (x86-64 ASSEMBLY)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  ; surface_create(x=100, y=200, w=800, h=600)
+  ;   arg0 = (100 << 32) | 200  = 0x00000064_000000C8
+  ;   arg1 = (800 << 32) | 600  = 0x00000320_00000258
+  mov  rax, 0x300              ; SYS_SURFACE_CREATE
+  mov  rdi, 0x00000064000000C8 ; x_y_packed
+  mov  rsi, 0x0000032000000258 ; w_h_packed
+  syscall
+  ; rax = surface_id on success
+
+  ; gpu_submit_strided(surface_id=1, pixels=0x200000, row_bytes=3200)
+  mov  rax, 0x364              ; SYS_GPU_SUBMIT_STRIDED
+  mov  rdi, 1                  ; surface_id
+  mov  rsi, 0x200000           ; pixel buffer pointer
+  mov  rdx, 3200               ; row_bytes (800px × 4 bytes)
+  syscall
+
+  ; platform_msg_post(channel="oscortex/system", data=...)
+  mov  rax, 0x360              ; SYS_PLATFORM_MSG_POST
+  mov  rdi, channel_ptr        ; channel name pointer
+  mov  rsi, 15                 ; channel name length
+  mov  rdx, data_ptr           ; message data pointer
+  mov  r10, data_len           ; message data length
+  syscall
+  ; rax = seq number
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+ DART FFI SYSCALL WRAPPER EXAMPLE
+═══════════════════════════════════════════════════════════════════════════════════
+
+  // In Dart, syscalls are invoked through platform channels or FFI:
+  //
+  // import 'dart:ffi';
+  //
+  // typedef SyscallNative = Int64 Function(Int64, Int64, Int64, Int64);
+  // typedef SyscallDart = int Function(int, int, int, int);
+  //
+  // final syscall = DynamicLibrary.process()
+  //     .lookupFunction<SyscallNative, SyscallDart>('oscortex_syscall');
+  //
+  // // Create a surface
+  // final surfaceId = syscall(0x300, packXY(100, 200), packWH(800, 600), 0);
+  //
+  // // Query framebuffer size
+  // final packed = syscall(0x305, 0, 0, 0);
+  // final width  = packed >> 32;
+  // final height = packed & 0xFFFFFFFF;
+
+
+  Source files:
+    kernel/src/embedder/abi.rs          ABI constants and struct definitions
+    kernel/src/syscall/dispatch.rs      Main dispatch table
+    kernel/src/syscall/posix.rs         POSIX compat implementations
+    kernel/src/syscall/handlers/        Per-subsystem handler modules
+    docs/arch.txt                       System architecture overview
+    docs/hardware.txt                   Hardware and driver model
+    docs/pkg-delivery.txt              Package delivery specification

@@ -36,9 +36,7 @@ pub fn init_block_and_net() {
         super::virtio_blk::init();
         super::nvme::init();
     } else {
-        log::info!(
-            "[Drivers] PCI profile unavailable on this arch — block/NVMe/net skipped"
-        );
+        log::info!("[Drivers] PCI profile unavailable on this arch — block/NVMe/net skipped");
     }
 
     register_block_natives();
@@ -49,6 +47,7 @@ pub fn init_block_and_net() {
     }
 
     crate::app_store::init();
+    crate::app_registry::install_system_apps();
     crate::net::init();
 }
 

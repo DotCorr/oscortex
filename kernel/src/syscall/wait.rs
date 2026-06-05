@@ -23,3 +23,10 @@ pub(crate) fn futex_waiter_present(addr: u64, pid: u32) -> bool {
     let table = FUTEX_WAITERS.lock();
     table.get(&addr).map_or(false, |waiters| waiters.contains(&pid))
 }
+
+pub(crate) fn futex_waiter_for(addr: u64, exclude: u32) -> Option<u32> {
+    let table = FUTEX_WAITERS.lock();
+    table.get(&addr).and_then(|waiters| {
+        waiters.iter().copied().find(|&pid| pid != exclude)
+    })
+}

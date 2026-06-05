@@ -16,8 +16,8 @@
 #![no_main]
 #![allow(unused)]
 
-mod sys;
 mod aot_loader;
+mod sys;
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -66,15 +66,15 @@ unsafe extern "C" fn _start() -> ! {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FlutterEngineProcTable {
-    pub run:                   u64,
-    pub shutdown:              u64,
-    pub send_window_metrics:   u64,
-    pub send_pointer_event:    u64,
-    pub send_key_event:        u64,
-    pub on_vsync:              u64,
-    pub schedule_frame:        u64,
+    pub run: u64,
+    pub shutdown: u64,
+    pub send_window_metrics: u64,
+    pub send_pointer_event: u64,
+    pub send_key_event: u64,
+    pub on_vsync: u64,
+    pub schedule_frame: u64,
     pub send_platform_message: u64,
-    pub _reserved:             [u64; 8],
+    pub _reserved: [u64; 8],
 }
 
 /// Engine-facing proc table used with `FlutterEngineGetProcAddresses`.
@@ -83,47 +83,47 @@ struct FlutterEngineProcTable {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct FlutterEngineProcTableApi {
-    pub struct_size:                            usize,
-    pub create_aot_data:                        u64,
-    pub collect_aot_data:                       u64,
-    pub run:                                    u64,
-    pub shutdown:                               u64,
-    pub initialize:                             u64,
-    pub deinitialize:                           u64,
-    pub run_initialized:                        u64,
-    pub send_window_metrics:                    u64,
-    pub send_pointer_event:                     u64,
-    pub send_key_event:                         u64,
-    pub send_platform_message:                  u64,
+    pub struct_size: usize,
+    pub create_aot_data: u64,
+    pub collect_aot_data: u64,
+    pub run: u64,
+    pub shutdown: u64,
+    pub initialize: u64,
+    pub deinitialize: u64,
+    pub run_initialized: u64,
+    pub send_window_metrics: u64,
+    pub send_pointer_event: u64,
+    pub send_key_event: u64,
+    pub send_platform_message: u64,
     pub platform_message_create_response_handle: u64,
     pub platform_message_release_response_handle: u64,
-    pub send_platform_message_response:         u64,
-    pub register_external_texture:              u64,
-    pub unregister_external_texture:            u64,
-    pub mark_external_texture_frame_available:  u64,
-    pub update_semantics_enabled:               u64,
-    pub update_accessibility_features:          u64,
-    pub dispatch_semantics_action:              u64,
-    pub on_vsync:                               u64,
-    pub reload_system_fonts:                    u64,
-    pub trace_event_duration_begin:             u64,
-    pub trace_event_duration_end:               u64,
-    pub trace_event_instant:                    u64,
-    pub post_render_thread_task:                u64,
-    pub get_current_time:                       u64,
-    pub run_task:                               u64,
-    pub update_locales:                         u64,
-    pub runs_aot_compiled_dart_code:            u64,
-    pub post_dart_object:                       u64,
-    pub notify_low_memory_warning:              u64,
-    pub post_callback_on_all_native_threads:    u64,
-    pub notify_display_update:                  u64,
-    pub schedule_frame:                         u64,
-    pub set_next_frame_callback:                u64,
-    pub add_view:                               u64,
-    pub remove_view:                            u64,
-    pub send_view_focus_event:                  u64,
-    pub send_semantics_action:                  u64,
+    pub send_platform_message_response: u64,
+    pub register_external_texture: u64,
+    pub unregister_external_texture: u64,
+    pub mark_external_texture_frame_available: u64,
+    pub update_semantics_enabled: u64,
+    pub update_accessibility_features: u64,
+    pub dispatch_semantics_action: u64,
+    pub on_vsync: u64,
+    pub reload_system_fonts: u64,
+    pub trace_event_duration_begin: u64,
+    pub trace_event_duration_end: u64,
+    pub trace_event_instant: u64,
+    pub post_render_thread_task: u64,
+    pub get_current_time: u64,
+    pub run_task: u64,
+    pub update_locales: u64,
+    pub runs_aot_compiled_dart_code: u64,
+    pub post_dart_object: u64,
+    pub notify_low_memory_warning: u64,
+    pub post_callback_on_all_native_threads: u64,
+    pub notify_display_update: u64,
+    pub schedule_frame: u64,
+    pub set_next_frame_callback: u64,
+    pub add_view: u64,
+    pub remove_view: u64,
+    pub send_view_focus_event: u64,
+    pub send_semantics_action: u64,
 }
 
 /// Raw `FlutterProjectArgs` blob written using authoritative offsets from
@@ -155,13 +155,13 @@ const OFF_PROJECT_ARGS_COMMAND_LINE_ARGV: usize = 48;
 
 // Legacy Dart AOT snapshot pointer offsets (FlutterProjectArgs).
 // Verified against tools/flutter-engine/flutter_embedder.h (Flutter 3.29).
-const OFF_PA_VM_SNAPSHOT_DATA:               usize =  64;
-const OFF_PA_VM_SNAPSHOT_DATA_SIZE:          usize =  72;
-const OFF_PA_VM_SNAPSHOT_INSTRUCTIONS:       usize =  80;
-const OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE:  usize =  88;
-const OFF_PA_ISO_SNAPSHOT_DATA:              usize =  96;
-const OFF_PA_ISO_SNAPSHOT_DATA_SIZE:         usize = 104;
-const OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS:      usize = 112;
+const OFF_PA_VM_SNAPSHOT_DATA: usize = 64;
+const OFF_PA_VM_SNAPSHOT_DATA_SIZE: usize = 72;
+const OFF_PA_VM_SNAPSHOT_INSTRUCTIONS: usize = 80;
+const OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE: usize = 88;
+const OFF_PA_ISO_SNAPSHOT_DATA: usize = 96;
+const OFF_PA_ISO_SNAPSHOT_DATA_SIZE: usize = 104;
+const OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS: usize = 112;
 const OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE: usize = 120;
 
 #[inline]
@@ -179,7 +179,7 @@ fn write_i32_at(buf: &mut [u8], off: usize, value: i32) {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterSoftwareRendererConfig {
-    struct_size:              usize,  // = 16
+    struct_size: usize, // = 16
     surface_present_callback: u64,
 }
 
@@ -195,8 +195,8 @@ struct FlutterSoftwareRendererConfig {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterRendererConfig {
-    renderer_type: u32,   // kSoftware = 1
-    _pad_type:     u32,   // align type field to 8 bytes
+    renderer_type: u32, // kSoftware = 1
+    _pad_type: u32,     // align type field to 8 bytes
     // Union payload: 112 bytes.  Software config is:
     //   [0..8]  struct_size (usize = 16)
     //   [8..16] surface_present_callback (fn ptr)
@@ -208,8 +208,8 @@ impl FlutterRendererConfig {
     fn new_software(present_cb: u64) -> Self {
         let mut cfg = Self {
             renderer_type: 1, // kSoftware
-            _pad_type:     0,
-            union_payload:  [0u8; 112],
+            _pad_type: 0,
+            union_payload: [0u8; 112],
         };
         // Write struct_size at union offset 0.
         let sz: usize = 16; // sizeof(FlutterSoftwareRendererConfig)
@@ -225,18 +225,18 @@ impl FlutterRendererConfig {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterWindowMetricsEvent {
-    struct_size:                usize,
-    width:                      usize,
-    height:                     usize,
-    pixel_ratio:                f64,
-    left:                       usize,
-    top:                        usize,
-    physical_view_inset_top:    f64,
-    physical_view_inset_right:  f64,
+    struct_size: usize,
+    width: usize,
+    height: usize,
+    pixel_ratio: f64,
+    left: usize,
+    top: usize,
+    physical_view_inset_top: f64,
+    physical_view_inset_right: f64,
     physical_view_inset_bottom: f64,
-    physical_view_inset_left:   f64,
-    display_id:                 u64,
-    view_id:                    i64,
+    physical_view_inset_left: f64,
+    display_id: u64,
+    view_id: i64,
 }
 
 /// Flutter pointer (mouse / touch / stylus) event.
@@ -244,50 +244,60 @@ struct FlutterWindowMetricsEvent {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterPointerEvent {
-    struct_size:    usize, // 8
-    phase:          i32,   // 4  (kAdd=0 kHover=1 kDown=2 kMove=3 kUp=4)
-    _pad0:          u32,   // 4  (alignment padding)
-    timestamp:      u64,   // 8  (microseconds)
-    x:              f64,   // 8
-    y:              f64,   // 8
-    device:         i32,   // 4
-    signal_kind:    i32,   // 4  (kNone=0 kScroll=1)
-    scroll_delta_x: f64,   // 8
-    scroll_delta_y: f64,   // 8
-    device_kind:    i32,   // 4  (kMouse=1 kTouch=2)
-    _pad1:          u32,   // 4  (alignment padding)
-    buttons:        i64,   // 8
-    pan_x:          f64,   // 8
-    pan_y:          f64,   // 8
-    scale:          f64,   // 8
-    rotation:       f64,   // 8
-    view_id:        i64,   // 8
+    struct_size: usize,  // 8
+    phase: i32,          // 4  (kCancel=0 kUp=1 kDown=2 kMove=3 kAdd=4 kRemove=5 kHover=6)
+    _pad0: u32,          // 4  (alignment padding)
+    timestamp: u64,      // 8  (microseconds)
+    x: f64,              // 8
+    y: f64,              // 8
+    device: i32,         // 4
+    signal_kind: i32,    // 4  (kNone=0 kScroll=1)
+    scroll_delta_x: f64, // 8
+    scroll_delta_y: f64, // 8
+    device_kind: i32,    // 4  (kMouse=1 kTouch=2)
+    _pad1: u32,          // 4  (alignment padding)
+    buttons: i64,        // 8
+    pan_x: f64,          // 8
+    pan_y: f64,          // 8
+    scale: f64,          // 8
+    rotation: f64,       // 8
+    view_id: i64,        // 8
+}
+
+/// Flutter platform-view focus event. Required by newer engine view routing.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FlutterViewFocusEvent {
+    struct_size: usize,
+    view_id: i64,
+    state: i32,     // kUnfocused=0, kFocused=1
+    direction: i32, // kUndefined=0, kForward=1, kBackward=2
 }
 
 /// Flutter keyboard event.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterKeyEvent {
-    struct_size:  usize,    // 8
-    timestamp:    f64,      // 8  (milliseconds)
-    kind:         u32,      // 4  (kDown=0 kUp=1 kRepeat=2)
-    _pad:         u32,      // 4  (alignment)
-    physical:     u64,      // 8  (HID usage page/id)
-    logical:      u64,      // 8  (unicode codepoint / key code)
-    character:    u64,      // 8  (*const u8, nullable)
-    synthesized:  bool,     // 1
-    _tail:        [u8; 7],  // 7  (padding)
+    struct_size: usize, // 8
+    timestamp: f64,     // 8  (milliseconds)
+    kind: u32,          // 4  (kDown=0 kUp=1 kRepeat=2)
+    _pad: u32,          // 4  (alignment)
+    physical: u64,      // 8  (HID usage page/id)
+    logical: u64,       // 8  (unicode codepoint / key code)
+    character: u64,     // 8  (*const u8, nullable)
+    synthesized: bool,  // 1
+    _tail: [u8; 7],     // 7  (padding)
 }
 
 /// Incoming platform-channel message from the Flutter engine.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterPlatformMessage {
-    struct_size:     usize, // 8
-    channel:         u64,  // 8  *const u8 (NUL-terminated channel name)
-    message:         u64,  // 8  *const u8 (raw message bytes)
-    message_size:    usize, // 8
-    response_handle: u64,  // 8  *mut FlutterPlatformMessageResponseHandle
+    struct_size: usize,   // 8
+    channel: u64,         // 8  *const u8 (NUL-terminated channel name)
+    message: u64,         // 8  *const u8 (raw message bytes)
+    message_size: usize,  // 8
+    response_handle: u64, // 8  *mut FlutterPlatformMessageResponseHandle
 }
 
 #[repr(C)]
@@ -304,14 +314,14 @@ const K_FLUTTER_ENGINE_AOT_DATA_SOURCE_TYPE_ELF_PATH: u32 = 0;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct FlutterEngineDisplay {
-    pub struct_size:         usize,
-    pub display_id:          u64,
-    pub single_display:      bool,
-    pub _pad0:               [u8; 7],
-    pub refresh_rate:        f64,
-    pub width:               usize,
-    pub height:              usize,
-    pub device_pixel_ratio:  f64,
+    pub struct_size: usize,
+    pub display_id: u64,
+    pub single_display: bool,
+    pub _pad0: [u8; 7],
+    pub refresh_rate: f64,
+    pub width: usize,
+    pub height: usize,
+    pub device_pixel_ratio: f64,
 }
 
 type NotifyDisplayUpdateFn = unsafe extern "C" fn(
@@ -323,33 +333,40 @@ type NotifyDisplayUpdateFn = unsafe extern "C" fn(
 
 // ── Engine function-pointer types ─────────────────────────────────────────────
 
-type GetProcAddressesFn  = unsafe extern "C" fn(table: *mut FlutterEngineProcTableApi) -> i32;
-type CreateAotDataFn     = unsafe extern "C" fn(source: *const FlutterEngineAotDataSource, data_out: *mut u64) -> i32;
-type RunFn               = unsafe extern "C" fn(
+type GetProcAddressesFn = unsafe extern "C" fn(table: *mut FlutterEngineProcTableApi) -> i32;
+type CreateAotDataFn =
+    unsafe extern "C" fn(source: *const FlutterEngineAotDataSource, data_out: *mut u64) -> i32;
+type RunFn = unsafe extern "C" fn(
     version: u32,
-    config:  *const FlutterRendererConfig,
-    args:    *const FlutterProjectArgsRaw,
-    ud:      *mut (),
-    engine:  *mut u64,
+    config: *const FlutterRendererConfig,
+    args: *const FlutterProjectArgsRaw,
+    ud: *mut (),
+    engine: *mut u64,
 ) -> i32;
-type SendWindowMetricsFn = unsafe extern "C" fn(engine: u64, evt: *const FlutterWindowMetricsEvent) -> i32;
-type ScheduleFrameFn    = unsafe extern "C" fn(engine: u64) -> i32;
-type SendPlatformMessageFn = unsafe extern "C" fn(engine: u64, msg: *const FlutterPlatformMessage) -> i32;
-type SendPointerEventFn  = unsafe extern "C" fn(engine: u64, evts: *const FlutterPointerEvent, n: usize) -> i32;
-type SendKeyEventFn      = unsafe extern "C" fn(engine: u64, evt: *const FlutterKeyEvent, cb: u64, ud: u64) -> i32;
-type OnVsyncFn           = unsafe extern "C" fn(engine: u64, baton: usize, start_ns: u64, target_ns: u64) -> i32;
+type SendWindowMetricsFn =
+    unsafe extern "C" fn(engine: u64, evt: *const FlutterWindowMetricsEvent) -> i32;
+type ScheduleFrameFn = unsafe extern "C" fn(engine: u64) -> i32;
+type SendPlatformMessageFn =
+    unsafe extern "C" fn(engine: u64, msg: *const FlutterPlatformMessage) -> i32;
+type SendPointerEventFn =
+    unsafe extern "C" fn(engine: u64, evts: *const FlutterPointerEvent, n: usize) -> i32;
+type SendKeyEventFn =
+    unsafe extern "C" fn(engine: u64, evt: *const FlutterKeyEvent, cb: u64, ud: u64) -> i32;
+type OnVsyncFn =
+    unsafe extern "C" fn(engine: u64, baton: usize, start_ns: u64, target_ns: u64) -> i32;
+type GetCurrentTimeFn = unsafe extern "C" fn() -> u64;
+type SendViewFocusEventFn =
+    unsafe extern "C" fn(engine: u64, evt: *const FlutterViewFocusEvent) -> i32;
 
 type InitializeFn = unsafe extern "C" fn(
     version: usize,
-    config:  *const FlutterRendererConfig,
-    args:    *const FlutterProjectArgsRaw,
-    ud:      *mut (),
-    engine:  *mut u64,
+    config: *const FlutterRendererConfig,
+    args: *const FlutterProjectArgsRaw,
+    ud: *mut (),
+    engine: *mut u64,
 ) -> i32;
 
-type RunInitializedFn = unsafe extern "C" fn(
-    engine: u64,
-) -> i32;
+type RunInitializedFn = unsafe extern "C" fn(engine: u64) -> i32;
 
 // ── Callbacks (called by the engine) ─────────────────────────────────────────
 
@@ -364,6 +381,7 @@ static mut SURFACE_H: u32 = 0;
 /// Handle returned by `FlutterEngineRun`; 0 until the engine starts.
 static ENGINE: AtomicU64 = AtomicU64::new(0);
 static NOTIFY_DISPLAY_UPDATE: AtomicU64 = AtomicU64::new(0);
+static IS_AOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // Custom task runner ABI structs
 #[repr(C)]
@@ -415,14 +433,22 @@ struct Spinlock {
 
 impl Spinlock {
     const fn new() -> Self {
-        Self { locked: core::sync::atomic::AtomicBool::new(false) }
+        Self {
+            locked: core::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     fn lock(&self) -> SpinlockGuard {
-        while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             core::hint::spin_loop();
         }
-        SpinlockGuard { locked: &self.locked }
+        SpinlockGuard {
+            locked: &self.locked,
+        }
     }
 }
 
@@ -441,6 +467,8 @@ static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
 static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_RESPONSE_FN: AtomicU64 = AtomicU64::new(0);
+static CURRENT_HOST_MODE: AtomicU64 = AtomicU64::new(0);
+static CURRENT_APP_ID: AtomicU64 = AtomicU64::new(0);
 
 const SHELL_CHANNEL: &[u8] = b"oscortex/shell";
 
@@ -483,6 +511,19 @@ unsafe extern "C" fn post_task_callback(
     target_time_ns: u64,
     _user_data: *mut (),
 ) {
+    static POST_TASK_LOG: AtomicU32 = AtomicU32::new(0);
+    let log_n = POST_TASK_LOG.fetch_add(1, Ordering::Relaxed);
+    if log_n < 32 {
+        write(b"[embedder] post_task runner=");
+        write_hex(task.runner);
+        write(b" task=");
+        write_hex(task.task);
+        write(b" now=");
+        write_hex(rdtsc_ns());
+        write(b" target=");
+        write_hex(target_time_ns);
+        write(b"\n");
+    }
     let _guard = PLATFORM_TASKS_LOCK.lock();
     for slot in unsafe { &mut PLATFORM_TASKS } {
         if !slot.active {
@@ -516,45 +557,43 @@ static CUSTOM_TASK_RUNNERS: FlutterCustomTaskRunners = FlutterCustomTaskRunners 
 
 static PRESENT_TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
+fn default_platform_reply(msg: &FlutterPlatformMessage) -> &'static [u8] {
+    if msg.message == 0 || msg.message_size == 0 {
+        return METHOD_SUCCESS_NULL;
+    }
+    let payload =
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) };
+    let first = payload[0];
+
+    // JSONMessageCodec / JSONMethodCodec messages begin with JSON text.
+    // Reply with JSONMethodCodec success envelope `[null]`; plain `null`
+    // triggers "Expected envelope List" errors on flutter/platform/navigation.
+    if first == b'{' || first == b'[' || first == b'"' || first == b'n' {
+        return b"[null]";
+    }
+
+    // StandardMethodCodec fallback for framework method channels.
+    METHOD_SUCCESS_NULL
+}
+
 /// Present a rendered frame.  Called by the engine on the raster thread.
 /// `allocation` is a row-major RGBA8 buffer; `row_bytes` may be > width*4.
 unsafe extern "C" fn present_callback(
     _user_data: *mut (),
-    allocation: *const u8,
-    row_bytes:  usize,
-    height:     usize,
+    _allocation: *const u8,
+    row_bytes: usize,
+    height: usize,
 ) -> bool {
     unsafe {
         let surface_id = SURFACE_ID;
-        let pixel_len  = row_bytes * height;
-        let pixels = core::slice::from_raw_parts(allocation, pixel_len);
-        let n = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-        if n < 4 {
-            // Diagnostic: find first non-zero byte to confirm the engine
-            // actually rasterized into this present buffer.
-            let mut first_nz: i64 = -1;
-            let mut nz_count: u64 = 0;
-            let scan = if pixel_len > 1_000_000 { 1_000_000 } else { pixel_len };
-            let mut i = 0usize;
-            while i < scan {
-                if pixels[i] != 0 {
-                    if first_nz < 0 { first_nz = i as i64; }
-                    nz_count += 1;
-                }
-                i += 1;
-            }
-            write_hex_u64(b"[present-scan] alloc_addr=", allocation as u64);
-            write_hex_u64(b"[present-scan] row_bytes=", row_bytes as u64);
-            write_hex_u64(b"[present-scan] pixel_len=", pixel_len as u64);
-            write_hex_u64(b"[present-scan] first_nz_off=", first_nz as u64);
-            write_hex_u64(b"[present-scan] nz_count=", nz_count);
-        }
+        let pixel_len = row_bytes * height;
+        let pixels = core::slice::from_raw_parts(_allocation, pixel_len);
         let ok = gpu_submit_strided(surface_id, pixels, row_bytes) >= 0;
         if ok {
             let n = PRESENT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
-            if n < 8 || n % 60 == 0 {
-                write(b"[embedder] present_callback\n");
-            }
+            write(b"[embedder] present_callback n=");
+            write_dec(n as u64);
+            write(b"\n");
         }
         ok
     }
@@ -564,10 +603,7 @@ unsafe extern "C" fn present_callback(
 /// notification (passing an opaque `baton`).  We forward the baton to the
 /// kernel; the APIC ISR returns it in the next `EV_VSYNC` event so the event
 /// loop can call `FlutterEngineOnVsync(engine, baton, start_ns, target_ns)`.
-unsafe extern "C" fn vsync_callback(
-    _user_data: *mut (),
-    baton:       usize,
-) {
+unsafe extern "C" fn vsync_callback(_user_data: *mut (), baton: usize) {
     engine_vsync_baton_post(baton as u64);
 }
 
@@ -577,7 +613,9 @@ unsafe extern "C" fn platform_message_callback(
     msg_ptr:   *const FlutterPlatformMessage,
     _user_data: *mut (),
 ) {
-    if msg_ptr.is_null() { return; }
+    if msg_ptr.is_null() {
+        return;
+    }
     let msg = unsafe { &*msg_ptr };
     let channel_slice = if msg.channel != 0 {
         unsafe { cstr_to_slice(msg.channel as *const u8) }
@@ -624,9 +662,8 @@ fn handle_shell_platform_message(msg: &FlutterPlatformMessage) {
         }
         return;
     }
-    let payload = unsafe {
-        core::slice::from_raw_parts(msg.message as *const u8, msg.message_size)
-    };
+    let payload =
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) };
     let reply = dispatch_shell_command(payload);
     if SHELL_MSG_LOG.load(Ordering::Relaxed) <= 4 {
         write(b"[embedder/shell] dispatch reply len=");
@@ -684,10 +721,28 @@ fn run_due_platform_tasks(engine: u64, now: u64, max_tasks: usize) {
 }
 
 fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
+    let host_mode = CURRENT_HOST_MODE.load(Ordering::Acquire);
+    let app_id = CURRENT_APP_ID.load(Ordering::Acquire);
+    let shell_capable = host_mode == HOST_MODE_SHELL;
+    let files_capable = host_mode == HOST_MODE_APP && app_id == 2;
+
     if payload.starts_with(b"list") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         return format_app_list_json();
     }
+    if payload.starts_with(b"vfs:list:") {
+        if !(shell_capable || files_capable) {
+            return b"{\"ok\":false,\"err\":\"cap\",\"entries\":[]}";
+        }
+        let path = trim_line(&payload[9..]);
+        return format_vfs_list_json(path);
+    }
     if payload.starts_with(b"launch:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let id = parse_u32_after_colon(payload);
         if id == 0 {
             return b"{\"ok\":false}";
@@ -699,6 +754,9 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         return b"{\"ok\":false}";
     }
     if payload.starts_with(b"uninstall:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let id = parse_u32_after_colon(payload);
         if id == 0 {
             return b"{\"ok\":false}";
@@ -709,6 +767,9 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         return b"{\"ok\":false}";
     }
     if payload.starts_with(b"install:") {
+        if !(shell_capable || files_capable) {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
         let path = &payload[8..];
         let path = trim_line(path);
         return install_osx_from_path(path);
@@ -736,7 +797,10 @@ fn parse_u32_after_colon(payload: &[u8]) -> u32 {
 }
 
 fn trim_line(s: &[u8]) -> &[u8] {
-    let end = s.iter().position(|&b| b == 0 || b == b'\n').unwrap_or(s.len());
+    let end = s
+        .iter()
+        .position(|&b| b == 0 || b == b'\n')
+        .unwrap_or(s.len());
     &s[..end]
 }
 
@@ -762,28 +826,126 @@ fn format_app_list_json() -> &'static [u8] {
             .position(|&b| b == 0)
             .unwrap_or(64);
         let name = &records[off + 4..off + 4 + name_end];
+        let version_end = records[off + 68..off + 84]
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(16);
+        let version = &records[off + 68..off + 68 + version_end];
+        let flags = u32::from_le_bytes(records[off + 84..off + 88].try_into().unwrap_or([0; 4]));
+        let system = (flags & 1) != 0;
         if i > 0 {
             out[pos] = b',';
             pos += 1;
         }
         out[pos] = b'{';
         pos += 1;
-        out[pos..pos + 5].copy_from_slice(b"\"id\":");
-        pos += 5;
+        const ID_PREFIX: &[u8] = b"\"id\":";
+        out[pos..pos + ID_PREFIX.len()].copy_from_slice(ID_PREFIX);
+        pos += ID_PREFIX.len();
         pos += write_json_u32(&mut out[pos..], id);
-        out[pos..pos + 9].copy_from_slice(b",\"name\":\"");
-        pos += 9;
-        let copy = name.len().min(out.len().saturating_sub(pos).saturating_sub(12));
+        const NAME_PREFIX: &[u8] = b",\"name\":\"";
+        out[pos..pos + NAME_PREFIX.len()].copy_from_slice(NAME_PREFIX);
+        pos += NAME_PREFIX.len();
+        let copy = name
+            .len()
+            .min(out.len().saturating_sub(pos).saturating_sub(64));
         out[pos..pos + copy].copy_from_slice(&name[..copy]);
         pos += copy;
-        out[pos..pos + 3].copy_from_slice(b"\"}");
-        pos += 3;
+        const VERSION_PREFIX: &[u8] = b"\",\"version\":\"";
+        out[pos..pos + VERSION_PREFIX.len()].copy_from_slice(VERSION_PREFIX);
+        pos += VERSION_PREFIX.len();
+        let copy = version
+            .len()
+            .min(out.len().saturating_sub(pos).saturating_sub(40));
+        out[pos..pos + copy].copy_from_slice(&version[..copy]);
+        pos += copy;
+        const SYSTEM_TRUE: &[u8] = b"\",\"system\":true";
+        const SYSTEM_FALSE: &[u8] = b"\",\"system\":false";
+        let system_slice = if system { SYSTEM_TRUE } else { SYSTEM_FALSE };
+        out[pos..pos + system_slice.len()].copy_from_slice(system_slice);
+        pos += system_slice.len();
+        if name == b"Canvas" {
+            const ROLE: &[u8] = b",\"coreRole\":\"canvas\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        } else if name == b"Files" {
+            const ROLE: &[u8] = b",\"coreRole\":\"files\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        } else if name == b"Web Link" {
+            const ROLE: &[u8] = b",\"coreRole\":\"web\"";
+            out[pos..pos + ROLE.len()].copy_from_slice(ROLE);
+            pos += ROLE.len();
+        }
+        out[pos] = b'}';
+        pos += 1;
         i += 1;
     }
     out[pos..pos + 2].copy_from_slice(b"]}");
     pos += 2;
     APP_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
     unsafe { core::slice::from_raw_parts(APP_LIST_JSON.as_ptr(), pos) }
+}
+
+static mut VFS_LIST_JSON: [u8; 8192] = [0; 8192];
+static VFS_LIST_JSON_LEN: AtomicU32 = AtomicU32::new(0);
+
+fn format_vfs_list_json(path: &[u8]) -> &'static [u8] {
+    let mut records = [0u8; 4096];
+    let n = sys::vfs_list(path, &mut records);
+    if n < 0 {
+        return b"{\"ok\":false,\"entries\":[]}";
+    }
+
+    let mut out = unsafe { &mut VFS_LIST_JSON };
+    let mut pos = 0usize;
+    const PREFIX: &[u8] = b"{\"ok\":true,\"entries\":[";
+    out[pos..pos + PREFIX.len()].copy_from_slice(PREFIX);
+    pos += PREFIX.len();
+
+    let mut first = true;
+    let valid = (n as usize).min(records.len());
+    for line in records[..valid].split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if !first {
+            out[pos] = b',';
+            pos += 1;
+        }
+        first = false;
+
+        const ITEM_PREFIX: &[u8] = b"{\"name\":\"";
+        out[pos..pos + ITEM_PREFIX.len()].copy_from_slice(ITEM_PREFIX);
+        pos += ITEM_PREFIX.len();
+        for &b in line {
+            if pos + 8 >= out.len() {
+                break;
+            }
+            if b == b'"' || b == b'\\' {
+                out[pos] = b'\\';
+                out[pos + 1] = b;
+                pos += 2;
+            } else {
+                out[pos] = b;
+                pos += 1;
+            }
+        }
+        let installable = line.ends_with(b".osx");
+        const MID_TRUE: &[u8] = b"\",\"installable\":true}";
+        const MID_FALSE: &[u8] = b"\",\"installable\":false}";
+        let suffix = if installable { MID_TRUE } else { MID_FALSE };
+        if pos + suffix.len() >= out.len() {
+            break;
+        }
+        out[pos..pos + suffix.len()].copy_from_slice(suffix);
+        pos += suffix.len();
+    }
+
+    out[pos..pos + 2].copy_from_slice(b"]}");
+    pos += 2;
+    VFS_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
+    unsafe { core::slice::from_raw_parts(VFS_LIST_JSON.as_ptr(), pos) }
 }
 
 fn write_json_u32(out: &mut [u8], mut v: u32) -> usize {
@@ -851,11 +1013,7 @@ fn install_osx_from_path(path: &[u8]) -> &'static [u8] {
 }
 
 /// Log callback — writes to the kernel's serial debug output.
-unsafe extern "C" fn log_message_callback(
-    tag: *const u8,
-    msg: *const u8,
-    _ud: *mut (),
-) {
+unsafe extern "C" fn log_message_callback(tag: *const u8, msg: *const u8, _ud: *mut ()) {
     // Write tag + ": " + message to fd 1.
     if !tag.is_null() {
         let tag_slice = unsafe { cstr_to_slice(tag) };
@@ -872,7 +1030,9 @@ unsafe extern "C" fn log_message_callback(
 unsafe fn cstr_to_slice<'a>(ptr: *const u8) -> &'a [u8] {
     let mut len = 0usize;
     unsafe {
-        while *ptr.add(len) != 0 && len < 4096 { len += 1; }
+        while *ptr.add(len) != 0 && len < 4096 {
+            len += 1;
+        }
         core::slice::from_raw_parts(ptr, len)
     }
 }
@@ -905,7 +1065,8 @@ fn read_host_bootstrap() -> (u64, u64, u64) {
 
 extern "C" fn main_embedder() {
     let (host_mode, app_id, aot_va) = read_host_bootstrap();
-    let _ = app_id;
+    CURRENT_HOST_MODE.store(host_mode, Ordering::Release);
+    CURRENT_APP_ID.store(app_id, Ordering::Release);
     write(b"[host] starting\n");
 
     // 1. Register as the engine host.
@@ -915,11 +1076,11 @@ extern "C" fn main_embedder() {
         exit(-1);
     }
 
-    // 1b. Phase 33-A: request 60 Hz vsync cadence from the compositor.
-    vsync_set_hz(60);
-
+    // 1b. Phase 33-A: request high refresh cadence for smoother input/render.
+    vsync_set_hz(120);
 
     // 2. Open the engine library.
+    dlopen(b"/system/lib/liboscortex_libc.so", 0);
     let handle = dlopen(ENGINE_LIB_PATH, 0);
     if handle <= 0 {
         write(b"[embedder] dlopen failed for /system/lib/libflutter_engine.so\n");
@@ -930,24 +1091,27 @@ extern "C" fn main_embedder() {
     // 2b. Call DT_INIT and DT_INIT_ARRAY constructors.
     //     Flutter's global heap/mutex state is uninitialized until these run.
     {
-        let mut init_fn:  u64 = 0;
+        let mut init_fn: u64 = 0;
         let mut array_va: u64 = 0;
-        let mut count:    u64 = 0;
+        let mut count: u64 = 0;
         dl_get_init_array(handle, &mut init_fn, &mut array_va, &mut count);
         if init_fn != 0 {
             let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(init_fn) };
-            unsafe { f(); }
+            unsafe {
+                f();
+            }
         }
         for i in 0..count as usize {
             let fn_ptr_addr = array_va + (i * 8) as u64;
             let fn_va = unsafe { core::ptr::read_unaligned(fn_ptr_addr as *const u64) };
             if fn_va != 0 && fn_va != u64::MAX {
                 let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(fn_va) };
-                unsafe { f(); }
+                unsafe {
+                    f();
+                }
             }
         }
     }
-
 
     // 3. Resolve FlutterEngineGetProcAddresses.
     let get_procs_va = dlsym(handle, b"FlutterEngineGetProcAddresses");
@@ -957,6 +1121,8 @@ extern "C" fn main_embedder() {
     let mut initialize_va = 0u64;
     let mut run_initialized_va = 0u64;
     let mut notify_display_update_va = 0u64;
+    let mut get_current_time_va = 0u64;
+    let mut send_view_focus_event_va = 0u64;
 
     if get_procs_va != 0 {
         let mut api_table = FlutterEngineProcTableApi::default();
@@ -967,30 +1133,33 @@ extern "C" fn main_embedder() {
         if rc != 0 {
             write(b"[embedder] GetProcAddresses returned non-zero\n");
         }
-        proctable.run                   = api_table.run;
-        proctable.shutdown              = api_table.shutdown;
-        proctable.send_window_metrics   = api_table.send_window_metrics;
-        proctable.send_pointer_event    = api_table.send_pointer_event;
-        proctable.send_key_event        = api_table.send_key_event;
-        proctable.on_vsync              = api_table.on_vsync;
-        proctable.schedule_frame        = api_table.schedule_frame;
+        proctable.run = api_table.run;
+        proctable.shutdown = api_table.shutdown;
+        proctable.send_window_metrics = api_table.send_window_metrics;
+        proctable.send_pointer_event = api_table.send_pointer_event;
+        proctable.send_key_event = api_table.send_key_event;
+        proctable.on_vsync = api_table.on_vsync;
+        proctable.schedule_frame = api_table.schedule_frame;
         proctable.send_platform_message = api_table.send_platform_message;
         SEND_PLATFORM_MESSAGE_FN.store(api_table.send_platform_message, Ordering::SeqCst);
-        SEND_PLATFORM_MESSAGE_RESPONSE_FN.store(api_table.send_platform_message_response, Ordering::SeqCst);
+        SEND_PLATFORM_MESSAGE_RESPONSE_FN
+            .store(api_table.send_platform_message_response, Ordering::SeqCst);
 
-        initialize_va                   = api_table.initialize;
-        run_initialized_va              = api_table.run_initialized;
-        notify_display_update_va        = api_table.notify_display_update;
+        initialize_va = api_table.initialize;
+        run_initialized_va = api_table.run_initialized;
+        notify_display_update_va = api_table.notify_display_update;
+        get_current_time_va = api_table.get_current_time;
+        send_view_focus_event_va = api_table.send_view_focus_event;
         RUN_TASK_FN.store(api_table.run_task, Ordering::SeqCst);
     } else {
         // Stub path: resolve each symbol manually.
-        proctable.run                   = dlsym(handle, b"FlutterEngineRun");
-        proctable.shutdown              = dlsym(handle, b"FlutterEngineShutdown");
-        proctable.send_window_metrics   = dlsym(handle, b"FlutterEngineSendWindowMetricsEvent");
-        proctable.send_pointer_event    = dlsym(handle, b"FlutterEngineSendPointerEvent");
-        proctable.send_key_event        = dlsym(handle, b"FlutterEngineSendKeyEvent");
-        proctable.on_vsync              = dlsym(handle, b"FlutterEngineOnVsync");
-        proctable.schedule_frame        = dlsym(handle, b"FlutterEngineScheduleFrame");
+        proctable.run = dlsym(handle, b"FlutterEngineRun");
+        proctable.shutdown = dlsym(handle, b"FlutterEngineShutdown");
+        proctable.send_window_metrics = dlsym(handle, b"FlutterEngineSendWindowMetricsEvent");
+        proctable.send_pointer_event = dlsym(handle, b"FlutterEngineSendPointerEvent");
+        proctable.send_key_event = dlsym(handle, b"FlutterEngineSendKeyEvent");
+        proctable.on_vsync = dlsym(handle, b"FlutterEngineOnVsync");
+        proctable.schedule_frame = dlsym(handle, b"FlutterEngineScheduleFrame");
         proctable.send_platform_message = dlsym(handle, b"FlutterEngineSendPlatformMessage");
         SEND_PLATFORM_MESSAGE_FN.store(proctable.send_platform_message, Ordering::SeqCst);
         SEND_PLATFORM_MESSAGE_RESPONSE_FN.store(
@@ -998,16 +1167,45 @@ extern "C" fn main_embedder() {
             Ordering::SeqCst,
         );
 
-        initialize_va                   = dlsym(handle, b"FlutterEngineInitialize");
-        run_initialized_va              = dlsym(handle, b"FlutterEngineRunInitialized");
-        notify_display_update_va        = dlsym(handle, b"FlutterEngineNotifyDisplayUpdate");
+        initialize_va = dlsym(handle, b"FlutterEngineInitialize");
+        run_initialized_va = dlsym(handle, b"FlutterEngineRunInitialized");
+        notify_display_update_va = dlsym(handle, b"FlutterEngineNotifyDisplayUpdate");
+        get_current_time_va = dlsym(handle, b"FlutterEngineGetCurrentTime");
+        send_view_focus_event_va = dlsym(handle, b"FlutterEngineSendViewFocusEvent");
         RUN_TASK_FN.store(dlsym(handle, b"FlutterEngineRunTask"), Ordering::SeqCst);
     }
 
-    if initialize_va == 0 || run_initialized_va == 0 || notify_display_update_va == 0 || RUN_TASK_FN.load(Ordering::SeqCst) == 0 {
+    if initialize_va == 0
+        || run_initialized_va == 0
+        || notify_display_update_va == 0
+        || RUN_TASK_FN.load(Ordering::SeqCst) == 0
+    {
         write(b"[embedder] ERROR: FlutterEngineInitialize, RunInitialized, NotifyDisplayUpdate or RunTask not found!\n");
         exit(-1);
     }
+
+    // Verify engine compilation mode: AOT vs JIT
+    let runs_aot_va = dlsym(handle, b"FlutterEngineRunsAOTCompiledDartCode");
+    let engine_load_base = if runs_aot_va != 0 {
+        runs_aot_va - 0x1960260
+    } else {
+        0x4_8000_0000
+    };
+    write(b"[embedder] FlutterEngineRunsAOTCompiledDartCode VA: ");
+    write_hex(runs_aot_va);
+    write(b"\n");
+    let mut is_aot = false;
+    if runs_aot_va != 0 {
+        let runs_aot: unsafe extern "C" fn() -> bool = unsafe { core::mem::transmute(runs_aot_va) };
+        is_aot = unsafe { runs_aot() };
+        write(b"[embedder] runs_aot_compiled_dart_code returned: ");
+        if is_aot {
+            write(b"true\n");
+        } else {
+            write(b"false\n");
+        }
+    }
+    IS_AOT.store(is_aot, Ordering::SeqCst);
 
     // 5. Register proc table with the kernel.
     engine_proctable_set(
@@ -1017,14 +1215,19 @@ extern "C" fn main_embedder() {
 
     // 6. Create a compositor surface sized to the framebuffer.
     let fb_packed = fb_size_packed();
-    let fb_w      = ((fb_packed >> 32) & 0xFFFF_FFFF) as u32;
-    let fb_h      = (fb_packed & 0xFFFF_FFFF) as u32;
+    let fb_w = ((fb_packed >> 32) & 0xFFFF_FFFF) as u32;
+    let fb_h = (fb_packed & 0xFFFF_FFFF) as u32;
     let (w, h) = if fb_w > 0 && fb_h > 0 && fb_w <= 16_384 && fb_h <= 16_384 {
         (fb_w, fb_h)
     } else {
         (1280, 720)
     };
 
+    write(b"[embedder] FB resolution: w=");
+    write_dec(w as u64);
+    write(b" h=");
+    write_dec(h as u64);
+    write(b"\n");
 
     // Create the surface at full framebuffer resolution so Flutter renders
     // to the entire screen. The kernel compositor handles memory allocation.
@@ -1037,20 +1240,18 @@ extern "C" fn main_embedder() {
 
     unsafe {
         SURFACE_ID = surface_id;
-        SURFACE_W  = w;
-        SURFACE_H  = h;
+        SURFACE_W = w;
+        SURFACE_H = h;
     }
 
     // 7. Build project args + renderer config.
     // IMPORTANT: FlutterRendererConfig is 120 bytes (C ABI union). Use the
     // new_software() constructor which zero-initialises all 120 bytes and
     // writes the software config fields at the correct offsets.
-    let renderer_config = FlutterRendererConfig::new_software(
-        present_callback as *const () as u64,
-    );
+    let renderer_config = FlutterRendererConfig::new_software(present_callback as *const () as u64);
 
-    let assets_path  = b"/system/flutter/flutter_assets\0";
-    let icu_path     = b"/system/flutter/icudtl.dat\0";
+    let assets_path = b"/system/flutter/flutter_assets\0";
+    let icu_path = b"/system/flutter/icudtl.dat\0";
 
     // Engine command-line switches. The first argv item is the executable
     // name (engine skips it). We disable Impeller because the Impeller
@@ -1061,22 +1262,47 @@ extern "C" fn main_embedder() {
     static ARG1: &[u8] = b"--enable-impeller=false\0";
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
+    static ARG4: &[u8] = b"--precompiled-mode\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 4]);
+    struct ArgvPtrs([*const u8; 5]);
     unsafe impl Sync for ArgvPtrs {}
-    static ENGINE_ARGV: ArgvPtrs = ArgvPtrs([
-        ARG0.as_ptr(),
-        ARG1.as_ptr(),
-        ARG2.as_ptr(),
-        ARG3.as_ptr(),
-    ]);
+    static ENGINE_ARGV: ArgvPtrs =
+        ArgvPtrs([
+            ARG0.as_ptr(),
+            ARG1.as_ptr(),
+            ARG2.as_ptr(),
+            ARG3.as_ptr(),
+            ARG4.as_ptr(),
+        ]);
 
-    let mut project_args = FlutterProjectArgsRaw { bytes: [0; FLUTTER_PROJECT_ARGS_SIZE] };
-    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_STRUCT_SIZE, FLUTTER_PROJECT_ARGS_SIZE as u64);
-    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ASSETS_PATH, assets_path.as_ptr() as u64);
-    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ICU_DATA_PATH, icu_path.as_ptr() as u64);
-    write_i32_at(&mut project_args.bytes, OFF_PROJECT_ARGS_COMMAND_LINE_ARGC, ENGINE_ARGV.0.len() as i32);
-    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_COMMAND_LINE_ARGV, ENGINE_ARGV.0.as_ptr() as u64);
+    let mut project_args = FlutterProjectArgsRaw {
+        bytes: [0; FLUTTER_PROJECT_ARGS_SIZE],
+    };
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_STRUCT_SIZE,
+        FLUTTER_PROJECT_ARGS_SIZE as u64,
+    );
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_ASSETS_PATH,
+        assets_path.as_ptr() as u64,
+    );
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_ICU_DATA_PATH,
+        icu_path.as_ptr() as u64,
+    );
+    write_i32_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_COMMAND_LINE_ARGC,
+        ENGINE_ARGV.0.len() as i32,
+    );
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_COMMAND_LINE_ARGV,
+        ENGINE_ARGV.0.as_ptr() as u64,
+    );
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_PLATFORM_MESSAGE_CALLBACK,
@@ -1087,8 +1313,16 @@ extern "C" fn main_embedder() {
         OFF_PROJECT_ARGS_VSYNC_CALLBACK,
         vsync_callback as *const () as u64,
     );
-    write_i32_at(&mut project_args.bytes, OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGC, 0);
-    write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGV, 0);
+    write_i32_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGC,
+        0,
+    );
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGV,
+        0,
+    );
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_LOG_MESSAGE_CALLBACK,
@@ -1096,37 +1330,28 @@ extern "C" fn main_embedder() {
     );
 
     if host_mode == HOST_MODE_APP {
-        // Per-app .osx bundles ship gen_snapshot libapp.so; only valid when the
-        // engine build matches (AOT engine). With the JIT shell engine, app
-        // hosts must bundle JIT snapshot assets instead (future work).
-        match aot_loader::load_dart_snapshot_from_mapping(aot_va) {
-            Some(snaps) => {
-                aot_loader::log_manifest(&snaps);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA,              snaps.vm_data);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE,         snaps.vm_data_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS,      snaps.vm_instr);
-                write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, snaps.vm_instr_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA,             snaps.iso_data);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE,        snaps.iso_data_size);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS,     snaps.iso_instr);
-                write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE,snaps.iso_instr_size);
-            }
-            None => {
-                write(b"[host] ERROR: app AOT load failed\n");
-                exit(-1);
-            }
+        write(b"[host] APP mode pid bootstrap app_id=");
+        write_dec(app_id as u64);
+        write(b" aot_va=");
+        write_hex(aot_va);
+        write(b"\n");
+        configure_app_assets(&mut project_args, app_id);
+        if is_aot {
+            configure_aot_snapshots(&mut project_args, aot_va);
         }
     } else {
-        // Shell: JIT engine reads vm/isolate snapshot files from initramfs.
-        write(b"[embedder] JIT mode: passing snapshot PATHS to engine (it will open+mmap)\n");
-        static VM_PATH:  &[u8] = b"/system/flutter/flutter_assets/vm_snapshot_data\0";
-        static ISO_PATH: &[u8] = b"/system/flutter/flutter_assets/isolate_snapshot_data\0";
-
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, VM_PATH.as_ptr() as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, (VM_PATH.len() - 1) as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ISO_PATH.as_ptr() as u64);
-        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, (ISO_PATH.len() - 1) as u64);
-        write(b"[embedder] JIT snapshot paths installed; engine will open them via file mmap\n");
+        write(b"[host] SHELL mode\n");
+        configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
+        if is_aot {
+            write(b"[embedder] registering shell libapp.so globally...\n");
+            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so", 0);
+            if aot_handle <= 0 {
+                write(b"[embedder] WARNING: dlopen /system/flutter/libapp.so failed\n");
+            } else {
+                write(b"[embedder] shell libapp.so registered globally\n");
+            }
+            configure_aot_snapshots(&mut project_args, 0);
+        }
     }
 
     // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
@@ -1147,12 +1372,17 @@ extern "C" fn main_embedder() {
     // Initialize the MessageLoop for the main thread before FlutterEngineInitialize.
     // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
     write(b"[embedder] initializing main thread message loop...\n");
-    const ENSURE_INITIALIZED_NM: u64 = 0x19bbd40;
-    let ensure_initialized_va = 0x1000000u64 + ENSURE_INITIALIZED_NM;
-    let ensure_initialized: unsafe extern "C" fn() =
-        unsafe { core::mem::transmute(ensure_initialized_va) };
-    unsafe { ensure_initialized(); }
-    write(b"[embedder] message loop initialized!\n");
+    let ensure_initialized_va = dlsym(handle, b"_ZN3fml11MessageLoop33EnsureInitializedForCurrentThreadEv");
+    if ensure_initialized_va != 0 {
+        let ensure_initialized: unsafe extern "C" fn() = unsafe { core::mem::transmute(ensure_initialized_va) };
+        unsafe {
+            ensure_initialized();
+        }
+        write(b"[embedder] message loop initialized!\n");
+    } else {
+        write(b"[embedder] ERROR: fml::MessageLoop::EnsureInitializedForCurrentThread not found!\n");
+        exit(-1);
+    }
 
     // 8. Initialize the engine synchronously on the main thread
     write(b"[embedder] calling FlutterEngineInitialize...\n");
@@ -1172,7 +1402,9 @@ extern "C" fn main_embedder() {
         let mut hex = *b"[embedder] FlutterEngineInitialize FAILED rc=0x________\n";
         let d = b"0123456789abcdef";
         let r = rc_init as u32;
-        for i in 0..8 { hex[41 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+        for i in 0..8 {
+            hex[41 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize];
+        }
         write(&hex);
         exit(-1);
     }
@@ -1182,14 +1414,17 @@ extern "C" fn main_embedder() {
     // 9. Run the engine on the main thread (starts the shell)
     write(b"[embedder] calling FlutterEngineRunInitialized...\n");
     let rc_run = unsafe {
-        let run_initialized_fn: RunInitializedFn = unsafe { core::mem::transmute(run_initialized_va) };
+        let run_initialized_fn: RunInitializedFn =
+            unsafe { core::mem::transmute(run_initialized_va) };
         run_initialized_fn(engine_out)
     };
     if rc_run != 0 {
         let mut hex = *b"[embedder] FlutterEngineRunInitialized FAILED rc=0x________\n";
         let d = b"0123456789abcdef";
         let r = rc_run as u32;
-        for i in 0..8 { hex[45 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+        for i in 0..8 {
+            hex[45 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize];
+        }
         write(&hex);
         exit(-1);
     }
@@ -1198,23 +1433,26 @@ extern "C" fn main_embedder() {
     // 10. Immediately notify display topology (now that shell exists)
     {
         let display = FlutterEngineDisplay {
-            struct_size:        core::mem::size_of::<FlutterEngineDisplay>(),
-            display_id:         0,
-            single_display:     true,
-            _pad0:              [0; 7],
-            refresh_rate:       60.0,
-            width:              w as usize,
-            height:             h as usize,
+            struct_size: core::mem::size_of::<FlutterEngineDisplay>(),
+            display_id: 0,
+            single_display: true,
+            _pad0: [0; 7],
+            refresh_rate: 60.0,
+            width: w as usize,
+            height: h as usize,
             device_pixel_ratio: 1.0,
         };
-        let notify_display: NotifyDisplayUpdateFn = unsafe { core::mem::transmute(notify_display_update_va) };
+        let notify_display: NotifyDisplayUpdateFn =
+            unsafe { core::mem::transmute(notify_display_update_va) };
         let rc_disp = unsafe { notify_display(engine_out, 0, &display as *const _, 1) };
         if rc_disp == 0 {
         } else {
             let mut hex = *b"[embedder] FlutterEngineNotifyDisplayUpdate FAILED rc=0x________\n";
             let d = b"0123456789abcdef";
             let r = rc_disp as u32;
-            for i in 0..8 { hex[54 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize]; }
+            for i in 0..8 {
+                hex[54 + i] = d[((r >> ((7 - i) * 4)) & 0xF) as usize];
+            }
             write(&hex);
         }
     }
@@ -1222,25 +1460,43 @@ extern "C" fn main_embedder() {
     // 11. Immediately send initial window metrics
     {
         let metrics = FlutterWindowMetricsEvent {
-            struct_size:                core::mem::size_of::<FlutterWindowMetricsEvent>(),
-            width:                      w as usize,
-            height:                     h as usize,
-            pixel_ratio:                1.0,
-            left:                       0,
-            top:                        0,
-            physical_view_inset_top:    0.0,
-            physical_view_inset_right:  0.0,
+            struct_size: core::mem::size_of::<FlutterWindowMetricsEvent>(),
+            width: w as usize,
+            height: h as usize,
+            pixel_ratio: 1.0,
+            left: 0,
+            top: 0,
+            physical_view_inset_top: 0.0,
+            physical_view_inset_right: 0.0,
             physical_view_inset_bottom: 0.0,
-            physical_view_inset_left:   0.0,
-            display_id:                 0,
-            view_id:                    0,
+            physical_view_inset_left: 0.0,
+            display_id: 0,
+            view_id: 0,
         };
-        let send_metrics: SendWindowMetricsFn = unsafe { core::mem::transmute(proctable.send_window_metrics) };
+        let send_metrics: SendWindowMetricsFn =
+            unsafe { core::mem::transmute(proctable.send_window_metrics) };
         let rc = unsafe { send_metrics(engine_out, &metrics as *const _) };
         if rc == 0 {
+            if send_view_focus_event_va != 0 {
+                let focus = FlutterViewFocusEvent {
+                    struct_size: core::mem::size_of::<FlutterViewFocusEvent>(),
+                    view_id: 0,
+                    state: 1,
+                    direction: 0,
+                };
+                let send_focus: SendViewFocusEventFn =
+                    unsafe { core::mem::transmute(send_view_focus_event_va) };
+                let rc_focus = unsafe { send_focus(engine_out, &focus as *const _) };
+                write(b"[embedder] send view focus rc=");
+                write_dec(rc_focus as u64);
+                write(b"\n");
+            } else {
+                write(b"[embedder] send view focus unavailable\n");
+            }
+
             if proctable.schedule_frame != 0 {
-                let schedule_frame: ScheduleFrameFn = unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let rc_sf = unsafe { schedule_frame(engine_out) };
+                let rc_sf =
+                    schedule_frame_with_log(engine_out, proctable.schedule_frame, b"initial");
                 if rc_sf == 0 {
                 } else {
                     let mut hex = *b"[embedder] FlutterEngineScheduleFrame FAILED rc=0x________\n";
@@ -1279,7 +1535,6 @@ extern "C" fn main_embedder() {
                     write(&hex);
                 }
             }
-
         } else {
             let mut hex = *b"[embedder] send metrics failed, rc = 0x________\n";
             let digits = b"0123456789abcdef";
@@ -1291,7 +1546,6 @@ extern "C" fn main_embedder() {
             write(&hex);
         }
     }
-
 
     // 12. Event loop: dispatch vsync / pointer / key / platform-channel events,
     // and run custom task runner platform tasks.
@@ -1331,14 +1585,9 @@ extern "C" fn main_embedder() {
             diff_ms.min(16).max(1)
         };
 
-        if engine_out != 0
-            && now >= startup_watchdog_next_ns
-            && startup_watchdog_stage < 6
-        {
+        if engine_out != 0 && now >= startup_watchdog_next_ns && startup_watchdog_stage < 6 {
             if proctable.schedule_frame != 0 {
-                let schedule_frame: ScheduleFrameFn =
-                    unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let rc_sf = unsafe { schedule_frame(engine_out) };
+                let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"startup");
             }
 
             if startup_watchdog_stage >= 2 && proctable.send_platform_message != 0 {
@@ -1354,8 +1603,7 @@ extern "C" fn main_embedder() {
                 let send_platform_message: SendPlatformMessageFn =
                     unsafe { core::mem::transmute(proctable.send_platform_message) };
                 let rc_pm = unsafe { send_platform_message(engine_out, &msg as *const _) };
-                if rc_pm == 0 {
-                }
+                if rc_pm == 0 {}
             }
 
             startup_watchdog_stage += 1;
@@ -1376,15 +1624,14 @@ extern "C" fn main_embedder() {
             // Frame pump: keep Flutter rendering at ~60 fps so the Dart UI
             // thread has time to finish init and produce a real frame.
             let now_pump = rdtsc_ns();
-            if engine_out != 0
-                && proctable.schedule_frame != 0
-                && now_pump >= frame_pump_next_ns
-            {
-                let schedule_frame: ScheduleFrameFn =
-                    unsafe { core::mem::transmute(proctable.schedule_frame) };
-                let _ = unsafe { schedule_frame(engine_out) };
+            if engine_out != 0 && proctable.schedule_frame != 0 && now_pump >= frame_pump_next_ns {
+                let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"idle");
                 let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-                let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
+                let interval = if presents < 10 {
+                    1_000_000u64
+                } else {
+                    16_666_666u64
+                };
                 frame_pump_next_ns = now_pump + interval;
             }
             continue;
@@ -1397,36 +1644,48 @@ extern "C" fn main_embedder() {
                 // delivering EV_VSYNC(baton=0).  Use these ticks to pump
                 // FlutterEngineScheduleFrame so Flutter posts a real baton and
                 // keeps rendering even for static (no-animation) apps.
-                if baton == 0
-                    && engine_out != 0
-                    && proctable.schedule_frame != 0
-                {
+                if baton == 0 && engine_out != 0 && proctable.schedule_frame != 0 {
                     let now_pump = rdtsc_ns();
                     if now_pump >= frame_pump_next_ns {
-                        let schedule_frame: ScheduleFrameFn =
-                            unsafe { core::mem::transmute(proctable.schedule_frame) };
-                        let _ = unsafe { schedule_frame(engine_out) };
+                        let _ = schedule_frame_with_log(
+                            engine_out,
+                            proctable.schedule_frame,
+                            b"vsync0",
+                        );
                         let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-                        let interval = if presents < 10 { 1_000_000u64 } else { 16_666_666u64 };
+                        let interval = if presents < 10 {
+                            1_000_000u64
+                        } else {
+                            16_666_666u64
+                        };
                         frame_pump_next_ns = now_pump + interval;
                     }
                 }
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
                     static VSYNC_SEND_LOG: AtomicU32 = AtomicU32::new(0);
                     let vsync_n = VSYNC_SEND_LOG.fetch_add(1, Ordering::Relaxed);
-                    let now_ns    = rdtsc_ns();
+                    let now_ns = rdtsc_ns();
                     let target_ns = now_ns + 16_666_666;
-                    let f: OnVsyncFn =
-                        unsafe { core::mem::transmute(proctable.on_vsync) };
+                    let f: OnVsyncFn = unsafe { core::mem::transmute(proctable.on_vsync) };
+                    write(b"[embedder/vsync] calling on_vsync n=");
+                    write_dec(vsync_n as u64);
+                    write(b" baton=");
+                    write_hex(baton as u64);
+                    write(b"\n");
                     // A baton is a one-shot token: call OnVsync EXACTLY once.
                     // Calling it twice corrupts the engine's vsync accounting
                     // and stops it from scheduling further frames.
                     unsafe { f(engine_out, baton, now_ns, target_ns) };
 
-                    // OnVsync posts raster/UI work — yield so runner threads can execute.
-                    for _ in 0..12 {
-                        sched_yield();
-                    }
+                    // OnVsync posts raster/UI work to the engine's runner threads
+                    // (separate PIDs). We deliberately do NOT spin on sched_yield
+                    // here: sys_sched_yield switches to a busy-spinning runner via
+                    // enter_user_by_pid_noreturn and never regains the CPU, which
+                    // stalls this loop so it stops draining WM pointer/key events
+                    // (clicks never reach Flutter). Instead we fall through to
+                    // wm_event_wait below, which cooperatively yields CPU to the
+                    // runner threads while remaining wakeable on the next vsync or
+                    // input event.
 
                     // Consecutive-no-present watchdog: if 2 vsync→engine calls in a row
                     // produced no new present, force FlutterEngineScheduleFrame to
@@ -1440,9 +1699,11 @@ extern "C" fn main_embedder() {
                     } else if vsync_n >= 2 {
                         let cons = NO_PRESENT_CONSECUTIVE.fetch_add(1, Ordering::Relaxed) + 1;
                         if cons >= 2 && proctable.schedule_frame != 0 {
-                            let schedule_frame: ScheduleFrameFn =
-                                unsafe { core::mem::transmute(proctable.schedule_frame) };
-                            let _ = unsafe { schedule_frame(engine_out) };
+                            let _ = schedule_frame_with_log(
+                                engine_out,
+                                proctable.schedule_frame,
+                                b"watchdog",
+                            );
                             NO_PRESENT_CONSECUTIVE.store(0, Ordering::Relaxed);
                         }
                     }
@@ -1450,9 +1711,11 @@ extern "C" fn main_embedder() {
                     let presents = cur_presents;
                     if presents == 0 && (vsync_n == 10 || vsync_n == 30) {
                         if proctable.schedule_frame != 0 {
-                            let schedule_frame: ScheduleFrameFn =
-                                unsafe { core::mem::transmute(proctable.schedule_frame) };
-                            let rc_sf = unsafe { schedule_frame(engine_out) };
+                            let _ = schedule_frame_with_log(
+                                engine_out,
+                                proctable.schedule_frame,
+                                b"late-vsync",
+                            );
                         }
 
                         if vsync_n == 30 && proctable.send_platform_message != 0 {
@@ -1467,59 +1730,127 @@ extern "C" fn main_embedder() {
                             };
                             let send_platform_message: SendPlatformMessageFn =
                                 unsafe { core::mem::transmute(proctable.send_platform_message) };
-                            let rc_pm = unsafe { send_platform_message(engine_out, &msg as *const _) };
-                            if rc_pm == 0 {
-                            }
+                            let rc_pm =
+                                unsafe { send_platform_message(engine_out, &msg as *const _) };
+                            if rc_pm == 0 {}
                         }
                     }
-
                 }
             }
             EV_POINTER => {
                 let buttons = ev.flags as i64;
                 if engine_out != 0 && proctable.send_pointer_event != 0 {
-                    let x       = ((ev.a >> 48) as i16) as f64;
-                    let y       = (((ev.a >> 32) & 0xFFFF) as i16) as f64;
-                    let phase = if buttons != 0 { 2i32 } else { 1i32 };
-                    let evt = FlutterPointerEvent {
-                        struct_size:    core::mem::size_of::<FlutterPointerEvent>(),
-                        phase,
-                        _pad0:          0,
-                        timestamp:      rdtsc_ns() / 1000,
-                        x,
-                        y,
-                        device:         0,
-                        signal_kind:    0,
-                        scroll_delta_x: 0.0,
-                        scroll_delta_y: 0.0,
-                        device_kind:    1,
-                        _pad1:          0,
-                        buttons,
-                        pan_x:          0.0,
-                        pan_y:          0.0,
-                        scale:          1.0,
-                        rotation:       0.0,
-                        view_id:        0,
-                    };
+                    // push_pointer packs: a = (x as u32 as u64) << 32 | (y as u32)
+                    let x = ((ev.a >> 32) as i32) as f64;
+                    let y = (ev.a as u32) as f64;
                     let f: SendPointerEventFn =
                         unsafe { core::mem::transmute(proctable.send_pointer_event) };
-                    unsafe { f(engine_out, &evt as *const _, 1) };
+
+                    static POINTER_ADDED: AtomicU32 = AtomicU32::new(0);
+                    static LAST_POINTER_BUTTONS: AtomicU64 = AtomicU64::new(0);
+                    static LAST_TIMESTAMP: AtomicU64 = AtomicU64::new(0);
+
+                    let engine_now_us = || -> u64 {
+                        if get_current_time_va != 0 {
+                            let get_time: GetCurrentTimeFn =
+                                unsafe { core::mem::transmute(get_current_time_va) };
+                            unsafe { get_time() / 1000 }
+                        } else {
+                            rdtsc_ns() / 1000
+                        }
+                    };
+
+                    let send = |phase: i32, btns: i64| -> i32 {
+                        let mut timestamp = engine_now_us();
+                        loop {
+                            let last = LAST_TIMESTAMP.load(Ordering::SeqCst);
+                            let next = if timestamp <= last {
+                                last + 1
+                            } else {
+                                timestamp
+                            };
+                            if LAST_TIMESTAMP
+                                .compare_exchange_weak(
+                                    last,
+                                    next,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                )
+                                .is_ok()
+                            {
+                                timestamp = next;
+                                break;
+                            }
+                        }
+                        let evt = FlutterPointerEvent {
+                            struct_size: core::mem::size_of::<FlutterPointerEvent>(),
+                            phase,
+                            _pad0: 0,
+                            timestamp,
+                            x,
+                            y,
+                            device: 0,
+                            signal_kind: 0,
+                            scroll_delta_x: 0.0,
+                            scroll_delta_y: 0.0,
+                            device_kind: 1,
+                            _pad1: 0,
+                            buttons: btns,
+                            pan_x: 0.0,
+                            pan_y: 0.0,
+                            scale: 1.0,
+                            rotation: 0.0,
+                            view_id: 0,
+                        };
+                        unsafe { f(engine_out, &evt as *const _, 1) }
+                    };
+
+                    if POINTER_ADDED.swap(1, Ordering::Relaxed) == 0 {
+                        let rc = send(4, 0); // kAdd
+                        write(b"[embedder/ptr] kAdd (4) rc=");
+                        write_dec(rc as u64);
+                        write(b"\n");
+                    }
+
+                    let prev_buttons =
+                        LAST_POINTER_BUTTONS.swap(buttons as u64, Ordering::Relaxed) as i64;
+                    let phase = if prev_buttons == 0 && buttons != 0 {
+                        2i32 // kDown
+                    } else if prev_buttons != 0 && buttons == 0 {
+                        1i32 // kUp
+                    } else if buttons == 0 {
+                        6i32 // kHover
+                    } else {
+                        3i32 // kMove (drag)
+                    };
+                    let rc = send(phase, buttons);
+                    write(b"[embedder/ptr] send phase=");
+                    write_dec(phase as u64);
+                    write(b" x=");
+                    write_dec(x as u64);
+                    write(b" y=");
+                    write_dec(y as u64);
+                    write(b" buttons=");
+                    write_dec(buttons as u64);
+                    write(b" rc=");
+                    write_dec(rc as u64);
+                    write(b"\n");
                 }
             }
             EV_KEY => {
                 let scancode = ev.a as u32;
-                let pressed  = (ev.flags & 1) != 0;
+                let pressed = (ev.flags & 1) != 0;
                 if engine_out != 0 && proctable.send_key_event != 0 {
                     let evt = FlutterKeyEvent {
-                        struct_size:  core::mem::size_of::<FlutterKeyEvent>(),
-                        timestamp:    (rdtsc_ns() / 1_000_000) as f64,
-                        kind:         if pressed { 0 } else { 1 },
-                        _pad:         0,
-                        physical:     scancode as u64,
-                        logical:      scancode as u64,
-                        character:    0,
-                        synthesized:  false,
-                        _tail:        [0; 7],
+                        struct_size: core::mem::size_of::<FlutterKeyEvent>(),
+                        timestamp: (rdtsc_ns() / 1_000_000) as f64,
+                        kind: if pressed { 0 } else { 1 },
+                        _pad: 0,
+                        physical: scancode as u64,
+                        logical: scancode as u64,
+                        character: 0,
+                        synthesized: false,
+                        _tail: [0; 7],
                     };
                     let f: SendKeyEventFn =
                         unsafe { core::mem::transmute(proctable.send_key_event) };
@@ -1528,13 +1859,11 @@ extern "C" fn main_embedder() {
             }
             EV_PLATFORM_MSG => {
                 // A native kernel module sent us a platform-channel message.
-                let _seq          = ev.a;
+                let _seq = ev.a;
                 let _channel_hash = ev.flags;
                 let n = platform_msg_recv(&mut platform_buf);
                 if n > 8 + 2 + 4 {
-                    let seq = u64::from_le_bytes(
-                        platform_buf[0..8].try_into().unwrap_or([0; 8]),
-                    );
+                    let seq = u64::from_le_bytes(platform_buf[0..8].try_into().unwrap_or([0; 8]));
                     // Echo-reply OK.
                     platform_msg_reply(seq, b"ok");
                 }
@@ -1584,4 +1913,3 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     write(b"[embedder] PANIC\n");
     exit(1)
 }
-

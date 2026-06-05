@@ -193,7 +193,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             // as MAP_FIXED, which clobbers libflutter pages when Dart's heap
             // allocator passes hints that overlap. Force hint=0 unless the
             // caller explicitly asked for MAP_FIXED.
-            let hint = if is_fixed { arg0 } else { 0 };
+            let hint = arg0;
             let va = sys_mmap(hint, arg1, effective_prot);
             if va < 0 { return va; }
             if file_backed {
@@ -389,6 +389,12 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         eabi::SYS_APP_LIST      => sys_app_list(arg0, arg1),
         eabi::SYS_APP_LAUNCH    => sys_app_launch(arg0, arg1),
         eabi::SYS_APP_UNINSTALL => sys_app_uninstall(arg0),
+
+        // On-demand package delivery
+        eabi::SYS_PKG_RESOLVE    => sys_pkg_resolve(arg0, arg1),
+        eabi::SYS_PKG_CATALOG    => sys_pkg_catalog(arg0, arg1),
+        eabi::SYS_PKG_SET_SERVER => sys_pkg_set_server(arg0, arg1),
+        eabi::SYS_PKG_EVICT      => sys_pkg_evict(arg0),
 
         // Phase 39 — Named port IPC namespace
         eabi::SYS_PORT_BIND   => sys_port_bind(arg0, arg1, arg2),
@@ -593,7 +599,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x410 => posix::sys_strerror_r(arg0 as i32, arg1, arg2),
         0x411 => posix::sys_passthrough_syscall(arg0, arg1, arg2, arg3),
         0x412 => 0, // madvise noop
-        0x413 => 0, // dladdr stub
+        0x413 => sys_dladdr(arg0, arg1),
         0x414 => 0, // dlerror → NULL (no error)
         0x415 => posix::sys_getenv(arg0, arg1),
         0x416 => posix::sys_setlocale(arg0, arg1),

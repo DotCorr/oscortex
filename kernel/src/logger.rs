@@ -16,19 +16,22 @@ impl Log for KernelLogger {
         let mut buf = FmtBuf::new();
         let _ = write!(buf, "[{}] {}: {}\n", record.level(), record.target(), record.args());
         let s = buf.as_str();
+
+        let rflags = crate::arch::interrupts_save_and_disable();
         SERIAL.lock().write_str(s).ok();
         crate::drivers::fb::write_str(s);
+        crate::arch::interrupts_restore(rflags);
     }
     fn flush(&self) {}
 }
 
 /// Tiny stack-allocated write buffer for log formatting (no heap needed).
 struct FmtBuf {
-    buf: [u8; 512],
+    buf: [u8; 2048],
     len: usize,
 }
 impl FmtBuf {
-    fn new() -> Self { Self { buf: [0u8; 512], len: 0 } }
+    fn new() -> Self { Self { buf: [0u8; 2048], len: 0 } }
     fn as_str(&self) -> &str {
         core::str::from_utf8(&self.buf[..self.len]).unwrap_or("(fmt err)")
     }

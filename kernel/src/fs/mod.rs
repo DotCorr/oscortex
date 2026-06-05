@@ -246,6 +246,15 @@ macro_rules! sysfs_serve {
     }};
 }
 
+sysfs_static!(sys_pkg_cache, 256);
+
+fn fill_sys_pkg_cache() {
+    let mut buf = sys_pkg_cache::DATA.lock();
+    let off = crate::pkg::cache::status_text(&mut *buf);
+    sys_pkg_cache::LEN.store(off, AOrdering::Release);
+    sys_pkg_cache::READY.store(true, AOrdering::Release);
+}
+
 fn sysfs_lookup(path: &str) -> Option<&'static [u8]> {
     match path {
         "/sys/kernel/version"    => sysfs_serve!(sys_kernel_version,  fill_sys_kernel_version),
@@ -253,6 +262,7 @@ fn sysfs_lookup(path: &str) -> Option<&'static [u8]> {
         "/sys/process/list"      => sysfs_serve!(sys_process_list,    fill_sys_process_list),
         "/sys/app/list"          => sysfs_serve!(sys_app_list,        fill_sys_app_list),
         "/sys/usb/controllers"   => sysfs_serve!(sys_usb_controllers, fill_sys_usb_controllers),
+        "/sys/pkg/cache"         => sysfs_serve!(sys_pkg_cache,       fill_sys_pkg_cache),
         _ => None,
     }
 }

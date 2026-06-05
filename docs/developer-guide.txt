@@ -1,0 +1,321 @@
+╔══════════════════════════════════════════════════════════════════════════════════╗
+║                     O S C O R T E X   D E V E L O P E R   G U I D E           ║
+║                     Build, Package & Ship Apps — updated 2026-06-01             ║
+╚══════════════════════════════════════════════════════════════════════════════════╝
+
+
+  OVERVIEW
+  ────────
+  OSCortex apps are Flutter projects compiled to AOT and packaged as .osx
+  bundles. They run as isolated processes on a bare-metal Rust kernel with
+  no Linux, no Android, and no traditional desktop target. This guide walks
+  through the full developer workflow from project creation to on-demand
+  delivery.
+
+
+  PREREQUISITES
+  ─────────────
+  ● Flutter SDK 3.29+ (stable channel)
+  ● Rust nightly toolchain (x86_64-unknown-none target)
+  ● QEMU 8.0+ (for testing)
+  ● OSCortex repo cloned (https://github.com/DotCorr/oscortex)
+
+  Quick setup:
+    git clone https://github.com/DotCorr/oscortex
+    cd oscortex
+    rustup toolchain install nightly
+    rustup target add x86_64-unknown-none --toolchain nightly
+
+
+  WHY NOT TARGET LINUX?
+  ─────────────────────
+  OSCortex is its own operating system. You cannot use `flutter build linux`
+  because:
+
+  ● There is no Linux kernel underneath — no /proc, no /dev, no glibc
+  ● The syscall ABI is completely different (0x300+ for surfaces, etc.)
+  ● The display path is: Flutter → kernel compositor → framebuffer
+  ● There is no X11/Wayland — the kernel IS the window manager
+
+  Instead, you compile Flutter to AOT and package it as a .osx bundle that
+  the kernel knows how to load and execute.
+
+
+  THE .OSX BUNDLE FORMAT
+  ──────────────────────
+  Every app on OSCortex is a .osx file — a simple binary format:
+
+  ┌────────────────────────────────────────────────────────────┐
+  │  .OSX BUNDLE FORMAT                                        │
+  │                                                            │
+  │  Offset  Size   Field            Value                     │
+  │  ──────  ────   ─────            ─────                     │
+  │  0       4      magic            "OSCP" (4 ASCII bytes)    │
+  │  4       4      format_version   1 (u32 LE)                │
+  │  8       64     name             "My App" (null-padded)    │
+  │  72      16     version          "1.0.0" (null-padded)     │
+  │  88      …      AOT snapshot     compiled Dart code        │
+  └────────────────────────────────────────────────────────────┘
+
+  Alongside the .osx binary, you stage flutter_assets/ (fonts, images,
+  asset manifests) which the engine reads at launch.
+
+
+  BUILDING YOUR FIRST APP
+  ───────────────────────
+
+  Step 1: Create a Flutter project
+
+    flutter create my_oscortex_app
+    cd my_oscortex_app
+
+  Step 2: Use the oscortex_ui package for native look
+
+    # In pubspec.yaml, add:
+    dependencies:
+      oscortex_ui:
+        path: /path/to/oscortex/packages/oscortex_ui
+
+  Step 3: Write your app using Osc* widgets
+
+    import 'package:flutter/material.dart';
+    import 'package:oscortex_ui/oscortex_ui.dart';
+
+    void main() => runApp(const MyApp());
+
+    class MyApp extends StatelessWidget {
+      const MyApp({super.key});
+
+      @override
+      Widget build(BuildContext context) {
+        return MaterialApp(
+          theme: OscTheme.dark(),
+          home: OscScaffold(
+            accent: OscColors.violet,
+            body: Center(
+              child: OscButton(
+                label: 'Hello OSCortex',
+                onPressed: () => print('Tapped!'),
+              ),
+            ),
+          ),
+        );
+      }
+    }
+
+  Step 4: Build the .osx bundle
+
+    ./tools/build-flutter-osx.sh \
+      /absolute/path/to/my_oscortex_app \
+      "My App" \
+      /tmp/MyApp.osx \
+      /tmp/MyApp.flutter_assets
+
+  Step 5: Test in QEMU
+
+    # Option A: Stage in initramfs and rebuild ISO
+    cp /tmp/MyApp.osx initramfs/Applications/MyApp.osx
+    scripts/build-iso.sh
+    bash run-qemu-debug.sh
+
+    # Option B: Serve via package server (on-demand)
+    cargo run -p pkg-server -- /tmp/
+    # Then launch QEMU — shell will show your app in the catalog
+
+
+  INSTALLING & LAUNCHING APPS
+  ───────────────────────────
+
+  THREE WAYS TO GET APPS ONTO OSCORTEX:
+
+  ┌───────────────────────────────────────────────────────────────┐
+  │  Method          │  When to Use        │  How It Works        │
+  ├───────────────────────────────────────────────────────────────┤
+  │  Preload (ISO)   │  System apps        │  Stage in initramfs  │
+  │                  │                     │  before ISO build    │
+  ├───────────────────────────────────────────────────────────────┤
+  │  Sideload        │  Dev testing        │  Copy .osx to /tmp   │
+  │                  │                     │  Install via Files   │
+  ├───────────────────────────────────────────────────────────────┤
+  │  On-Demand       │  Production         │  Serve from pkg      │
+  │                  │  distribution       │  server, fetched     │
+  │                  │                     │  on first launch     │
+  └───────────────────────────────────────────────────────────────┘
+
+  Once installed (by any method), the app appears in the shell.
+  Tapping it calls app_launch, which spawns a NEW /bin/oscortex-host
+  process with its own PID. The app runs in full isolation.
+
+
+  THE OSCORTEX UI PACKAGE
+  ───────────────────────
+  Located at packages/oscortex_ui/ — provides the OS design language.
+
+  Available widgets:
+  ┌──────────────────────┬──────────────────────────────────────┐
+  │  Widget              │  Purpose                             │
+  ├──────────────────────┼──────────────────────────────────────┤
+  │  OscButton           │  Primary action button               │
+  │  OscOutlineButton    │  Secondary / ghost button            │
+  │  OscIconButton       │  Compact icon-only button            │
+  │  OscTextField        │  Text input field                    │
+  │  OscCard             │  Content container card              │
+  │  OscToolbar          │  Top toolbar with status text        │
+  │  OscScaffold         │  Page scaffold with frame            │
+  │  OscAppRail          │  Vertical icon rail                  │
+  │  OscHubDock          │  Bottom dock bar with segments       │
+  │  OscChip / OscChipRow│  Tag/filter chips                    │
+  │  OscSwitch           │  Toggle switch                       │
+  │  OscSlider           │  Value slider                        │
+  │  OscProgressBar      │  Linear progress indicator           │
+  │  OscCheckbox         │  Checkbox with label                 │
+  │  OscDialog           │  Modal dialog                        │
+  │  OscPopover          │  Contextual popover                  │
+  │  OscDivider          │  Section divider                     │
+  │  OscAvatar           │  User/app avatar                     │
+  │  OscTabBar / OscTab  │  Tab navigation                      │
+  │  OscTooltip          │  Hover tooltip                       │
+  │  OscBadge            │  Status badge                        │
+  │  OscSkeleton         │  Loading placeholder                 │
+  └──────────────────────┴──────────────────────────────────────┘
+
+  Design tokens:
+  ● OscColors    — violet, skyBlue, surface, border, text palettes
+  ● OscTypography — clock, body, title, subtitle styles
+  ● OscRadii     — cardBorder, innerBorder, pill border radii
+  ● OscShadows   — card, hover, elevated shadows
+  ● OscSpacing   — consistent padding/margin values
+
+  A2UI Protocol:
+  Every widget supports A2UI rendering — AI agents can compose UI by
+  sending JSON component trees that map to Osc* widgets automatically.
+  See the A2UI renderer at packages/oscortex_ui/lib/src/a2ui/.
+
+
+  PLATFORM CHANNELS
+  ─────────────────
+  Flutter apps communicate with the kernel via BasicMessageChannel:
+
+    const _channel = BasicMessageChannel<String>(
+      'oscortex/shell',
+      StringCodec(),
+    );
+
+  Available commands (sent as string, JSON response):
+
+  ┌────────────────────────┬──────────────────────────────────────┐
+  │  Command               │  Response                            │
+  ├────────────────────────┼──────────────────────────────────────┤
+  │  "list"                │  {"apps": [...], "ok": true}         │
+  │  "launch:<id>"         │  {"ok": true}                        │
+  │  "install:<path>"      │  {"ok": true}                        │
+  │  "pkg_catalog"         │  {"packages": [...]}                 │
+  │  "pkg_resolve:<name>"  │  {"app_id": 42}                      │
+  │  "pkg_set_server:      │  {"ok": true}                        │
+  │    <ip>:<port>"        │                                      │
+  └────────────────────────┴──────────────────────────────────────┘
+
+  The kernel embedder translates these into the appropriate syscalls.
+
+
+  DEBUGGING
+  ─────────
+
+  Serial output:
+    # Watch live boot log
+    bash run-qemu-debug.sh
+
+    # Or manually:
+    tail -f serial.log
+
+  Common issues:
+
+  ┌──────────────────────┬──────────────────────────────────────────┐
+  │  Symptom             │  Fix                                     │
+  ├──────────────────────┼──────────────────────────────────────────┤
+  │  App not in catalog  │  Rebuild ISO or restart pkg-server       │
+  │  Black screen        │  Check serial.log for kernel panic       │
+  │  App crashes on tap  │  That's fine — only kills that PID       │
+  │  "hash mismatch"     │  .osx changed after catalog was built    │
+  │  "server unreachable"│  pkg-server not running on host          │
+  │  Shell is blank      │  Flutter engine failed to load (dlopen)  │
+  └──────────────────────┴──────────────────────────────────────────┘
+
+
+  PUBLISHING TO A PACKAGE SERVER
+  ──────────────────────────────
+
+  1. Build your .osx bundles into a directory:
+     mkdir -p ~/osx-packages
+     ./tools/build-flutter-osx.sh /path/to/app1 "App1" ~/osx-packages/app1.osx ...
+     ./tools/build-flutter-osx.sh /path/to/app2 "App2" ~/osx-packages/app2.osx ...
+
+  2. Start the package server:
+     cargo run -p pkg-server -- ~/osx-packages/
+
+     Output:
+       [pkg-server] scanning ~/osx-packages/ for .osx bundles...
+       [pkg-server] found 2 packages
+       [pkg-server] listening on 0.0.0.0:8080
+
+  3. QEMU guest reaches the server at 10.0.2.2:8080 (QEMU user gateway)
+
+  4. The shell auto-fetches the catalog on refresh
+     Remote apps show with a ☁ cloud badge
+     Tapping fetches → verifies → caches → launches
+
+
+  ARCHITECTURE CONSTRAINTS
+  ────────────────────────
+  When building apps for OSCortex, remember:
+
+  ● NO direct hardware access — all I/O goes through syscalls
+  ● NO Linux syscalls — OSCortex has its own ABI (0x300+)
+  ● NO shared memory between apps — separate page tables
+  ● NO file persistence per-app — use kernel VFS syscalls
+  ● ONE render path — Flutter → compositor → framebuffer
+  ● Your app CAN crash without affecting the shell or other apps
+  ● The kernel OWNS the compositor — you get a surface, not a window
+
+
+  REPO LAYOUT (for contributors)
+  ──────────────────────────────
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │  Directory                 │  What's Inside                    │
+  ├────────────────────────────┼───────────────────────────────────┤
+  │  kernel/                   │  Rust bare-metal kernel           │
+  │  kernel/src/compositor/    │  Surface manager + blitter        │
+  │  kernel/src/pkg/           │  On-demand package delivery       │
+  │  kernel/src/app_registry/  │  .osx bundle manager              │
+  │  kernel/src/syscall/       │  Syscall dispatch + handlers      │
+  │  kernel/src/net/           │  smoltcp TCP/IP + virtio-net      │
+  │  kernel/src/fs/            │  VFS, initramfs, ramdisk, sysfs   │
+  │  kernel/src/cortex/        │  AI subsystem (PID 0)             │
+  ├────────────────────────────┼───────────────────────────────────┤
+  │  apps/oscortex_app/        │  System shell (Flutter)           │
+  │  packages/oscortex_ui/     │  Reusable UI components           │
+  ├────────────────────────────┼───────────────────────────────────┤
+  │  tools/flutter-embedder/   │  oscortex-host binary source      │
+  │  tools/flutter-engine/     │  Engine patches + libflutter.so   │
+  │  tools/pkg-server/         │  Package delivery server          │
+  ├────────────────────────────┼───────────────────────────────────┤
+  │  userspace/init/           │  PID 1 supervisor                 │
+  │  tests/                    │  Unit + QEMU integration tests    │
+  │  scripts/                  │  build-iso.sh, helper scripts     │
+  │  docs/                     │  Architecture specs (.txt)        │
+  │  landing/                  │  Website (out of scope for OS)    │
+  └────────────────────────────┴───────────────────────────────────┘
+
+
+  QUICK REFERENCE CARD
+  ────────────────────
+
+  Build kernel:         cargo build (from kernel/)
+  Build ISO:            scripts/build-iso.sh
+  Run in QEMU:          bash run-qemu-debug.sh
+  Build app bundle:     tools/build-flutter-osx.sh <project> <name> <output>
+  Start pkg server:     cargo run -p pkg-server -- <bundle_dir>
+  Run tests:            tests/run_all.sh
+  Flutter analyze:      flutter analyze (from apps/oscortex_app/)
+  Check kernel errors:  cargo build 2>&1 | grep "error\["
