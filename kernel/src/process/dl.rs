@@ -1151,20 +1151,8 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
         candidate
     };
 
-    for p in 0..pages {
-        let virt = base_va + (p * 4096) as u64;
-        let phys = match frame_allocator::alloc_frame() {
-            Some(f) => f,
-            None    => return u64::MAX,
-        };
-        let hhdm = (phys + frame_allocator::hhdm_offset()) as *mut u8;
-        unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
-        unsafe {
-            if paging::map_user_page_with_flags(pml4_phys, virt, phys, writable, exec).is_err() {
-                return u64::MAX;
-            }
-        }
-    }
+    // Lazily allocate physical frames on demand during page fault (demand_page).
+    // We do not eagerly allocate frames here to prevent physical OOM.
 
     base_va
 }

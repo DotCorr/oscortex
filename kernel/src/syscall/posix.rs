@@ -224,6 +224,9 @@ pub fn sys_free(ptr: u64) -> i64 {
     let (_, pml4) = pid_and_pml4();
     let block = MALLOC_ALLOCS.lock().remove(&(pml4, ptr));
     if let Some(block) = block {
+        // Unmap the physical memory and free frames to prevent physical OOM leaks.
+        crate::mm::paging::unmap_user_range(pml4, block.base, block.pages as u64 * 4096);
+
         let mut free = MALLOC_FREE.lock();
         free.push(block);
         coalesce_free_blocks(&mut free);

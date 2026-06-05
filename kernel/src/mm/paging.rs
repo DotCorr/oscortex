@@ -465,8 +465,18 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
     let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
 
-    // Check if the fault address is in the mirroring range [0x1_0000_0000, 0x3_0000_0000)
     let page_va = cr2 & !0xFFF;
+
+    // Check if the page is already mapped (stale TLB entry due to another CPU core mapping it first)
+    if translate_user_page(cr3_phys, page_va).is_some() {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) page_va, options(nostack, preserves_flags));
+        }
+        return true;
+    }
+
+    // Check if the fault address is in the mirroring range [0x1_0000_0000, 0x3_0000_0000)
     if page_va >= 0x1_0000_0000 && page_va < 0x3_0000_0000 {
         let mirrored_va = page_va - 0x1_0000_0000;
         
@@ -482,16 +492,21 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
         }
     }
 
-    // Phase 32-C: Demand page anonymous memory in range [0x3_0000_0000, 0x4_0000_0000)
-    if page_va >= 0x3_0000_0000 && page_va < 0x4_0000_0000 {
-        if let Some(phys) = frame_allocator::alloc_frame() {
+    // Phase 32-C: Demand page anonymous memory in range [0x3_0000_0000, 0x8_0000_0000)
+    if page_va >= 0x3_0000_0000 && page_va < 0x8_0000_0000 {
+        let frame_opt = frame_allocator::alloc_frame();
+        if let Some(phys) = frame_opt {
             let hhdm = (phys + frame_allocator::hhdm_offset()) as *mut u8;
             unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
-            if unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) }.is_ok() {
+            let map_res = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) };
+            if map_res.is_ok() {
                 return true;
             } else {
+                log::error!("[demand_page] map_user_page_with_flags failed at {:#x}: {:?}", page_va, map_res.err());
                 frame_allocator::free_frame(phys);
             }
+        } else {
+            log::error!("[demand_page] OOM: alloc_frame returned None for addr {:#x}", page_va);
         }
     }
 

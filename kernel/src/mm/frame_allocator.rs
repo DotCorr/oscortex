@@ -128,7 +128,12 @@ pub fn init(mmap: &MemmapResponse, hhdm_offset: u64) {
 
 /// Allocate a single 4 KiB physical frame. Returns the physical address.
 pub fn alloc_frame() -> Option<u64> {
-    BITMAP.lock().alloc()
+    let res = BITMAP.lock().alloc();
+    if res.is_none() {
+        let bm = BITMAP.lock();
+        log::error!("[MM::FrameAlloc] alloc_frame failed! used={} total={}", bm.used, bm.total);
+    }
+    res
 }
 
 /// Allocate `count` contiguous 4 KiB physical frames.

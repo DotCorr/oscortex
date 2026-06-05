@@ -5,7 +5,6 @@ import 'package:oscortex_ui/oscortex_ui.dart';
 
 import '../models/app_tile.dart';
 import '../services/shell_service.dart';
-import 'app_card.dart';
 
 // ─── Shell Desktop ─────────────────────────────────────────────────────
 class ShellDesktop extends StatefulWidget {

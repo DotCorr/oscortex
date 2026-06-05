@@ -150,6 +150,14 @@ pub extern "C" fn kernel_main() -> ! {
     let fb_response = FB_REQUEST.response();
     logger::init(fb_response);
 
+    log::warn!(
+        "[MM::FrameAlloc] capacity stats at boot: total_usable_frames={} ({} MiB), used_at_boot={} ({} MiB)",
+        mm::frame_allocator::frames_total(),
+        (mm::frame_allocator::frames_total() * 4096) / (1024 * 1024),
+        mm::frame_allocator::frames_used(),
+        (mm::frame_allocator::frames_used() * 4096) / (1024 * 1024)
+    );
+
     // Report framebuffer state on serial so we can verify it was found.
     if let Some(ref fbr) = fb_response {
         let fbs = fbr.framebuffers();
