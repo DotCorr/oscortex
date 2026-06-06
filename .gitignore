@@ -42,3 +42,7 @@ qemu-log.txt
 serial.log
 docs/goal-embedded.md
 docs/goal-general-purpose.md
+
+# Build/runtime artifacts — regenerated, never track (root-anchored)
+/initramfs.tar
+/vdisk.img
