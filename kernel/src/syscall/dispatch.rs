@@ -164,7 +164,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         }
     }
 
-    match number {
+    let __ret: i64 = match number {
         // POSIX-compatible
         0   => sys_read(arg0, arg1, arg2),
         1   => sys_write(arg0, arg1, arg2),
@@ -479,7 +479,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         // Phase 31 Slice C — threads
         eabi::SYS_THREAD_CREATE => sys_thread_create(arg0, arg1, arg2, arg3),
         eabi::SYS_THREAD_EXIT   => sys_thread_exit(arg0),
-        eabi::SYS_THREAD_JOIN   => sys_thread_join(arg0),
+        eabi::SYS_THREAD_JOIN   => sys_thread_join(arg0, arg1),
 
         // ── POSIX compat shim (0x3A0+) ───────────────────────────────────
         // Memory
@@ -741,7 +741,8 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             }
             -38 // ENOSYS
         }
-    }
+    };
+    __ret
 }
 
 /// Legacy INT 0x80 syscall path (handled by `arch::x86_64::syscall::legacy_syscall_entry`).
