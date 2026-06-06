@@ -678,6 +678,17 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         return;
     }
 
+    // SMP SAFETY: the scheduler is cooperative and BSP-only — it assumes at most
+    // ONE user thread runs at a time. Only CPU 0 may enter/run user threads. If an
+    // AP's timer ISR were allowed past here it would claim and enter a user thread
+    // (via the wake-assist below), running it CONCURRENTLY with the BSP. Two user
+    // threads executing in true parallel break the futex/condvar emulation's
+    // single-core assumptions → nondeterministic livelock (the smp>1 failure).
+    // Keep APs out: they EOI'd above and now simply return to halt.
+    if cpu_id != 0 {
+        return;
+    }
+
     // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall
     // hlt loop, queued input can otherwise leave PID 1 runnable-but-unentered.
     // If the interrupt lands in idle (cur=0), PID 1 is still the safe target

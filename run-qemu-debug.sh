@@ -26,9 +26,11 @@ echo "A QEMU window will open. Close it or Ctrl+C here to stop."
 echo ""
 
 # Real graphical window (Cocoa on macOS); readonly avoids lock conflicts.
-## NOTE: smp=1 (single core) is REQUIRED for now — multi-core hits an SMP
-## scheduler/sync race that livelocks the Flutter engine threads. Single core
-## runs the cooperative path cleanly and renders the UI reliably.
+## NOTE: multi-core is now SAFE (the SMP livelock is fixed — user threads run
+## BSP-only so the cooperative scheduler's single-core assumption holds). We
+## still default to smp=1: the secondary core only halts (no parallel scheduler
+## yet), so it adds ISR overhead without speeding anything up. Bump to cpus=2+
+## if you want to exercise the multi-core path — it renders correctly either way.
 ## Also: first frame takes ~60-90s (the engine JIT-compiles the whole Material
 ## framework on emulated bare metal). Be patient — the shell WILL appear.
 qemu-system-x86_64 \
