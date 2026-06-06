@@ -162,7 +162,16 @@ pub(crate) fn sys_mmap(hint_va: u64, size: u64, prot: u64) -> i64 {
 }
 
 pub(crate) fn sys_munmap(va: u64, size: u64) -> i64 {
-    log::warn!("[sys_munmap] Mocking munmap as no-op: va={:#x} size={:#x}", va, size);
+    if size == 0 { return 0; }
+    let pid = crate::process::current_pid();
+    if pid == 0 { return -1; } // EPERM
+    let pml4_phys = match crate::process::get_user_context(pid) {
+        Some(ctx) => ctx.pml4_phys,
+        None => return -9, // EBADF
+    };
+    log::warn!("[sys_munmap] pid={} va={:#x} size={:#x}", pid, va, size);
+    crate::mm::paging::unmap_user_range(pml4_phys, va, size);
+    crate::process::dl::recycle_anon_va(pid, va, size);
     0
 }
 
@@ -233,19 +242,11 @@ pub(crate) fn sys_mprotect(va: u64, size: u64, prot: u64) -> i64 {
                 }
             }
         } else {
+            // Non-mirrored anonymous memory. Only update permission flags if page is already present.
+            // If it is not present, we do not eagerly allocate a physical frame; we let demand_page
+            // lazily allocate and map it on first access.
             unsafe {
-                if crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec).is_err() {
-                    if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
-                        let hhdm_va = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
-                        core::ptr::write_bytes(hhdm_va, 0, 4096);
-                        if crate::mm::paging::map_user_page_with_flags(pml4_phys, curr_va, phys, writable, exec).is_err() {
-                            crate::mm::frame_allocator::free_frame(phys);
-                            return -12;
-                        }
-                    } else {
-                        return -12; // ENOMEM
-                    }
-                }
+                let _ = crate::mm::paging::update_user_page(pml4_phys, curr_va, writable, exec);
             }
         }
         curr_va += 4096;

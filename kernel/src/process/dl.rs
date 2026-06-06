@@ -66,7 +66,10 @@ const SHN_UNDEF:  u16 = 0;
 /// Virtual address of the first library slot in each process.
 const LIB_VA_BASE:   u64 = 0x1_4000_0000; // 5 GiB
 /// Base address for anonymous memory mappings.
-const ANON_VA_BASE:  u64 = 0x3_1000_0000; // 12.25 GiB
+/// Must be above the Dart GC heap zone (~0x32a_000_000 ≈ 12.7 GiB) and
+/// inside the demand_page anonymous window [0x3_0000_0000, 0x100_0000_0000).
+/// 0x60_0000_0000 (384 GiB) satisfies both constraints.
+const ANON_VA_BASE:  u64 = 0x3_1000_0000; // 12.25 GiB — original
 /// Minimum VA bump stride between consecutive libraries.
 const LIB_VA_STRIDE: u64 = 0x0100_0000; // 16 MiB per slot
 
@@ -213,6 +216,15 @@ struct LoadedLib {
 
 // ── Global library table ───────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug)]
+struct RecycledRange {
+    pml4_phys: u64,
+    va:        u64,
+    size:      u64,
+}
+
+const MAX_RECYCLED: usize = 256;
+
 /// Maximum number of distinct address spaces we track bump cursors for.
 const MAX_AS_SLOTS: usize = 64;
 
@@ -222,6 +234,7 @@ struct LibTable {
     /// Per-address-space bump VAs for dynamic loading and anonymous mappings.
     /// Format: (pml4_phys, next_lib_va, next_anon_va). `pml4_phys == 0` => free.
     as_slots:    [(u64, u64, u64); MAX_AS_SLOTS],
+    recycled:    [Option<RecycledRange>; MAX_RECYCLED],
 }
 
 impl LibTable {
@@ -230,18 +243,19 @@ impl LibTable {
             entries:     Vec::new(),
             next_handle: 1,
             as_slots:    [(0, 0, 0); MAX_AS_SLOTS],
+            recycled:    [None; MAX_RECYCLED],
         }
     }
 
     fn bump_lib_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
         let aligned = (size + LIB_VA_STRIDE - 1) / LIB_VA_STRIDE * LIB_VA_STRIDE;
-        log::info!("[DL] bump_lib_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
+        log::debug!("[DL] bump_lib_va: pml4_phys={:#x} size={:#x} aligned={:#x}", pml4_phys, size, aligned);
         // Find existing slot for this address space.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == pml4_phys {
                 let base = slot.1;
                 slot.1 = base + aligned;
-                log::info!("[DL] bump_lib_va: existing slot base={:#x} new_next={:#x}", base, slot.1);
+                log::debug!("[DL] bump_lib_va: existing slot base={:#x} new_next={:#x}", base, slot.1);
                 return base;
             }
         }
@@ -249,44 +263,89 @@ impl LibTable {
         for slot in self.as_slots.iter_mut() {
             if slot.0 == 0 {
                 *slot = (pml4_phys, LIB_VA_BASE + aligned, ANON_VA_BASE);
-                log::info!("[DL] bump_lib_va: new slot base={:#x} next_lib={:#x}", LIB_VA_BASE, slot.1);
+                log::debug!("[DL] bump_lib_va: new slot base={:#x} next_lib={:#x}", LIB_VA_BASE, slot.1);
                 return LIB_VA_BASE;
             }
         }
         // Fallback: should not happen
         let base = self.as_slots[0].1;
         self.as_slots[0].1 = base + aligned;
-        log::info!("[DL] bump_lib_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].1);
+        log::debug!("[DL] bump_lib_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].1);
         base
     }
 
     fn bump_anon_va(&mut self, pml4_phys: u64, size: u64) -> u64 {
         let aligned = (size + 4095) / 4096 * 4096;
-        let stride = 0x200000;
-        let aligned_stride = (aligned + stride - 1) / stride * stride;
-        log::info!("[DL] bump_anon_va: pml4_phys={:#x} size={:#x} aligned={:#x} stride={:#x}", pml4_phys, size, aligned, aligned_stride);
-        // Find existing slot for this address space.
+        let align_mask = if size > 4096 {
+            0x1fffff // 2 MiB alignment
+        } else {
+            0xfff // 4 KiB alignment
+        };
+
+        // 1. Try to find a recycled range for this pml4 that fits.
+        for slot in self.recycled.iter_mut() {
+            if let Some(r) = slot {
+                if r.pml4_phys == pml4_phys {
+                    let aligned_va = (r.va + align_mask) & !align_mask;
+                    let end_va = aligned_va + aligned;
+                    if end_va <= r.va + r.size {
+                        let base = aligned_va;
+                        let remaining_end = r.va + r.size;
+                        if end_va < remaining_end {
+                            r.va = end_va;
+                            r.size = remaining_end - end_va;
+                        } else {
+                            *slot = None;
+                        }
+                        log::debug!("[DL] bump_anon_va: reused recycled base={:#x} new_next={:#x}", base, end_va);
+                        return base;
+                    }
+                }
+            }
+        }
+
+        // 2. Find existing slot for this address space and bump.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == pml4_phys {
-                let base = slot.2;
-                slot.2 = base + aligned_stride;
-                log::info!("[DL] bump_anon_va: existing slot base={:#x} new_next={:#x}", base, slot.2);
+                let base = (slot.2 + align_mask) & !align_mask;
+                slot.2 = base + aligned;
+                log::debug!("[DL] bump_anon_va: existing slot base={:#x} new_next={:#x}", base, slot.2);
                 return base;
             }
         }
         // Allocate a new slot.
         for slot in self.as_slots.iter_mut() {
             if slot.0 == 0 {
-                *slot = (pml4_phys, LIB_VA_BASE, ANON_VA_BASE + aligned_stride);
-                log::info!("[DL] bump_anon_va: new slot base={:#x} next_anon={:#x}", ANON_VA_BASE, slot.2);
-                return ANON_VA_BASE;
+                let base = (ANON_VA_BASE + align_mask) & !align_mask;
+                *slot = (pml4_phys, LIB_VA_BASE, base + aligned);
+                log::debug!("[DL] bump_anon_va: new slot base={:#x} next_anon={:#x}", base, slot.2);
+                return base;
             }
         }
         // Fallback: should not happen
-        let base = self.as_slots[0].2;
-        self.as_slots[0].2 = base + aligned_stride;
-        log::info!("[DL] bump_anon_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].2);
+        let base = (self.as_slots[0].2 + align_mask) & !align_mask;
+        self.as_slots[0].2 = base + aligned;
+        log::debug!("[DL] bump_anon_va: fallback base={:#x} new_next={:#x}", base, self.as_slots[0].2);
         base
+    }
+
+    /// Move the anon cursor for `pml4_phys` forward to `va` if `va` is ahead.
+    /// Used by `mmap_anon` to commit the resolved position after skipping a
+    /// dense mapped region without calling `bump_anon_va` in a tight loop.
+    fn set_anon_cursor(&mut self, pml4_phys: u64, va: u64) {
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == pml4_phys {
+                if va > slot.2 { slot.2 = va; }
+                return;
+            }
+        }
+        // Process not yet registered — create a slot starting from va.
+        for slot in self.as_slots.iter_mut() {
+            if slot.0 == 0 {
+                *slot = (pml4_phys, LIB_VA_BASE, va);
+                return;
+            }
+        }
     }
 }
 
@@ -990,26 +1049,49 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
                     break;
                 }
             }
-            if matches {
-                // Return base Instructions pointer unconditionally (no offset arithmetic):
-                //   mov rax, [rdi+8]  ; base_instructions_ ptr
-                //   inc rax           ; +1 Dart tagged ptr
-                //   ret
-                //   nop * 6           ; pad to match original 14 bytes
+            // Patch7: fix GetInstructionsAt for late Code objects whose instructions live in
+            // the VM image (below the isolate image base) — their PC offset is NEGATIVE.
+            // The original `mov ecx, esi` ZERO-extends the 32-bit offset, turning a small
+            // negative offset into a ~4GB positive one → entry lands in the heap → executing a
+            // Dart object faults. Fix: SIGN-extend the offset so base + (-distance) points back
+            // into the VM image.
+            //   mov rax, [rdi+8]        ; instructions image base
+            //   movsxd rcx, esi         ; SIGN-extend the 32-bit offset
+            //   lea rax, [rax+rcx+1]    ; base + offset + 1 (Dart tagged), fused with the +1
+            //   ret
+            let patch7_enabled = true;
+            if patch7_enabled && matches {
                 const REPLACEMENT: [u8; 14] = [
-                    0x48, 0x8B, 0x47, 0x08, // mov rax, qword ptr [rdi + 8]
-                    0x48, 0xFF, 0xC0,       // inc rax
-                    0xC3,                   // ret
-                    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // nop * 6
+                    0x48, 0x8B, 0x47, 0x08,       // mov rax, [rdi+8]
+                    0x48, 0x63, 0xCE,             // movsxd rcx, esi
+                    0x48, 0x8D, 0x44, 0x08, 0x01, // lea rax, [rax+rcx+1]
+                    0xC3,                         // ret
+                    0x90,                         // nop (pad to 14)
                 ];
                 if write_va(va, &REPLACEMENT) {
-                    log::info!("[DL] Patch7 ImageReader::GetInstructionsAt @ {:#x} -> safe base-ptr stub (no offset arith)", va);
+                    log::info!("[DL] Patch7 ImageReader::GetInstructionsAt @ {:#x} -> sign-extend offset fix", va);
                 } else {
                     log::warn!("[DL] Patch7 FAILED: write inline patch @ {:#x}", va);
                 }
             } else {
                 log::warn!("[DL] Patch7 SKIPPED: bytes @ {:#x} do not match expected instructions", va);
             }
+        }
+    }
+
+    // NOTE: the experimental "RO-protect non-writable segments" pass was removed. It was
+    // added during the AOT-deser wild-write hunt (now obsolete — OSCortex runs JIT). For a
+    // large engine it iterated thousands of pages calling update_user_page; keeping engine
+    // segments mapped+writable (as the loader does above) is correct for JIT.
+
+    // Diagnostic: verify a few first-segment data pages are still mapped at end of dlopen
+    // (a JIT-phase fault read engine vaddr 0xd2d908 as not-present — checking if dl.rs leaves
+    // the engine's read-only data segment mapped).
+    if export_count > 50 {
+        for probe in [0x0u64, 0x954248, 0xd2d908, 0x1900000] {
+            let va = load_base + probe;
+            let mapped = paging::translate_user_page(pml4_phys, va).is_some();
+            log::info!("[DL] post-load map check: va={:#x} (off {:#x}) mapped={}", va, probe, mapped);
         }
     }
 
@@ -1126,27 +1208,36 @@ pub fn mmap_anon(pid: u32, pml4_phys: u64, hint_va: u64, pages: usize, prot: u64
             LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64)
         }
     } else {
-        // Bump-allocate, but skip over any already-mapped ranges. This
-        // prevents the TLS/stack allocator from clobbering a region that
-        // was previously mmap'd by userspace (e.g. a Dart heap chunk that
-        // sits at the same VA the bump cursor would return next).
-        let mut candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
-        for _ in 0..64 {
-            let mut clear = true;
+        // Bump-allocate, skipping over already-mapped ranges by jumping the
+        // candidate directly past each conflicting page — O(dense_pages) not
+        // O(dense_bytes / alloc_size) — so a 16 MiB Dart heap block is
+        // escaped in ~4096 iterations rather than millions.
+        let size_bytes = (pages * 4096) as u64;
+        let align_mask: u64 = if size_bytes > 4096 { 0x1f_ffff } else { 0xfff };
+        let mut candidate = LIBS.lock().bump_anon_va(pml4_phys, size_bytes);
+        let mut conflict_count = 0u32;
+        'retry: loop {
             for p in 0..pages {
-                let v = candidate + (p * 4096) as u64;
+                let v = candidate + (p as u64) * 4096;
                 if paging::translate_user_page(pml4_phys, v).is_some() {
-                    if v >= 0x33b000000 && v < 0x33e000000 {
-                        log::warn!("[mmap_anon] collision detected at {:#x} for candidate {:#x}", v, candidate);
+                    conflict_count += 1;
+                    // Jump directly past the conflicting page.
+                    candidate = (v + 4096 + align_mask) & !align_mask;
+                    if conflict_count > 131072 {
+                        log::warn!("[mmap_anon] gave up after {} conflicts, candidate={:#x}",
+                            conflict_count, candidate);
+                        break 'retry;
                     }
-                    clear = false;
-                    break;
+                    continue 'retry;
                 }
             }
-            if clear { break; }
-            log::warn!("[mmap_anon] bump candidate {:#x} pages={} conflicts; advancing",
-                candidate, pages);
-            candidate = LIBS.lock().bump_anon_va(pml4_phys, (pages * 4096) as u64);
+            break; // all pages are clear
+        }
+        // Commit the resolved position so the next allocation starts past here.
+        LIBS.lock().set_anon_cursor(pml4_phys, candidate + size_bytes);
+        if conflict_count > 0 {
+            log::info!("[mmap_anon] resolved after {} conflicts, settled at {:#x}",
+                conflict_count, candidate);
         }
         candidate
     };
@@ -1176,5 +1267,90 @@ pub fn dladdr(pid: u32, addr: u64) -> Option<(Vec<u8>, u64)> {
         }
     }
     None
+}
+
+pub fn recycle_anon_va(pid: u32, va: u64, size: u64) {
+    let pml4_phys = match crate::process::get_user_context(pid) {
+        Some(ctx) => ctx.pml4_phys,
+        None => return,
+    };
+    if pml4_phys == 0 || va == 0 || size == 0 { return; }
+    
+    let mut t = LIBS.lock();
+    // 1. Try to merge with an existing range
+    for slot in t.recycled.iter_mut() {
+        if let Some(r) = slot {
+            if r.pml4_phys == pml4_phys {
+                if r.va + r.size == va {
+                    r.size += size;
+                    log::info!("[DL] recycle_anon_va: merged (appended) va={:#x} size={:#x} -> new_size={:#x}", va, size, r.size);
+                    return;
+                }
+                if va + size == r.va {
+                    r.va = va;
+                    r.size += size;
+                    log::info!("[DL] recycle_anon_va: merged (prepended) va={:#x} size={:#x} -> new_va={:#x} new_size={:#x}", va, size, r.va, r.size);
+                    return;
+                }
+            }
+        }
+    }
+    // 2. Find an empty slot
+    for slot in t.recycled.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(RecycledRange { pml4_phys, va, size });
+            log::info!("[DL] recycle_anon_va: added recycled range va={:#x} size={:#x}", va, size);
+            return;
+        }
+    }
+    log::warn!("[DL] recycle_anon_va: recycled table full, discarding va={:#x} size={:#x}", va, size);
+}
+
+/// Clone the bump-cursor slot from `parent_pml4` into a new slot for `child_pml4`.
+///
+/// Must be called immediately after `clone_address_space` in `fork_current` so
+/// that the child's bump allocator continues from the same `next_lib_va` /
+/// `next_anon_va` as the parent, instead of resetting to `ANON_VA_BASE` and
+/// re-colliding with every page the parent already mapped.
+pub fn clone_as_slot(parent_pml4: u64, child_pml4: u64) {
+    if parent_pml4 == 0 || child_pml4 == 0 { return; }
+    let mut t = LIBS.lock();
+
+    // Find the parent's cursors.
+    let mut parent_lib_va  = LIB_VA_BASE;
+    let mut parent_anon_va = ANON_VA_BASE;
+    let mut found = false;
+    for slot in t.as_slots.iter() {
+        if slot.0 == parent_pml4 {
+            parent_lib_va  = slot.1;
+            parent_anon_va = slot.2;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        log::warn!("[DL] clone_as_slot: parent pml4={:#x} not in as_slots; child will start from base", parent_pml4);
+    }
+
+    // If child already has a slot (shouldn't happen right after fork), update it.
+    for slot in t.as_slots.iter_mut() {
+        if slot.0 == child_pml4 {
+            slot.1 = parent_lib_va;
+            slot.2 = parent_anon_va;
+            log::info!("[DL] clone_as_slot: updated child pml4={:#x} lib_va={:#x} anon_va={:#x}", child_pml4, parent_lib_va, parent_anon_va);
+            return;
+        }
+    }
+
+    // Allocate a fresh slot for the child.
+    for slot in t.as_slots.iter_mut() {
+        if slot.0 == 0 {
+            *slot = (child_pml4, parent_lib_va, parent_anon_va);
+            log::info!("[DL] clone_as_slot: new child pml4={:#x} lib_va={:#x} anon_va={:#x}", child_pml4, parent_lib_va, parent_anon_va);
+            return;
+        }
+    }
+
+    log::warn!("[DL] clone_as_slot: as_slots full; child pml4={:#x} will reset to base — expect allocation conflicts", child_pml4);
 }
 
