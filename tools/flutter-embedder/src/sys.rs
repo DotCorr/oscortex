@@ -543,6 +543,8 @@ pub const SYS_APP_LAUNCH: u64 = 0x371;
 pub const SYS_APP_UNINSTALL: u64 = 0x372;
 pub const SYS_VFS_READ:      u64 = 0x37A;
 pub const SYS_VFS_STAT:      u64 = 0x37C;
+pub const SYS_VFS_LIST:      u64 = 0x379;
+
 
 pub fn app_install(bundle: &[u8], id_out: &mut u32) -> i64 {
     unsafe {
@@ -606,6 +608,20 @@ pub fn vfs_stat(path: &[u8]) -> i64 {
         rc
     }
 }
+
+pub fn vfs_list(path: &[u8], buf: &mut [u8]) -> i64 {
+    let len = path_len(path);
+    unsafe {
+        syscall4(
+            SYS_VFS_LIST,
+            path.as_ptr() as u64,
+            len as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        )
+    }
+}
+
 
 /// Phase 36 — Send a message to a destination isolate's inbox.
 ///

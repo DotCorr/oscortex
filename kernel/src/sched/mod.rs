@@ -61,7 +61,7 @@ impl Scheduler {
 }
 
 static SCHED: Mutex<Scheduler> = Mutex::new(Scheduler::new());
-static NEXT_PID: AtomicU64 = AtomicU64::new(0);
+static NEXT_PID: AtomicU64 = AtomicU64::new(10000);
 
 // ── Stack helpers ─────────────────────────────────────────────────────────────
 

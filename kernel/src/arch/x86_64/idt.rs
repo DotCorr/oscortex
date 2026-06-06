@@ -318,11 +318,51 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
                 slots[24], slots[25], slots[26], slots[27], slots[28], slots[29], slots[30], slots[31]
             );
         }
+        // Virtual-call diagnostic: when executing in the anon/heap window (a bad
+        // C++ vtable dispatch), dump r12 (the `this` object), its vtable pointer
+        // [r12], and the first vtable slots so we can tell a relocation bug
+        // (vtable ptr is engine .text/.data) from object corruption (vtable ptr
+        // points into the heap).
+        if frame.rip >= 0x3_0000_0000 && frame.rip < 0x100_0000_0000 {
+            let rd = |va: u64| -> Option<u64> {
+                if va < 0x1000 || va >= 0x0000_8000_0000_0000 { return None; }
+                if crate::mm::paging::translate_user_page(pml4_phys, va & !0xFFF).is_none() { return None; }
+                Some(unsafe { core::ptr::read_volatile(va as *const u64) })
+            };
+            if let Some(vptr) = rd(frame.r12) {
+                log::error!("[PageFault] vcall: r12={:#x} [r12]=vtable={:#x}", frame.r12, vptr);
+                if let (Some(v0), Some(v1), Some(v2)) = (rd(vptr), rd(vptr.wrapping_add(8)), rd(vptr.wrapping_add(16))) {
+                    log::error!("[PageFault] vtable: [0]={:#x} [+8]={:#x} [+16]={:#x}", v0, v1, v2);
+                    // Dump the runtime bytes at the call target ([vtable+0x10] = v2): if these
+                    // are NOT a normal function prologue, the engine .text was corrupted by a
+                    // wild write during deserialization.
+                    let tgt = v2 & !1;
+                    if crate::mm::paging::translate_user_page(pml4_phys, tgt & !0xFFF).is_some() {
+                        let mut tb = [0u8; 16];
+                        unsafe { for i in 0..16 { tb[i] = core::ptr::read_volatile((tgt + i as u64) as *const u8); } }
+                        log::error!(
+                            "[PageFault] target-bytes @ {:#x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                            tgt, tb[0],tb[1],tb[2],tb[3],tb[4],tb[5],tb[6],tb[7],tb[8],tb[9],tb[10],tb[11],tb[12],tb[13],tb[14],tb[15]
+                        );
+                    }
+                }
+            }
+            // Bytes at the faulting IP (the executed "stub") — distinguish valid
+            // Dart code from garbage/data executed as code.
+            if crate::mm::paging::translate_user_page(pml4_phys, frame.rip & !0xFFF).is_some() {
+                let mut b = [0u8; 16];
+                unsafe { for i in 0..16 { b[i] = core::ptr::read_volatile((frame.rip + i as u64) as *const u8); } }
+                log::error!(
+                    "[PageFault] ip-bytes @ {:#x}: {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+                    frame.rip, b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]
+                );
+            }
+        }
         // For ip=0 (NULL call), try to disassemble the bytes just before
         // the return-address pushed on the stack — that's the indirect
         // call instruction. Print the 12 bytes preceding [rsp] so we can
         // decode `call *...` and identify the source operand.
-        if frame.rip == 0 && frame.rsp != 0 {
+        if (frame.rip == 0 || (frame.rip >= 0x3_0000_0000 && frame.rip < 0x100_0000_0000)) && frame.rsp != 0 {
             unsafe {
                 let ret_addr = core::ptr::read_volatile(frame.rsp as *const u64);
                 if ret_addr > 0x10 {
