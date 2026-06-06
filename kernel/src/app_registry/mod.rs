@@ -473,15 +473,17 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
         }
     };
 
-    let (aot_va, _aot_size) = match map_aot_into_process(app_id, child_pid) {
-        Ok(v) => v,
-        Err(e) => {
-            let _ = crate::process::kill(child_pid);
-            return e;
-        }
-    };
-
-    crate::process::set_bootstrap_regs(child_pid, HOST_MODE_APP, app_id as u64, aot_va);
+    // JIT mode: launched apps run from their own kernel_blob.bin (loaded by the
+    // embedder via configure_app_assets), NOT from AOT. We deliberately do NOT
+    // dlopen the app's AOT libapp.so here:
+    //   (1) the full-JIT engine can't run AOT anyway (is_aot=false), so it's dead
+    //       weight (~5MB), and
+    //   (2) loading it FIRST shifted the engine's load base from 0x141000000 (where
+    //       the shell loads it) up to 0x142000000 — and the engine crashes
+    //       (GPF in engine code) when based anywhere but 0x141000000. Skipping the
+    //       AOT keeps the app's engine at 0x141000000, matching the shell.
+    // aot_va=0: the embedder ignores it in APP mode when is_aot=false.
+    crate::process::set_bootstrap_regs(child_pid, HOST_MODE_APP, app_id as u64, 0);
 
     crate::wm::push_app_event(child_pid, crate::embedder::abi::APP_LAUNCH, 0);
 
