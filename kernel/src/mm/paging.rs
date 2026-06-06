@@ -398,6 +398,13 @@ mod x86_64_impl {
         if virt >= 0x112670000 && virt <= 0x112690000 {
             log::warn!("[DEBUG-PAGING] unmapped virt={:#x} in pml4={:#x}", virt, pml4_phys);
         }
+        // JIT debug: catch what unmaps the engine's first R-data segment (0x141000000..0x141954248)
+        // OR the main user stack (0x7FFFFFBF0000..0x7FFFFFFF0000) — both crash JIT reads.
+        if (virt >= 0x141000000 && virt < 0x141954248)
+            || (virt >= 0x7fff_ffbf_0000 && virt < 0x7fff_ffff_0000)
+        {
+            log::error!("[REGION-UNMAP] virt={:#x} phys={:#x} pml4={:#x}", virt, phys, pml4_phys);
+        }
         Ok(phys)
     }
 }
@@ -492,13 +499,19 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
         }
     }
 
-    // Phase 32-C: Demand page anonymous memory in range [0x3_0000_0000, 0x8_0000_0000)
-    if page_va >= 0x3_0000_0000 && page_va < 0x8_0000_0000 {
+    // Demand-page anonymous memory in [0x3_0000_0000, 0x100_0000_0000).
+    // Upper bound extended to cover ANON_VA_BASE (0x60_0000_0000 = 384 GiB)
+    // and any thread stacks / TLS blocks placed by the bump allocator.
+    if page_va >= 0x3_0000_0000 && page_va < 0x100_0000_0000 {
         let frame_opt = frame_allocator::alloc_frame();
         if let Some(phys) = frame_opt {
             let hhdm = (phys + frame_allocator::hhdm_offset()) as *mut u8;
             unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
-            let map_res = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, false) };
+            // Map anon memory executable (RWX). Dart AOT mmaps executable regions
+            // (mmap prot=7) that get relocated into this anon window; the lazy demand
+            // pager must honor execute or calls into them NX-fault. W^X isn't a concern
+            // on this single-app bare-metal OS.
+            let map_res = unsafe { map_user_page_with_flags(cr3_phys, page_va, phys, true, true) };
             if map_res.is_ok() {
                 return true;
             } else {
@@ -632,16 +645,39 @@ pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static
 }
 
 /// Unmap a range of virtual addresses in a specific PML4 and free their physical frames.
+pub static UNMAP_NOT_PRESENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static UNMAP_FREED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Unmap a range of virtual addresses in a specific PML4 and free their physical frames.
 pub fn unmap_user_range(pml4_phys: u64, start_va: u64, size: u64) {
     if size == 0 { return; }
     let start = start_va & !0xFFF;
     let end = (start_va + size + 4095) & !0xFFF;
+    let mut local_freed = 0;
+    let mut local_not_present = 0;
     for virt in (start..end).step_by(4096) {
         unsafe {
-            if let Ok(phys) = unmap_user_page(pml4_phys, virt) {
-                crate::mm::frame_allocator::free_frame(phys);
+            match unmap_user_page(pml4_phys, virt) {
+                Ok(phys) => {
+                    crate::mm::frame_allocator::free_frame(phys);
+                    local_freed += 1;
+                }
+                Err(_) => {
+                    local_not_present += 1;
+                }
             }
         }
+    }
+    UNMAP_FREED.fetch_add(local_freed, core::sync::atomic::Ordering::Relaxed);
+    UNMAP_NOT_PRESENT.fetch_add(local_not_present, core::sync::atomic::Ordering::Relaxed);
+
+    static UNMAP_LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let count = UNMAP_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count % 1000 == 999 {
+        log::warn!("[unmap_user_range] stats: calls={} last_freed={}/{} (total_freed={} total_not_present={})",
+            count + 1, local_freed, local_freed + local_not_present,
+            UNMAP_FREED.load(core::sync::atomic::Ordering::Relaxed),
+            UNMAP_NOT_PRESENT.load(core::sync::atomic::Ordering::Relaxed));
     }
 }
 
