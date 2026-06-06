@@ -461,11 +461,14 @@ PATCHES["P7_EPILOGUE"] = PATCHES["P9_EPILOGUE"]
 
 
 def patch_kernel_blob(path: Path) -> None:
-    """Patch the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8)."""
-    libapp_path = ROOT / "initramfs/system/flutter/libapp.so"
-    extracted_hash = get_sdk_hash_from_elf(libapp_path) if libapp_path.exists() else None
-    target_hash = extracted_hash or b"78da37fed6"
-    
+    """Patch the 10-char SDK hash in a kernel_blob.bin (Dill header offset 8).
+
+    JIT MODE: the kernel must match the *engine's* SdkHash (the value at engine file
+    offset 0x188ced = 1a420a3f9a), NOT the AOT snapshot format version (78da37fed6).
+    Proven: kernel hash 1a420a3f9a -> loads & runs (renders); 78da37fed6 -> "Invalid SDK hash".
+    """
+    target_hash = b"1a420a3f9a"
+
     data = path.read_bytes()
     if len(data) < 18:
         raise ValueError(f"kernel blob too short: {path}")
@@ -565,37 +568,23 @@ def main() -> int:
 
     data = bytearray(engine.read_bytes())
 
+    # ── JIT MODE (proven correct) ────────────────────────────────────────────────
+    # OSCortex runs the full-JIT engine in JIT mode from kernel_blob.bin (NOT the AOT
+    # libapp.so snapshot — a JIT engine cannot deserialize an AOT snapshot; that mismatch
+    # caused every prior deser failure/OOM). Proven in Docker: stock engine + kernel_blob.bin
+    # (SDK hash = engine's 1a420a3f9a) renders a real frame with NO patches beyond rendering.
+    # So we apply ONLY the software-rendering/framebuffer patches (P1-P6, P9*, P10) plus a
+    # couple of bare-metal env bypasses. All AOT-mode forcing (P_RUNS_AOT, P_*PRECOMPILED*,
+    # P_JIT_AOT_CHECK) and AOT deser hacks (P_READ_INSTRUCTIONS, P_DEBUG_CAVE,
+    # P_GETINSTR_CLAMP_*, P_POSTLOAD_BYPASS_*, P_BYPASS_FINALIZE_CLASS_NAMES) and the
+    # AOT TTS/FinishInit init bypasses are REMOVED — they were workarounds for the mismatch.
     all_patches = [
         "P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE",
-        "P_RUNS_AOT",
-        "P_JIT_AOT_CHECK", "P_ALLOW_ALL_DART_FLAGS",
-        "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2",
-        "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE",
-        "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1", "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2", "P_VM_CONSTANTS_CAVE",
-        "P_IS_PRECOMPILED_RUNTIME", "P_FLAG_PRECOMPILED_MODE_DEFAULT", "P_FLAG_PRECOMPILED_MODE_INITIAL",
+        "P_ALLOW_ALL_DART_FLAGS",
+        # Bare-metal env: skip the VM service / service isolate (no networking on bare metal).
         "P_BYPASS_VM_SERVICE_TASK",
         "P_BYPASS_SERVICE_ISOLATE_RUN",
-        "P_DEBUG_CAVE",
-        # AOT strips class-name strings, so finalizing them calls Utf8::Length on a null String
-        # → crash. This bypass (in a non-reader code region) is legitimately needed for AOT.
-        "P_BYPASS_FINALIZE_CLASS_NAMES",
-        # ENV-NEEDED (not a deser hack): redirects Dart's ReadInstructions to the bare-metal
-        # cave (P_DEBUG_CAVE) that handles OSCortex's SEPARATE instructions image. Without it
-        # the engine's inline-instructions reader desyncs the stream on code/ObjectPool clusters
-        # → garbage Array length → OOM.
-        "P_READ_INSTRUCTIONS",
-        # Clamp the one anomalous isolate Code instruction offset (0x80380000) that
-        # would otherwise resolve to an unmapped ptr and crash entry-point setup.
-        "P_GETINSTR_CLAMP_HOOK", "P_GETINSTR_CLAMP_CAVE",
-        # ── INTENTIONALLY OMITTED: P_SDK_HASH*, P_SNAPSHOT_FEATURES_CHECK,
-        #    P_BYPASS_BASE_OBJECTS_CHECK, P_BYPASS_BASE_OBJECTS_COMPARE, and all deser-content
-        #    hacks. The reader-region bypasses (FEATURES_CHECK + BASE_OBJECTS_*) skip stream reads
-        #    and desync the deserialization cursor → garbage Array length → OOM. Removing them
-        #    makes deserialization correct.
     ]
-    # Bypass CLUSTER PostLoads at their CORRECTED addresses — they null-deref on AOT-stripped
-    # fields. (Roots PostLoads are excluded from the list so they run and populate base objects.)
-    all_patches.extend([f"P_POSTLOAD_BYPASS_{fo:x}" for fo, _ in _POSTLOADS_TO_BYPASS])
 
 
     if args.verify:
