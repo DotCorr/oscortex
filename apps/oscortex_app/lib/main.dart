@@ -9,8 +9,14 @@ const _bg = Color(0xFF0C1C26);
 const _accent = Color(0xFF2DD4BF);
 
 void main() {
-  WidgetsFlutterBinding.ensureInitialized();
+  print('OSCX:main-start');
+  final binding = WidgetsFlutterBinding.ensureInitialized();
+  print('OSCX:binding-initialized');
+  binding.addPostFrameCallback((_) {
+    print('OSCX:FIRST-FRAME-RENDERED');
+  });
   runApp(const OscortexShellApp());
+  print('OSCX:main-after-runApp');
 }
 
 class OscortexShellApp extends StatelessWidget {

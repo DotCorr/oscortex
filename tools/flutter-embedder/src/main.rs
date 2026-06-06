@@ -1275,8 +1275,23 @@ extern "C" fn main_embedder() {
     static ARG5: &[u8] = b"--old_gen_heap_size=64\0";
     static ARG6: &[u8] = b"--new_gen_heap_size=8\0";
     static ARG7: &[u8] = b"--max_old_gen_heap_size=64\0";
+    // SINGLE-THREADED VM/GC: the bare-metal sync layer cannot reliably bring all
+    // Dart VM threads to a GC stop-the-world safepoint, so the scavenger livelocks
+    // (endless new-space page churn, first frame never completes for the heavy
+    // Material app; a trivial tree squeaks through). Eliminate the background
+    // threads that must be coordinated: no background JIT compiler thread (compile
+    // synchronously on the mutator), no concurrent mark/sweep threads, serial GC
+    // marker/scavenger tasks. Fewer threads → safepoint always reachable.
+    // Pass Dart VM flags the canonical way: a single --dart-flags= switch that the
+    // Flutter engine's SettingsFromCommandLine splits and forwards to Dart_SetVMFlags.
+    // (Bare --flag args are NOT forwarded to the VM by the engine.) marker_tasks=0
+    // and scavenger_tasks=0 make GC serial on the mutator (no parallel GC tasks to
+    // coordinate through a safepoint); no-background_compilation removes the
+    // background JIT compiler thread.
+    static ARG8: &[u8] =
+        b"--dart-flags=--no-background_compilation --no-concurrent_mark --no-concurrent_sweep --marker_tasks=0 --scavenger_tasks=0\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 8]);
+    struct ArgvPtrs([*const u8; 9]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
         ArgvPtrs([
@@ -1288,6 +1303,7 @@ extern "C" fn main_embedder() {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
+            ARG8.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
