@@ -485,6 +485,15 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
 
     crate::wm::push_app_event(child_pid, crate::embedder::abi::APP_LAUNCH, 0);
 
+    // Switch focus to the freshly launched app. This does double duty:
+    //  (1) the compositor mirrors the focused pid's surface, so the app becomes
+    //      visible once it produces its first frame, and
+    //  (2) the scheduler / APIC-timer preemption prioritises the focused pid,
+    //      giving the new host the CPU it needs to JIT-warm up — without this the
+    //      shell (still frame-pumping) starves the launched app on a single core
+    //      (observed: shell 2644 syscalls vs app 37, app never even starts JIT).
+    crate::wm::set_focus_pid(child_pid);
+
     let name_end = name.iter().position(|&b| b == 0).unwrap_or(64);
     let name_str = core::str::from_utf8(&name[..name_end]).unwrap_or("?");
     log::info!(
