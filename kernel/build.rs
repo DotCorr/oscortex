@@ -75,10 +75,18 @@ fn collect_dir(
             // raw Flutter engine module which is handled separately.
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.starts_with('.') { continue; }
-            // JIT MODE: the shell runs from kernel_blob.bin, so it MUST be embedded.
-            // Exclude only the per-app kernel blobs (Applications/*) to avoid bloating the
-            // kernel by ~120MB; keep the shell one at system/flutter/flutter_assets/.
-            if fname == "kernel_blob.bin" && name != "system/flutter/flutter_assets/kernel_blob.bin" { continue; }
+            // JIT MODE: every Flutter host (the shell AND each launched app) runs from
+            // its own kernel_blob.bin, so they MUST be embedded. Keep the shell blob at
+            // system/flutter/flutter_assets/ and each app blob at
+            // Applications/<name>.app/flutter_assets/. Exclude any other stray blobs
+            // (e.g. a legacy system/apps/ duplicate) to limit bloat.
+            // NOTE (scalability follow-up): embedding ~40MB per app does not scale; the
+            // real fix is to deliver app blobs as Limine modules / from disk so the
+            // kernel ELF stays lean. This embed is the working-proof path.
+            if fname == "kernel_blob.bin"
+                && name != "system/flutter/flutter_assets/kernel_blob.bin"
+                && !(name.starts_with("Applications/") && name.ends_with(".app/flutter_assets/kernel_blob.bin"))
+            { continue; }
             if fname == "libflutter_engine.so" || fname.ends_with(".bak") { continue; }
             println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {

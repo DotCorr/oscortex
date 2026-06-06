@@ -145,6 +145,32 @@ if [ -d "$APP_ASSETS_DIR" ]; then
     python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
     python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 
+    # Each launched app is its own Flutter host and hits the same bare-metal font
+    # issue as the shell: no system font provider + no default/Roboto family ->
+    # Material text livelocks in font fallback. Give every app the bundled
+    # NotoSans and alias the common default families to it.
+    NOTO_SRC="$APP_DIR/assets/fonts/NotoSans.ttf"
+    for APP_ASSETS in \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets"; do
+        [ -d "$APP_ASSETS" ] || continue
+        mkdir -p "$APP_ASSETS/assets/fonts"
+        [ -f "$NOTO_SRC" ] && cp "$NOTO_SRC" "$APP_ASSETS/assets/fonts/NotoSans.ttf"
+        python3 - "$APP_ASSETS/FontManifest.json" <<'PYFONT'
+import json, sys, os
+p = sys.argv[1]
+m = json.load(open(p)) if os.path.exists(p) else []
+have = {e["family"] for e in m}
+noto = [{"asset": "assets/fonts/NotoSans.ttf"}]
+if "NotoSans" not in have: m.append({"family": "NotoSans", "fonts": noto})
+for fam in ["Roboto", "sans-serif", "Arial", "Helvetica", ".SF UI Text", "DejaVu Sans"]:
+    if fam not in have: m.append({"family": fam, "fonts": noto})
+json.dump(m, open(p, "w"))
+print("[fonts] app", os.path.dirname(p).split('/')[-2], "-> NotoSans default")
+PYFONT
+    done
+
     rm -f \
         "$ROOT/initramfs/system/flutter/kernel_blob.bin" \
         "$ROOT/initramfs/system/flutter/vm_snapshot_data" \

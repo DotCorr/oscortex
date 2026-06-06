@@ -40,6 +40,16 @@ unsafe extern "C" fn _start() -> ! {
             // libflutter_engine.so uses `movaps` against 16-aligned stack
             // slots and #GPs on a misaligned rsp. Force-align here.
             "and rsp, -16",
+            // Preserve the kernel's bootstrap registers (rdi=host_mode,
+            // rsi=app_id, rdx=aot_va) across the breadcrumb syscall below.
+            // SYS_WRITE clobbers rdi/rsi/rdx, which made read_host_bootstrap()
+            // see rdi=1 (the write fd) for EVERY process — so a launched app
+            // (kernel sets rdi=HOST_MODE_APP=2) booted as a second SHELL and
+            // loaded the shell's blob instead of the app's. r12-r14 are
+            // callee-saved and survive the syscall.
+            "mov r12, rdi",
+            "mov r13, rsi",
+            "mov r14, rdx",
             // Earliest possible userspace breadcrumb: write one byte to serial
             // before calling into Rust code.
             "mov rax, 1",
@@ -47,6 +57,10 @@ unsafe extern "C" fn _start() -> ! {
             "lea rsi, [rip + 2f]",
             "mov rdx, 1",
             "syscall",
+            // Restore the bootstrap registers for main_embedder.
+            "mov rdi, r12",
+            "mov rsi, r13",
+            "mov rdx, r14",
             "call {main}",
             // If main returns, exit(0).
             "mov rax, 60",  // SYS_EXIT
@@ -1634,6 +1648,14 @@ extern "C" fn main_embedder() {
         None
     };
 
+    // Foreground/background lifecycle. A host that loses focus (the shell when an
+    // app is launched over it, or an app when the user returns to the shell) must
+    // STOP driving frames: on a single core the backgrounded host's frame pump
+    // otherwise hogs the CPU and starves the foreground host so it can never even
+    // JIT-warm up. Start focused; the EV_FOCUS arm toggles this and all frame-pump
+    // / schedule_frame work is gated on it.
+    let mut focused = true;
+
     write(b"[embedder] entering event loop\n");
     loop {
         let now = rdtsc_ns();
@@ -1666,7 +1688,7 @@ extern "C" fn main_embedder() {
             diff_ms.min(16).max(1)
         };
 
-        if engine_out != 0 && now >= startup_watchdog_next_ns && startup_watchdog_stage < 6 {
+        if focused && engine_out != 0 && now >= startup_watchdog_next_ns && startup_watchdog_stage < 6 {
             if proctable.schedule_frame != 0 {
                 let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"startup");
             }
@@ -1704,8 +1726,10 @@ extern "C" fn main_embedder() {
         if r <= 0 {
             // Frame pump: keep Flutter rendering at ~60 fps so the Dart UI
             // thread has time to finish init and produce a real frame.
+            // Skipped entirely while backgrounded (focused=false) so we don't
+            // starve the foreground host on a single core.
             let now_pump = rdtsc_ns();
-            if engine_out != 0 && proctable.schedule_frame != 0 && now_pump >= frame_pump_next_ns {
+            if focused && engine_out != 0 && proctable.schedule_frame != 0 && now_pump >= frame_pump_next_ns {
                 let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"idle");
                 let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
                 let interval = if presents < 10 {
@@ -1725,7 +1749,7 @@ extern "C" fn main_embedder() {
                 // delivering EV_VSYNC(baton=0).  Use these ticks to pump
                 // FlutterEngineScheduleFrame so Flutter posts a real baton and
                 // keeps rendering even for static (no-animation) apps.
-                if baton == 0 && engine_out != 0 && proctable.schedule_frame != 0 {
+                if focused && baton == 0 && engine_out != 0 && proctable.schedule_frame != 0 {
                     let now_pump = rdtsc_ns();
                     if now_pump >= frame_pump_next_ns {
                         let _ = schedule_frame_with_log(
@@ -1960,6 +1984,45 @@ extern "C" fn main_embedder() {
                     let seq = u64::from_le_bytes(platform_buf[0..8].try_into().unwrap_or([0; 8]));
                     // Echo-reply OK.
                     platform_msg_reply(seq, b"ok");
+                }
+            }
+            EV_FOCUS => {
+                // Foreground/background transition (ev.flags: FOCUS_LOST=1,
+                // FOCUS_GAINED=2). Backgrounded hosts stop driving frames so the
+                // foreground host gets the single core; foregrounded hosts resume.
+                let gained = ev.flags == 2;
+                focused = gained;
+                write(if gained {
+                    b"[embedder] FOCUS_GAINED -> resume rendering\n" as &[u8]
+                } else {
+                    b"[embedder] FOCUS_LOST -> pause rendering\n" as &[u8]
+                });
+                if engine_out != 0 && proctable.send_platform_message != 0 {
+                    static LIFECYCLE_CH: &[u8] = b"flutter/lifecycle\0";
+                    let body: &[u8] = if gained {
+                        b"AppLifecycleState.resumed"
+                    } else {
+                        b"AppLifecycleState.paused"
+                    };
+                    let msg = FlutterPlatformMessage {
+                        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+                        channel: LIFECYCLE_CH.as_ptr() as u64,
+                        message: body.as_ptr() as u64,
+                        message_size: body.len(),
+                        response_handle: 0,
+                    };
+                    let send_platform_message: SendPlatformMessageFn =
+                        unsafe { core::mem::transmute(proctable.send_platform_message) };
+                    let _ = unsafe { send_platform_message(engine_out, &msg as *const _) };
+                }
+                if gained && engine_out != 0 && proctable.schedule_frame != 0 {
+                    // Re-kick the pipeline on resume.
+                    frame_pump_next_ns = rdtsc_ns();
+                    let _ = schedule_frame_with_log(
+                        engine_out,
+                        proctable.schedule_frame,
+                        b"focus-resume",
+                    );
                 }
             }
             _ => {}
