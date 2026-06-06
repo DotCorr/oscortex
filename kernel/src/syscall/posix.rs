@@ -259,10 +259,16 @@ pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
     // madvise(MADV_DONTNEED) on its loaded platform-kernel data (which lives inside
     // the engine image), and unmapping it caused a later read of that table to
     // SIGSEGV. madvise is advisory, so ignoring it for lib regions is correct.
-    const ANON_VA_BASE: u64 = 0x3_1000_0000;
-    if (advice == 4 || advice == 8) && addr >= ANON_VA_BASE {
+    // Only the demand-pageable anon window [0x3_0000_0000, 0x100_0000_0000) may be
+    // unmapped: those pages re-fault as zeros. Everything else — library images
+    // (0x140000000..) AND the high user stacks (0x7FFF_xxxx, above the demand range)
+    // — is mapped without a backing pager, so unmapping loses the data permanently
+    // (the Dart VM madvise(MADV_DONTNEED)s both its loaded kernel and stack regions).
+    const DEMAND_LO: u64 = 0x3_0000_0000;
+    const DEMAND_HI: u64 = 0x100_0000_0000;
+    if (advice == 4 || advice == 8) && addr >= DEMAND_LO && addr.saturating_add(len) <= DEMAND_HI {
         let (_, pml4) = pid_and_pml4();
-        if pml4 != 0 && addr != 0 && len > 0 {
+        if pml4 != 0 && len > 0 {
             crate::mm::paging::unmap_user_range(pml4, addr, len);
         }
     }
@@ -1855,6 +1861,40 @@ pub fn sys_pthread_attr_setdetachstate(attr: u64, state: u64) -> i64 {
     0
 }
 
+/// Compute thread stack bounds by scanning the mapped region around the current
+/// user RSP. clone-threads (Dart VM mutator/GC/helper threads) have no recorded
+/// user_stack_base, so pthread_getattr_np/getstack would report 0 and Dart's
+/// GetAndValidateThreadStackBounds aborts ("pthread error"). When the thread calls
+/// these, its stack IS mapped (it's running on it), so we can derive valid bounds.
+pub(crate) fn computed_stack_bounds() -> (u64, u64) {
+    let (_, pml4) = pid_and_pml4();
+    if pml4 == 0 {
+        return (0, 0);
+    }
+    let rsp = crate::arch::syscall::user_rsp() & !0xFFF;
+    if rsp == 0 || crate::mm::paging::translate_user_page(pml4, rsp).is_none() {
+        return (0, 0);
+    }
+    // Scan up from RSP to the top of the contiguous mapped stack region.
+    let mut top = rsp;
+    let mut steps = 0;
+    while steps < 8192 {
+        let p = top + 4096;
+        if crate::mm::paging::translate_user_page(pml4, p).is_none() {
+            break;
+        }
+        top = p;
+        steps += 1;
+    }
+    top += 4096; // exclusive top
+    // Report an 8 MiB window below the mapped top. The lower (unused) part is
+    // demand-paged on growth (thread stacks live in the anon range); Dart only
+    // compares SP against these bounds, it never dereferences `base`.
+    let size = 0x80_0000u64; // 8 MiB
+    let base = top.saturating_sub(size);
+    (base, size)
+}
+
 pub fn sys_pthread_attr_getstack(attr: u64, base_out: u64, size_out: u64) -> i64 {
     // The Dart VM calls pthread_getattr_np(self, &attr) then
     // pthread_attr_getstack(&attr, &base, &size) to validate stack bounds.
@@ -1867,17 +1907,17 @@ pub fn sys_pthread_attr_getstack(attr: u64, base_out: u64, size_out: u64) -> i64
     // (stored at attr+0x10 = base, attr+0x18 = size).
     let (eff_base, eff_size) = if base != 0 {
         (base, size)
-    } else if attr >= 0x1000 {
-        // Try reading what pthread_getattr_np may have written into attr.
+    } else if attr >= 0x1000 && {
+        let a_base = unsafe { *(attr.wrapping_add(0x10) as *const u64) };
+        a_base != 0
+    } {
+        // Read what pthread_getattr_np wrote into attr.
         let a_base = unsafe { *(attr.wrapping_add(0x10) as *const u64) };
         let a_size = unsafe { *(attr.wrapping_add(0x18) as *const u64) };
-        if a_base != 0 && a_size != 0 {
-            (a_base, a_size)
-        } else {
-            (0, 0)
-        }
+        (a_base, a_size)
     } else {
-        (0, 0)
+        // clone-thread with no recorded bounds: derive from the mapped stack.
+        computed_stack_bounds()
     };
 
     log::debug!(
