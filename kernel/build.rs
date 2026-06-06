@@ -75,7 +75,10 @@ fn collect_dir(
             // raw Flutter engine module which is handled separately.
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
             if fname.starts_with('.') { continue; }
-            if fname == "kernel_blob.bin" { continue; }
+            // JIT MODE: the shell runs from kernel_blob.bin, so it MUST be embedded.
+            // Exclude only the per-app kernel blobs (Applications/*) to avoid bloating the
+            // kernel by ~120MB; keep the shell one at system/flutter/flutter_assets/.
+            if fname == "kernel_blob.bin" && name != "system/flutter/flutter_assets/kernel_blob.bin" { continue; }
             if fname == "libflutter_engine.so" || fname.ends_with(".bak") { continue; }
             println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {
