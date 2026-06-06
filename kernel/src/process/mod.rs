@@ -888,11 +888,27 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
         start = 0;
     }
 
+    // FOREGROUND-EXCLUSIVE SCHEDULING. When an app is foreground (focus is not the
+    // shell pid 1), run ONLY that app's thread group and leave the backgrounded
+    // shell suspended. Two concurrent heavy Flutter VMs overwhelm the cooperative
+    // scheduler's context save/restore — a backgrounded host's thread gets switched
+    // in with a corrupted resume RIP and #GPs. Serialising to one VM group at a time
+    // keeps the (reliable) single-host path. focus=1 means the shell is foreground
+    // and fg_group=1 covers the whole system as before (no behavioural change until
+    // an app is launched). Idle (pid 0) and the launcher are never starved because
+    // input/baton priority above already handled the focus pid.
+    let fg = crate::wm::focus_pid();
+    let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
+    let exclusive = fg_group > 1;
+
     let mut res = None;
     for off in 0..MAX_PROCS {
         let idx = (start + off) % MAX_PROCS;
         let p = unsafe { &mut PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
+            if exclusive && get_group_leader_locked(p.pid) != fg_group {
+                continue; // not in the foreground app's group — skip while it runs
+            }
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
                 if current == 0 || p.pid != current {
                     p.current_cpu = Some(my_cpu);
@@ -905,7 +921,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
 
     if res.is_none() && current != 0 {
         let c = unsafe { &mut PTABLE[idx_of(current)] };
-        if c.pid == current && c.state == ProcState::Running {
+        if c.pid == current && c.state == ProcState::Running
+            && (!exclusive || get_group_leader_locked(current) == fg_group)
+        {
             if c.current_cpu.is_none() || c.current_cpu == Some(my_cpu) {
                 c.current_cpu = Some(my_cpu);
                 res = Some(current);
