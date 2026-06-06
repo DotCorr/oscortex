@@ -398,13 +398,6 @@ mod x86_64_impl {
         if virt >= 0x112670000 && virt <= 0x112690000 {
             log::warn!("[DEBUG-PAGING] unmapped virt={:#x} in pml4={:#x}", virt, pml4_phys);
         }
-        // JIT debug: catch what unmaps the engine's first R-data segment (0x141000000..0x141954248)
-        // OR the main user stack (0x7FFFFFBF0000..0x7FFFFFFF0000) — both crash JIT reads.
-        if (virt >= 0x141000000 && virt < 0x141954248)
-            || (virt >= 0x7fff_ffbf_0000 && virt < 0x7fff_ffff_0000)
-        {
-            log::error!("[REGION-UNMAP] virt={:#x} phys={:#x} pml4={:#x}", virt, phys, pml4_phys);
-        }
         Ok(phys)
     }
 }
