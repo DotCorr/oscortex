@@ -3,14 +3,9 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-#[repr(C, align(64))]
-struct XStateScratch([u8; 4096]);
-
 static XSAVE_ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVE_OPT_ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVE_MASK: AtomicU64 = AtomicU64::new(0b11); // x87 + SSE fallback
-
-static mut PREEMPT_XSTATE: XStateScratch = XStateScratch([0; 4096]);
 
 #[inline]
 unsafe fn save_xstate_inner(ptr: *mut u8) {
@@ -230,17 +225,11 @@ pub fn get_fs_base() -> u64 {
     ((hi as u64) << 32) | (lo as u64)
 }
 
-#[inline]
-pub unsafe fn save_preempt_xstate() {
-    let ptr = core::ptr::addr_of_mut!(PREEMPT_XSTATE.0) as *mut u8;
-    save_xstate_inner(ptr);
-}
-
-#[inline]
-pub unsafe fn restore_preempt_xstate() {
-    let ptr = core::ptr::addr_of!(PREEMPT_XSTATE.0) as *const u8;
-    restore_xstate_inner(ptr);
-}
+// NOTE: the former save_preempt_xstate/restore_preempt_xstate (and the single
+// global PREEMPT_XSTATE scratch buffer) were dead code with no callers. They were
+// removed: a single shared FPU/SSE buffer would have been an SMP hazard, and
+// preemption already saves per-process xstate via save_xstate(pid). Per-process
+// xstate buffers are the only correct design here.
 
 #[inline]
 pub unsafe fn save_xstate_to(ptr: *mut u8) {
