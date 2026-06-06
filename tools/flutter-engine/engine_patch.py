@@ -211,24 +211,40 @@ PATCHES["P_READFILL_OBJPOOL_ALL_CLUSTERS"] = (
 # ReadFill pool lookups now write 0 to all object fields, PostLoad crashes on null derefs.
 # Bypassing PostLoad is safe for the boot stub path -- we just need the isolate to start.
 _POSTLOADS_TO_BYPASS = [
-    (0x2293210, 'TypedDataViewDeserializationCluster::PostLoad'),
-    (0x2293c60, 'RODataDeserializationCluster::PostLoad'),
-    (0x2295b20, 'TypeArgumentsDeserializationCluster::PostLoad'),
-    (0x22967f0, 'FunctionDeserializationCluster::PostLoad'),
-    (0x2297710, 'FieldDeserializationCluster::PostLoad'),
-    (0x2298430, 'KernelProgramInfoDeserializationCluster::PostLoad'),
-    (0x2298ca0, 'CodeDeserializationCluster::PostLoad'),
-    (0x229c1b0, 'TypeDeserializationCluster::PostLoad'),
-    (0x229cb50, 'FunctionTypeDeserializationCluster::PostLoad'),
-    (0x229d500, 'RecordTypeDeserializationCluster::PostLoad'),
-    (0x229ded0, 'TypeParameterDeserializationCluster::PostLoad'),
-    (0x22a0c70, 'StringDeserializationCluster::PostLoad'),
-    (0x22a20b0, 'VMDeserializationRoots::PostLoad'),
-    (0x22a2480, 'ProgramDeserializationRoots::PostLoad'),
-    (0x22a29a0, 'UnitDeserializationRoots::PostLoad'),
+    # CORRECTED addresses (old list was stale by -0x1000 and hit wrong functions). Only the
+    # CLUSTER PostLoads (which null-deref on AOT-stripped fields). The ROOTS PostLoads
+    # (VMDeser/ProgramDeser/UnitDeser) are intentionally NOT here — they populate base objects.
+    (0x2294210, 'TypedDataViewDeserializationCluster::PostLoad'),
+    (0x2294c60, 'RODataDeserializationCluster::PostLoad'),
+    (0x2296b20, 'TypeArgumentsDeserializationCluster::PostLoad'),
+    (0x22977f0, 'FunctionDeserializationCluster::PostLoad'),
+    (0x2298710, 'FieldDeserializationCluster::PostLoad'),
+    (0x2299430, 'KernelProgramInfoDeserializationCluster::PostLoad'),
+    (0x2299ca0, 'CodeDeserializationCluster::PostLoad'),
+    (0x229a9e0, 'ObjectPoolDeserializationCluster::PostLoad'),
+    (0x229d1b0, 'TypeDeserializationCluster::PostLoad'),
+    (0x229db50, 'FunctionTypeDeserializationCluster::PostLoad'),
+    (0x229e500, 'RecordTypeDeserializationCluster::PostLoad'),
+    (0x229eed0, 'TypeParameterDeserializationCluster::PostLoad'),
+    (0x22a1c70, 'StringDeserializationCluster::PostLoad'),
+    # ── ROOTS PostLoads REMOVED: these three addresses are STALE (off by 0x1000) and
+    #    actually point at unrelated functions (0x22a20b0 = CompressedStackMaps::Handle),
+    #    so ret-patching them corrupted VM-snapshot deserialization. Worse, the REAL roots
+    #    PostLoads MUST run — VMDeserializationRoots::PostLoad (0x22a30b0) tail-calls
+    #    set_vm_isolate_snapshot_object_table (populates the 1247 VM base objects), and
+    #    UnitDeserializationRoots::PostLoad (0x22a39a0) calls LoadingUnit::set_base_objects.
+    #    Bypassing them caused "Snapshot expects 1247 base objects, but deserializer provided 0".
+    # (0x22a30b0, 'VMDeserializationRoots::PostLoad'),    — must RUN, do not bypass
+    # (0x22a3480, 'ProgramDeserializationRoots::PostLoad') — re-add with correct addr only if it crashes
+    # (0x22a39a0, 'UnitDeserializationRoots::PostLoad'),  — must RUN, do not bypass
 ]
-for _fo, _name in _POSTLOADS_TO_BYPASS:
-    PATCHES[f'P_POSTLOAD_BYPASS_{_fo:x}'] = (_fo, bytes([0xC3]))  # ret
+for _va, _name in _POSTLOADS_TO_BYPASS:
+    # The addresses above are VIRTUAL addresses (from objdump). apply() writes by FILE
+    # offset, and the exec segment has vaddr = fileoffset + 0x1000, so the raw value must
+    # be converted or the 0xC3 lands 0x1000 high — e.g. StringDeser::PostLoad (va 0x22a1c70)
+    # was corrupting AddBaseObjects+0x350 (va 0x22a2c70), turning a `mov` into a `ret` that
+    # popped a heap object off the stack and jumped into the Dart heap. Convert with va_to_file.
+    PATCHES[f'P_POSTLOAD_BYPASS_{_va:x}'] = (va_to_file(_va), bytes([0xC3]))  # ret
 
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
 P9_HOOK_VA = 0x1A8BEB8
@@ -527,32 +543,31 @@ def main() -> int:
 
     all_patches = [
         "P1", "P2", "P3", "P4", "P5", "P6", "P10", "P9", "P9_CAVE", "P9_PROLOGUE", "P9_EPILOGUE",
-        "P_SDK_HASH", "P_SDK_HASH_2", "P_SDK_HASH_3", "P_RUNS_AOT",
-        "P_JIT_AOT_CHECK", "P_SNAPSHOT_FEATURES_CHECK", "P_ALLOW_ALL_DART_FLAGS",
+        "P_RUNS_AOT",
+        "P_JIT_AOT_CHECK", "P_ALLOW_ALL_DART_FLAGS",
         "P_FINISH_INIT_HOOK", "P_FINISH_INIT_CAVE", "P_FINISH_INIT_HOOK_2", "P_FINISH_INIT_CAVE_2",
         "P_INIT_TTS_HOOK", "P_INIT_TTS_CAVE",
         "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART1", "P_BYPASS_TTS_INIT_IN_VM_CONSTANTS_PART2", "P_VM_CONSTANTS_CAVE",
-        "P_BYPASS_FINALIZE_CLASS_NAMES", "P_BYPASS_BASE_OBJECTS_CHECK", "P_BYPASS_BASE_OBJECTS_COMPARE",
         "P_IS_PRECOMPILED_RUNTIME", "P_FLAG_PRECOMPILED_MODE_DEFAULT", "P_FLAG_PRECOMPILED_MODE_INITIAL",
         "P_BYPASS_VM_SERVICE_TASK",
         "P_BYPASS_SERVICE_ISOLATE_RUN",
-        "P_READ_INSTRUCTIONS",
         "P_DEBUG_CAVE",
-        "P_READFILL_OBJPOOL_0",
-        "P_READFILL_OBJPOOL",
-        "P_READFILL_OBJPOOL_2",
-        "P_READFILL_OBJPOOL_3",
-        "P_READFILL_OBJPOOL_4",
-        "P_READFILL_OBJPOOL_5",
-        "P_READFILL_STACKMAPS",
-        "P_READFILL_OBJPOOL_7",
-        "P_READFILL_OBJPOOL_8",
-        "P_READFILL_OBJPOOL_9",
-        "P_READFILL_OBJPOOL_10",
-        "P_READFILL_OBJPOOL_11",
-        "P_READFILL_OBJPOOL_ALL_CLUSTERS",  # mass-patches all 97 pool lookups in all deser clusters
+        # AOT strips class-name strings, so finalizing them calls Utf8::Length on a null String
+        # → crash. This bypass (in a non-reader code region) is legitimately needed for AOT.
+        "P_BYPASS_FINALIZE_CLASS_NAMES",
+        # ENV-NEEDED (not a deser hack): redirects Dart's ReadInstructions to the bare-metal
+        # cave (P_DEBUG_CAVE) that handles OSCortex's SEPARATE instructions image. Without it
+        # the engine's inline-instructions reader desyncs the stream on code/ObjectPool clusters
+        # → garbage Array length → OOM.
+        "P_READ_INSTRUCTIONS",
+        # ── INTENTIONALLY OMITTED: P_SDK_HASH*, P_SNAPSHOT_FEATURES_CHECK,
+        #    P_BYPASS_BASE_OBJECTS_CHECK, P_BYPASS_BASE_OBJECTS_COMPARE, and all deser-content
+        #    hacks. The reader-region bypasses (FEATURES_CHECK + BASE_OBJECTS_*) skip stream reads
+        #    and desync the deserialization cursor → garbage Array length → OOM. Removing them
+        #    makes deserialization correct.
     ]
-    # Add dynamic PostLoad bypass patches
+    # Bypass CLUSTER PostLoads at their CORRECTED addresses — they null-deref on AOT-stripped
+    # fields. (Roots PostLoads are excluded from the list so they run and populate base objects.)
     all_patches.extend([f"P_POSTLOAD_BYPASS_{fo:x}" for fo, _ in _POSTLOADS_TO_BYPASS])
 
 
