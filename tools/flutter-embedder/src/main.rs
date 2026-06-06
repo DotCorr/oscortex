@@ -613,13 +613,6 @@ unsafe extern "C" fn present_callback(
 /// kernel; the APIC ISR returns it in the next `EV_VSYNC` event so the event
 /// loop can call `FlutterEngineOnVsync(engine, baton, start_ns, target_ns)`.
 unsafe extern "C" fn vsync_callback(_user_data: *mut (), baton: usize) {
-    static VSYNC_CB_LOG: AtomicU32 = AtomicU32::new(0);
-    let n = VSYNC_CB_LOG.fetch_add(1, Ordering::Relaxed);
-    if n < 12 {
-        write(b"[vsync_cb] engine requested vsync, baton=");
-        write_hex(baton as u64);
-        write(b"\n");
-    }
     engine_vsync_baton_post(baton as u64);
 }
 
@@ -1333,10 +1326,12 @@ extern "C" fn main_embedder() {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_VSYNC_CALLBACK,
-        // Disabled: do NOT delegate vsync to the embedder. The custom vsync_callback was
-        // never driven (engine never requested a baton), so no frames were produced. With
-        // it null the engine uses its INTERNAL vsync timer thread — the exact config that
-        // rendered in the Docker reference test. (Thread creation now works post pthread_join.)
+        // RELIABILITY TEST: engine-internal vsync (NULL). Still on-demand (the
+        // engine's own VsyncWaiter only produces frames when needed) but avoids the
+        // cross-process baton round-trip (engine->kernel->pid1->OnVsync) which is
+        // one more thing to stall under the heavy real-app sync load. This was the
+        // render-milestone config. Toggle back to embedder vsync once the sync
+        // layer is reliable.
         0u64,
     );
     write_i32_at(
@@ -1397,12 +1392,17 @@ extern "C" fn main_embedder() {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_CUSTOM_TASK_RUNNERS,
-        // EXPERIMENT: disable custom task runners so the engine spawns its own UI/raster
-        // threads and self-drives the frame pipeline — the proven Docker config that rendered.
-        // (Custom merged runners produced no frame: present_callback was never called.)
-        // Engine-spawned threads work now that pthread_join is fixed.
+        // EXPERIMENT 1 (vsync isolation): engine-default task runners (NULL) so the
+        // engine spawns and manages its own platform/UI/raster/IO threads — the
+        // proven-rendering threading. This isolates the ONE variable under test:
+        // embedder-driven vsync (vsync_callback is SET above). With this config the
+        // UI thread's Animator should call our vsync_callback on each frame request,
+        // posting a baton the main loop acks via FlutterEngineOnVsync. If the serial
+        // log shows on_vsync called with NON-ZERO batons, embedder-driven on-demand
+        // vsync works and we can delete the frame-pump hacks (experiment 2).
         0u64,
     );
+    let _ = &CUSTOM_TASK_RUNNERS; // silence unused while custom runners are disabled
 
     // Initialize the MessageLoop for the main thread before FlutterEngineInitialize.
     // Without this, task runners stall in epoll_wait and RunInitialized blocks forever.
@@ -1699,7 +1699,20 @@ extern "C" fn main_embedder() {
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
                     static VSYNC_SEND_LOG: AtomicU32 = AtomicU32::new(0);
                     let vsync_n = VSYNC_SEND_LOG.fetch_add(1, Ordering::Relaxed);
-                    let now_ns = rdtsc_ns();
+                    // CRITICAL: frame_start/target MUST be on the engine's own monotonic
+                    // clock (FlutterEngineGetCurrentTime), NOT rdtsc_ns(). rdtsc_ns adds a
+                    // ~1.7e18 ns epoch offset and assumes 3GHz, so it lands ~17 years in
+                    // the engine's future — the Animator then schedules BeginFrame
+                    // effectively never, so no frame is built and (because the pending-frame
+                    // semaphore is never released) no further vsync is requested. Using the
+                    // engine clock here is what every reference embedder does.
+                    let now_ns = if get_current_time_va != 0 {
+                        let get_time: GetCurrentTimeFn =
+                            unsafe { core::mem::transmute(get_current_time_va) };
+                        unsafe { get_time() }
+                    } else {
+                        rdtsc_ns()
+                    };
                     let target_ns = now_ns + 16_666_666;
                     let f: OnVsyncFn = unsafe { core::mem::transmute(proctable.on_vsync) };
                     write(b"[embedder/vsync] calling on_vsync n=");

@@ -1084,16 +1084,6 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
     // large engine it iterated thousands of pages calling update_user_page; keeping engine
     // segments mapped+writable (as the loader does above) is correct for JIT.
 
-    // Diagnostic: verify a few first-segment data pages are still mapped at end of dlopen
-    // (a JIT-phase fault read engine vaddr 0xd2d908 as not-present — checking if dl.rs leaves
-    // the engine's read-only data segment mapped).
-    if export_count > 50 {
-        for probe in [0x0u64, 0x954248, 0xd2d908, 0x1900000] {
-            let va = load_base + probe;
-            let mapped = paging::translate_user_page(pml4_phys, va).is_some();
-            log::info!("[DL] post-load map check: va={:#x} (off {:#x}) mapped={}", va, probe, mapped);
-        }
-    }
 
     log::info!("[DL] pid={} dlopen base={:#x} handle={} exports={}", pid, load_base, handle, export_count);
     Ok(handle)
