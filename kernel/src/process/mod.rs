@@ -630,11 +630,19 @@ pub fn exit(pid: u32, code: i32) {
     if !p.is_thread {
         paging::free_user_pml4(p.pml4_phys);
     } else {
-        if p.user_stack_base != 0 && p.user_stack_size != 0 {
+        // Only reclaim thread-private memory in the demand-pageable anon window.
+        // Threads SHARE the parent's PML4, so a fs_base/stack that the Dart VM placed
+        // in the main user stack (0x7FFF_xxxx) or a library image must NOT be unmapped
+        // here — doing so clobbers pages other threads (incl. pid 1) are still using,
+        // and those regions have no backing pager to re-fault them.
+        let is_anon = |va: u64| va >= 0x3_0000_0000 && va < 0x100_0000_0000;
+        if p.user_stack_base != 0 && p.user_stack_size != 0 && is_anon(p.user_stack_base) {
             paging::unmap_user_range(p.pml4_phys, p.user_stack_base, p.user_stack_size);
+            dl::recycle_anon_va(pid, p.user_stack_base, p.user_stack_size);
         }
-        if p.fs_base != 0 {
+        if p.fs_base != 0 && is_anon(p.fs_base) {
             paging::unmap_user_range(p.pml4_phys, p.fs_base, 4096);
+            dl::recycle_anon_va(pid, p.fs_base, 4096);
         }
     }
     free_syscall_stack(p.syscall_stack_base);
@@ -2051,6 +2059,10 @@ pub fn fork_current() -> Result<u32, &'static str> {
 
     // Allocate a new PML4 for the child and deep-copy user pages.
     let child_pml4 = clone_address_space(parent_pml4)?;
+
+    // Inherit the parent's VA bump cursors so the child allocator
+    // starts past the already-mapped region, not from ANON_VA_BASE.
+    crate::process::dl::clone_as_slot(parent_pml4, child_pml4);
 
     // Allocate a new syscall stack for child.
     let (child_stack_base, child_stack_top) = alloc_syscall_stack()
