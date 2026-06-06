@@ -129,11 +129,17 @@ pub fn sys_malloc(size: u64) -> i64 {
         log::error!("[malloc] pid=0 — no user context; size={:#x}", size);
         return 0;
     }
-    // Progress counter — prints every 100K mallocs to show life signs
     static MALLOC_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     let n = MALLOC_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if n % 100_000 == 99_999 {
-        log::warn!("[malloc] progress: {} mallocs pid={}", n + 1, pid);
+    if n % 1000 == 999 {
+        let used = crate::mm::frame_allocator::frames_used();
+        let total = crate::mm::frame_allocator::frames_total();
+        let allocs = MALLOC_ALLOCS.lock();
+        let free_blocks = MALLOC_FREE.lock();
+        let active_pages: usize = allocs.values().map(|b| b.pages).sum();
+        let free_pages: usize = free_blocks.iter().map(|b| b.pages).sum();
+        log::warn!("[malloc] stats: calls={} frames={}/{} allocs={} (active_pages={}) free_blocks={} (free_pages={})",
+            n + 1, used, total, allocs.len(), active_pages, free_blocks.len(), free_pages);
     }
     // Allocate size + 16 bytes (header stores size for realloc).
     let alloc_size = size as usize + 16;
@@ -221,17 +227,44 @@ pub fn sys_free(ptr: u64) -> i64 {
     if ptr <= 16 {
         return 0;
     }
+    static FREE_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = FREE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n % 5000 == 4999 {
+        let used = crate::mm::frame_allocator::frames_used();
+        let total = crate::mm::frame_allocator::frames_total();
+        log::warn!("[free] stats: calls={} frames={}/{} allocs={} free_blocks={}",
+            n + 1, used, total, MALLOC_ALLOCS.lock().len(), MALLOC_FREE.lock().len());
+    }
     let (_, pml4) = pid_and_pml4();
     let block = MALLOC_ALLOCS.lock().remove(&(pml4, ptr));
     if let Some(block) = block {
-        // Unmap the physical memory and free frames to prevent physical OOM leaks.
-        crate::mm::paging::unmap_user_range(pml4, block.base, block.pages as u64 * 4096);
-
         let mut free = MALLOC_FREE.lock();
         free.push(block);
         coalesce_free_blocks(&mut free);
     } else {
         log::warn!("[free] ptr={:#x} not found in MALLOC_ALLOCS", ptr);
+    }
+    0
+}
+
+pub fn sys_madvise(addr: u64, len: u64, advice: u64) -> i64 {
+    // MADV_DONTNEED (4) / MADV_FREE (8): Linux discards the pages so the next
+    // access re-faults (anon -> zero-filled; file-backed -> reloaded from file).
+    // OSCortex unmaps+frees the frames to reclaim memory — which is ONLY safe for
+    // anonymous memory (>= ANON_VA_BASE), because anon pages re-fault as zeros.
+    //
+    // Library regions [LIB_VA_BASE, ANON_VA_BASE) are mapped EAGERLY and are NOT
+    // demand-pageable (the mirror demand-pager has no backing for high-mapped libs),
+    // so unmapping them loses the data permanently. The Dart VM calls
+    // madvise(MADV_DONTNEED) on its loaded platform-kernel data (which lives inside
+    // the engine image), and unmapping it caused a later read of that table to
+    // SIGSEGV. madvise is advisory, so ignoring it for lib regions is correct.
+    const ANON_VA_BASE: u64 = 0x3_1000_0000;
+    if (advice == 4 || advice == 8) && addr >= ANON_VA_BASE {
+        let (_, pml4) = pid_and_pml4();
+        if pml4 != 0 && addr != 0 && len > 0 {
+            crate::mm::paging::unmap_user_range(pml4, addr, len);
+        }
     }
     0
 }
