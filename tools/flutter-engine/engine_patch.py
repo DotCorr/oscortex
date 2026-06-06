@@ -246,6 +246,30 @@ for _va, _name in _POSTLOADS_TO_BYPASS:
     # popped a heap object off the stack and jumped into the Dart heap. Convert with va_to_file.
     PATCHES[f'P_POSTLOAD_BYPASS_{_va:x}'] = (va_to_file(_va), bytes([0xC3]))  # ret
 
+# ── ImageReader::GetInstructionsAt anomalous-offset clamp ──────────────────────
+# 8000+ isolate Code objects decode sane small signed instruction offsets, but a
+# late one decodes 0x80380000 (sign-extended -0x7FC80000, ~2GB below the image
+# base) -> unmapped ptr -> SIGSEGV in Code::InitializeCachedEntryPointsFrom.
+# Clamp out-of-range offsets to 0 (returns base+1, a mapped address) so the
+# snapshot finishes loading. Supersedes the kernel dl.rs Patch7 (which byte-match
+# guards and auto-skips once 0x22cfe60 starts with 0xE9). Cave at file 0x1F44C60
+# (free space after P_DEBUG_CAVE which ends at 0x1F44C5A).
+_GI_HOOK_VA = 0x22cfe60
+_GI_CAVE_FILE = 0x1F44C60
+_GI_CAVE_VA = file_to_va(_GI_CAVE_FILE)
+PATCHES["P_GETINSTR_CLAMP_HOOK"] = (va_to_file(_GI_HOOK_VA), jmp_rel32(_GI_HOOK_VA, _GI_CAVE_VA))
+PATCHES["P_GETINSTR_CLAMP_CAVE"] = (_GI_CAVE_FILE, bytes([
+    0x48, 0x8b, 0x47, 0x08,                    # mov rax, [rdi+8]      ; image base
+    0x48, 0x63, 0xce,                          # movsxd rcx, esi       ; signed offset
+    0x48, 0x81, 0xf9, 0x20, 0x50, 0x29, 0x00,  # cmp rcx, 0x295020     ; iso image size
+    0x7f, 0x09,                                # jg  L_clamp
+    0x48, 0x81, 0xf9, 0x00, 0x00, 0xf0, 0xff,  # cmp rcx, -0x100000
+    0x7d, 0x02,                                # jge L_done
+    0x31, 0xc9,                                # L_clamp: xor ecx, ecx
+    0x48, 0x8d, 0x44, 0x08, 0x01,              # L_done:  lea rax, [rax+rcx+1]
+    0xc3,                                      # ret
+]))
+
 # P7/P9: wire Draw.fPixels from SkBitmapDevice before skcpu::Draw::drawPaint.
 P9_HOOK_VA = 0x1A8BEB8
 P9_RESUME_VA = 0x1A8BEC5
@@ -560,6 +584,9 @@ def main() -> int:
         # the engine's inline-instructions reader desyncs the stream on code/ObjectPool clusters
         # → garbage Array length → OOM.
         "P_READ_INSTRUCTIONS",
+        # Clamp the one anomalous isolate Code instruction offset (0x80380000) that
+        # would otherwise resolve to an unmapped ptr and crash entry-point setup.
+        "P_GETINSTR_CLAMP_HOOK", "P_GETINSTR_CLAMP_CAVE",
         # ── INTENTIONALLY OMITTED: P_SDK_HASH*, P_SNAPSHOT_FEATURES_CHECK,
         #    P_BYPASS_BASE_OBJECTS_CHECK, P_BYPASS_BASE_OBJECTS_COMPARE, and all deser-content
         #    hacks. The reader-region bypasses (FEATURES_CHECK + BASE_OBJECTS_*) skip stream reads
