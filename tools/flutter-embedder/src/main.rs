@@ -1615,10 +1615,33 @@ extern "C" fn main_embedder() {
     // rendering even after it goes idle (static UI or before Dart init completes).
     let mut frame_pump_next_ns: u64 = rdtsc_ns() + 1_000_000;
 
+    // Pump the engine's platform task runner. With engine-default task runners
+    // (custom_task_runners=NULL — our proven render config) the engine posts
+    // platform-thread work, INCLUDING platform-message DELIVERY (the oscortex/shell
+    // channel, flutter/textinput, flutter/mousecursor, every MethodChannel), to the
+    // fml MessageLoop we initialized on this thread (pid 1). Nothing was draining it,
+    // so platform_message_callback was NEVER invoked: the startup `list` and the
+    // Install-demo `install:` round-trips were silently dropped (the UI sat on "No
+    // apps installed"). __FlutterEngineFlushPendingTasksNow runs the expired tasks
+    // on the current thread, delivering those messages.
+    let flush_pending_va = dlsym(handle, b"__FlutterEngineFlushPendingTasksNow");
+    if flush_pending_va == 0 {
+        write(b"[embedder] WARN: __FlutterEngineFlushPendingTasksNow not found\n");
+    }
+    let flush_pending: Option<unsafe extern "C" fn()> = if flush_pending_va != 0 {
+        Some(unsafe { core::mem::transmute(flush_pending_va) })
+    } else {
+        None
+    };
+
     write(b"[embedder] entering event loop\n");
     loop {
         let now = rdtsc_ns();
         run_due_platform_tasks(engine_out, now, 64);
+        // Deliver any pending platform messages (shell channel, text input, etc.).
+        if let Some(f) = flush_pending {
+            unsafe { f() };
+        }
 
         // Calculate timeout for next task (wait up to 16ms)
         let now = rdtsc_ns();
