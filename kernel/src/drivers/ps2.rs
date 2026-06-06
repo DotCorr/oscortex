@@ -224,7 +224,10 @@ pub fn kbd_irq() {
 /// Accumulates 3-byte packets and pushes pointer events.
 pub fn mouse_irq() {
     let byte = unsafe { in8(PS2_DATA) };
-    log::trace!("[PS2 MOUSE] byte=0x{:02X}", byte);
+    static MOUSE_IRQ_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if MOUSE_IRQ_LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+        log::warn!("[PS2 MOUSE IRQ12] byte=0x{:02X}", byte);
+    }
     handle_mouse_byte(byte);
     unsafe { pic_eoi_slave(); }
 }
@@ -298,6 +301,10 @@ fn handle_mouse_byte(byte: u8) {
     CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
     LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
     crate::compositor::invalidate();
+    static PTR_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if PTR_LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+        log::warn!("[PS2 MOUSE] push_pointer x={} y={} buttons={}", x, y, buttons);
+    }
     crate::wm::push_pointer(x, y, buttons);
 }
 

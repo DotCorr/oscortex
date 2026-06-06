@@ -222,29 +222,18 @@ pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
         }
     }
 
-    for prefer in [2u32, 3, 4, 7, 1] {
-        let ready = coop_target_ready_locked(prefer, my_cpu);
-        if prefer != cur && ready {
-            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(prefer)] };
-            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
-                p.current_cpu = Some(my_cpu);
-                return Some(prefer);
-            }
-        }
-    }
-
-    if (tick & 31) == 0 {
-        if let Some(sib) = crate::process::next_runnable_sibling_thread_locked(cur, my_cpu) {
-            if sib <= 7 && coop_target_ready_locked(sib, my_cpu) {
-                let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(sib)] };
-                if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
-                    p.current_cpu = Some(my_cpu);
-                    return Some(sib);
-                }
-            }
-        }
-    }
-
+    // FAIRNESS FIX (scalable — removes hardcoded thread pids). Previously this
+    // preferred a HARDCODED set [2,3,4,7,1] and only considered other siblings
+    // when (tick & 31)==0 AND sib<=7. That permanently STARVED the Dart VM's
+    // later helper threads (pids 8,9,10,11: JIT compiler, GC, thread pool): the
+    // hot mutator (pid 2) would yield only ever back to 2/3/4/7/1, never to the
+    // helper it was blocked waiting on → single-core livelock where a non-trivial
+    // app's first frame never completes (a trivial ColoredBox squeaked through
+    // because it never spawns those helpers). A fair round-robin over ALL
+    // runnable threads lets every engine/VM thread make progress. Input/baton
+    // responsiveness is still handled by the priority checks above and the
+    // matching checks inside next_runnable_pid_locked.
+    let _ = tick;
     crate::process::next_runnable_pid_locked(cur, my_cpu)
 }
 

@@ -1268,12 +1268,38 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     let n = PENDING_CONSUME_LOG.fetch_add(1, Ordering::Relaxed);
                     if n < 32 {
                         log::warn!(
-                            "[cond-pending-consume] #{} pid={} cond={:#x} mutex={:#x} — returning immediately",
+                            "[cond-pending-consume] #{} pid={} cond={:#x} mutex={:#x} — yield then return",
                             n, pid, cond, mutex
                         );
                     }
-                    // Re-acquire the mutex (which cond_wait semantically releases then re-acquires).
-                    // We never released it (returning early), so just return 0.
+                    // SINGLE-CORE FAIRNESS FIX: yield the CPU to a sibling thread
+                    // before returning. Returning 0 immediately let a hot Dart
+                    // mutator (pid 2) consume pending signals (often ones IT posted
+                    // via cond_signal woke=0 on the same monitor), re-test its
+                    // predicate, and spin — never giving the helper thread (GC /
+                    // JIT compiler / peer waiter) that satisfies the predicate any
+                    // CPU. On one core that is a livelock: first frame never
+                    // completes. By yielding here, the helper runs; when we are
+                    // rescheduled we return 0, the caller re-tests, and (pending now
+                    // consumed) the next cond_wait blocks for real until signalled.
+                    if pid != 0 {
+                        if let Some(next) = super::cooperative_sched_target(pid) {
+                            if next != pid {
+                                let urip = crate::arch::syscall::user_rip();
+                                let ursp = crate::arch::syscall::user_rsp();
+                                // Resume AFTER the syscall (urip, not urip-2) with
+                                // rax=0 so the cond_wait call returns success. Stay
+                                // Running so round-robin reschedules us promptly.
+                                crate::process::save_return_context(pid, urip, ursp);
+                                crate::process::save_full_user_gprs(pid);
+                                crate::process::set_rax(pid, 0);
+                                crate::process::save_xstate(pid);
+                                crate::process::enter_user_by_pid_noreturn(next);
+                            }
+                        }
+                    }
+                    // No sibling to yield to (single runnable thread): the mutex was
+                    // never released, so just return 0 and let the caller re-test.
                     return 0;
                 }
             }
