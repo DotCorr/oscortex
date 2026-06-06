@@ -142,6 +142,7 @@ const OFF_PROJECT_ARGS_ASSETS_PATH: usize = 8;
 const OFF_PROJECT_ARGS_ICU_DATA_PATH: usize = 32;
 const OFF_PROJECT_ARGS_PLATFORM_MESSAGE_CALLBACK: usize = 56;
 const OFF_PROJECT_ARGS_VSYNC_CALLBACK: usize = 168;
+const OFF_PROJECT_ARGS_DART_OLD_GEN_HEAP_SIZE: usize = 208;
 const OFF_PROJECT_ARGS_AOT_DATA: usize = 216;
 const OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGC: usize = 232;
 const OFF_PROJECT_ARGS_DART_ENTRYPOINT_ARGV: usize = 240;
@@ -612,6 +613,13 @@ unsafe extern "C" fn present_callback(
 /// kernel; the APIC ISR returns it in the next `EV_VSYNC` event so the event
 /// loop can call `FlutterEngineOnVsync(engine, baton, start_ns, target_ns)`.
 unsafe extern "C" fn vsync_callback(_user_data: *mut (), baton: usize) {
+    static VSYNC_CB_LOG: AtomicU32 = AtomicU32::new(0);
+    let n = VSYNC_CB_LOG.fetch_add(1, Ordering::Relaxed);
+    if n < 12 {
+        write(b"[vsync_cb] engine requested vsync, baton=");
+        write_hex(baton as u64);
+        write(b"\n");
+    }
     engine_vsync_baton_post(baton as u64);
 }
 
@@ -1271,8 +1279,11 @@ extern "C" fn main_embedder() {
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
     static ARG4: &[u8] = b"--precompiled-mode\0";
+    static ARG5: &[u8] = b"--old_gen_heap_size=64\0";
+    static ARG6: &[u8] = b"--new_gen_heap_size=8\0";
+    static ARG7: &[u8] = b"--max_old_gen_heap_size=64\0";
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 5]);
+    struct ArgvPtrs([*const u8; 8]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
         ArgvPtrs([
@@ -1281,6 +1292,9 @@ extern "C" fn main_embedder() {
             ARG2.as_ptr(),
             ARG3.as_ptr(),
             ARG4.as_ptr(),
+            ARG5.as_ptr(),
+            ARG6.as_ptr(),
+            ARG7.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
@@ -1319,7 +1333,11 @@ extern "C" fn main_embedder() {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_VSYNC_CALLBACK,
-        vsync_callback as *const () as u64,
+        // Disabled: do NOT delegate vsync to the embedder. The custom vsync_callback was
+        // never driven (engine never requested a baton), so no frames were produced. With
+        // it null the engine uses its INTERNAL vsync timer thread — the exact config that
+        // rendered in the Docker reference test. (Thread creation now works post pthread_join.)
+        0u64,
     );
     write_i32_at(
         &mut project_args.bytes,
@@ -1335,6 +1353,11 @@ extern "C" fn main_embedder() {
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_LOG_MESSAGE_CALLBACK,
         log_message_callback as *const () as u64,
+    );
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_DART_OLD_GEN_HEAP_SIZE,
+        64, // 64 MB heap limit
     );
 
     if host_mode == HOST_MODE_APP {
@@ -1374,7 +1397,11 @@ extern "C" fn main_embedder() {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_CUSTOM_TASK_RUNNERS,
-        &CUSTOM_TASK_RUNNERS as *const _ as u64,
+        // EXPERIMENT: disable custom task runners so the engine spawns its own UI/raster
+        // threads and self-drives the frame pipeline — the proven Docker config that rendered.
+        // (Custom merged runners produced no frame: present_callback was never called.)
+        // Engine-spawned threads work now that pthread_join is fixed.
+        0u64,
     );
 
     // Initialize the MessageLoop for the main thread before FlutterEngineInitialize.
@@ -1912,6 +1939,118 @@ fn rdtsc_ns() -> u64 {
     let tsc = ((hi as u64) << 32) | (lo as u64);
     let tsc_ns = tsc / 3;
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
+}
+
+fn write_hex(mut v: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    let digits = b"0123456789abcdef";
+    for i in 0..16 {
+        let nyb = ((v >> ((15 - i) * 4)) & 0xF) as usize;
+        buf[2 + i] = digits[nyb];
+    }
+    write(&buf);
+}
+
+fn configure_project_assets(project_args: &mut FlutterProjectArgsRaw, path: &[u8]) {
+    static mut ASSETS_PATH_BUF: [u8; 256] = [0; 256];
+    unsafe {
+        let len = path.len().min(255);
+        ASSETS_PATH_BUF[..len].copy_from_slice(&path[..len]);
+        ASSETS_PATH_BUF[len] = 0;
+        write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ASSETS_PATH, ASSETS_PATH_BUF.as_ptr() as u64);
+    }
+}
+
+fn configure_app_assets(project_args: &mut FlutterProjectArgsRaw, app_id: u64) {
+    let mut records = [0u8; 4096];
+    let count = sys::app_list(&mut records) as usize;
+    static mut APP_ASSETS_PATH_BUF: [u8; 256] = [0; 256];
+    
+    let mut found = false;
+    for i in 0..count {
+        let off = i * 88;
+        if off + 88 > records.len() {
+            break;
+        }
+        let id = u32::from_le_bytes(records[off..off + 4].try_into().unwrap_or([0; 4]));
+        if id as u64 == app_id {
+            let name_end = records[off + 4..off + 68]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(64);
+            let name = &records[off + 4..off + 4 + name_end];
+            
+            unsafe {
+                let prefix = b"/Applications/";
+                let suffix = b".app/flutter_assets";
+                let mut pos = 0usize;
+                
+                APP_ASSETS_PATH_BUF[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                
+                let copy_len = name.len().min(APP_ASSETS_PATH_BUF.len() - pos - suffix.len() - 1);
+                APP_ASSETS_PATH_BUF[pos..pos + copy_len].copy_from_slice(&name[..copy_len]);
+                pos += copy_len;
+                
+                APP_ASSETS_PATH_BUF[pos..pos + suffix.len()].copy_from_slice(suffix);
+                pos += suffix.len();
+                
+                APP_ASSETS_PATH_BUF[pos] = 0;
+                
+                write_u64_at(&mut project_args.bytes, OFF_PROJECT_ARGS_ASSETS_PATH, APP_ASSETS_PATH_BUF.as_ptr() as u64);
+            }
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        write(b"[embedder] WARNING: app_id ");
+        write_dec(app_id);
+        write(b" not found in registry\n");
+    }
+}
+
+fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64) {
+    let opt = if aot_va == 0 {
+        aot_loader::load_dart_snapshot(b"/system/flutter/libapp.so")
+    } else {
+        aot_loader::load_dart_snapshot_from_mapping(aot_va)
+    };
+    if let Some((ptrs, _loaded_va)) = opt {
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA, ptrs.vm_data);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_DATA_SIZE, ptrs.vm_data_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS, ptrs.vm_instr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_VM_SNAPSHOT_INSTRUCTIONS_SIZE, ptrs.vm_instr_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA, ptrs.iso_data);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_DATA_SIZE, ptrs.iso_data_size);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS, ptrs.iso_instr);
+        write_u64_at(&mut project_args.bytes, OFF_PA_ISO_SNAPSHOT_INSTRUCTIONS_SIZE, ptrs.iso_instr_size);
+        write(b"[embedder/aot] SNAPSHOT PTRS:\n");
+        write_hex_u64(b"[embedder/aot]   vm_data  =", ptrs.vm_data);
+        write_hex_u64(b"[embedder/aot]   vm_instr =", ptrs.vm_instr);
+        write_hex_u64(b"[embedder/aot]   vm_instr_size =", ptrs.vm_instr_size);
+        write_hex_u64(b"[embedder/aot]   iso_data =", ptrs.iso_data);
+        write_hex_u64(b"[embedder/aot]   iso_instr=", ptrs.iso_instr);
+        write_hex_u64(b"[embedder/aot]   iso_instr_size=", ptrs.iso_instr_size);
+    } else {
+        write(b"[embedder] ERROR: failed to load Dart AOT snapshot\n");
+    }
+}
+
+fn schedule_frame_with_log(engine: u64, schedule_frame_va: u64, label: &[u8]) -> i32 {
+    write(b"[embedder/sched] schedule_frame entry label=");
+    write(label);
+    write(b"\n");
+    
+    let func: unsafe extern "C" fn(u64) -> i32 = unsafe { core::mem::transmute(schedule_frame_va) };
+    let rc = unsafe { func(engine) };
+    
+    write(b"[embedder/sched] schedule_frame exit rc=");
+    write_dec(rc as u64);
+    write(b"\n");
+    rc
 }
 
 // ── Panic handler ─────────────────────────────────────────────────────────────
