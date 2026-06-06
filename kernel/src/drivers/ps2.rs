@@ -225,7 +225,7 @@ pub fn kbd_irq() {
 pub fn mouse_irq() {
     let byte = unsafe { in8(PS2_DATA) };
     static MOUSE_IRQ_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if MOUSE_IRQ_LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+    if MOUSE_IRQ_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
         log::warn!("[PS2 MOUSE IRQ12] byte=0x{:02X}", byte);
     }
     handle_mouse_byte(byte);
@@ -235,9 +235,19 @@ pub fn mouse_irq() {
 fn handle_mouse_byte(byte: u8) {
     let idx = MOUSE_IDX.load(Ordering::Relaxed);
 
-    // Byte 0 sanity check: bit 3 must be set (always-1 flag).
-    if idx == 0 && (byte & 0x08) == 0 {
-        return; // desync — ignore until we see a valid flags byte
+    // Byte-0 (flags) resync gate. A real first packet byte ALWAYS has bit3=1
+    // (always-one). It must ALSO not be a controller response byte — ACK (0xFA),
+    // RESEND (0xFE) and NAK/ERROR (0xFC) all have bits 6&7 set (0xC0). Those bytes
+    // get injected into the data stream (e.g. the ACK to the 0xF4 enable command,
+    // or any later command) and, if absorbed as a flags byte, permanently
+    // MISALIGN the 3-byte accumulator: the misaligned flags then carry overflow
+    // bits and every packet is discarded → the cursor freezes (only the rare
+    // lucky resync gets through). A normal MOVEMENT flags byte effectively never
+    // has both overflow bits set, so rejecting 0xC0 here cleanly skips the
+    // spurious byte and resyncs on the next true flags byte. (Genuine
+    // double-overflow movement packets are discarded below anyway.)
+    if idx == 0 && ((byte & 0x08) == 0 || (byte & 0xC0) != 0) {
+        return; // not a valid packet start (desync / ACK / resend) — skip & resync
     }
 
     MOUSE_BUF[idx as usize].store(byte, Ordering::Relaxed);
@@ -302,7 +312,7 @@ fn handle_mouse_byte(byte: u8) {
     LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
     crate::compositor::invalidate();
     static PTR_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    if PTR_LOG.fetch_add(1, Ordering::Relaxed) < 4 {
+    if PTR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
         log::warn!("[PS2 MOUSE] push_pointer x={} y={} buttons={}", x, y, buttons);
     }
     crate::wm::push_pointer(x, y, buttons);
