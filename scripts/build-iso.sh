@@ -170,6 +170,27 @@ if [ -d "$APP_ASSETS_DIR" ]; then
             cp -R "$APP_ASSETS_DIR/$d" "$ROOT/initramfs/system/flutter/flutter_assets/$d"
         fi
     done
+
+    # CRITICAL (bare metal): Flutter has NO system font provider here, and the
+    # bundle ships no default/Roboto family — so Material's default-font text
+    # would loop forever in font fallback and the first frame never renders.
+    # Alias the common default families to the bundled NotoSans so every Text
+    # (incl. Material widgets) resolves to a real glyph set.
+    FONT_MANIFEST="$ROOT/initramfs/system/flutter/flutter_assets/FontManifest.json"
+    if [ -f "$FONT_MANIFEST" ]; then
+        python3 - "$FONT_MANIFEST" <<'PYFONT'
+import json, sys
+p = sys.argv[1]
+m = json.load(open(p))
+have = {e["family"] for e in m}
+noto = [{"asset": "assets/fonts/NotoSans.ttf"}]
+for fam in ["Roboto", "sans-serif", "Arial", "Helvetica", ".SF UI Text", "DejaVu Sans"]:
+    if fam not in have:
+        m.append({"family": fam, "fonts": noto})
+json.dump(m, open(p, "w"))
+print("[fonts] aliased default families -> NotoSans:", sorted(e["family"] for e in m))
+PYFONT
+    fi
 else
     echo "ERROR: Flutter app assets directory missing: $APP_ASSETS_DIR" >&2
     exit 1
