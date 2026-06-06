@@ -735,20 +735,45 @@ pub(crate) fn sys_thread_exit(code: u64) -> i64 {
 }
 
 /// Wait for a thread to finish and return its exit code.
-pub(crate) fn sys_thread_join(thread_handle: u64) -> i64 {
+pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
+    // pthread_join(thread, retval) MUST return 0 on success — the joined thread's
+    // exit value goes into *retval, NOT the return code. The Dart VM wraps this in
+    // VALIDATE_PTHREAD_RESULT and FATALs ("pthread error: %d") on any non-zero return,
+    // so returning the exit code (or ECHILD/EAGAIN) crashed worker threads.
+    // Block until the target exits (busy-wait with pause; preemption runs it), then 0.
     let tid = if thread_handle > 0x100000 {
         match crate::process::find_tid_by_fs_base(thread_handle) {
             Some(t) => t,
-            None => return -10, // ECHILD
+            None => {
+                if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
+                return 0; // already exited+reaped (or never existed) — treat as joined
+            }
         }
     } else {
         thread_handle as u32
     };
 
-    match crate::process::waitpid(tid) {
-        Ok(code) => code as i64,
-        Err("not exited") => -11,  // EAGAIN
-        Err(_) => -10,             // ECHILD
+    let mut spins: u64 = 0;
+    loop {
+        match crate::process::waitpid(tid) {
+            Ok(code) => {
+                if retval != 0 { unsafe { *(retval as *mut u64) = code as u64; } }
+                return 0;
+            }
+            Err("not exited") => {
+                spins += 1;
+                if spins > 2_000_000_000 {
+                    // Safety cap so a deadlocked join can't hang forever; treat as joined.
+                    if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
+                    return 0;
+                }
+                unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+            }
+            Err(_) => {
+                if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
+                return 0;
+            }
+        }
     }
 }
 
