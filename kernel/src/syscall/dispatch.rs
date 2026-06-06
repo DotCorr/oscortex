@@ -562,7 +562,15 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         // stack bounds so the Dart VM can call pthread_attr_getstack on it.
         0x3F6 => {
             let tid = crate::process::current_pid();
-            let (base, size) = crate::process::get_user_stack_bounds(tid);
+            let (mut base, mut size) = crate::process::get_user_stack_bounds(tid);
+            if base == 0 {
+                // clone-thread (Dart VM mutator/GC/helper): no recorded bounds.
+                // Derive them from the mapped stack around the current RSP so the
+                // VM's GetAndValidateThreadStackBounds succeeds instead of aborting.
+                let (cb, cs) = posix::computed_stack_bounds();
+                base = cb;
+                size = cs;
+            }
             if arg1 >= 0x1000 && base != 0 {
                 // Store base at attr+0x10, size at attr+0x18 (common layout).
                 unsafe {
@@ -598,7 +606,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x40F => posix::sys_strerror(arg0 as i32),
         0x410 => posix::sys_strerror_r(arg0 as i32, arg1, arg2),
         0x411 => posix::sys_passthrough_syscall(arg0, arg1, arg2, arg3),
-        0x412 => 0, // madvise noop
+        0x412 => posix::sys_madvise(arg0, arg1, arg2),
         0x413 => sys_dladdr(arg0, arg1),
         0x414 => 0, // dlerror → NULL (no error)
         0x415 => posix::sys_getenv(arg0, arg1),
