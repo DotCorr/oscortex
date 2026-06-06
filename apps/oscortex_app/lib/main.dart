@@ -9,14 +9,8 @@ const _bg = Color(0xFF0C1C26);
 const _accent = Color(0xFF2DD4BF);
 
 void main() {
-  print('OSCX:main-start');
-  final binding = WidgetsFlutterBinding.ensureInitialized();
-  print('OSCX:binding-initialized');
-  binding.addPostFrameCallback((_) {
-    print('OSCX:FIRST-FRAME-RENDERED');
-  });
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const OscortexShellApp());
-  print('OSCX:main-after-runApp');
 }
 
 class OscortexShellApp extends StatelessWidget {
@@ -34,6 +28,10 @@ class OscortexShellApp extends StatelessWidget {
           surface: _bg,
         ),
         useMaterial3: true,
+        // CRITICAL on bare metal: there is NO system font provider and the bundle
+        // ships no default/Roboto family, so Material's default Text font fallback
+        // livelocks the first frame. Pin every text style to the bundled NotoSans.
+        fontFamily: 'NotoSans',
       ),
       home: const ShellDesktop(),
     );

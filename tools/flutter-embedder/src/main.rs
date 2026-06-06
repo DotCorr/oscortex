@@ -1288,8 +1288,15 @@ extern "C" fn main_embedder() {
     // and scavenger_tasks=0 make GC serial on the mutator (no parallel GC tasks to
     // coordinate through a safepoint); no-background_compilation removes the
     // background JIT compiler thread.
+    // Dart VM flags: UNDERSCORE names, COMMA-separated (Flutter splits --dart-flags
+    // by comma; a space list is one invalid flag, ignored — delivery confirmed via
+    // --print_flags). The real app's first frame triggers an old-gen GC whose
+    // multi-thread STOP-THE-WORLD safepoint never converges on this bare-metal sync
+    // layer (livelock). Strategy: make the heap large enough that NO GC fires during
+    // the first frame — no safepoint, no livelock. (Do NOT use --marker_tasks=0 /
+    // --scavenger_tasks=0: the debug VM asserts num_tasks>0 and SIGABRTs.)
     static ARG8: &[u8] =
-        b"--dart-flags=--no-background_compilation --no-concurrent_mark --no-concurrent_sweep --marker_tasks=0 --scavenger_tasks=0\0";
+        b"--dart-flags=--old_gen_heap_size=512,--new_gen_semi_max_size=64,--no_background_compilation\0";
     #[repr(transparent)]
     struct ArgvPtrs([*const u8; 9]);
     unsafe impl Sync for ArgvPtrs {}
