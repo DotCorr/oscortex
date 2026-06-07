@@ -46,6 +46,10 @@ docs/goal-general-purpose.md
 # Build/runtime artifacts — regenerated, never track (root-anchored)
 /initramfs.tar
 /vdisk.img
+/qemu-pipe.*
+
+# Scratch / debugging area — experiments only, never track (public repo)
+/scratch/
 
 # Local preview mirror of the Desktop landing page (served by .claude/launch.json)
 /.preview-oscortex-desktop/
