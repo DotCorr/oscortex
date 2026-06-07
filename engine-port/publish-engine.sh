@@ -56,7 +56,16 @@ WS="$(dirname "$REPO_ROOT")/oscortex-engine-build"
 TARBALL="$WS/_publish/${NAME}.tar.gz"
 echo "[publish] tarball: $TARBALL  (key: $KEY)"
 
-# 2. Upload to R2. Prefer wrangler (native R2, via npx — no install needed).
+# 2. Upload to the artifact host. Prefer GCS (configured host), then R2/S3.
+if [ -n "${GCS_BUCKET:-}" ] && command -v gcloud >/dev/null && gcloud storage ls "gs://$GCS_BUCKET" >/dev/null 2>&1; then
+  gcloud storage cp "$TARBALL"        "gs://$GCS_BUCKET/$KEY"
+  gcloud storage cp "$TARBALL.sha256" "gs://$GCS_BUCKET/$KEY.sha256"
+  echo "[publish] uploaded via gcloud storage -> gs://$GCS_BUCKET/$KEY"
+  echo "[publish] public: $ARTIFACT_BASE_URL/$KEY"
+  exit 0
+fi
+
+# (R2/S3 fallbacks) Prefer wrangler (native R2, via npx — no install needed).
 WR="npx --yes wrangler@latest"
 if $WR whoami >/dev/null 2>&1; then
   $WR r2 object put "${R2_BUCKET}/${KEY}"        --file "$TARBALL"        --remote
