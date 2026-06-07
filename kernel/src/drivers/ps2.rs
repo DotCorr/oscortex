@@ -389,27 +389,15 @@ pub fn init() {
         wait_write(); out8(PS2_STATUS, 0xAE); // enable port 1 (keyboard)
         wait_write(); out8(PS2_STATUS, 0xA8); // enable port 2 (mouse)
 
-        // Enable the IntelliMouse scroll wheel via the "magic knock": setting the
-        // sample rate to 200, then 100, then 80 makes the mouse switch to device
-        // ID 3 → 4-byte packets whose 4th byte is the signed scroll-wheel delta.
-        // Without this the wheel is invisible (3-byte packets, no scroll).
-        let mouse_cmd = |b: u8| -> u8 {
-            wait_write();
-            out8(PS2_STATUS, 0xD4); // "next byte goes to the aux (mouse) port"
-            wait_write();
-            out8(PS2_DATA, b);
-            if wait_read() { in8(PS2_DATA) } else { 0 } // ACK (0xFA)
-        };
-        for &(c, v) in &[(0xF3u8, 0xC8u8), (0xF3, 0x64), (0xF3, 0x50)] {
-            mouse_cmd(c);
-            mouse_cmd(v);
-        }
-        // Read the device ID (0xF2): 0x00 = standard mouse, 0x03 = IntelliMouse.
-        mouse_cmd(0xF2);
-        let mouse_id = if wait_read() { in8(PS2_DATA) } else { 0 };
-        let has_wheel = mouse_id == 0x03;
-        MOUSE_HAS_WHEEL.store(has_wheel, Ordering::Release);
-        log::info!("[PS2 MOUSE] device id={:#x} scroll_wheel={}", mouse_id, has_wheel);
+        // NOTE: the IntelliMouse "magic knock" (sample-rate 200/100/80 → device ID
+        // 3 → 4-byte scroll packets) is DISABLED. The 4-byte packet handling
+        // regressed pointer input (corrupted dy → cursor pinned to the top,
+        // corrupted flags byte → buttons stuck at 0). Working 3-byte mouse beats a
+        // broken wheel; stay in the default 3-byte packet mode. Scroll will be
+        // re-added later with correct 4-byte packet parsing + resync, verified
+        // against clicks/Y not regressing.
+        MOUSE_HAS_WHEEL.store(false, Ordering::Release);
+        log::info!("[PS2 MOUSE] 3-byte mode (IntelliMouse/scroll disabled)");
 
         // Activate mouse data reporting: "send byte to auxiliary" (0xD4) then 0xF4.
         wait_write(); out8(PS2_STATUS, 0xD4);
