@@ -27,25 +27,51 @@ engine-port/
 ```
 (`patches/` and `src/` are populated during Phase 1–2.)
 
-## Contributor flow (do this once, then iterate)
+## Two flows: most people FETCH, maintainers BUILD
 
+The engine is a **pinned, frozen artifact** (Flutter 3.41.1 / engine `cc8e596`,
+plus our port). You build it **once per (version × arch × mode)** and **publish**
+it; everyone else downloads it. This is exactly how Flutter distributes its own
+engine — app developers never build it.
+
+### Consumer flow (devs + CI) — the default, takes seconds
 ```bash
-# 1. Set up the build environment (Docker container + 22 GB engine checkout).
-#    Idempotent — safe to re-run. Takes a while the first time.
-engine-port/setup-engine-build.sh
+engine-port/fetch-engine.sh x64 release   # download the pinned prebuilt engine
+# ...then the normal OS build (build-kernel-iso-fast.sh etc.) links against it.
+```
+No `gclient` checkout, no hour-long build. Pin + host URL live in
+`engine-port/artifact.config`.
 
-# 2. Prove the toolchain with a stock host build (Phase 0 checkpoint).
-engine-port/build-engine.sh baseline
-#    -> out/host_debug_unopt_x64/libflutter_engine.so  (377 MB, x64, embedder API)
-
-# 3. Apply the OSCortex port into the checkout, then build the native target.
-engine-port/apply-port.sh
-engine-port/build-engine.sh oscortex
+### Maintainer flow — only when you CHANGE the engine port
+You only do this if you edit `engine-port/` (the ~1,200 lines of platform
+backend) or bump the Flutter pin. Then you rebuild **and re-publish**, bumping
+`ARTIFACT_VERSION` so consumers pull fresh:
+```bash
+engine-port/setup-engine-build.sh          # once: Docker container + 22 GB checkout
+engine-port/build-engine.sh baseline       # (optional) prove the toolchain
+engine-port/apply-port.sh                   # apply patches/ + src/ into the checkout
+engine-port/build-engine.sh oscortex        # build the OSCortex engine
+engine-port/publish-engine.sh x64 release   # package + upload to R2
 ```
 
+## Artifact distribution
+
+| Role | Runs | When |
+|---|---|---|
+| **Consumer** (every dev, CI) | `fetch-engine.sh` → downloads from R2 | every checkout (seconds) |
+| **Maintainer** (engine port owner) | `setup` + `build` + `publish-engine.sh` | rare — port/version change |
+
+- **Host:** Cloudflare R2 (S3-compatible, zero egress, CDN). Layout:
+  `$ARTIFACT_BASE_URL/$ARTIFACT_VERSION/oscortex-<arch>-<mode>.tar.gz` (+ `.sha256`).
+  Each tarball: `libflutter_engine.so`, `gen_snapshot`, `icudtl.dat`, `MANIFEST.txt`.
+- **Pin/version:** `engine-port/artifact.config`. Bump `ARTIFACT_VERSION` on any
+  port/Flutter change; set `ARTIFACT_BASE_URL` (or `OSCORTEX_ENGINE_BASE_URL`) to
+  your R2 public URL.
+- **Multi-arch:** same model, one tarball per ISA (`oscortex-arm64-release`, …) —
+  the engine builds per-arch with a flag, so publishing is just more rows.
+
 The engine checkout is pinned to **Flutter 3.41.1** (`582a0e7c55`, engine
-`cc8e596`) — the exact version this repo's SDK uses. Do not bump it without
-re-deriving the port.
+`cc8e596`). Do not bump it without re-deriving the port + re-publishing.
 
 ## Edit→build loop (during the port)
 
