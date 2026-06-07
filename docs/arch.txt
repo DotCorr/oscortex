@@ -1,6 +1,6 @@
 ╔══════════════════════════════════════════════════════════════════════════════════╗
 ║                           O S C O R T E X   A R C H                            ║
-║                     Canonical target — updated 2026-06-01                        ║
+║                     Canonical target — updated 2026-06-07                        ║
 ╚══════════════════════════════════════════════════════════════════════════════════╝
 
   DECISION (one sentence)
@@ -14,6 +14,69 @@
   hosted views via platform-channel FFI — never as parallel shells or render paths.
 
   Out of scope for agents: landing/
+
+
+  EXECUTION MODEL — HOW CODE ACTUALLY RUNS TODAY (JIT, not AOT)
+  ─────────────────────────────────────────────────────────────
+  The single most important fact about boot time, RAM use, and input latency:
+  OSCortex runs the Flutter engine's JIT (debug) build, NOT AOT (release). Almost
+  every "why is it slow / heavy" question bottoms out here.
+
+  WHAT SHIPS in a .osx / kernel_blob.bin:
+    Dart source ──(flutter build bundle --debug)──▶ kernel_blob.bin
+    kernel_blob.bin is Dart KERNEL BYTECODE (portable IL) — NOT native machine
+    code. It is a recipe, not a compiled program.
+
+  WHAT HAPPENS AT RUNTIME (this is "compiling the whole framework to memory"):
+    1. The JIT engine maps kernel_blob.bin (bytecode).
+    2. The FIRST time any function executes, the engine compiles THAT function
+       from bytecode to x86-64 machine code on the fly (lazy JIT).
+    3. Drawing even one Material screen executes thousands of framework functions
+       (MaterialApp, Theme, Scaffold, RenderObject layout, text shaping, paint).
+       So producing the first frame forces the engine to JIT-compile ~the whole
+       framework. THAT is what the boot spinner is waiting on.
+
+  WHY IT'S EXPENSIVE:
+    • TIME  — warmup = JIT-compiling the framework (tens of seconds, high
+              variance on emulated bare metal). There is no precompiled code to
+              skip, so it pays the cost on every cold path, every boot.
+    • RAM   — JIT keeps THREE things resident per isolate: the compiler, the
+              source bytecode, AND the generated machine code — plus the object
+              heap. Hundreds of MB per Flutter VM. shell + 1 app = the gigabytes.
+    • The KERNEL itself is ~64 MB at runtime. The GBs are entirely Flutter-in-JIT,
+              not the OS. (Disk image is fat for a different reason: the engine
+              .so + every app blob are baked into the 315 MB kernel binary.)
+
+  THE AOT ALTERNATIVE (the target — currently BLOCKED):
+    AOT = `flutter build` precompiles ALL Dart (app + framework) to native code
+    ahead of time into libapp.so. The engine just maps & runs it: no compiler in
+    RAM, no warmup, a fraction of the heap. Phones do this in <512 MB.
+    BLOCKER: the engine binary we have is the JIT engine; feeding it AOT snapshots
+    on bare metal dead-ended (it can't deserialize AOT instructions). Until that
+    is solved, JIT is the ONLY path that renders. This is THE lever for a truly
+    fast + lite OS. (History: MEMORY / "jit-not-aot" notes.)
+
+  SCHEDULING REALITY (why a button can feel dead):
+    One cooperative, single-core scheduler. User threads run on the BSP only; the
+    other cores (APs) just halt. The Dart UI thread, the raster thread, and the
+    embedder all share that ONE core and hand off cooperatively (hand-rolled
+    futex/cond). While the UI thread is JIT-compiling or GC-ing, input and frames
+    wait behind it. The embedder's frame pump is therefore adaptive — gentle
+    during warmup, 60 fps for a short window after input, ~8 fps when idle — so it
+    doesn't steal that scarce core (tools/flutter-embedder pump_interval_ns).
+    Real parallelism needs an SMP scheduler; an active 2nd core currently breaks
+    the single-core sync assumptions.
+
+  BOOT-TIME UX:
+    Warmup is unavoidable under JIT, so the KERNEL (not Flutter) draws an animated
+    loading spinner directly on the framebuffer from first-framebuffer-up until
+    Flutter presents its first real frame (drivers/fb.rs::draw_boot_splash, driven
+    by compositor::tick). A Flutter spinner can't cover this window — the engine
+    isn't ready yet.
+
+  ONE-LINE MENTAL MODEL:
+    Kernel = small + fast. Flutter-in-JIT = heavy + slow. Every perf/RAM problem
+    is the JIT engine on one cooperative core; the real fix is AOT + an SMP sched.
 
 
   TARGET USERSPACE MODEL
@@ -37,7 +100,9 @@
   ─────────────
   Dev:     flutter project → tools/oscortex-pack → app.osx
   Install: app_install syscall (runtime, persistent storage — Phase 2)
-  Launch:  app_launch → spawn /bin/oscortex-host (new PID) + map app AOT
+  Launch:  app_launch → spawn /bin/oscortex-host (new PID) + map app JIT blob
+           (kernel_blob.bin bytecode — AOT is the TARGET but is blocked today;
+            see "EXECUTION MODEL" below)
   ISO:     kernel + init + engine + shell only — no apps/* bake loop
 
   On-Demand (new):
@@ -205,6 +270,17 @@
   ⏳ tools/oscortex-pack
   ⏳ TLS / HTTPS for remote package servers
   ⏳ TUF signing framework
+
+  RUNTIME REALITY (see EXECUTION MODEL up top):
+  ✅ Full Material shell renders (mouse, keyboard, scroll, platform channels)
+  ✅ App forward-launch (tap tile → app loads its own JIT blob + renders)
+  ✅ Kernel boot spinner over the JIT warmup (drivers/fb.rs)
+  ✅ Adaptive frame pump (cut the 1ms warmup flood; 115:1 → ~7:1 req:frame)
+  ✅ Settings UI: live scroll direction/speed via config:* on oscortex/shell
+  ⏳ AOT on bare metal — THE blocker for fast+lite (JIT-only renders today)
+  ⏳ SMP / preemptive scheduler (active 2nd core breaks single-core sync)
+  ⏳ Blob delivery via Limine modules/disk (today: ~250 MB baked into kernel)
+  ⏳ Return-nav (app → shell) without the two-VM crash
 
   Skills: .cursor/skills/oscortex-architecture · oscortex-hardware · codebase-audit-cleanup
   Rule:   .cursor/rules/oscortex-core.mdc

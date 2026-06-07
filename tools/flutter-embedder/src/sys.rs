@@ -78,6 +78,7 @@ pub const EV_FOCUS: u32 = 5;
 pub const EV_PLATFORM_MSG: u32 = 6;
 pub const EV_ISOLATE: u32 = 7; // Phase 35
 pub const EV_ISOLATE_MSG: u32 = 8; // Phase 36
+pub const EV_SCROLL: u32 = 9; // mouse scroll wheel; a = packed (x<<32|y), b = signed dz
                                    // Isolate state values (carried in WmEvent.flags on EV_ISOLATE events).
 pub const ISOLATE_RUNNING: u32 = 1;
 pub const ISOLATE_PAUSED: u32 = 2;
