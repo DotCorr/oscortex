@@ -49,24 +49,64 @@ are the *same* effort, not two separate ones.
 The OS-specific code surface is **bounded** (QNX proves it). The *build
 infrastructure* is the mountain.
 
+## Port surface map (measured 2026-06-07, from the real checkout)
+
+The exact code we own. Everything else in the engine (~millions of LOC: Skia,
+dart:ui, flow, display_list, the embedder) is OS-agnostic and untouched.
+
+**Dart VM OS layer** — mirror the linux impl against OSCortex native syscalls:
+- `runtime/vm/os_oscortex.cc`        ← clone `os_linux.cc` (782 lines): time,
+  monotonic clocks, memory/RSS, ProcessId, NumberOfAvailableProcessors, print,
+  DSO base, GC notify. ~30 `OS::` methods (see `vm/os.h`).
+- `runtime/vm/os_thread_oscortex.cc` ← clone `os_thread_linux.cc` (235 lines):
+  thread create/join, mutex, monitor/condvar, TLS.
+  → ~1,000 lines total. Most map 1:1 to syscalls OSCortex already has.
+
+**fml platform layer** — like QNX (which overrode just 1 file), reuse posix:
+- `fml/platform/oscortex/message_loop_oscortex.cc` ← clone `message_loop_linux.cc`
+  (epoll + timerfd + eventfd wakeup). **THE critical file** — this is the engine's
+  UI/raster thread pump, and its hand-emulated equivalent is exactly what has been
+  livelocking rendering today. Porting it natively is the chance to make the
+  wakeup mechanism provably correct → the native port also *fixes the sync bugs*,
+  not just enables AOT.
+- `fml/platform/oscortex/paths_oscortex.cc` ← trivial (QNX = 1 file).
+- Reuse `fml/platform/posix/*` as-is (file, mapping, native_library, process,
+  command_line) — contingent on OSCortex POSIX being clean.
+
+**Build-system glue:**
+- `flutter/tools/gn`: add `oscortex` to `--target-os` choices (next to `qnx`).
+- `build/config/` + toolchain: add an `oscortex` config (clone `linux`).
+- `fml/BUILD.gn`: add an `if (is_oscortex)` sources block (mirrors the `is_qnx`/
+  `is_linux` switch at lines ~189-200).
+- Dart `runtime/vm/BUILD.gn`: select `os_oscortex.cc` / `os_thread_oscortex.cc`.
+- Software-only: drop Impeller (GPU) from the oscortex target — OSCortex rasters
+  in software, and Impeller is the slowest ~300 objects of every build.
+
+**Total core port: ~1,200 lines + GN config.** Bounded, exactly as QNX/Fuchsia
+predicted. The AOT snapshot/gen_snapshot work is separate (Phase 3).
+
+**Where the port code lives:** in the OSCortex repo (tracked, no remnants), under
+`engine-port/`, applied into the external engine checkout by a script before
+building. The 30 GB engine checkout itself stays out of the repo.
+
 ## Phased plan
 
 Each phase ends in a committed, verifiable state. We do not advance until the
 current phase's checkpoint passes.
 
-### Phase 0 — Build infrastructure (prerequisite, no OSCortex code yet)
-- [ ] Install `depot_tools`.
-- [ ] Full engine checkout via `gclient` at the SDK's engine hash
-      (`cc8e596aa65130a0678cc59613ed1c5125184db4`, Flutter 3.41.1) — keep history
-      shallow to save disk (~tight on 76 GB free).
-- [ ] Linux/amd64 build environment (Docker, since dev host is arm64 macOS).
-- **Checkpoint:** a *baseline* `linux-x64` debug embedder builds from source and
-  produces a `libflutter_engine.so` matching the prebuilt we already use. This
-  proves the toolchain before we change anything.
+### Phase 0 — Build infrastructure ✅ DONE (2026-06-07)
+- [x] Install `depot_tools` (in container `oscx-engine`).
+- [x] Full engine checkout via `gclient` at Flutter 3.41.1 / `582a0e7c55`
+      (`name:"."` per `engine/scripts/standard.gclient`; first try used `name:"flutter"`
+      → wrong layout, fixed). 22 GB.
+- [x] Linux/amd64 build environment (Docker on arm64 macOS, emulated).
+- [x] **Checkpoint HIT:** baseline `out/host_debug_unopt_x64/libflutter_engine.so`
+      built from source — 377 MB x64, exports the C embedder API
+      (`FlutterEngineRun` et al.), debug/JIT as expected. Toolchain proven.
 
-### Phase 1 — Map + define the OSCortex platform target
-- [ ] Enumerate every host primitive the Dart VM OS layer + fml require; map each
-      to an existing OSCortex syscall or mark "to implement".
+### Phase 1 — Map + define the OSCortex platform target  (IN PROGRESS)
+- [x] Enumerate the host-primitive surface — see "Port surface map" above
+      (~1,200 lines: Dart VM os_* + fml message_loop/paths, reuse posix).
 - [ ] Add `oscortex` as a GN target OS (toolchain, defines, sysroot) — start by
       cloning the `linux` target and renaming, building against OSCortex headers.
 - **Checkpoint:** the engine *configures* for `--target-os=oscortex` and fails
