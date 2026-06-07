@@ -46,3 +46,9 @@ docs/goal-general-purpose.md
 # Build/runtime artifacts — regenerated, never track (root-anchored)
 /initramfs.tar
 /vdisk.img
+
+# Local preview mirror of the Desktop landing page (served by .claude/launch.json)
+/.preview-oscortex-desktop/
+
+# Local agent/session data — never track
+/.claude/

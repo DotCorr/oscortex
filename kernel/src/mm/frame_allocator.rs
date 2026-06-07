@@ -9,7 +9,15 @@ use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 const FRAME_SIZE: usize = 4096;
-const MAX_FRAMES: usize = 1 << 20; // 4 GiB / 4 KiB = 1 M frames
+// 4 GiB / 4 KiB = 1 M frames. DO NOT raise this to "unlock" RAM above 4 GiB:
+// on q35 the firmware remaps part of RAM above the 4 GiB PCI hole (to physical
+// 0x1_0000_0000+), but the kernel's paging/HHDM path does NOT safely hand out
+// frames above 4 GiB yet — backing the Flutter heap with high frames freezes
+// rendering hard (engine schedules thousands of frames, presents ~2). Keeping
+// the cap at 4 GiB confines every allocation to the low region that paging
+// handles correctly. Using >4 GiB requires fixing the paging path first; until
+// then this cap is load-bearing, not an optimisation knob.
+const MAX_FRAMES: usize = 1 << 20;
 const MIN_ALLOC_PHYS: u64 = 0x10_0000; // keep allocator out of legacy low memory
 const MIN_ALLOC_FRAME: usize = (MIN_ALLOC_PHYS as usize) / FRAME_SIZE;
 

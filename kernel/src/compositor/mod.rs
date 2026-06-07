@@ -784,6 +784,9 @@ pub fn render_frame() {
         drop(c);
         if let Some((w, h)) = crate::drivers::fb::size_px() {
             crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
+            // No app has presented a frame yet → we're in the engine warm-up.
+            // Draw the animated loading splash so the screen isn't a dead blank.
+            crate::drivers::fb::draw_boot_splash(frame);
         }
         draw_software_cursor();
         crate::drivers::fb::swap_buffers();
@@ -873,6 +876,14 @@ pub fn tick() {
             dirty = true;
             break;
         }
+    }
+
+    // 4. Boot splash animation: while nothing visible has been presented yet,
+    // force a periodic redraw so the loading indicator animates and the user
+    // can see the machine is alive during the engine warm-up. Throttled so it
+    // doesn't steal CPU the JIT warm-up needs.
+    if !dirty && !has_visible_content(&c) && c.frame_counter % 5 == 0 {
+        dirty = true;
     }
 
     if dirty {

@@ -485,6 +485,14 @@ static SEND_PLATFORM_MESSAGE_RESPONSE_FN: AtomicU64 = AtomicU64::new(0);
 static CURRENT_HOST_MODE: AtomicU64 = AtomicU64::new(0);
 static CURRENT_APP_ID: AtomicU64 = AtomicU64::new(0);
 
+// ── User-configurable input settings (driven by the Settings UI over the
+// oscortex/shell channel: "config:scroll_invert:0|1", "config:scroll_speed:NN").
+// These live in the embedder because it owns the FlutterPointerEvent it builds,
+// so no kernel round-trip is needed for scroll feel. Defaults match the
+// previously hard-coded behaviour (reverse/natural off, 100% speed).
+static SCROLL_INVERT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static SCROLL_SPEED_PCT: AtomicU32 = AtomicU32::new(100);
+
 const SHELL_CHANNEL: &[u8] = b"oscortex/shell";
 
 const APPS_REQUEST_CHANNEL: &[u8] = b"oscortex/apps/request";
@@ -797,7 +805,64 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         let path = trim_line(path);
         return install_osx_from_path(path);
     }
+    // ── Settings. Driver/input preferences, settable from any host (the Settings
+    // UI may run in the shell or its own app). "config:get" returns current state.
+    if payload.starts_with(b"config:scroll_invert:") {
+        let v = parse_u32_after_colon(payload);
+        SCROLL_INVERT.store(v != 0, Ordering::Release);
+        return b"{\"ok\":true}";
+    }
+    if payload.starts_with(b"config:scroll_speed:") {
+        let v = parse_u32_after_colon(payload).clamp(10, 500);
+        SCROLL_SPEED_PCT.store(v, Ordering::Release);
+        return b"{\"ok\":true}";
+    }
+    if payload.starts_with(b"config:get") {
+        return format_config_json();
+    }
     b"{\"ok\":false}"
+}
+
+/// Serialise the current input settings as JSON for the Settings UI to load.
+fn format_config_json() -> &'static [u8] {
+    static mut CONFIG_JSON: [u8; 128] = [0; 128];
+    let invert = SCROLL_INVERT.load(Ordering::Acquire);
+    let speed = SCROLL_SPEED_PCT.load(Ordering::Acquire);
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(CONFIG_JSON) };
+    let mut pos = 0usize;
+
+    fn append(buf: &mut [u8], pos: &mut usize, s: &[u8]) {
+        for &b in s {
+            if *pos < buf.len() {
+                buf[*pos] = b;
+                *pos += 1;
+            }
+        }
+    }
+
+    append(buf, &mut pos, b"{\"ok\":true,\"scroll_invert\":");
+    append(buf, &mut pos, if invert { b"true" } else { b"false" });
+    append(buf, &mut pos, b",\"scroll_speed\":");
+    // speed as decimal
+    let mut digits = [0u8; 10];
+    let mut di = 0;
+    let mut n = speed;
+    if n == 0 {
+        append(buf, &mut pos, b"0");
+    } else {
+        while n > 0 {
+            digits[di] = b'0' + (n % 10) as u8;
+            di += 1;
+            n /= 10;
+        }
+        while di > 0 {
+            di -= 1;
+            let d = digits[di];
+            append(buf, &mut pos, &[d]);
+        }
+    }
+    append(buf, &mut pos, b"}");
+    unsafe { core::slice::from_raw_parts(buf.as_ptr(), pos) }
 }
 
 fn parse_u32_after_colon(payload: &[u8]) -> u32 {
@@ -1628,6 +1693,10 @@ extern "C" fn main_embedder() {
     // Frame pump: call FlutterEngineScheduleFrame at ~60 fps so Flutter keeps
     // rendering even after it goes idle (static UI or before Dart init completes).
     let mut frame_pump_next_ns: u64 = rdtsc_ns() + 1_000_000;
+    // Timestamp of the last user input (pointer/key/scroll). The pump runs fast
+    // (60 fps) for a short window after input so reactions are snappy, then backs
+    // right off so the single cooperative core isn't drowned in no-op frames.
+    let mut last_input_ns: u64 = rdtsc_ns();
 
     // Pump the engine's platform task runner. With engine-default task runners
     // (custom_task_runners=NULL — our proven render config) the engine posts
@@ -1731,15 +1800,16 @@ extern "C" fn main_embedder() {
             let now_pump = rdtsc_ns();
             if focused && engine_out != 0 && proctable.schedule_frame != 0 && now_pump >= frame_pump_next_ns {
                 let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"idle");
-                let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-                let interval = if presents < 10 {
-                    1_000_000u64
-                } else {
-                    16_666_666u64
-                };
-                frame_pump_next_ns = now_pump + interval;
+                frame_pump_next_ns = now_pump + pump_interval_ns(now_pump, last_input_ns);
             }
             continue;
+        }
+
+        // Any real user input enters the "active" window: pump at 60 fps for a
+        // short while so the reaction is snappy, and fire the next pump right away.
+        if ev.kind == EV_POINTER || ev.kind == EV_KEY || ev.kind == EV_SCROLL {
+            last_input_ns = rdtsc_ns();
+            frame_pump_next_ns = last_input_ns;
         }
 
         match ev.kind {
@@ -1757,13 +1827,7 @@ extern "C" fn main_embedder() {
                             proctable.schedule_frame,
                             b"vsync0",
                         );
-                        let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
-                        let interval = if presents < 10 {
-                            1_000_000u64
-                        } else {
-                            16_666_666u64
-                        };
-                        frame_pump_next_ns = now_pump + interval;
+                        frame_pump_next_ns = now_pump + pump_interval_ns(now_pump, last_input_ns);
                     }
                 }
                 if engine_out != 0 && proctable.on_vsync != 0 && baton != 0 {
@@ -1950,6 +2014,78 @@ extern "C" fn main_embedder() {
                     write_dec(y as u64);
                     write(b" buttons=");
                     write_dec(buttons as u64);
+                    write(b" rc=");
+                    write_dec(rc as u64);
+                    write(b"\n");
+                }
+            }
+            EV_SCROLL => {
+                // Mouse wheel. a = packed (x<<32 | y), b = signed dz (low 32 bits).
+                if engine_out != 0 && proctable.send_pointer_event != 0 {
+                    let x = ((ev.a >> 32) as i32) as f64;
+                    let y = (ev.a as u32) as f64;
+                    let dz = (ev.b as u32) as i32; // sign-preserved through u32
+
+                    // One wheel notch → a chunk of logical pixels. Wheel up (+dz)
+                    // scrolls content up → negative scroll_delta_y in Flutter's
+                    // convention; so the base sign is negative. Both the direction
+                    // (natural/reverse) and the pixels-per-notch speed are user
+                    // configurable via the Settings UI (config:scroll_* commands).
+                    let base = 50.0 * (SCROLL_SPEED_PCT.load(Ordering::Acquire) as f64) / 100.0;
+                    let sign = if SCROLL_INVERT.load(Ordering::Acquire) { 1.0 } else { -1.0 };
+                    let scroll_dy = sign * (dz as f64) * base;
+
+                    let engine_now_us = || -> u64 {
+                        if get_current_time_va != 0 {
+                            let get_time: GetCurrentTimeFn =
+                                unsafe { core::mem::transmute(get_current_time_va) };
+                            unsafe { get_time() / 1000 }
+                        } else {
+                            rdtsc_ns() / 1000
+                        }
+                    };
+
+                    static SCROLL_TS: AtomicU64 = AtomicU64::new(0);
+                    let mut timestamp = engine_now_us();
+                    loop {
+                        let last = SCROLL_TS.load(Ordering::SeqCst);
+                        let next = if timestamp <= last { last + 1 } else { timestamp };
+                        if SCROLL_TS
+                            .compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            timestamp = next;
+                            break;
+                        }
+                    }
+
+                    let f: SendPointerEventFn =
+                        unsafe { core::mem::transmute(proctable.send_pointer_event) };
+                    let evt = FlutterPointerEvent {
+                        struct_size: core::mem::size_of::<FlutterPointerEvent>(),
+                        phase: 6, // kHover — scroll while not dragging
+                        _pad0: 0,
+                        timestamp,
+                        x,
+                        y,
+                        device: 0,
+                        signal_kind: 1, // kFlutterPointerSignalKindScroll
+                        scroll_delta_x: 0.0,
+                        scroll_delta_y: scroll_dy,
+                        device_kind: 1,
+                        _pad1: 0,
+                        buttons: 0,
+                        pan_x: 0.0,
+                        pan_y: 0.0,
+                        scale: 1.0,
+                        rotation: 0.0,
+                        view_id: 0,
+                    };
+                    let rc = unsafe { f(engine_out, &evt as *const _, 1) };
+                    write(b"[embedder/scroll] dz=");
+                    write_dec(dz as u64);
+                    write(b" dy=");
+                    write_dec(scroll_dy as i64 as u64);
                     write(b" rc=");
                     write_dec(rc as u64);
                     write(b"\n");
@@ -2158,6 +2294,26 @@ fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64
         write_hex_u64(b"[embedder/aot]   iso_instr_size=", ptrs.iso_instr_size);
     } else {
         write(b"[embedder] ERROR: failed to load Dart AOT snapshot\n");
+    }
+}
+
+/// Adaptive frame-pump interval (ns). The single cooperative core is the scarce
+/// resource, so we request frames only as often as actually useful:
+///   • Warm-up (engine still JIT-compiling, <10 presents): 50 ms. One pending
+///     schedule_frame is enough to mark "frame wanted"; pumping faster (the old
+///     code used 1 ms = 1000/s) just floods the UI thread with tasks and steals
+///     the very CPU the warm-up needs, so the FIRST frame arrives LATER.
+///   • Active (input within the last 400 ms): 16 ms (~60 fps) for snappy reactions.
+///   • Idle (warm, no recent input): 120 ms (~8 fps) — enough to keep on-demand
+///     vsync alive and pick up late async state changes, without burning the core.
+fn pump_interval_ns(now_ns: u64, last_input_ns: u64) -> u64 {
+    let presents = PRESENT_TRACE_COUNT.load(Ordering::Relaxed);
+    if presents < 10 {
+        50_000_000 // warm-up: gentle nudge, leave the core free to compile
+    } else if now_ns.saturating_sub(last_input_ns) < 400_000_000 {
+        16_666_666 // recently interacted: full 60 fps
+    } else {
+        120_000_000 // idle: back off hard
     }
 }
 
