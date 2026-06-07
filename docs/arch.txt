@@ -51,10 +51,22 @@
     AOT = `flutter build` precompiles ALL Dart (app + framework) to native code
     ahead of time into libapp.so. The engine just maps & runs it: no compiler in
     RAM, no warmup, a fraction of the heap. Phones do this in <512 MB.
-    BLOCKER: the engine binary we have is the JIT engine; feeding it AOT snapshots
-    on bare metal dead-ended (it can't deserialize AOT instructions). Until that
-    is solved, JIT is the ONLY path that renders. This is THE lever for a truly
-    fast + lite OS. (History: MEMORY / "jit-not-aot" notes.)
+    BLOCKER: the prebuilt engine binary we have is the JIT engine; feeding it AOT
+    snapshots dead-ended (a JIT engine cannot deserialize AOT — proven in clean
+    Docker, not a bare-metal bug). And Flutter publishes NO release/AOT linux-x64
+    engine that exports the C embedder API (release builds are GTK-wrapped). So
+    AOT is not a code-fix on the current engine — it requires BUILDING the engine
+    from source.
+
+    ── COMMITTED DIRECTION (2026-06-07): NATIVE ENGINE PORT ──────────────────────
+    We will build the Flutter engine FROM SOURCE as a first-class OSCortex target,
+    in AOT mode — NOT shim another Linux build (no flutter-elinux, no more
+    Linux-syscall emulation, no engine_patch.py binary surgery). Precedent: Flutter
+    already ships non-Linux backends — the entire QNX fml port is ONE 473-byte file
+    (reuses fml/platform/posix/*); Fuchsia has a full backend. OSCortex adds
+    fml/platform/oscortex + a Dart-VM OS backend + a GN target, and builds AOT.
+    This unifies "native targeting" and "AOT" into one effort and lets the whole
+    hack pile be DELETED. Full plan + phases: docs/native-engine-port.md.
 
   SCHEDULING REALITY (why a button can feel dead):
     One cooperative, single-core scheduler. User threads run on the BSP only; the
