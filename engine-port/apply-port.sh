@@ -40,6 +40,16 @@ docker exec "$CONTAINER" bash -c '
 #    0002 is rooted at the build/ dep.
 apply_patch "$PATCHES/0002-buildconfig-is-oscortex.patch" "build"
 
+#    0003 (fml backend wiring: build_config.h, message_loop_impl.cc, fml/BUILD.gn)
+#    is rooted at the flutter monorepo root, like 0001.
+docker cp "$PATCHES/0003-fml-oscortex-backend.patch" "$CONTAINER":/tmp/0003.patch
+docker exec "$CONTAINER" bash -c '
+  cd /work/engine
+  if git apply --check /tmp/0003.patch 2>/dev/null; then git apply /tmp/0003.patch && echo "[apply-port] applied 0003 (fml backend)";
+  elif git apply --reverse --check /tmp/0003.patch 2>/dev/null; then echo "[apply-port] already applied: 0003 (skip)";
+  else echo "[apply-port] WARN: 0003 does not apply cleanly" >&2; fi
+'
+
 # 2. OSCortex platform backend sources (Phase 2 — copied 1:1 into the checkout).
 if [ -d "$SRC" ]; then
   docker exec "$CONTAINER" bash -c 'mkdir -p /work/engine/engine/src/flutter/fml/platform/oscortex'
