@@ -1410,10 +1410,15 @@ extern "C" fn main_embedder() {
         OFF_PROJECT_ARGS_ICU_DATA_PATH,
         icu_path.as_ptr() as u64,
     );
+    // ARG0-ARG4 are AOT-safe (name, impeller=false, software-rendering,
+    // disable-vm-service, precompiled-mode). ARG5-ARG8 are JIT-era GC/heap
+    // workarounds that the RELEASE/AOT engine rejects as disallowed Dart VM flags
+    // (switches.cc:478 FATAL). So pass only the first 5 args under AOT.
+    let engine_argc: i32 = if is_aot { 5 } else { ENGINE_ARGV.0.len() as i32 };
     write_i32_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_COMMAND_LINE_ARGC,
-        ENGINE_ARGV.0.len() as i32,
+        engine_argc,
     );
     write_u64_at(
         &mut project_args.bytes,
