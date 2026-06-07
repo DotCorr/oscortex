@@ -58,28 +58,27 @@ engine-port/publish-engine.sh x64 release   # package + upload to R2
 
 | Role | Runs | When |
 |---|---|---|
-| **Consumer** (every dev, CI) | `fetch-engine.sh` → downloads from R2 | every checkout (seconds) |
-| **Maintainer** (engine port owner) | `setup` + `build` + `publish-engine.sh` | rare — port/version change |
+| **Consumer** (every dev, CI) | `fetch-engine.sh` → downloads from GitHub Releases | every checkout (seconds) |
+| **Maintainer** (engine port owner) | `build-engine.sh` + `publish-engine.sh` | rare — port/version change |
 
-- **Host:** Cloudflare R2 (S3-compatible, zero egress, CDN). Layout:
-  `$ARTIFACT_BASE_URL/$ARTIFACT_VERSION/oscortex-<arch>-<mode>.tar.gz` (+ `.sha256`).
+- **Host:** **GitHub Releases** on the public repo — free, **zero egress fees**, no
+  separate cloud account. Each `ARTIFACT_VERSION` is a release **tag**; the
+  per-target tarballs are its **assets**. Layout:
+  `$ARTIFACT_BASE_URL/$ARTIFACT_VERSION/oscortex-<arch>-<mode>.tar.gz` (+ `.sha256`),
+  i.e. `https://github.com/<repo>/releases/download/<tag>/<asset>`.
   Each tarball: `libflutter_engine.so`, `gen_snapshot`, `icudtl.dat`, `MANIFEST.txt`.
 - **Pin/version:** `engine-port/artifact.config`. Bump `ARTIFACT_VERSION` on any
-  port/Flutter change; set `ARTIFACT_BASE_URL` (or `OSCORTEX_ENGINE_BASE_URL`) to
-  your R2 public URL.
+  port/Flutter change.
 - **Multi-arch:** same model, one tarball per ISA (`oscortex-arm64-release`, …) —
-  the engine builds per-arch with a flag, so publishing is just more rows.
+  the engine builds per-arch with a flag, so publishing is just more assets.
 
-### One-time R2 host setup (maintainer)
-Creating the bucket needs *your* Cloudflare account, so authenticate first, then
-run the helper (it creates the bucket, enables the public `r2.dev` URL, and wires
-`ARTIFACT_BASE_URL` into `artifact.config`):
-```bash
-npx wrangler login            # one-time browser OAuth (or set CLOUDFLARE_API_TOKEN)
-engine-port/setup-r2.sh       # create bucket + public URL + update artifact.config
-```
-After that, `publish-engine.sh` uploads via `wrangler` (no install — uses `npx`),
-and `fetch-engine.sh` just works for everyone.
+### Host setup (maintainer) — none needed
+GitHub Releases needs no bucket/account setup: `gh` (already used for PRs) is the
+uploader, and a public repo serves assets anonymously. `publish-engine.sh` creates
+the release tag on first publish and uploads the assets; `fetch-engine.sh` just
+`curl`s them. (Alternate hosts — GCS / Cloudflare R2 — are supported by
+`publish-engine.sh` as fallbacks; see `artifact.config` + `setup-r2.sh`. GCS has
+egress fees; R2 needs dashboard activation; GitHub Releases is the default.)
 
 The engine checkout is pinned to **Flutter 3.41.1** (`582a0e7c55`, engine
 `cc8e596`). Do not bump it without re-deriving the port + re-publishing.
