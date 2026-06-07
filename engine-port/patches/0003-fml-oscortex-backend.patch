@@ -1,0 +1,77 @@
+diff --git a/engine/src/flutter/fml/BUILD.gn b/engine/src/flutter/fml/BUILD.gn
+index 479d697f..034abec9 100644
+--- a/engine/src/flutter/fml/BUILD.gn
++++ b/engine/src/flutter/fml/BUILD.gn
+@@ -186,7 +186,23 @@ source_set("fml") {
+     ]
+   }
+ 
+-  if (is_linux) {
++  # OSCortex native port: select the OSCortex backend instead of linux. Checked
++  # before is_linux because is_oscortex builds are linux-linked (is_linux is also
++  # true), so this must take priority. Reuses the shared linux timerfd helper.
++  # See docs/native-engine-port.md.
++  if (is_oscortex) {
++    sources += [
++      "platform/linux/timerfd.cc",
++      "platform/linux/timerfd.h",
++      "platform/oscortex/message_loop_oscortex.cc",
++      "platform/oscortex/message_loop_oscortex.h",
++      "platform/oscortex/paths_oscortex.cc",
++    ]
++    if (!defined(defines)) {
++      defines = []
++    }
++    defines += [ "FLUTTER_OSCORTEX" ]
++  } else if (is_linux) {
+     sources += [
+       "platform/linux/message_loop_linux.cc",
+       "platform/linux/message_loop_linux.h",
+diff --git a/engine/src/flutter/fml/build_config.h b/engine/src/flutter/fml/build_config.h
+index aa2f0d7b..c3ee31ee 100644
+--- a/engine/src/flutter/fml/build_config.h
++++ b/engine/src/flutter/fml/build_config.h
+@@ -56,6 +56,15 @@
+ #error Please add support for your platform in flutter/fml/build_config.h
+ #endif
+ 
++// OSCortex native port: an ADDITIVE OS flag. OSCortex links against linux for now
++// (so FML_OS_LINUX stays defined above and supplies the libc base); FML_OS_OSCORTEX
++// only steers the few platform-backend selections we override. Gated on the
++// FLUTTER_OSCORTEX GN define (set by fml/BUILD.gn when is_oscortex).
++// See docs/native-engine-port.md.
++#if defined(FLUTTER_OSCORTEX)
++#define FML_OS_OSCORTEX 1
++#endif
++
+ // For access to standard BSD features, use FML_OS_BSD instead of a
+ // more specific macro.
+ #if defined(FML_OS_FREEBSD) || defined(FML_OS_OPENBSD)
+diff --git a/engine/src/flutter/fml/message_loop_impl.cc b/engine/src/flutter/fml/message_loop_impl.cc
+index 01f4d58d..741db03a 100644
+--- a/engine/src/flutter/fml/message_loop_impl.cc
++++ b/engine/src/flutter/fml/message_loop_impl.cc
+@@ -12,7 +12,11 @@
+ #include "flutter/fml/build_config.h"
+ #include "flutter/fml/logging.h"
+ 
+-#if FML_OS_MACOSX
++#if FML_OS_OSCORTEX
++// OSCortex native port: checked first since FML_OS_LINUX is also defined (linux-
++// linked). See docs/native-engine-port.md.
++#include "flutter/fml/platform/oscortex/message_loop_oscortex.h"
++#elif FML_OS_MACOSX
+ #include "flutter/fml/platform/darwin/message_loop_darwin.h"
+ #elif FML_OS_ANDROID
+ #include "flutter/fml/platform/android/message_loop_android.h"
+@@ -27,7 +31,9 @@
+ namespace fml {
+ 
+ fml::RefPtr<MessageLoopImpl> MessageLoopImpl::Create() {
+-#if FML_OS_MACOSX
++#if FML_OS_OSCORTEX
++  return fml::MakeRefCounted<MessageLoopOscortex>();
++#elif FML_OS_MACOSX
+   return fml::MakeRefCounted<MessageLoopDarwin>();
+ #elif FML_OS_ANDROID
+   return fml::MakeRefCounted<MessageLoopAndroid>();
