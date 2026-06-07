@@ -139,10 +139,20 @@ and the engine (symptom: `app_snapshot.cc: expects N base objects, provided 0`).
 Building from source dissolves it — verified that (a) a release/AOT oscortex build
 **configures cleanly**, and (b) `gen_snapshot` build rules exist in our tree, so we
 build the engine AND its matching `gen_snapshot` from ONE source = guaranteed match.
-- [ ] Build the engine in release/AOT mode for the oscortex target.
-- [ ] Build `gen_snapshot` from the same tree; compile the shell to an AOT snapshot.
-- [ ] Wire the embedder's AOT-data path (scaffolding partly exists). The base-object
-      handoff should now resolve since engine+snapshot are version-matched.
+- [x] Built the engine release/AOT for oscortex: `libflutter_engine.so` **33 MB**
+      (vs 377 MB debug — no JIT compiler), embedder API, our backend baked in.
+- [x] Built `gen_snapshot` (6.5 MB) from the same tree → version-matched, and
+      compiled the shell to an AOT snapshot: `app.dart` → frontend_server → AOT
+      dill (24 MB) → gen_snapshot → **`libapp.so` 4.4 MB**. Verified it's a real
+      AOT snapshot: all 4 `_kDart*Snapshot{Data,Instructions}` symbols present with
+      REAL native instructions (`T`/text, not the zeroed stubs the old
+      engine_patch.py produced). ELF64 x86-64. **The "Snapshot expects N base
+      objects, provided 0" dead-end is GONE** — version-matched engine+gen_snapshot
+      deserialize cleanly. Reproducible via `engine-port/compile-app-aot.sh`.
+- [x] Published the first artifact to GitHub Releases (`oscortex-engine-1`);
+      `fetch-engine.sh` round-trip verified.
+- [ ] Wire the embedder to load `libapp.so` (AOT) instead of `kernel_blob.bin`
+      (JIT); build the OSCortex ISO; boot → render from AOT.
 - **Checkpoint:** the shell renders from an AOT snapshot — no JIT, no W^X codegen,
   fast cold start, fraction of the RAM.
 
