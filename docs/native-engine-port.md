@@ -119,19 +119,30 @@ current phase's checkpoint passes.
       cleanly ("Made 1714 targets"), `out/oscortex_debug_unopt/args.gn` shows
       `target_os = "linux"` + `is_oscortex = true`.
 
-### Phase 2 — Implement the OSCortex platform backend
-- [ ] `fml/platform/oscortex/` (reuse posix; override the minimum).
-- [ ] Dart VM `os_oscortex.cc` / `os_thread_oscortex.cc` against OSCortex
-      native syscalls (NOT the Linux-emulation numbers).
-- **Checkpoint:** a debug/JIT engine built *for OSCortex* boots on OSCortex with
-  NO `engine_patch.py` and NO Linux-syscall emulation in the hot path.
+### Phase 2 — Implement the OSCortex platform backend  (2a DONE, 2b deferred)
+- [x] `fml/platform/oscortex/` — `message_loop_oscortex.{cc,h}` + `paths_oscortex.cc`,
+      selected via `is_oscortex`/`FML_OS_OSCORTEX` (patch 0003). Verified compiling
+      into `libfml`; linux backend excluded. This is the divergence SEAM.
+- [ ] Full oscortex engine LINKS (`libflutter_engine.so` for the oscortex target).
+- [~] Dart VM `os_oscortex.cc` / `os_thread_oscortex.cc` — **DEFERRED ON PURPOSE.**
+      On path A (Linux-ABI-compatible) `os_linux.cc` already works (it makes the
+      Linux-ABI calls OSCortex natively implements), so a byte-identical
+      `os_oscortex.cc` clone would be pure busywork that risks the whole Dart VM's
+      pervasive `DART_HOST_OS_LINUX` assumptions. We add a Dart VM backend ONLY
+      when we actually need to diverge a primitive (e.g. a native wait to fix the
+      message-loop livelock), not for ceremony.
+- **Checkpoint:** an engine built *for OSCortex* (our fml backend) links and boots.
 
-### Phase 3 — AOT
-- [ ] Build the engine in release/AOT mode for the OSCortex target.
-- [ ] Build an OSCortex `gen_snapshot`; compile the shell app to an AOT snapshot.
-- [ ] Wire the embedder's AOT-data path (scaffolding partly exists); resolve the
-      known last blocker from the prior AOT attempt: the VM-isolate base-object
-      handoff (`app_snapshot.cc: expects N base objects, provided 0`).
+### Phase 3 — AOT  (DE-RISKED 2026-06-07)
+KEY: the old AOT dead-end was a VERSION MISMATCH between a prebuilt `gen_snapshot`
+and the engine (symptom: `app_snapshot.cc: expects N base objects, provided 0`).
+Building from source dissolves it — verified that (a) a release/AOT oscortex build
+**configures cleanly**, and (b) `gen_snapshot` build rules exist in our tree, so we
+build the engine AND its matching `gen_snapshot` from ONE source = guaranteed match.
+- [ ] Build the engine in release/AOT mode for the oscortex target.
+- [ ] Build `gen_snapshot` from the same tree; compile the shell to an AOT snapshot.
+- [ ] Wire the embedder's AOT-data path (scaffolding partly exists). The base-object
+      handoff should now resolve since engine+snapshot are version-matched.
 - **Checkpoint:** the shell renders from an AOT snapshot — no JIT, no W^X codegen,
   fast cold start, fraction of the RAM.
 
