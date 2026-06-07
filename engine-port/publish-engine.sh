@@ -56,8 +56,13 @@ WS="$(dirname "$REPO_ROOT")/oscortex-engine-build"
 TARBALL="$WS/_publish/${NAME}.tar.gz"
 echo "[publish] tarball: $TARBALL  (key: $KEY)"
 
-# 2. Upload to R2.
-if command -v rclone >/dev/null && rclone listremotes 2>/dev/null | grep -q '^r2:'; then
+# 2. Upload to R2. Prefer wrangler (native R2, via npx — no install needed).
+WR="npx --yes wrangler@latest"
+if $WR whoami >/dev/null 2>&1; then
+  $WR r2 object put "${R2_BUCKET}/${KEY}"        --file "$TARBALL"        --remote
+  $WR r2 object put "${R2_BUCKET}/${KEY}.sha256" --file "$TARBALL.sha256" --remote
+  echo "[publish] uploaded via wrangler -> ${R2_BUCKET}/${KEY}"
+elif command -v rclone >/dev/null && rclone listremotes 2>/dev/null | grep -q '^r2:'; then
   rclone copyto "$TARBALL"         "r2:${R2_BUCKET}/${KEY}"
   rclone copyto "$TARBALL.sha256"  "r2:${R2_BUCKET}/${KEY}.sha256"
   echo "[publish] uploaded via rclone -> r2:${R2_BUCKET}/${KEY}"
