@@ -56,7 +56,19 @@ WS="$(dirname "$REPO_ROOT")/oscortex-engine-build"
 TARBALL="$WS/_publish/${NAME}.tar.gz"
 echo "[publish] tarball: $TARBALL  (key: $KEY)"
 
-# 2. Upload to the artifact host. Prefer GCS (configured host), then R2/S3.
+# 2. Upload to the artifact host. Prefer GitHub Releases (public repo, free, no
+# egress) -> then GCS -> then R2/S3.
+if [ -n "${GITHUB_REPO:-}" ] && command -v gh >/dev/null && gh auth status >/dev/null 2>&1; then
+  TAG="$ARTIFACT_VERSION"
+  gh release view "$TAG" -R "$GITHUB_REPO" >/dev/null 2>&1 || \
+    gh release create "$TAG" -R "$GITHUB_REPO" \
+      --title "OSCortex engine $ARTIFACT_VERSION" \
+      --notes "Prebuilt OSCortex Flutter engine artifacts (Flutter $FLUTTER_VERSION / engine $ENGINE_HASH). Fetched by engine-port/fetch-engine.sh — see engine-port/README.md."
+  gh release upload "$TAG" "$TARBALL" "$TARBALL.sha256" -R "$GITHUB_REPO" --clobber
+  echo "[publish] uploaded via gh release -> $GITHUB_REPO @ $TAG / ${NAME}.tar.gz"
+  echo "[publish] public: $ARTIFACT_BASE_URL/$ARTIFACT_VERSION/${NAME}.tar.gz"
+  exit 0
+fi
 if [ -n "${GCS_BUCKET:-}" ] && command -v gcloud >/dev/null && gcloud storage ls "gs://$GCS_BUCKET" >/dev/null 2>&1; then
   gcloud storage cp "$TARBALL"        "gs://$GCS_BUCKET/$KEY"
   gcloud storage cp "$TARBALL.sha256" "gs://$GCS_BUCKET/$KEY.sha256"
