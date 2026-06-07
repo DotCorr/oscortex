@@ -70,6 +70,17 @@ engine-port/publish-engine.sh x64 release   # package + upload to R2
 - **Multi-arch:** same model, one tarball per ISA (`oscortex-arm64-release`, …) —
   the engine builds per-arch with a flag, so publishing is just more rows.
 
+### One-time R2 host setup (maintainer)
+Creating the bucket needs *your* Cloudflare account, so authenticate first, then
+run the helper (it creates the bucket, enables the public `r2.dev` URL, and wires
+`ARTIFACT_BASE_URL` into `artifact.config`):
+```bash
+npx wrangler login            # one-time browser OAuth (or set CLOUDFLARE_API_TOKEN)
+engine-port/setup-r2.sh       # create bucket + public URL + update artifact.config
+```
+After that, `publish-engine.sh` uploads via `wrangler` (no install — uses `npx`),
+and `fetch-engine.sh` just works for everyone.
+
 The engine checkout is pinned to **Flutter 3.41.1** (`582a0e7c55`, engine
 `cc8e596`). Do not bump it without re-deriving the port + re-publishing.
 
