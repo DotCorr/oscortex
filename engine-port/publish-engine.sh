@@ -51,8 +51,10 @@ EOF
   echo '[publish] packaged' \$(ls -lah /work/_publish/${NAME}.tar.gz | awk '{print \$5}')
 "
 
-# The container's /work is bind-mounted to the host engine-build workspace.
-WS="$(dirname "$REPO_ROOT")/oscortex-engine-build"
+# Resolve the host path bind-mounted to the container's /work (robust regardless
+# of the workspace dir name).
+WS="$(docker inspect "$CONTAINER" --format '{{ range .Mounts }}{{ if eq .Destination "/work" }}{{ .Source }}{{ end }}{{ end }}' 2>/dev/null)"
+[ -n "$WS" ] || WS="$(dirname "$REPO_ROOT")/oscortex-engine-build"
 TARBALL="$WS/_publish/${NAME}.tar.gz"
 echo "[publish] tarball: $TARBALL  (key: $KEY)"
 
