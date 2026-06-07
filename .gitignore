@@ -56,3 +56,6 @@ docs/goal-general-purpose.md
 
 # Local agent/session data — never track
 /.claude/
+
+# Downloaded prebuilt engine artifacts (fetch-engine.sh cache)
+/.engine-cache/
