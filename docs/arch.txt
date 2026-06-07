@@ -68,6 +68,42 @@
     This unifies "native targeting" and "AOT" into one effort and lets the whole
     hack pile be DELETED. Full plan + phases: docs/native-engine-port.md.
 
+  TARGET ARCHITECTURE (NATIVE, POST-PORT) — where we are going
+  ─────────────────────────────────────────────────────────────
+  The destination once the native AOT port lands. THREE clean layers; the kernel
+  contains neither the engine nor any app.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  APPS  — self-contained native AOT bundles (.osx, own PID each)        │
+    │  ┌────────────┐ ┌────────────┐ ┌────────────┐                         │
+    │  │ Shell      │ │ Canvas     │ │ Files  …    │  each: own libapp.so    │
+    │  │ (own PID)  │ │ (own PID)  │ │ (own PID)  │  (AOT native code)      │
+    │  └─────┬──────┘ └─────┬──────┘ └─────┬──────┘                         │
+    │        └──────── map shared, read-only ───────┐                        │
+    │  ┌──────────────────────────────────────────▼─────────────────────┐  │
+    │  │  ENGINE  — libflutter_engine.so, built FOR OSCortex (AOT).       │  │
+    │  │  A shared system library mapped into every app process. Native   │  │
+    │  │  framework code is shared read-only across PIDs (W^X, no JIT).    │  │
+    │  └──────────────────────────────────────────┬─────────────────────┘  │
+    ├──────────────── OSCortex native syscall ABI ─┴──────────────────────────┤
+    │  KERNEL  — scheduler, compositor/WM, VFS, net, pkg loader. Provides an  │
+    │  API; contains NO engine and NO apps. Lean (~60 MB). NO Linux emulation.│
+    └────────────────────────────────────────────────────────────────────────┘
+
+  Key properties vs. today:
+  ● Apps are native AOT bundles ON DISK, loaded on demand → own PID → scheduler
+    runs them. They self-manage; the kernel never bakes them in.
+  ● The framework compiles ONCE (AOT) and is SHARED read-only across every app
+    process — launching a 2nd app maps existing pages, it does NOT re-cook Flutter.
+    (Today's JIT re-JITs the whole framework per app → the slow 2nd-app launch.)
+  ● No JIT → no warm-up, no W^X codegen, a fraction of the RAM, instant cold start.
+  ● Engine speaks OSCortex's native ABI → DELETE: Linux-syscall emulation shim,
+    engine_patch.py, snapshot deser hacks, embedded-in-kernel blobs.
+  ● Kernel shrinks back toward ~60 MB; blobs delivered via disk/Limine modules.
+
+  This is the QNX/Fuchsia model: own OS, POSIX-clean, engine built as a first-class
+  target — not a Linux costume. Build path + phases: docs/native-engine-port.md.
+
   SCHEDULING REALITY (why a button can feel dead):
     One cooperative, single-core scheduler. User threads run on the BSP only; the
     other cores (APs) just halt. The Dart UI thread, the raster thread, and the
