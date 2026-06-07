@@ -49,6 +49,7 @@ class _ShellDesktopState extends State<ShellDesktop> {
   List<_AppTile> _apps = const [];
   String? _error;
   bool _loading = false;
+  _AppTile? _launching;
 
   @override
   void initState() {
@@ -84,15 +85,24 @@ class _ShellDesktopState extends State<ShellDesktop> {
     }
   }
 
-  Future<void> _launchApp(int id) async {
-    final raw = await _shell.send('launch:$id');
-    if (raw == null || !raw.contains('"ok":true')) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Launch failed for app $id')),
-        );
-      }
+  Future<void> _launchApp(_AppTile app) async {
+    // Show the launching overlay and force it to paint BEFORE we ask the kernel
+    // to launch: foreground-exclusive scheduling pauses the shell the moment the
+    // child gets focus, so if we don't paint first the user sees a frozen screen
+    // with no feedback while the new app's engine warms up.
+    setState(() => _launching = app);
+    await WidgetsBinding.instance.endOfFrame;
+
+    final raw = await _shell.send('launch:${app.id}');
+    final ok = raw != null && raw.contains('"ok":true');
+    if (!ok && mounted) {
+      setState(() => _launching = null);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Launch failed for ${app.name}')),
+      );
     }
+    // On success we leave the overlay up: the shell is about to be paused and
+    // the compositor will switch to the app's surface once it presents.
   }
 
   Future<void> _installSeed() async {
@@ -109,7 +119,9 @@ class _ShellDesktopState extends State<ShellDesktop> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: SafeArea(
+      body: Stack(
+        children: [
+          SafeArea(
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -135,6 +147,17 @@ class _ShellDesktopState extends State<ShellDesktop> {
                     onPressed: () => _refreshApps(showSpinner: true),
                     icon: const Icon(Icons.refresh),
                     tooltip: 'Refresh',
+                  ),
+                  IconButton(
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const SettingsPage(),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.settings_outlined),
+                    tooltip: 'Settings',
                   ),
                 ],
               ),
@@ -179,16 +202,188 @@ class _ShellDesktopState extends State<ShellDesktop> {
                                 final app = _apps[index];
                                 return _AppCard(
                                   app: app,
-                                  onLaunch: () => _launchApp(app.id),
+                                  onLaunch: () => _launchApp(app),
                                 );
                               },
                             ),
             ),
           ],
         ),
+          ),
+          if (_launching != null) _buildLaunchOverlay(_launching!),
+        ],
       ),
     );
   }
+
+  Widget _buildLaunchOverlay(_AppTile app) {
+    return Positioned.fill(
+      child: Container(
+        color: _bg.withValues(alpha: 0.92),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SizedBox(
+                width: 48,
+                height: 48,
+                child: CircularProgressIndicator(color: _accent, strokeWidth: 3),
+              ),
+              const SizedBox(height: 24),
+              Text(
+                'Launching ${app.name}…',
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'first launch warms up the engine — a few moments',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.white.withValues(alpha: 0.5),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// System Settings. Today it exposes input/driver preferences (scroll
+/// direction + speed) which are applied live in the native embedder. New driver
+/// settings plug in as additional `config:*` commands over the shell channel.
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  bool _naturalScroll = false; // maps to embedder scroll_invert
+  double _scrollSpeed = 100; // percent, 10..500
+  bool _loaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadConfig();
+  }
+
+  Future<void> _loadConfig() async {
+    try {
+      final raw = await _shell.send('config:get');
+      final m = jsonDecode(raw ?? '{}') as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        _naturalScroll = m['scroll_invert'] as bool? ?? false;
+        _scrollSpeed = ((m['scroll_speed'] as num?)?.toDouble() ?? 100)
+            .clamp(10, 500);
+        _loaded = true;
+      });
+    } catch (_) {
+      if (mounted) setState(() => _loaded = true);
+    }
+  }
+
+  Future<void> _setNaturalScroll(bool v) async {
+    setState(() => _naturalScroll = v);
+    await _shell.send('config:scroll_invert:${v ? 1 : 0}');
+  }
+
+  Future<void> _setSpeed(double v) async {
+    setState(() => _scrollSpeed = v);
+    await _shell.send('config:scroll_speed:${v.round()}');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Settings'),
+        backgroundColor: _bg,
+      ),
+      body: !_loaded
+          ? const Center(child: CircularProgressIndicator())
+          : ListView(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+              children: [
+                _sectionLabel('Input · Mouse & Trackpad'),
+                SwitchListTile(
+                  value: _naturalScroll,
+                  onChanged: _setNaturalScroll,
+                  activeColor: _accent,
+                  title: const Text('Natural scrolling'),
+                  subtitle: Text(
+                    _naturalScroll
+                        ? 'Content tracks finger/wheel direction'
+                        : 'Classic: wheel up scrolls up',
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.55),
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Scroll speed · ${_scrollSpeed.round()}%',
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                      Slider(
+                        value: _scrollSpeed,
+                        min: 10,
+                        max: 500,
+                        divisions: 49,
+                        activeColor: _accent,
+                        label: '${_scrollSpeed.round()}%',
+                        onChanged: (v) => setState(() => _scrollSpeed = v),
+                        onChangeEnd: _setSpeed,
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 16),
+                _sectionLabel('Try it · scroll this list'),
+                Container(
+                  height: 220,
+                  margin: const EdgeInsets.symmetric(horizontal: 16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.04),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(8),
+                    itemCount: 40,
+                    itemBuilder: (context, i) => ListTile(
+                      dense: true,
+                      leading: Icon(Icons.drag_indicator,
+                          color: Colors.white.withValues(alpha: 0.35)),
+                      title: Text('Scrollable row ${i + 1}'),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+    );
+  }
+
+  Widget _sectionLabel(String s) => Padding(
+        padding: const EdgeInsets.fromLTRB(0, 8, 0, 8),
+        child: Text(
+          s.toUpperCase(),
+          style: TextStyle(
+            color: _accent.withValues(alpha: 0.9),
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.8,
+          ),
+        ),
+      );
 }
 
 class _AppTile {

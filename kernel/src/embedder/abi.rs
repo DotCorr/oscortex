@@ -206,6 +206,10 @@ pub const ISOLATE_DEAD:    u32 = 3;
 // `flags` = 0, `a` = dst_isolate_id, `b` = message_byte_len.
 pub const EV_ISOLATE_MSG: u32 = 8;
 
+// Mouse scroll-wheel event. `flags` = 0, `a` = packed cursor pos
+// ((x as u32) << 32 | (y as u32)), `b` = signed scroll delta-z (as i32 in low bits).
+pub const EV_SCROLL: u32 = 9;
+
 // Focus transition flags used with EV_FOCUS events.
 pub const FOCUS_LOST:   u32 = 1;
 pub const FOCUS_GAINED: u32 = 2;
