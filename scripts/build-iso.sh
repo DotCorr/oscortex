@@ -67,49 +67,11 @@ else
     exit 1
 fi
 
-echo "[0.3/5] Compiling system shell to AOT ELF (libapp.so)..."
-DARTAOT="/opt/homebrew/share/flutter/bin/cache/dart-sdk/bin/dartaotruntime"
-FRONTEND_SERVER="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
-SDK_ROOT_PRODUCT="/opt/homebrew/share/flutter/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
-GEN_SNAP="$ROOT/scratch/linux-x64/gen_snapshot"
-PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
-APP_MAIN="$APP_DIR/lib/main.dart"
-AOT_DILL="$APP_DIR/build/app_aot.dill"
-LIBAPP_SO_DEST="$ROOT/initramfs/system/flutter/libapp.so"
-
-"$DARTAOT" "$FRONTEND_SERVER" \
-    --sdk-root "$SDK_ROOT_PRODUCT" \
-    --target=flutter \
-    --aot \
-    --tfa \
-    --packages="$PKG_CONFIG" \
-    --output-dill "$AOT_DILL" \
-    "$APP_MAIN" 2>&1 | grep -v '^+' | tail -5
-
-if [ ! -f "$AOT_DILL" ]; then
-    echo "ERROR: AOT kernel compilation failed — app_aot.dill not produced" >&2
-    exit 1
-fi
-
-mkdir -p "$ROOT/initramfs/system/flutter"
-docker run --rm --platform linux/amd64 \
-    -v "$ROOT:$ROOT" \
-    -w "$ROOT" \
-    ubuntu:22.04 \
-    "$GEN_SNAP" \
-    --deterministic \
-    --snapshot_kind=app-aot-elf \
-    --elf="$LIBAPP_SO_DEST" \
-    --dedup_instructions \
-    --strip \
-    "$AOT_DILL" 2>&1
-
-if [ ! -f "$LIBAPP_SO_DEST" ]; then
-    echo "ERROR: gen_snapshot_x64 failed — libapp.so not produced" >&2
-    exit 1
-fi
-python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO_DEST"
-echo "[0.3/5] libapp.so staged: $(wc -c < "$LIBAPP_SO_DEST") bytes"
+# NOTE: the old [0.3/5] step compiled the shell to an AOT libapp.so via a vendored
+# gen_snapshot (formerly scratch/linux-x64/gen_snapshot) and patch_libapp.py. That
+# whole path is GONE: OSCortex runs the JIT engine off kernel_blob.bin, not an AOT
+# libapp.so. Native AOT is being done properly via the engine port — see
+# docs/native-engine-port.md. (Removed with the scratch/ debugging tree.)
 
 echo "[0.35/5] Building core system apps into /Applications..."
 mkdir -p "$ROOT/initramfs/Applications"
@@ -246,7 +208,6 @@ REQUIRED_FILES=(
     "$ROOT/initramfs/system/lib/libflutter_engine.so"
     "$ROOT/initramfs/system/lib/liboscortex_libc.so"
     "$ROOT/initramfs/system/flutter/icudtl.dat"
-    "$ROOT/initramfs/system/flutter/libapp.so"
     "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx"
     "$ROOT/initramfs/Applications/Files.app/Files.osx"
     "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
