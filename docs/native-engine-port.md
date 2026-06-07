@@ -104,13 +104,20 @@ current phase's checkpoint passes.
       built from source — 377 MB x64, exports the C embedder API
       (`FlutterEngineRun` et al.), debug/JIT as expected. Toolchain proven.
 
-### Phase 1 — Map + define the OSCortex platform target  (IN PROGRESS)
+### Phase 1 — Map + define the OSCortex platform target  ✅ DONE (2026-06-07)
 - [x] Enumerate the host-primitive surface — see "Port surface map" above
       (~1,200 lines: Dart VM os_* + fml message_loop/paths, reuse posix).
-- [ ] Add `oscortex` as a GN target OS (toolchain, defines, sysroot) — start by
-      cloning the `linux` target and renaming, building against OSCortex headers.
-- **Checkpoint:** the engine *configures* for `--target-os=oscortex` and fails
-  only on genuinely-missing OSCortex primitives (a known, listed set).
+- [x] Add `oscortex` as a `--target-os`. Refined approach (vs. a full new
+      toolchain): OSCortex has no sysroot/libc yet (it runs linux-ABI binaries via
+      emulation), so `--target-os=oscortex` links against **linux** but sets a new
+      `is_oscortex` GN flag that will select the OSCortex backend sources. A true
+      OSCortex sysroot/toolchain is a later sub-phase once OSCortex grows a libc.
+      Edits (tracked in `engine-port/patches/`, applied by `apply-port.sh`):
+      `flutter/tools/gn` (choices + x64 cpu + linux-link override + software-only,
+      no GPU) and `build/config/BUILDCONFIG.gn` (`is_oscortex` declare_arg).
+- [x] **Checkpoint HIT:** `flutter/tools/gn --target-os=oscortex …` configures
+      cleanly ("Made 1714 targets"), `out/oscortex_debug_unopt/args.gn` shows
+      `target_os = "linux"` + `is_oscortex = true`.
 
 ### Phase 2 — Implement the OSCortex platform backend
 - [ ] `fml/platform/oscortex/` (reuse posix; override the minimum).

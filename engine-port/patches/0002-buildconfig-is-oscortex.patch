@@ -1,0 +1,18 @@
+diff --git a/engine/src/build/config/BUILDCONFIG.gn b/engine/src/build/config/BUILDCONFIG.gn
+index 2b0d94e1..141e8757 100644
+--- a/engine/src/build/config/BUILDCONFIG.gn
++++ b/engine/src/build/config/BUILDCONFIG.gn
+@@ -140,6 +140,13 @@ declare_args() {
+   # Whether this is a minimal linux instance without x11, etc.
+   is_minimal_linux = false
+ 
++  # OSCortex native port. When true, build the OSCortex platform backend (fml +
++  # Dart VM OS layer) instead of the linux one. We still link against linux for
++  # now (OSCortex runs linux-ABI binaries via emulation until it grows its own
++  # sysroot/libc), so target_os stays "linux" — this flag only selects backend
++  # sources. See docs/native-engine-port.md.
++  is_oscortex = false
++
+   # Whether we're a traditional desktop unix.
+   is_desktop_linux = current_os == "linux" && current_os != "chromeos"
+ 

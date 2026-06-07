@@ -1,0 +1,56 @@
+diff --git a/engine/src/flutter/tools/gn b/engine/src/flutter/tools/gn
+index 06a3e289..c2e48abf 100755
+--- a/engine/src/flutter/tools/gn
++++ b/engine/src/flutter/tools/gn
+@@ -190,6 +190,8 @@ def get_target_cpu(args):
+     return args.windows_cpu
+   if args.target_os == 'qnx':
+     return 'arm64'
++  if args.target_os == 'oscortex':
++    return 'x64'
+ 
+   # Host build. Default to x64 unless overridden.
+   if get_host_os() == 'mac' and args.mac_cpu:
+@@ -530,6 +532,16 @@ def to_gn_args(args):
+     gn_args['target_os'] = args.target_os
+     gn_args['target_cpu'] = get_target_cpu(args)
+     gn_args['dart_target_arch'] = gn_args['target_cpu']
++    # OSCortex native port: there is no OSCortex sysroot/libc yet (OSCortex runs
++    # linux-ABI binaries via emulation), so link against linux for now and just
++    # flag is_oscortex so the OSCortex platform backend sources are selected.
++    # The out/ dir is still named from args.target_os ('oscortex'), so this does
++    # not collide with a plain linux build. See docs/native-engine-port.md.
++    if args.target_os == 'oscortex':
++      gn_args['target_os'] = 'linux'
++      gn_args['host_os'] = get_host_os()
++      gn_args['host_cpu'] = get_host_cpu()
++      gn_args['is_oscortex'] = True
+ 
+   if not args.build_engine_artifacts:
+     gn_args['flutter_build_engine_artifacts'] = False
+@@ -651,6 +663,13 @@ def to_gn_args(args):
+     gn_args['skia_enable_ganesh'] = False
+     gn_args['skia_enable_graphite'] = False
+     gn_args['arm_use_neon'] = False
++  elif args.target_os == 'oscortex':
++    # OSCortex rasterizes in SOFTWARE — no GPU. Disable all GPU backends so the
++    # build skips the GL/Impeller paths (also the slowest objects to compile).
++    gn_args['shell_enable_gl'] = False
++    gn_args['skia_use_gl'] = False
++    gn_args['skia_enable_ganesh'] = False
++    gn_args['skia_enable_graphite'] = False
+   else:
+     gn_args['skia_use_gl'] = args.target_os != 'fuchsia'
+ 
+@@ -965,7 +984,10 @@ def parse_args(args):
+   parser.add_argument(
+       '--target-os',
+       type=str,
+-      choices=['android', 'ios', 'mac', 'linux', 'fuchsia', 'wasm', 'win', 'qnx']
++      choices=[
++          'android', 'ios', 'mac', 'linux', 'fuchsia', 'wasm', 'win', 'qnx',
++          'oscortex'
++      ]
+   )
+   parser.add_argument('--android', dest='target_os', action='store_const', const='android')
+   parser.add_argument(
