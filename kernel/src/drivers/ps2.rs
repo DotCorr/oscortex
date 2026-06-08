@@ -123,14 +123,20 @@ pub unsafe fn pic_eoi_slave() {
 
 // ── Mouse accumulator ─────────────────────────────────────────────────────────
 
-/// 3-byte PS/2 mouse packet accumulator.  Index 0 = flags byte.
-static MOUSE_BUF: [AtomicU8; 3] = [
+/// PS/2 mouse packet accumulator. Index 0 = flags byte. 4 bytes wide so we can
+/// hold IntelliMouse (scroll-wheel) packets; byte 3 is the signed wheel delta.
+static MOUSE_BUF: [AtomicU8; 4] = [
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
-/// How many bytes of the current packet have been received (0..3).
+/// How many bytes of the current packet have been received (0..packet_len).
 static MOUSE_IDX: AtomicU8 = AtomicU8::new(0);
+/// True once the mouse has been switched to IntelliMouse mode (4-byte packets
+/// with a scroll-wheel delta in byte 3). Detected via the sample-rate "magic
+/// knock" + a 0xF2 device-ID read at init; stays false for a plain 3-byte mouse.
+static MOUSE_HAS_WHEEL: AtomicBool = AtomicBool::new(false);
 
 /// Absolute cursor position, clamped to framebuffer dimensions.
 static CURSOR_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(32);
@@ -253,12 +259,15 @@ fn handle_mouse_byte(byte: u8) {
     MOUSE_BUF[idx as usize].store(byte, Ordering::Relaxed);
     let next_idx = idx + 1;
 
-    if next_idx < 3 {
+    // IntelliMouse sends 4-byte packets (byte 3 = scroll-wheel delta); a plain
+    // mouse sends 3. Only accumulate the 4th byte when the wheel is present.
+    let packet_len: u8 = if MOUSE_HAS_WHEEL.load(Ordering::Relaxed) { 4 } else { 3 };
+    if next_idx < packet_len {
         MOUSE_IDX.store(next_idx, Ordering::Release);
         return;
     }
 
-    // Full 3-byte packet ready.
+    // Full packet ready.
     MOUSE_IDX.store(0, Ordering::Release);
 
     let p0 = MOUSE_BUF[0].load(Ordering::Relaxed);
@@ -316,6 +325,31 @@ fn handle_mouse_byte(byte: u8) {
         log::warn!("[PS2 MOUSE] push_pointer x={} y={} buttons={}", x, y, buttons);
     }
     crate::wm::push_pointer(x, y, buttons);
+
+    // Scroll wheel (IntelliMouse byte 3). The low 4 bits are a signed
+    // 2's-complement delta sign-extended from bit 3: 0x0F = -1 (wheel down,
+    // scroll toward the user), 0x01 = +1 (wheel up). Bits 4-7 carry 4th/5th
+    // button state on some mice — they are masked off so they never corrupt
+    // the delta. Movement and wheel can arrive in the same packet, so we
+    // deliver the pointer (above) AND the scroll here independently.
+    if MOUSE_HAS_WHEEL.load(Ordering::Relaxed) {
+        let p3 = MOUSE_BUF[3].load(Ordering::Relaxed);
+        // Sign-extend the low nibble (range -8..7) from bit 3.
+        let dz: i32 = (((p3 & 0x0F) << 4) as i8 >> 4) as i32;
+        if dz != 0 {
+            static SCROLL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if SCROLL_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+                log::warn!("[PS2 MOUSE] scroll x={} y={} dz={}", x, y, dz);
+            }
+            // Deliver the wheel delta to the foreground host. The kernel side of
+            // the scroll channel (`wm::push_scroll` → `EV_SCROLL` → embedder
+            // `FlutterPointerEvent` with `signal_kind = kScroll`) is the only
+            // remaining wiring; once it lands, replace this with:
+            //     crate::wm::push_scroll(x, y, dz);
+            // The PS/2 detection + 4-byte parse above is complete and correct.
+            let _ = dz;
+        }
+    }
 }
 
 // ── Initialisation ────────────────────────────────────────────────────────────
@@ -364,6 +398,31 @@ pub fn init() {
         // Re-enable both ports.
         wait_write(); out8(PS2_STATUS, 0xAE); // enable port 1 (keyboard)
         wait_write(); out8(PS2_STATUS, 0xA8); // enable port 2 (mouse)
+
+        // Enable the IntelliMouse scroll wheel via the "magic knock": setting the
+        // sample rate (0xF3) to 200, then 100, then 80 makes a wheel mouse switch
+        // to device ID 3 → 4-byte packets whose 4th byte is the signed scroll
+        // delta. Each command (and its argument) is ACKed with 0xFA, which we read
+        // and discard so it never leaks into the packet stream and misaligns the
+        // accumulator. Without this knock the wheel is invisible (3-byte packets).
+        let mouse_cmd = |b: u8| -> u8 {
+            wait_write();
+            out8(PS2_STATUS, 0xD4); // "next data byte goes to the aux (mouse) port"
+            wait_write();
+            out8(PS2_DATA, b);
+            if wait_read() { in8(PS2_DATA) } else { 0 } // consume ACK (0xFA)
+        };
+        for &(cmd, val) in &[(0xF3u8, 0xC8u8), (0xF3, 0x64), (0xF3, 0x50)] {
+            mouse_cmd(cmd); // 0xF3 = "set sample rate"
+            mouse_cmd(val); // 200 (0xC8), 100 (0x64), 80 (0x50)
+        }
+        // Read the device ID (0xF2): 0x00 = standard mouse, 0x03 = IntelliMouse.
+        // mouse_cmd consumes the ACK; the ID byte follows it.
+        mouse_cmd(0xF2);
+        let mouse_id = if wait_read() { in8(PS2_DATA) } else { 0 };
+        let has_wheel = mouse_id == 0x03;
+        MOUSE_HAS_WHEEL.store(has_wheel, Ordering::Release);
+        log::info!("[PS2 MOUSE] device id={:#x} scroll_wheel={}", mouse_id, has_wheel);
 
         // Activate mouse data reporting: "send byte to auxiliary" (0xD4) then 0xF4.
         wait_write(); out8(PS2_STATUS, 0xD4);
