@@ -30,10 +30,13 @@ pub mod uart;
 pub mod boot;
 pub mod mmu;
 pub mod vectors;
+pub mod gic;
+pub mod timer;
 pub mod bringup;
 pub mod bringup_mmu;
 pub mod bringup_vectors;
 pub mod bringup_irq;
+pub mod bringup_user;
 
 pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
