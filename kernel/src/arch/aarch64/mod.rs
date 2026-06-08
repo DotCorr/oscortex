@@ -25,6 +25,12 @@ pub mod acpi;
 pub mod smp;
 pub mod enter_user;
 
+// ── Bare-metal bring-up (direct `-kernel` boot) ─────────────────────────────
+pub mod uart;
+pub mod boot;
+pub mod bringup;
+pub mod bringup_mmu;
+
 pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
 use core::arch::asm;
