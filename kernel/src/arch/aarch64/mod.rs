@@ -32,6 +32,7 @@ pub mod mmu;
 pub mod vectors;
 pub mod gic;
 pub mod timer;
+pub mod psci;
 pub mod bringup;
 pub mod bringup_mmu;
 pub mod bringup_vectors;
