@@ -42,6 +42,24 @@ static EXIT_CODE: AtomicU64 = AtomicU64::new(0);
 /// write the return value back into x0. Runs at EL1 with the user frame on the
 /// kernel stack; returning lets the vector stub restore + eret to EL0.
 fn svc_handler(f: &mut vectors::TrapFrame) {
+    // Capture the trapping thread's user registers into the per-CPU snapshot,
+    // exactly as the shared dispatch path expects (user_rip/user_rsp/user_gprs).
+    crate::arch::aarch64::syscall::capture_from_trap(f);
+
+    // On the first syscall, prove the shared per-CPU snapshot accessors now
+    // reflect the trapping EL0 thread (user_rip should be just past the svc,
+    // user_rsp should be the EL0 stack).
+    static SNAP_CHECKED: AtomicBool = AtomicBool::new(false);
+    if !SNAP_CHECKED.swap(true, Ordering::Relaxed) {
+        let rip = crate::arch::aarch64::syscall::user_rip();
+        let rsp = crate::arch::aarch64::syscall::user_rsp();
+        uart::puts("[svc] snapshot: user_rip=");
+        uart::puthex_full(rip);
+        uart::puts(" user_rsp=");
+        uart::puthex_full(rsp);
+        uart::puts("\n");
+    }
+
     let nr = f.x[8];
     match nr {
         64 => {

@@ -61,12 +61,45 @@ fn cpu_idx() -> usize {
     crate::arch::aarch64::smp::current_cpu_id() as usize
 }
 
+/// Capture the user register snapshot from an EL0 SVC trap frame into this
+/// CPU's scratch, mirroring the x86 syscall-entry GS snapshot. After this, the
+/// shared accessors (`user_rip`, `user_rsp`, `user_gprs`, ...) return the
+/// trapping thread's state, so the architecture-neutral `dispatch_fast` path can
+/// read it.
+///
+/// AArch64→x86 field mapping (Linux aarch64 ABI): x0..x5 → rdi/rsi/rdx/r10/r8/r9
+/// (the syscall arg registers), x8 → syscall number (handled by the caller),
+/// SP_EL0 → user_rsp, ELR_EL1 → user_rip; callee-saved x19..x23/x29 fill the
+/// rbx/r12..r15/rbp slots used by `save_full_user_gprs`.
+pub fn capture_from_trap(frame: &super::vectors::TrapFrame) {
+    let i = cpu_idx();
+    unsafe {
+        let s = &mut (*core::ptr::addr_of_mut!(CPU_SCRATCHES))[i];
+        s.user_rsp = frame.sp_el0;
+        s.user_rip = frame.elr;
+        s.rdi = frame.x[0];
+        s.rsi = frame.x[1];
+        s.rdx = frame.x[2];
+        s.r10 = frame.x[3];
+        s.r8 = frame.x[4];
+        s.r9 = frame.x[5];
+        // Callee-saved mapping for cross-arch register preservation.
+        s.rbx = frame.x[19];
+        s.r12 = frame.x[20];
+        s.r13 = frame.x[21];
+        s.r14 = frame.x[22];
+        s.r15 = frame.x[23];
+        s.rbp = frame.x[29];
+    }
+}
+
 /// Initialise the SVC fast path on the BSP.
 ///
-/// TODO(arm): install the EL1 exception vector table (VBAR_EL1) whose
-/// synchronous handler decodes the SVC and stashes the user GPR snapshot.
+/// The EL1 exception vector table (VBAR_EL1) that decodes SVC and captures the
+/// user snapshot is installed by the bring-up (`vectors::install`); this only
+/// logs readiness.
 pub fn init() {
-    log::info!("[Syscall] aarch64 SVC scaffold (exception vector not yet installed)");
+    log::info!("[Syscall] aarch64 SVC entry ready (capture_from_trap wired)");
 }
 
 /// Per-AP SVC init.
