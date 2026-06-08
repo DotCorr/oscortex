@@ -7,7 +7,31 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use spin::Mutex;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// The mouse-cursor shape the compositor currently draws. Set from userspace
+/// via `SYS_CURSOR_SHAPE_SET` when the Flutter framework activates a system
+/// cursor (e.g. hovering a button → click/hand, hovering a text field → I-beam).
+/// Values are the `CURSOR_SHAPE_*` constants in `embedder::abi`.
+static ACTIVE_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(0);
+
+/// Set the active mouse-cursor shape drawn by the compositor overlay.
+/// Returns `false` if `shape` is out of range.
+pub fn set_cursor_shape(shape: u32) -> bool {
+    if shape > crate::embedder::abi::CURSOR_SHAPE_MAX {
+        return false;
+    }
+    ACTIVE_CURSOR_SHAPE.store(shape, Ordering::Release);
+    // Repaint so the new pointer shape shows immediately even if Flutter's
+    // surface content has not changed.
+    invalidate();
+    true
+}
+
+/// Current active cursor shape.
+pub fn cursor_shape() -> u32 {
+    ACTIVE_CURSOR_SHAPE.load(Ordering::Acquire)
+}
 
 /// When `true`, a userspace process owns the framebuffer directly.
 /// `render_frame()` skips the background fill and placeholder blits.
@@ -651,7 +675,46 @@ fn blend_pixel(bg: u32, fg: u32, alpha: u8) -> u32 {
     (r_out << 16) | (g_out << 8) | b_out
 }
 
-/// Circular cursor rendering with active click scaling, custom color, and inactivity auto-fade.
+/// Plot one solid cursor pixel with bounds checking.
+#[inline]
+fn cursor_px(x: i32, y: i32, dx: i32, dy: i32, color: u32) {
+    let px = x + dx;
+    let py = y + dy;
+    if px >= 0 && py >= 0 {
+        crate::drivers::fb::set_pixel(px as u32, py as u32, color);
+    }
+}
+
+/// Draw a 1px-thick filled line between two points (Bresenham). Used to build
+/// the vector cursor sprites without per-shape bitmap tables.
+fn cursor_line(x: i32, y: i32, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        cursor_px(x, y, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// Mouse-cursor overlay rendering. The OS draws the pointer in software (Flutter
+/// does not in software-renderer mode). The shape is selected by the Flutter
+/// framework via `SYS_CURSOR_SHAPE_SET` (e.g. button hover → click/hand, text
+/// field hover → I-beam), so hovering interactive widgets actually changes the
+/// cursor — a real platform capability, not a stub.
 fn draw_software_cursor() {
     use core::sync::atomic::Ordering;
     if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
@@ -665,37 +728,60 @@ fn draw_software_cursor() {
         return;
     }
 
+    let shape = cursor_shape();
+    use crate::embedder::abi::*;
+    if shape == CURSOR_SHAPE_NONE {
+        return;
+    }
+
     let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
     let buttons = crate::drivers::ps2::cursor_buttons();
 
-    // Determine scale and color based on click/active state
-    let (r, r_glow, color) = if buttons != 0 {
-        (4i32, 8i32, 0x0038BDF8) // Clicked: 8px diameter, cyan accent
-    } else {
-        (6i32, 10i32, 0x00FFFFFF) // Idle: 12px diameter, white
-    };
-
+    // Keep the sprite fully on-screen (max sprite extent is ~10px from hotspot).
     if let Some((w, h)) = crate::drivers::fb::size_px() {
-        x = x.clamp(r_glow, w as i32 - 1 - r_glow);
-        y = y.clamp(r_glow, h as i32 - 1 - r_glow);
+        x = x.clamp(10, w as i32 - 11);
+        y = y.clamp(10, h as i32 - 11);
     }
 
-    // Draw circular pointer and fading radial glow using integer distance metric
+    // White fill, dark outline — readable on any background.
+    let fill = 0x00FFFFFFu32;
+    let edge = 0x00101820u32;
+    let accent = if buttons != 0 { 0x0038BDF8u32 } else { fill };
+
+    match shape {
+        CURSOR_SHAPE_BASIC => draw_arrow_cursor(x, y, buttons, accent, edge),
+        CURSOR_SHAPE_TEXT => draw_ibeam_cursor(x, y, fill, edge),
+        CURSOR_SHAPE_CLICK => draw_hand_cursor(x, y, fill, edge),
+        CURSOR_SHAPE_FORBIDDEN => draw_forbidden_cursor(x, y),
+        CURSOR_SHAPE_GRAB | CURSOR_SHAPE_GRABBING => {
+            draw_hand_cursor(x, y, fill, edge)
+        }
+        CURSOR_SHAPE_RESIZE_LR => draw_resize_cursor(x, y, true, fill, edge),
+        CURSOR_SHAPE_RESIZE_UD => draw_resize_cursor(x, y, false, fill, edge),
+        // Unknown → fall back to the basic pointer.
+        _ => draw_arrow_cursor(x, y, buttons, accent, edge),
+    }
+}
+
+/// The classic circular pointer (the original OSCortex cursor), kept as the
+/// default `basic` shape with its click scaling + radial glow.
+fn draw_arrow_cursor(x: i32, y: i32, buttons: u32, _accent: u32, _edge: u32) {
+    let (r, r_glow, color) = if buttons != 0 {
+        (4i32, 8i32, 0x0038BDF8) // Clicked: cyan accent
+    } else {
+        (6i32, 10i32, 0x00FFFFFF) // Idle: white
+    };
     for dy in -r_glow..=r_glow {
         for dx in -r_glow..=r_glow {
             let dist2 = dx * dx + dy * dy;
             let px = x + dx;
             let py = y + dy;
-
             if px >= 0 && py >= 0 {
                 let px = px as u32;
                 let py = py as u32;
-
                 if dist2 <= r * r {
-                    // Solid central core
                     crate::drivers::fb::set_pixel(px, py, color);
                 } else if dist2 <= r_glow * r_glow {
-                    // Soft radial shadow/glow
                     let bg = crate::drivers::fb::get_pixel(px, py);
                     let t = (r_glow * r_glow) - dist2;
                     let max_t = (r_glow * r_glow) - (r * r);
@@ -705,6 +791,100 @@ fn draw_software_cursor() {
                     crate::drivers::fb::set_pixel(px, py, blended);
                 }
             }
+        }
+    }
+}
+
+/// I-beam (text cursor): a vertical bar with top/bottom serifs.
+fn draw_ibeam_cursor(x: i32, y: i32, fill: u32, edge: u32) {
+    // Outline first (1px around), then fill, for legibility on any background.
+    for dy in -8..=8 {
+        cursor_px(x, y, -1, dy, edge);
+        cursor_px(x, y, 1, dy, edge);
+        cursor_px(x, y, 0, dy, fill);
+    }
+    // Serifs at the top and bottom.
+    for dx in -3..=3 {
+        cursor_px(x, y, dx, -9, edge);
+        cursor_px(x, y, dx, 9, edge);
+        cursor_px(x, y, dx, -8, fill);
+        cursor_px(x, y, dx, 8, fill);
+    }
+}
+
+/// Hand / link cursor (also used for grab): a pointing-finger silhouette.
+fn draw_hand_cursor(x: i32, y: i32, fill: u32, edge: u32) {
+    // Pointing finger: a vertical column for the finger and a rounded palm.
+    // Finger (extends up from the hotspot).
+    for dy in -9..=2 {
+        for dx in -1..=1 {
+            cursor_px(x, y, dx, dy, fill);
+        }
+    }
+    // Palm (a filled rounded block below the finger).
+    for dy in 2..=9 {
+        for dx in -4..=4 {
+            let edge_block = dy == 9 || dx == -4 || dx == 4;
+            cursor_px(x, y, dx, dy, if edge_block { edge } else { fill });
+        }
+    }
+    // Knuckle lines hinting folded fingers.
+    cursor_px(x, y, -2, 3, edge);
+    cursor_px(x, y, 0, 3, edge);
+    cursor_px(x, y, 2, 3, edge);
+    // Outline the finger.
+    for dy in -9..=2 {
+        cursor_px(x, y, -2, dy, edge);
+        cursor_px(x, y, 2, dy, edge);
+    }
+    cursor_px(x, y, 0, -10, edge);
+}
+
+/// Forbidden / no-drop cursor: a red circle with a diagonal slash.
+fn draw_forbidden_cursor(x: i32, y: i32) {
+    let red = 0x00E02424u32;
+    let r = 8i32;
+    // Ring (distance-based outline, 2px thick).
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let dist2 = dx * dx + dy * dy;
+            if dist2 <= r * r && dist2 >= (r - 2) * (r - 2) {
+                cursor_px(x, y, dx, dy, red);
+            }
+        }
+    }
+    // Diagonal slash (top-left to bottom-right).
+    cursor_line(x, y, -5, -5, 5, 5, red);
+    cursor_line(x, y, -5, -4, 5, 6, red);
+}
+
+/// Resize cursor: a double-headed arrow, horizontal or vertical.
+fn draw_resize_cursor(x: i32, y: i32, horizontal: bool, fill: u32, edge: u32) {
+    if horizontal {
+        // Shaft.
+        for dx in -8..=8 {
+            cursor_px(x, y, dx, 0, fill);
+            cursor_px(x, y, dx, -1, edge);
+            cursor_px(x, y, dx, 1, edge);
+        }
+        // Arrow heads.
+        for i in 0..4 {
+            cursor_px(x, y, -8 + i, -i, fill);
+            cursor_px(x, y, -8 + i, i, fill);
+            cursor_px(x, y, 8 - i, -i, fill);
+            cursor_px(x, y, 8 - i, i, fill);
+        }
+    } else {
+        for dy in -8..=8 {
+            cursor_px(x, y, 0, dy, fill);
+            cursor_px(x, y, -1, dy, edge);
+            cursor_px(x, y, 1, dy, edge);
+        }
+        for i in 0..4 {
+            cursor_px(x, y, -i, -8 + i, fill);
+            cursor_px(x, y, i, -8 + i, fill);
+            cursor_px(x, y, -i, 8 - i, fill);
+            cursor_px(x, y, i, 8 - i, fill);
         }
     }
 }

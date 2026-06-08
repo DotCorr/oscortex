@@ -398,6 +398,146 @@ static ENGINE: AtomicU64 = AtomicU64::new(0);
 static NOTIFY_DISPLAY_UPDATE: AtomicU64 = AtomicU64::new(0);
 static IS_AOT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+// ════════════════════════════════════════════════════════════════════════════
+// Semantics / accessibility tree.
+//
+// The engine produces semantics updates only after the embedder enables them
+// (FlutterEngineUpdateSemanticsEnabled) AND provides update_semantics_callback2.
+// We keep the LIVE tree here so an accessibility / UI-automation consumer (a
+// screen reader, a test harness) can read the current node set: each node's id,
+// label, screen rect, flags and actions. This makes the semantics pipeline real
+// rather than dead — Flutter computes it, we receive and retain it.
+// ════════════════════════════════════════════════════════════════════════════
+
+const MAX_SEMANTICS_NODES: usize = 256;
+const SEMANTICS_LABEL_CAP: usize = 96;
+
+#[derive(Clone, Copy)]
+struct SemanticsNode {
+    id: i32,
+    flags: u32,
+    actions: u32,
+    // Bounding rect in logical pixels (left, top, right, bottom).
+    rect: [f64; 4],
+    label_len: u16,
+    label: [u8; SEMANTICS_LABEL_CAP],
+}
+
+impl SemanticsNode {
+    const fn empty() -> Self {
+        Self {
+            id: -1,
+            flags: 0,
+            actions: 0,
+            rect: [0.0; 4],
+            label_len: 0,
+            label: [0u8; SEMANTICS_LABEL_CAP],
+        }
+    }
+}
+
+struct SemanticsTree {
+    count: usize,
+    nodes: [SemanticsNode; MAX_SEMANTICS_NODES],
+}
+
+static mut SEMANTICS_TREE: SemanticsTree = SemanticsTree {
+    count: 0,
+    nodes: [SemanticsNode::empty(); MAX_SEMANTICS_NODES],
+};
+static SEMANTICS_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SEMANTICS_UPDATES: AtomicU32 = AtomicU32::new(0);
+
+// Field offsets within FlutterSemanticsNode2 (verified against
+// tools/flutter-engine/flutter_embedder.h, x86_64 layout).
+const OFF_SN2_ID: usize = 8;
+const OFF_SN2_FLAGS: usize = 12;
+const OFF_SN2_ACTIONS: usize = 16;
+const OFF_SN2_LABEL: usize = 80; // const char*
+const OFF_SN2_RECT: usize = 128; // FlutterRect { double left, top, right, bottom }
+
+// Field offsets within FlutterSemanticsUpdate2.
+const OFF_SU2_NODE_COUNT: usize = 8;
+const OFF_SU2_NODES: usize = 16; // FlutterSemanticsNode2**
+
+#[inline]
+fn read_u64_ptr(base: u64, off: usize) -> u64 {
+    unsafe { core::ptr::read_unaligned((base as usize + off) as *const u64) }
+}
+#[inline]
+fn read_i32_ptr(base: u64, off: usize) -> i32 {
+    unsafe { core::ptr::read_unaligned((base as usize + off) as *const i32) }
+}
+#[inline]
+fn read_u32_ptr(base: u64, off: usize) -> u32 {
+    unsafe { core::ptr::read_unaligned((base as usize + off) as *const u32) }
+}
+#[inline]
+fn read_f64_ptr(base: u64, off: usize) -> f64 {
+    unsafe { core::ptr::read_unaligned((base as usize + off) as *const f64) }
+}
+
+/// `update_semantics_callback2`: receives a `FlutterSemanticsUpdate2*` and
+/// stores the node set into the embedder's live semantics tree.
+unsafe extern "C" fn update_semantics_callback2(update: *const u8, _user_data: *mut ()) {
+    if update.is_null() {
+        return;
+    }
+    let upd = update as u64;
+    let node_count = read_u64_ptr(upd, OFF_SU2_NODE_COUNT) as usize;
+    let nodes_arr = read_u64_ptr(upd, OFF_SU2_NODES); // FlutterSemanticsNode2**
+    if nodes_arr == 0 {
+        return;
+    }
+
+    let n = node_count.min(MAX_SEMANTICS_NODES);
+    let tree = unsafe { &mut *core::ptr::addr_of_mut!(SEMANTICS_TREE) };
+    for i in 0..n {
+        // The update carries an array of POINTERS to nodes.
+        let node_ptr = unsafe {
+            core::ptr::read_unaligned((nodes_arr as usize + i * 8) as *const u64)
+        };
+        if node_ptr == 0 {
+            continue;
+        }
+        let dst = &mut tree.nodes[i];
+        dst.id = read_i32_ptr(node_ptr, OFF_SN2_ID);
+        dst.flags = read_u32_ptr(node_ptr, OFF_SN2_FLAGS);
+        dst.actions = read_u32_ptr(node_ptr, OFF_SN2_ACTIONS);
+        dst.rect[0] = read_f64_ptr(node_ptr, OFF_SN2_RECT);
+        dst.rect[1] = read_f64_ptr(node_ptr, OFF_SN2_RECT + 8);
+        dst.rect[2] = read_f64_ptr(node_ptr, OFF_SN2_RECT + 16);
+        dst.rect[3] = read_f64_ptr(node_ptr, OFF_SN2_RECT + 24);
+        // Copy the label string (NUL-terminated C string) up to our cap.
+        let label_ptr = read_u64_ptr(node_ptr, OFF_SN2_LABEL);
+        let mut llen = 0usize;
+        if label_ptr != 0 {
+            while llen < SEMANTICS_LABEL_CAP {
+                let c = unsafe { *((label_ptr as usize + llen) as *const u8) };
+                if c == 0 {
+                    break;
+                }
+                dst.label[llen] = c;
+                llen += 1;
+            }
+        }
+        dst.label_len = llen as u16;
+    }
+    tree.count = n;
+
+    let seq = SEMANTICS_UPDATES.fetch_add(1, Ordering::Relaxed);
+    if seq < 8 {
+        write(b"[embedder/semantics] update nodes=");
+        write_dec(node_count as u64);
+        write(b" stored=");
+        write_dec(n as u64);
+        write(b"\n");
+    }
+}
+
+const OFF_PROJECT_ARGS_UPDATE_SEMANTICS_CALLBACK2: usize = 280;
+
 // Custom task runner ABI structs
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -482,6 +622,11 @@ static PLATFORM_THREAD_RSP: AtomicU64 = AtomicU64::new(0);
 static RUN_TASK_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_FN: AtomicU64 = AtomicU64::new(0);
 static SEND_PLATFORM_MESSAGE_RESPONSE_FN: AtomicU64 = AtomicU64::new(0);
+/// `__FlutterEngineFlushPendingTasksNow` VA — drains queued platform tasks
+/// (including pending message replies) on the current thread.
+static FLUSH_PENDING_FN: AtomicU64 = AtomicU64::new(0);
+/// `FlutterEngineUpdateSemanticsEnabled` VA — toggles semantics production.
+static UPDATE_SEMANTICS_ENABLED_FN: AtomicU64 = AtomicU64::new(0);
 static CURRENT_HOST_MODE: AtomicU64 = AtomicU64::new(0);
 static CURRENT_APP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -522,6 +667,17 @@ fn respond_platform_message(msg: &FlutterPlatformMessage, data: &[u8]) {
     // FlutterEngineRunInitialized before our event loop runs. Deferring to the
     // main thread deadlocks init (spinner forever on shell list).
     send_platform_response_now(msg.response_handle, data);
+}
+
+/// Drain queued engine platform tasks (incl. pending message replies) on the
+/// current thread. Used before exiting an app on SystemNavigator.pop so the
+/// final reply is actually delivered.
+fn flush_engine_tasks() {
+    let va = FLUSH_PENDING_FN.load(Ordering::SeqCst);
+    if va != 0 {
+        let f: unsafe extern "C" fn() = unsafe { core::mem::transmute(va) };
+        unsafe { f() };
+    }
 }
 
 unsafe extern "C" fn runs_task_on_current_thread_callback(_user_data: *mut ()) -> bool {
@@ -705,9 +861,15 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
         // ── Graceful-ack JSON channels: the framework only needs a valid
         //    `[null]` envelope back. We still route them explicitly so the
         //    catch-all log only ever fires for something genuinely new.
+        // flutter/accessibility is a BasicMessageChannel using StandardMessageCodec
+        // (announce/tap/longPress/tooltip events). A StandardMessageCodec null
+        // reply is a single 0x00 byte — NOT the JSON `[null]`. Reply correctly.
+        b"flutter/accessibility" => {
+            respond_platform_message(msg, &[0x00u8]);
+        }
+
         b"flutter/navigation"
         | b"flutter/system"
-        | b"flutter/accessibility"
         | b"flutter/spellcheck"
         | b"flutter/processtext"
         | b"flutter/menu"
@@ -1440,17 +1602,21 @@ fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
     let mut method = [0u8; 64];
     if let Some((mlen, _)) = json_method_name(payload, &mut method) {
         if &method[..mlen] == b"MouseCursor.activateSystemCursor" {
-            // args = { device, kind }. There is no kernel set-cursor-shape
-            // syscall yet (out of scope for this worktree), so record the
-            // requested kind on serial and ack success.
+            // args = { device, kind }. Map the Flutter cursor `kind` to a kernel
+            // cursor shape and apply it via SYS_CURSOR_SHAPE_SET so the compositor
+            // actually draws the matching pointer (hand on links, I-beam on text…).
             if let Some(vi) = json_find_value(payload, b"kind") {
                 if payload.get(vi) == Some(&b'"') {
                     let mut kind = [0u8; 32];
                     if let Some((klen, _)) = json_parse_string(payload, vi, &mut kind) {
+                        let shape = cursor_kind_to_shape(&kind[..klen]);
+                        sys::cursor_shape_set(shape);
                         static CUR_LOG: AtomicU32 = AtomicU32::new(0);
                         if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
                             write(b"[embedder/cursor] kind=");
                             write(&kind[..klen]);
+                            write(b" -> shape=");
+                            write_dec(shape as u64);
                             write(b"\n");
                         }
                     }
@@ -1461,11 +1627,35 @@ fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
     respond_platform_message(msg, JSON_SUCCESS_NULL);
 }
 
+/// Map a Flutter `SystemMouseCursors` kind string to a kernel `CURSOR_SHAPE_*`.
+/// Unknown kinds fall back to the basic arrow.
+fn cursor_kind_to_shape(kind: &[u8]) -> u32 {
+    match kind {
+        b"text" => sys::CURSOR_SHAPE_TEXT,
+        b"click" => sys::CURSOR_SHAPE_CLICK,
+        b"forbidden" | b"noDrop" | b"notAllowed" => sys::CURSOR_SHAPE_FORBIDDEN,
+        b"grab" => sys::CURSOR_SHAPE_GRAB,
+        b"grabbing" | b"move" | b"allScroll" => sys::CURSOR_SHAPE_GRABBING,
+        b"resizeLeftRight" | b"resizeColumn" | b"resizeLeft" | b"resizeRight" => {
+            sys::CURSOR_SHAPE_RESIZE_LR
+        }
+        b"resizeUpDown" | b"resizeRow" | b"resizeUp" | b"resizeDown" => {
+            sys::CURSOR_SHAPE_RESIZE_UD
+        }
+        b"none" => sys::CURSOR_SHAPE_NONE,
+        // basic, precise, copy, contextMenu, help, progress, wait, cell, zoomIn,
+        // zoomOut, alias, disappearing, and any unknown → arrow.
+        _ => sys::CURSOR_SHAPE_BASIC,
+    }
+}
+
 // ── flutter/platform channel: clipboard, navigation, sound, chrome ───────────
 
-const CLIPBOARD_CAP: usize = 4096;
+// The clipboard is backed by the KERNEL (SYS_CLIPBOARD_*) so copied text is
+// system-wide: it survives across apps/hosts, not just within one embedder.
+// These buffers are just scratch space for marshalling to/from the syscalls.
+const CLIPBOARD_CAP: usize = 8192;
 static mut CLIPBOARD_BUF: [u8; CLIPBOARD_CAP] = [0; CLIPBOARD_CAP];
-static CLIPBOARD_LEN: AtomicU32 = AtomicU32::new(0);
 static mut CLIPBOARD_REPLY: [u8; CLIPBOARD_CAP + 64] = [0; CLIPBOARD_CAP + 64];
 
 fn handle_platform_channel(msg: &FlutterPlatformMessage) {
@@ -1487,35 +1677,34 @@ fn handle_platform_channel(msg: &FlutterPlatformMessage) {
 
     match method {
         b"Clipboard.setData" => {
-            // args = { text: "..." }
+            // args = { text: "..." } → push into the kernel system clipboard.
             if let Some(vi) = json_find_value(payload, b"text") {
                 if payload.get(vi) == Some(&b'"') {
-                    let buf = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_BUF) };
-                    let mut tmp = [0u8; CLIPBOARD_CAP];
-                    if let Some((len, _)) = json_parse_string(payload, vi, &mut tmp) {
+                    let tmp = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_BUF) };
+                    if let Some((len, _)) = json_parse_string(payload, vi, tmp) {
                         let len = len.min(CLIPBOARD_CAP);
-                        buf[..len].copy_from_slice(&tmp[..len]);
-                        CLIPBOARD_LEN.store(len as u32, Ordering::Release);
+                        sys::clipboard_set(&tmp[..len]);
                     }
                 }
             }
             respond_platform_message(msg, JSON_SUCCESS_NULL);
         }
         b"Clipboard.getData" => {
-            // Reply [{"text": "..."}]
-            let len = CLIPBOARD_LEN.load(Ordering::Acquire) as usize;
-            let src = unsafe { &*core::ptr::addr_of!(CLIPBOARD_BUF) };
+            // Pull from the kernel system clipboard and reply [{"text": "..."}].
+            let buf = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_BUF) };
+            let rc = sys::clipboard_get(buf);
+            let len = if rc < 0 { 0 } else { (rc as usize).min(CLIPBOARD_CAP) };
             let out = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_REPLY) };
             let mut pos = 0usize;
             json_push(out, &mut pos, b"[{\"text\":");
-            json_push_str_escaped(out, &mut pos, &src[..len.min(CLIPBOARD_CAP)]);
+            json_push_str_escaped(out, &mut pos, &buf[..len]);
             json_push(out, &mut pos, b"}]");
             let reply =
                 unsafe { core::slice::from_raw_parts(CLIPBOARD_REPLY.as_ptr(), pos) };
             respond_platform_message(msg, reply);
         }
         b"Clipboard.hasStrings" => {
-            let has = CLIPBOARD_LEN.load(Ordering::Acquire) > 0;
+            let has = sys::clipboard_len() > 0;
             respond_platform_message(
                 msg,
                 if has {
@@ -1526,15 +1715,38 @@ fn handle_platform_channel(msg: &FlutterPlatformMessage) {
             );
         }
         b"SystemNavigator.pop" => {
-            // Request to close the foreground app / pop the route. If a kernel
-            // app-close mechanism exists it would go here; for now ack success
-            // (the framework handles the in-app route pop itself).
+            // The foreground app asked to close. If this host is a launched app
+            // (not the shell), return focus to the shell via the kernel and exit
+            // this process so the shell resumes. The framework has already popped
+            // any in-app routes before reaching here.
             write(b"[embedder/platform] SystemNavigator.pop\n");
+            let host_mode = CURRENT_HOST_MODE.load(Ordering::Acquire);
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+            if host_mode == HOST_MODE_APP {
+                write(b"[embedder/platform] closing app -> refocus shell\n");
+                sys::app_close_foreground();
+                // Flush the response we just queued, then terminate this host.
+                flush_engine_tasks();
+                sys::exit(0);
+            }
+        }
+        // SystemSound.play → a real PC-speaker beep (the OS provides the device).
+        b"SystemSound.play" => {
+            // The argument is a sound-type string (e.g. "SystemSoundType.alert"
+            // or ".click"). Alert is lower/longer so the two are distinguishable.
+            let is_alert = payload.windows(5).any(|w| w == b"alert");
+            if is_alert {
+                sys::beep(660, 90);
+            } else {
+                sys::beep(1000, 25);
+            }
             respond_platform_message(msg, JSON_SUCCESS_NULL);
         }
         // No-op acknowledgements — correct typed null keeps the framework happy.
-        b"SystemSound.play"
-        | b"HapticFeedback.vibrate"
+        // HapticFeedback: no vibration motor on this hardware (deliberate no-op).
+        // SystemChrome: no system UI overlays/orientation on a single full-screen
+        // compositor surface (deliberate no-op, acked correctly).
+        b"HapticFeedback.vibrate"
         | b"SystemChrome.setApplicationSwitcherDescription"
         | b"SystemChrome.setSystemUIOverlayStyle"
         | b"SystemChrome.setPreferredOrientations"
@@ -2113,6 +2325,7 @@ extern "C" fn main_embedder() {
         get_current_time_va = api_table.get_current_time;
         send_view_focus_event_va = api_table.send_view_focus_event;
         RUN_TASK_FN.store(api_table.run_task, Ordering::SeqCst);
+        UPDATE_SEMANTICS_ENABLED_FN.store(api_table.update_semantics_enabled, Ordering::SeqCst);
     } else {
         // Stub path: resolve each symbol manually.
         proctable.run = dlsym(handle, b"FlutterEngineRun");
@@ -2135,6 +2348,10 @@ extern "C" fn main_embedder() {
         get_current_time_va = dlsym(handle, b"FlutterEngineGetCurrentTime");
         send_view_focus_event_va = dlsym(handle, b"FlutterEngineSendViewFocusEvent");
         RUN_TASK_FN.store(dlsym(handle, b"FlutterEngineRunTask"), Ordering::SeqCst);
+        UPDATE_SEMANTICS_ENABLED_FN.store(
+            dlsym(handle, b"FlutterEngineUpdateSemanticsEnabled"),
+            Ordering::SeqCst,
+        );
     }
 
     if initialize_va == 0
@@ -2330,6 +2547,14 @@ extern "C" fn main_embedder() {
         OFF_PROJECT_ARGS_LOG_MESSAGE_CALLBACK,
         log_message_callback as *const () as u64,
     );
+    // Wire the semantics update callback so that once we enable semantics the
+    // engine actually delivers the accessibility tree to us (stored in
+    // SEMANTICS_TREE for a11y / automation consumers).
+    write_u64_at(
+        &mut project_args.bytes,
+        OFF_PROJECT_ARGS_UPDATE_SEMANTICS_CALLBACK2,
+        update_semantics_callback2 as *const () as u64,
+    );
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_DART_OLD_GEN_HEAP_SIZE,
@@ -2461,6 +2686,26 @@ extern "C" fn main_embedder() {
         exit(-1);
     }
     write(b"[embedder] FlutterEngineRunInitialized OK\n");
+
+    // 9b. Enable the semantics pipeline. With the callback wired (above) this
+    // makes the engine compute and deliver the accessibility tree to
+    // update_semantics_callback2, which we store for a11y / automation use.
+    {
+        let sem_va = UPDATE_SEMANTICS_ENABLED_FN.load(Ordering::SeqCst);
+        if sem_va != 0 {
+            let update_semantics_enabled: unsafe extern "C" fn(u64, bool) -> i32 =
+                unsafe { core::mem::transmute(sem_va) };
+            let rc_sem = unsafe { update_semantics_enabled(engine_out, true) };
+            if rc_sem == 0 {
+                SEMANTICS_ENABLED.store(true, Ordering::Release);
+                write(b"[embedder] semantics enabled\n");
+            } else {
+                write(b"[embedder] WARN: UpdateSemanticsEnabled non-zero\n");
+            }
+        } else {
+            write(b"[embedder] WARN: FlutterEngineUpdateSemanticsEnabled not found\n");
+        }
+    }
 
     // 10. Immediately notify display topology (now that shell exists)
     {
@@ -2606,6 +2851,7 @@ extern "C" fn main_embedder() {
     if flush_pending_va == 0 {
         write(b"[embedder] WARN: __FlutterEngineFlushPendingTasksNow not found\n");
     }
+    FLUSH_PENDING_FN.store(flush_pending_va, Ordering::SeqCst);
     let flush_pending: Option<unsafe extern "C" fn()> = if flush_pending_va != 0 {
         Some(unsafe { core::mem::transmute(flush_pending_va) })
     } else {

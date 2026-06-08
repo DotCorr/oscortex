@@ -186,6 +186,11 @@ pub fn set_tsc_hz(tsc_hz: u64) {
     VSYNC_TSC_PERIOD.store(period, Ordering::Release);
 }
 
+/// Current assumed/measured TSC frequency in Hz.
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
 /// Returns `true` and updates the last-vsync timestamp if enough TSC time has
 /// elapsed for the next vsync.  Designed to be called from the APIC timer ISR.
 #[inline]
