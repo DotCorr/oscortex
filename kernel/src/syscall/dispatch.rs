@@ -403,6 +403,13 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         eabi::SYS_APP_LAUNCH    => sys_app_launch(arg0, arg1),
         eabi::SYS_APP_UNINSTALL => sys_app_uninstall(arg0),
 
+        // Phase 70 — Flutter platform-contract OS capabilities.
+        eabi::SYS_CURSOR_SHAPE_SET     => sys_cursor_shape_set(arg0),
+        eabi::SYS_CLIPBOARD_SET        => sys_clipboard_set(arg0, arg1),
+        eabi::SYS_CLIPBOARD_GET        => sys_clipboard_get(arg0, arg1),
+        eabi::SYS_APP_CLOSE_FOREGROUND => sys_app_close_foreground(),
+        eabi::SYS_BEEP                 => sys_beep(arg0, arg1),
+
         // On-demand package delivery
         eabi::SYS_PKG_RESOLVE    => sys_pkg_resolve(arg0, arg1),
         eabi::SYS_PKG_CATALOG    => sys_pkg_catalog(arg0, arg1),
