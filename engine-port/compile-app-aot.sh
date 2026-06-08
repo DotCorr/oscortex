@@ -21,6 +21,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="${1:?usage: compile-app-aot.sh <app_dir> <out_libapp.so>}"
 OUT="${2:?usage: compile-app-aot.sh <app_dir> <out_libapp.so>}"
 CONTAINER="oscx-engine"
+# Which built engine out/ dir's gen_snapshot to use. Defaults to the x86_64
+# release. For an arm64 (aarch64) libapp.so, point this at the arm64 build:
+#   OSCORTEX_ENGINE_OUT=oscortex_arm64_release engine-port/compile-app-aot.sh ...
+# The gen_snapshot MUST match the engine the app runs against (same arch + tree).
+ENGINE_OUT="${OSCORTEX_ENGINE_OUT:-oscortex_release}"
 
 FL="${FLUTTER_ROOT:-/opt/homebrew/share/flutter}"
 DARTAOT="$FL/bin/cache/dart-sdk/bin/dartaotruntime"
@@ -49,7 +54,7 @@ echo "[aot] 2/2 gen_snapshot (version-matched): app_aot.dill -> libapp.so"
 if [ -x "$GEN_SNAP" ]; then
   echo "[aot]   (note: staged gen_snapshot is linux-x64; running it via the build container)"
 fi
-docker exec "$CONTAINER" /work/engine/engine/src/out/oscortex_release/gen_snapshot \
+docker exec "$CONTAINER" "/work/engine/engine/src/out/$ENGINE_OUT/gen_snapshot" \
   --snapshot_kind=app-aot-elf --elf=/work/libapp.so --strip /work/app_aot.dill
 
 mkdir -p "$(dirname "$OUT")"

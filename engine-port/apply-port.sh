@@ -37,6 +37,16 @@ docker exec "$CONTAINER" bash -c '
   elif git apply --reverse --check /tmp/0001.patch 2>/dev/null; then echo "[apply-port] already applied: 0001 (skip)";
   else echo "[apply-port] WARN: 0001 does not apply cleanly" >&2; fi
 '
+#    0004 (multi-arch: --linux-cpu selects oscortex target_cpu = x64|arm64) is
+#    rooted at the flutter monorepo root, like 0001, and stacks on top of it.
+docker cp "$PATCHES/0004-gn-oscortex-arm64.patch" "$CONTAINER":/tmp/0004.patch
+docker exec "$CONTAINER" bash -c '
+  cd /work/engine
+  if git apply --check /tmp/0004.patch 2>/dev/null; then git apply /tmp/0004.patch && echo "[apply-port] applied 0004 (gn oscortex arm64)";
+  elif git apply --reverse --check /tmp/0004.patch 2>/dev/null; then echo "[apply-port] already applied: 0004 (skip)";
+  else echo "[apply-port] WARN: 0004 does not apply cleanly" >&2; fi
+'
+
 #    0002 is rooted at the build/ dep.
 apply_patch "$PATCHES/0002-buildconfig-is-oscortex.patch" "build"
 

@@ -17,6 +17,7 @@ engine-port/
   README.md                 — this file
   setup-engine-build.sh     — one-shot: container + depot_tools + gclient checkout
   build-engine.sh           — configure (gn) + build (ninja): baseline | oscortex
+  build-engine-arm64.sh     — same, cross-built to aarch64 (arm64) release/AOT
   apply-port.sh             — copy our platform backend + patches INTO the checkout
   patches/                  — diffs against the stock engine (gn target-os, BUILD.gn)
   src/                      — OSCortex platform backend sources (added 1:1 to engine)
@@ -71,6 +72,9 @@ engine-port/publish-engine.sh x64 release   # package + upload to R2
   port/Flutter change.
 - **Multi-arch:** same model, one tarball per ISA (`oscortex-arm64-release`, …) —
   the engine builds per-arch with a flag, so publishing is just more assets.
+  aarch64: `engine-port/build-engine-arm64.sh` cross-builds the arm64 release
+  engine + gen_snapshot from the same x64 host container (patch 0004 routes
+  `--linux-cpu=arm64` to `target_cpu=arm64`). Fetch with `fetch-engine.sh arm64`.
 
 ### Host setup (maintainer) — none needed
 GitHub Releases needs no bucket/account setup: `gh` (already used for PRs) is the

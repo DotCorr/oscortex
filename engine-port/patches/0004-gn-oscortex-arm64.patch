@@ -1,0 +1,19 @@
+diff --git a/engine/src/flutter/tools/gn b/engine/src/flutter/tools/gn
+index db5f59c4..45f7d678 100755
+--- a/engine/src/flutter/tools/gn
++++ b/engine/src/flutter/tools/gn
+@@ -198,8 +198,13 @@ def get_target_cpu(args):
+     return args.windows_cpu
+   if args.target_os == 'qnx':
+     return 'arm64'
+   if args.target_os == 'oscortex':
+-    return 'x64'
++    # OSCortex supports multi-arch. --linux-cpu selects the target arch
++    # (x64 default, or arm64 cross-compiled from an x64 host). Mirrors the
++    # linux arm64 cross-build path. See docs/native-engine-port.md + multiarch.txt.
++    if args.linux_cpu in ('arm64', 'x64'):
++      return args.linux_cpu
++    return 'x64'
+
+   # Host build. Default to x64 unless overridden.
+   if get_host_os() == 'mac' and args.mac_cpu:
