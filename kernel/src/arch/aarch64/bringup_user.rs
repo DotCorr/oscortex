@@ -209,6 +209,10 @@ fn emit_load_imm(asm: &mut heapless_vec::Vec, reg: u32, imm: u64) {
 }
 
 pub fn run() -> ! {
+    // Optional milestone 8: try to wake a secondary core via PSCI before we
+    // drop to EL0. Best-effort — single-core is the proven path.
+    crate::arch::aarch64::bringup_smp::try_wake_secondary();
+
     a64println!("[boot] Milestone 6 (SVC) + 7 (EL0): launching a user process...");
 
     // Map the user page into EL0 at USER_VA_BASE.

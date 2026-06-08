@@ -37,7 +37,12 @@ pub fn system_off() -> ! {
 }
 
 /// Bring a secondary CPU online at `entry` (physical) with context `ctx`.
-/// Returns the PSCI status (0 = success). SMP milestone helper.
+/// Returns the PSCI status (0 = success, negative = error). SMP milestone
+/// helper.
+///
+/// QEMU `-M virt` boots the kernel at EL1 and provides the PSCI conduit over
+/// HVC; we issue HVC here. If no conduit is active the call traps as Undefined
+/// (caught by the EL1 sync vector) — callers should treat SMP as best-effort.
 pub fn cpu_on(target_mpidr: u64, entry: u64, ctx: u64) -> i64 {
     let ret: i64;
     unsafe {
@@ -46,7 +51,7 @@ pub fn cpu_on(target_mpidr: u64, entry: u64, ctx: u64) -> i64 {
             "mov x1, {mpidr}",
             "mov x2, {entry}",
             "mov x3, {ctx}",
-            "smc #0",
+            "hvc #0",
             "mov {ret}, x0",
             fn_id = in(reg) PSCI_CPU_ON,
             mpidr = in(reg) target_mpidr,

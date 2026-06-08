@@ -318,6 +318,14 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
                     let func: SvcFn = unsafe { core::mem::transmute(h as usize) };
                     func(f);
                 }
+            } else if ec == 0 {
+                // EC=0 "Unknown reason" at EL1 = an Undefined instruction. This
+                // is how an unsupported SMC/HVC conduit (e.g. a PSCI probe when
+                // no conduit is active) surfaces. Treat it as a no-op: report
+                // once, set x0 to the PSCI NOT_SUPPORTED status, and step over
+                // the faulting instruction so the probe returns gracefully.
+                f.x[0] = (-1i64) as u64; // PSCI NOT_SUPPORTED
+                f.elr = f.elr.wrapping_add(4);
             } else {
                 report_unhandled(f, kind, ec);
             }

@@ -38,6 +38,7 @@ pub mod bringup_mmu;
 pub mod bringup_vectors;
 pub mod bringup_irq;
 pub mod bringup_user;
+pub mod bringup_smp;
 
 pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
