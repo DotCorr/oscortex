@@ -1760,7 +1760,46 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
 /// `enter_user_by_pid_noreturn`, otherwise the yielding thread will resume
 /// with stale rbx/rbp/r12–r15/rdi/rsi/etc. and corrupt its C++ caller's
 /// `this` pointer and locals.
+/// Per-CPU "already captured the user GPRs for the current syscall" flag.
+///
+/// The user GPR snapshot lives in a PER-CPU scratch area (`gs:[..]`), written by
+/// the syscall entry stub. It is shared by every thread on that core, so if a
+/// thread switch lands mid-handler (the wait loops `sti; hlt` and the timer ISR
+/// can switch threads), another thread's syscall entry OVERWRITES it. A later
+/// `save_full_user_gprs` would then read the *other* thread's callee-saved regs
+/// and store them into our context → on resume `rbx`/`rbp`/`r12-15` are garbage
+/// (observed: `MessageLoopOscortex::Run` resuming from `epoll_wait` with
+/// `rbx`=a Skia stride → SIGSEGV; the root of the "sporadic" render crashes).
+///
+/// Fix: capture ONCE, eagerly, at syscall entry (`capture_user_gprs_at_entry`,
+/// called from `dispatch_fast` while the snapshot is still fresh for THIS
+/// thread). This flag makes every subsequent yield-time `save_full_user_gprs`
+/// in the same syscall a no-op, so a clobbered per-CPU snapshot can never leak
+/// into our saved context.
+const GPR_CAP_MAX_CPUS: usize = 64;
+static GPRS_CAPTURED: [core::sync::atomic::AtomicBool; GPR_CAP_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; GPR_CAP_MAX_CPUS];
+
+#[inline]
+fn gpr_cap_cpu_idx() -> usize {
+    (crate::arch::smp::this_cpu().cpu_id as usize).min(GPR_CAP_MAX_CPUS - 1)
+}
+
+/// Capture the user GPRs into `pid`'s PTABLE slot at syscall ENTRY, while the
+/// per-CPU snapshot is guaranteed fresh for this thread. Marks them captured so
+/// later `save_full_user_gprs` calls this syscall don't re-read the (possibly
+/// since-clobbered) shared per-CPU snapshot.
+pub fn capture_user_gprs_at_entry(pid: u32) {
+    GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
+    save_full_user_gprs(pid);
+}
+
 pub fn save_full_user_gprs(pid: u32) {
+    // Only the first call per syscall (the eager entry capture) reads the
+    // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops.
+    if GPRS_CAPTURED[gpr_cap_cpu_idx()].swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let snap = crate::arch::syscall::user_gprs();
     if pid == 2 {
         log::warn!(
