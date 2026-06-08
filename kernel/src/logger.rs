@@ -55,7 +55,11 @@ pub fn init(fb: Option<&limine::request::FramebufferResponse>) {
         crate::drivers::fb::init(fb_resp);
     }
     log::set_logger(&LOGGER).ok();
-    log::set_max_level(log::LevelFilter::Debug);
+    // Hot per-syscall traces (epoll_ctl, mprotect, cond-signal, keypress) at
+    // Debug/Warn flood the synchronous COM1 UART *and* re-render the framebuffer
+    // text console for every line, with interrupts disabled — tens of seconds of
+    // warmup on emulated bare metal. Default to Error; raise for deep debugging.
+    log::set_max_level(log::LevelFilter::Error);
 }
 
 /// Write a raw string to COM1 without going through the log framework.
