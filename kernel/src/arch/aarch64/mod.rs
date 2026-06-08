@@ -29,9 +29,11 @@ pub mod enter_user;
 pub mod uart;
 pub mod boot;
 pub mod mmu;
+pub mod vectors;
 pub mod bringup;
 pub mod bringup_mmu;
 pub mod bringup_vectors;
+pub mod bringup_irq;
 
 pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
