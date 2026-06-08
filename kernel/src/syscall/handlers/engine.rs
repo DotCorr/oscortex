@@ -743,6 +743,107 @@ pub(crate) fn sys_app_uninstall(app_id: u64) -> i64 {
     if crate::app_registry::uninstall(app_id as u32) { 0 } else { -2 } // ENOENT
 }
 
+// ── Flutter platform-contract capabilities (Phase 70) ────────────────────────
+
+/// Set the active mouse-cursor shape drawn by the compositor.
+/// `shape` is a `CURSOR_SHAPE_*` constant. Returns 0 on success, -EINVAL if
+/// the shape is out of range. Backs `flutter/mousecursor.activateSystemCursor`.
+pub(crate) fn sys_cursor_shape_set(shape: u64) -> i64 {
+    if crate::compositor::set_cursor_shape(shape as u32) {
+        0
+    } else {
+        -22 // EINVAL
+    }
+}
+
+/// Replace the system-wide clipboard with `len` bytes from `ptr`.
+/// Backs `flutter/platform` `Clipboard.setData`.
+pub(crate) fn sys_clipboard_set(ptr: u64, len: u64) -> i64 {
+    if len == 0 {
+        crate::embedder::clipboard::set(&[]);
+        return 0;
+    }
+    if len as usize > eabi::CLIPBOARD_MAX {
+        return -22; // EINVAL
+    }
+    let data = match unsafe { read_user_bytes(ptr, len as usize) } {
+        Some(b) => b,
+        None => return -14, // EFAULT
+    };
+    crate::embedder::clipboard::set(data);
+    0
+}
+
+/// Copy the system-wide clipboard into the user buffer at `buf_ptr`.
+/// Returns the FULL stored length (may exceed `buf_len`, signalling truncation);
+/// if `buf_ptr` is 0 returns the length without copying. Backs
+/// `flutter/platform` `Clipboard.getData` / `Clipboard.hasStrings`.
+pub(crate) fn sys_clipboard_get(buf_ptr: u64, buf_len: u64) -> i64 {
+    if buf_ptr == 0 || buf_len == 0 {
+        return crate::embedder::clipboard::len() as i64;
+    }
+    if buf_len as usize > eabi::CLIPBOARD_MAX {
+        return -22; // EINVAL
+    }
+    // Copy clipboard into a kernel staging buffer, then to user space.
+    let cap = (buf_len as usize).min(eabi::CLIPBOARD_MAX);
+    let mut staging = alloc::vec![0u8; cap];
+    let full_len = crate::embedder::clipboard::get(&mut staging);
+    let copied = full_len.min(cap);
+    if !unsafe { write_user_bytes(buf_ptr, &staging[..copied]) } {
+        return -14; // EFAULT
+    }
+    // Return the FULL stored length so the caller can detect truncation.
+    full_len as i64
+}
+
+/// Close the foreground application and return focus to the shell (pid 1).
+///
+/// Called by the foreground app's embedder on `SystemNavigator.pop` when there
+/// is no in-app route left to pop. The caller (the foreground host) is expected
+/// to terminate itself after this returns; we refocus the shell so it resumes,
+/// and wake it if it was parked. Returns the shell pid (1).
+pub(crate) fn sys_app_close_foreground() -> i64 {
+    const SHELL_PID: u32 = 1;
+    let caller = crate::process::current_pid();
+
+    // Only a launched app (not the shell itself) may close to the shell.
+    if caller == SHELL_PID {
+        return SHELL_PID as i64;
+    }
+
+    // Hand focus back to the shell: this delivers EV_FOCUS FOCUS_GAINED to pid 1
+    // (it resumes its frame pump) and FOCUS_LOST to the foreground app.
+    crate::wm::set_focus_pid(SHELL_PID);
+
+    // If the shell was parked/blocked (foreground-exclusive scheduling suspends
+    // background groups), wake it so it can take over rendering again.
+    if crate::process::is_blocked(SHELL_PID) {
+        crate::process::set_state(SHELL_PID, crate::process::ProcState::Running);
+    }
+
+    log::info!(
+        "[APP] close_foreground: pid={} → refocus shell (pid {})",
+        caller, SHELL_PID
+    );
+    SHELL_PID as i64
+}
+
+/// Emit a PC-speaker tone (SystemSound.play / a generic beep).
+/// `freq_hz` of 0 plays the default system beep; durations are clamped by the
+/// driver. On non-x86 hardware (no PC speaker) this is a no-op.
+pub(crate) fn sys_beep(freq_hz: u64, duration_ms: u64) -> i64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::drivers::beep::play(freq_hz as u32, duration_ms);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (freq_hz, duration_ms);
+    }
+    0
+}
+
 // ── On-demand package delivery ───────────────────────────────────────────────
 
 /// Resolve a package by name — fetch on demand if not cached.

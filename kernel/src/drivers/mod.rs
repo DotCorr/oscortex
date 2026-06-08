@@ -1,5 +1,7 @@
 //! Driver subsystem root.
 
+#[cfg(target_arch = "x86_64")]
+pub mod beep;
 pub mod common;
 pub mod fb;
 pub mod nvme;
