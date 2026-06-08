@@ -1831,6 +1831,16 @@ extern "C" fn main_embedder() {
         if ev.kind == EV_POINTER || ev.kind == EV_KEY || ev.kind == EV_SCROLL {
             last_input_ns = rdtsc_ns();
             frame_pump_next_ns = last_input_ns;
+            // Request a frame RIGHT NOW so the reaction (hover highlight, button
+            // press, scroll) paints this same iteration instead of waiting up to
+            // ~16ms for the idle pump in the no-event branch to notice. The engine
+            // coalesces redundant requests, and Flutter batches the pointer packet
+            // (sent just below in the match) + flushes it at BeginFrame, so the
+            // scheduled frame still reflects this event. This is the input latency
+            // the user sees as a "few ms, very noticeable" feedback delay.
+            if focused && engine_out != 0 && proctable.schedule_frame != 0 {
+                let _ = schedule_frame_with_log(engine_out, proctable.schedule_frame, b"input");
+            }
         }
 
         match ev.kind {
