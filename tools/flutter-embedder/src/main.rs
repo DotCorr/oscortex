@@ -1479,7 +1479,10 @@ extern "C" fn main_embedder() {
                 write(b"[host] APP libapp.so: ");
                 write(&libapp[..libapp.len().saturating_sub(1)]);
                 write(b"\n");
-                sys::dlopen(libapp, 0);
+                // dlopen uses the byte length (not NUL-termination), so pass the
+                // path WITHOUT the trailing NUL or the kernel treats it as part of
+                // the filename and the open fails.
+                sys::dlopen(&libapp[..libapp.len().saturating_sub(1)], 0);
                 configure_aot_snapshots(&mut project_args, 0, libapp);
             } else {
                 write(b"[host] WARNING: no libapp.so path for app\n");
@@ -1490,7 +1493,7 @@ extern "C" fn main_embedder() {
         configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
         if is_aot {
             write(b"[embedder] registering shell libapp.so globally...\n");
-            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so\0", 0);
+            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so", 0);
             if aot_handle <= 0 {
                 write(b"[embedder] WARNING: dlopen /system/flutter/libapp.so failed\n");
             } else {
