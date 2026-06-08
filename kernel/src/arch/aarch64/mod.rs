@@ -23,6 +23,9 @@ pub mod cpu;
 pub mod syscall;
 pub mod acpi;
 pub mod smp;
+pub mod enter_user;
+
+pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
 use core::arch::asm;
 
@@ -79,6 +82,21 @@ pub fn smp_init(resp: Option<&'static limine::request::MpResponse>) {
 #[inline(always)]
 pub fn halt() {
     unsafe { asm!("wfi", options(nomem, nostack)) };
+}
+
+/// Unmask interrupts, wait for one (WFI), then mask again.
+///
+/// Mirror of the x86_64 `sti; hlt; cli` idle pattern.
+#[inline(always)]
+pub fn enable_and_halt() {
+    unsafe {
+        asm!(
+            "msr daifclr, #0b0011",
+            "wfi",
+            "msr daifset, #0b0011",
+            options(nomem, nostack),
+        )
+    };
 }
 
 /// Permanently halt this core (used in panic).

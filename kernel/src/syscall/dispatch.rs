@@ -695,7 +695,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             if buf == 0 || len == 0 { return 0; }
             // Best-effort: cap at 256 MiB to avoid runaway.
             let n = len.min(256 * 1024 * 1024);
-            let mut s: u64 = unsafe { core::arch::x86_64::_rdtsc() } ^ 0xA5A5_F00D_DEAD_BEEFu64;
+            let mut s: u64 = crate::arch::rdtsc() ^ 0xA5A5_F00D_DEAD_BEEFu64;
             unsafe {
                 let p = buf as *mut u8;
                 let mut i = 0usize;

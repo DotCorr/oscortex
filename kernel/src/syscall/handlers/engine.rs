@@ -1258,12 +1258,12 @@ pub(crate) fn sys_sched_yield() -> i64 {
         } else if cur == 1 {
             // OnVsync posts work to runner threads — sleep briefly so they can run (SMP or IRQ wake).
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
         } else {
             // No other runnable process — sleep until the next IRQ (timerfd, vsync…).
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
         }
     }

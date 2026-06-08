@@ -640,7 +640,7 @@ pub(crate) fn sys_exit(code: u64) -> i64 {
     }
     // No runnable user process left.
     loop {
-        unsafe { core::arch::asm!("sti; hlt; cli", options(nomem, nostack)); }
+        crate::arch::enable_and_halt();
     }
 }
 
@@ -768,8 +768,5 @@ pub(crate) fn sys_exec_wait(path_ptr: u64, path_len: u64) -> i64 {
 
 pub(crate) fn sys_poweroff() -> i64 {
     log::info!("[syscall] sys_poweroff requested — triggering ACPI S5 shutdown");
-    #[cfg(target_arch = "x86_64")]
     crate::arch::acpi_shutdown();
-    #[cfg(not(target_arch = "x86_64"))]
-    loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }

@@ -1243,13 +1243,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     crate::arch::cpu::set_fs_base(fs_base);
 
     // Switch to the user address space.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {cr3}",
-            cr3 = in(reg) pml4_phys,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
+    crate::arch::memory::write_cr3(pml4_phys);
 
     // Deliver pending errno (e.g. EINTR=4 from sys_epoll_wait_real) NOW,
     // after the CR3 switch so we write into the resuming thread's own SYSDATA
@@ -1264,6 +1258,15 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         }
     }
 
+    // Assemble the full user register state for the arch entry hook. The
+    // arch backend owns the actual ring-3 transition asm (IRETQ vs SYSRETQ on
+    // x86_64); the shared code above owns all the PTABLE/CR3/errno logic.
+    let enter_regs = crate::arch::EnterUserRegs {
+        rip, rsp, rflags,
+        rax, rbx, rcx, rdx, rsi, rdi, rbp,
+        r8, r9, r10, r11, r12, r13, r14, r15,
+    };
+
     if preempted_by_timer {
         // ── IRET path ────────────────────────────────────────────────────────
         // This thread was timer-preempted at an arbitrary user instruction, so
@@ -1271,67 +1274,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         // RFLAGS) before returning.  SYSRETQ is wrong here because it would
         // set RIP=RCX and RFLAGS=R11, corrupting those registers and losing
         // the real FLAGS state (e.g. CF/ZF from a cmp instruction).
-        //
-        // Layout of iret_frame (accessed via r11 as base register):
-        //   [r11 + 0x00]  RIP   ─┐
-        //   [r11 + 0x08]  CS      │ hardware IRET frame pushed onto
-        //   [r11 + 0x10]  RFLAGS  │ the kernel stack by the `push` sequence
-        //   [r11 + 0x18]  RSP    ─┘ (ring-3 switch includes RSP+SS)
-        //   [r11 + 0x20]  SS
-        //   [r11 + 0x28]  RAX .. R15  (all user GPRs, r11 loaded last)
-        let iret_frame: [u64; 20] = [
-            /* 0x00 */ rip,
-            /* 0x08 */ crate::arch::gdt::USER_CS as u64,   // 0x2B
-            /* 0x10 */ rflags | 0x200,  // ensure IF=1
-            /* 0x18 */ rsp,
-            /* 0x20 */ crate::arch::gdt::USER_DS as u64,   // 0x23
-            /* 0x28 */ rax,
-            /* 0x30 */ rbx,
-            /* 0x38 */ rcx,   // real RCX (not SYSCALL convention)
-            /* 0x40 */ rdx,
-            /* 0x48 */ rdi,
-            /* 0x50 */ rsi,
-            /* 0x58 */ rbp,
-            /* 0x60 */ r8,
-            /* 0x68 */ r9,
-            /* 0x70 */ r10,
-            /* 0x78 */ r11,   // real R11 (not RFLAGS convention)
-            /* 0x80 */ r12,
-            /* 0x88 */ r13,
-            /* 0x90 */ r14,
-            /* 0x98 */ r15,
-        ];
-        unsafe {
-            core::arch::asm!(
-                // Push the 5-word IRET frame: SS, RSP, RFLAGS, CS, RIP.
-                // These land on the current kernel stack; IRETQ will consume
-                // them and switch to the user stack (RSP) automatically.
-                "push qword ptr [r11 + 0x20]",  // SS
-                "push qword ptr [r11 + 0x18]",  // RSP
-                "push qword ptr [r11 + 0x10]",  // RFLAGS
-                "push qword ptr [r11 + 0x08]",  // CS
-                "push qword ptr [r11 + 0x00]",  // RIP
-                // Restore all user GPRs (r11 last because it is our base ptr).
-                "mov rax, [r11 + 0x28]",
-                "mov rbx, [r11 + 0x30]",
-                "mov rcx, [r11 + 0x38]",
-                "mov rdx, [r11 + 0x40]",
-                "mov rdi, [r11 + 0x48]",
-                "mov rsi, [r11 + 0x50]",
-                "mov rbp, [r11 + 0x58]",
-                "mov r8,  [r11 + 0x60]",
-                "mov r9,  [r11 + 0x68]",
-                "mov r10, [r11 + 0x70]",
-                "mov r12, [r11 + 0x80]",
-                "mov r13, [r11 + 0x88]",
-                "mov r14, [r11 + 0x90]",
-                "mov r15, [r11 + 0x98]",
-                "mov r11, [r11 + 0x78]",   // real R11 — must be last
-                "iretq",
-                in("r11") iret_frame.as_ptr(),
-                options(noreturn),
-            )
-        }
+        unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
     // ── SYSRET path (syscall-yield context) ──────────────────────────────────
@@ -1342,58 +1285,8 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // RAX changed to the syscall return value. This is required because the
     // SysV ABI mandates that callee-saved regs (rbx, rbp, r12–r15) survive
     // a function call, and the userspace SYSCALL trampoline is such a call.
-    //
-    // Stage values in a fixed-layout stack array and load them inside the asm
-    // block via a single pointer. RSP and the syscall-consumed regs (RCX,
-    // R11) are loaded last so all intermediate reads complete first.
-    let frame: [u64; 16] = [
-        /* 0x00 */ rip,
-        /* 0x08 */ rflags,
-        /* 0x10 */ rsp,
-        /* 0x18 */ rdi,
-        /* 0x20 */ rsi,
-        /* 0x28 */ rdx,
-        /* 0x30 */ rax,
-        /* 0x38 */ rbx,
-        /* 0x40 */ rbp,
-        /* 0x48 */ r8,
-        /* 0x50 */ r9,
-        /* 0x58 */ r10,
-        /* 0x60 */ r12,
-        /* 0x68 */ r13,
-        /* 0x70 */ r14,
-        /* 0x78 */ r15,
-    ];
     log::trace!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
-    unsafe {
-        core::arch::asm!(
-            // Pin the frame base in r11. r11 is consumed by SYSRET (as user
-            // RFLAGS) and is the LAST register we load — every other load
-            // can therefore use [r11 + disp] safely. If we let the compiler
-            // pick the base register, it can alias the base with the first
-            // destination (e.g. rax) and have the very first `mov` clobber
-            // the pointer before any further reads happen.
-            "mov rax, [r11 + 0x30]",
-            "mov rdi, [r11 + 0x18]",
-            "mov rsi, [r11 + 0x20]",
-            "mov rdx, [r11 + 0x28]",
-            "mov rbx, [r11 + 0x38]",
-            "mov rbp, [r11 + 0x40]",
-            "mov r8,  [r11 + 0x48]",
-            "mov r9,  [r11 + 0x50]",
-            "mov r10, [r11 + 0x58]",
-            "mov r12, [r11 + 0x60]",
-            "mov r13, [r11 + 0x68]",
-            "mov r14, [r11 + 0x70]",
-            "mov r15, [r11 + 0x78]",
-            "mov rcx, [r11 + 0x00]",   // user RIP   → RCX (consumed by sysretq)
-            "mov rsp, [r11 + 0x10]",   // switch to user stack (mapped in user PML4)
-            "mov r11, [r11 + 0x08]",   // user RFL  → R11 (consumed by sysretq) — load LAST
-            "sysretq",
-            in("r11") frame.as_ptr(),
-            options(noreturn),
-        )
-    }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
 pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
@@ -1446,13 +1339,7 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
     crate::arch::cpu::set_fs_base(fs_base);
 
     // Switch to the user address space.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {cr3}",
-            cr3 = in(reg) pml4_phys,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
+    crate::arch::memory::write_cr3(pml4_phys);
 
     if errno_to_deliver != 0 {
         unsafe {
@@ -1463,99 +1350,17 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         }
     }
 
+    let enter_regs = crate::arch::EnterUserRegs {
+        rip, rsp, rflags,
+        rax, rbx, rcx, rdx, rsi, rdi, rbp,
+        r8, r9, r10, r11, r12, r13, r14, r15,
+    };
+
     if preempted_by_timer {
-        let iret_frame: [u64; 20] = [
-            /* 0x00 */ rip,
-            /* 0x08 */ crate::arch::gdt::USER_CS as u64,
-            /* 0x10 */ rflags | 0x200,
-            /* 0x18 */ rsp,
-            /* 0x20 */ crate::arch::gdt::USER_DS as u64,
-            /* 0x28 */ rax,
-            /* 0x30 */ rbx,
-            /* 0x38 */ rcx,
-            /* 0x40 */ rdx,
-            /* 0x48 */ rdi,
-            /* 0x50 */ rsi,
-            /* 0x58 */ rbp,
-            /* 0x60 */ r8,
-            /* 0x68 */ r9,
-            /* 0x70 */ r10,
-            /* 0x78 */ r11,
-            /* 0x80 */ r12,
-            /* 0x88 */ r13,
-            /* 0x90 */ r14,
-            /* 0x98 */ r15,
-        ];
-        unsafe {
-            core::arch::asm!(
-                "push qword ptr [r11 + 0x20]",
-                "push qword ptr [r11 + 0x18]",
-                "push qword ptr [r11 + 0x10]",
-                "push qword ptr [r11 + 0x08]",
-                "push qword ptr [r11 + 0x00]",
-                "mov rax, [r11 + 0x28]",
-                "mov rbx, [r11 + 0x30]",
-                "mov rcx, [r11 + 0x38]",
-                "mov rdx, [r11 + 0x40]",
-                "mov rdi, [r11 + 0x48]",
-                "mov rsi, [r11 + 0x50]",
-                "mov rbp, [r11 + 0x58]",
-                "mov r8,  [r11 + 0x60]",
-                "mov r9,  [r11 + 0x68]",
-                "mov r10, [r11 + 0x70]",
-                "mov r12, [r11 + 0x80]",
-                "mov r13, [r11 + 0x88]",
-                "mov r14, [r11 + 0x90]",
-                "mov r15, [r11 + 0x98]",
-                "mov r11, [r11 + 0x78]",
-                "iretq",
-                in("r11") iret_frame.as_ptr(),
-                options(noreturn),
-            )
-        }
+        unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
-    let frame: [u64; 16] = [
-        /* 0x00 */ rip,
-        /* 0x08 */ rflags,
-        /* 0x10 */ rsp,
-        /* 0x18 */ rdi,
-        /* 0x20 */ rsi,
-        /* 0x28 */ rdx,
-        /* 0x30 */ rax,
-        /* 0x38 */ rbx,
-        /* 0x40 */ rbp,
-        /* 0x48 */ r8,
-        /* 0x50 */ r9,
-        /* 0x58 */ r10,
-        /* 0x60 */ r12,
-        /* 0x68 */ r13,
-        /* 0x70 */ r14,
-        /* 0x78 */ r15,
-    ];
-    unsafe {
-        core::arch::asm!(
-            "mov rax, [r11 + 0x30]",
-            "mov rdi, [r11 + 0x18]",
-            "mov rsi, [r11 + 0x20]",
-            "mov rdx, [r11 + 0x28]",
-            "mov rbx, [r11 + 0x38]",
-            "mov rbp, [r11 + 0x40]",
-            "mov r8,  [r11 + 0x48]",
-            "mov r9,  [r11 + 0x50]",
-            "mov r10, [r11 + 0x58]",
-            "mov r12, [r11 + 0x60]",
-            "mov r13, [r11 + 0x68]",
-            "mov r14, [r11 + 0x70]",
-            "mov r15, [r11 + 0x78]",
-            "mov rcx, [r11 + 0x00]",
-            "mov rsp, [r11 + 0x10]",
-            "mov r11, [r11 + 0x08]",
-            "sysretq",
-            in("r11") frame.as_ptr(),
-            options(noreturn),
-        )
-    }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
 /// Kernel-task entry point: loads the user PML4 and SYSRETs to ring-3.
@@ -1571,7 +1376,7 @@ fn user_launch_task() {
     // Disable interrupts so the APIC timer cannot preempt between
     // mark_current_zombie() and sysretq.  SYSRET restores RFLAGS from R11
     // (0x0202 = IF=1), so the user process runs with interrupts enabled.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
+    crate::arch::interrupts_disable();
     // Mark this kernel task as Zombie before we SYSRET.  The SYSRET transfers
     // execution to ring-3 permanently; this task slot must never be resumed as
     // a kernel task again.  Marking it Zombie prevents the scheduler from

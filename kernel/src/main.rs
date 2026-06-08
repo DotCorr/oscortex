@@ -69,7 +69,10 @@ static FB_REQUEST: FramebufferRequest = FramebufferRequest::new();
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 static MMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 static KADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
+#[cfg(target_arch = "x86_64")]
 static SMP_REQUEST: MpRequest = MpRequest::new(limine::mp::MP_FLAG_X2APIC);
+#[cfg(not(target_arch = "x86_64"))]
+static SMP_REQUEST: MpRequest = MpRequest::new(0);
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
 /// Slice of libflutter_engine.so as provided by Limine, stored once at boot.

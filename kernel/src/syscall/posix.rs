@@ -1020,7 +1020,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
         while atom.load(Ordering::Acquire) != 0 && super::futex_waiter_present(mutex, pid) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
             if let Some(next) = mutex_handoff_target() {
                 if next != pid {
@@ -1186,7 +1186,7 @@ pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
         while atom.load(Ordering::Acquire) != 2 && super::futex_waiter_present(once, pid) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
             if let Some(next) = crate::process::next_runnable_pid(pid) {
                 if next != pid {
@@ -1394,7 +1394,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     }
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
-                        core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                        { crate::arch::enable_and_halt(); }
                     }
                     if let Some(next) = super::cooperative_sched_target(pid) {
                         if next != pid {
@@ -2039,9 +2039,7 @@ pub fn sys_sem_wait(sem: u64) -> i64 {
         {
             break;
         }
-        unsafe {
-            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
-        }
+        crate::arch::spin_pause();
     }
     0
 }
@@ -2181,9 +2179,7 @@ pub fn sys_abort() -> ! {
     super::dump_user_backtrace(16);
     super::sys_exit((-6i64) as u64);
     loop {
-        unsafe {
-            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
-        }
+        crate::arch::enable_and_halt();
     }
 }
 
@@ -2220,21 +2216,14 @@ pub fn sys_nanosleep(req: u64, _rem: u64) -> i64 {
     let secs = unsafe { *(req as *const u64) };
     // Yield for approximately secs * 1000 iterations (very rough).
     for _ in 0..(secs * 1000).min(10000) {
-        unsafe {
-            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
-        }
+        crate::arch::spin_pause();
     }
     0
 }
 
 /// Fake monotonic time: use TSC / 1000 as nanoseconds.
 fn read_tsc() -> u64 {
-    let lo: u32;
-    let hi: u32;
-    unsafe {
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-    }
-    ((hi as u64) << 32) | lo as u64
+    crate::arch::rdtsc()
 }
 
 pub fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {

@@ -613,10 +613,7 @@ pub fn monotonic_ns() -> u64 {
     //   1_700_000_000 * 10^9 + tsc_ns
     // timerfd_settime with TFD_TIMER_ABSTIME passes this value, so our
     // "now" must use the same epoch or timers will never fire.
-    let lo: u32;
-    let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
-    let tsc_ns = (((hi as u64) << 32) | lo as u64) / 3;
+    let tsc_ns = crate::arch::rdtsc() / 3;
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
 }
 
@@ -1330,7 +1327,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
 
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            { crate::arch::enable_and_halt(); }
         }
     }
 }

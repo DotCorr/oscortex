@@ -486,7 +486,7 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
@@ -585,7 +585,7 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
@@ -767,7 +767,7 @@ pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
                     if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
                     return 0;
                 }
-                unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+                crate::arch::spin_pause();
             }
             Err(_) => {
                 if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }

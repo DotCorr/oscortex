@@ -461,9 +461,7 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
     if error & 0x1 != 0 { return false; } // page present — protection fault, not demand page
 
     // Read current CR3 to get the active PML4.
-    let cr3_phys: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_phys) };
-    let cr3_phys = cr3_phys & 0x000f_ffff_ffff_f000;
+    let cr3_phys = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
 
     let page_va = cr2 & !0xFFF;
 

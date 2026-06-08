@@ -672,7 +672,7 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         while crate::process::is_blocked(cur) {
             #[cfg(target_arch = "x86_64")]
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
 
             if !crate::process::is_blocked(cur) {

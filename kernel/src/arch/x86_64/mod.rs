@@ -13,6 +13,9 @@ pub(crate) mod port_io;
 pub mod syscall;
 pub mod acpi;
 pub mod smp;
+pub mod enter_user;
+
+pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
 
 // Re-export commonly used types so external code uses `crate::arch::InterruptFrame`
 pub use idt::InterruptFrame;
@@ -66,6 +69,15 @@ pub fn smp_init(resp: Option<&'static limine::request::MpResponse>) {
 #[inline(always)]
 pub fn halt() {
     unsafe { asm!("hlt") }
+}
+
+/// Enable interrupts, halt until one arrives, then disable interrupts again.
+///
+/// The `sti; hlt` pair is atomic on x86 (STI defers IF until after the next
+/// instruction), so no interrupt can sneak in between enabling and halting.
+#[inline(always)]
+pub fn enable_and_halt() {
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack)) }
 }
 
 /// Permanently halt (used in panic).
