@@ -26,6 +26,19 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         return crate::process::posix_trampolines::libm_call(number, arg0, arg1, arg2);
     }
 
+    // Eagerly snapshot this thread's user GPRs NOW, while the per-CPU entry
+    // snapshot (gs:[..]) is still fresh for us — before any handler runs, yields,
+    // or opens an interrupt window in which another thread's syscall entry could
+    // clobber the shared per-CPU snapshot. This is what makes a thread that
+    // yields inside a syscall (e.g. epoll_wait) resume with its OWN callee-saved
+    // registers intact, instead of leaking another thread's rbx/rbp/r12-15.
+    {
+        let cur = crate::process::current_pid();
+        if cur != 0 {
+            crate::process::capture_user_gprs_at_entry(cur);
+        }
+    }
+
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
 
