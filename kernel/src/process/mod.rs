@@ -859,9 +859,26 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
 }
 
 pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
-    let focus = crate::wm::focus_pid();
+    // FOREGROUND-EXCLUSIVE SCHEDULING. When an app is foreground (focus is not the
+    // shell pid 1), run ONLY that app's thread group and leave the backgrounded
+    // shell suspended. Two concurrent heavy Flutter VMs overwhelm the cooperative
+    // scheduler's context save/restore — a backgrounded host's thread gets switched
+    // in with a corrupted callee-saved reg (rbx/r12=garbage `this`) and #GPs (e.g.
+    // the app's dart EventHandler::Poll). Serialising to one VM group at a time keeps
+    // the (reliable) single-host path. Computed FIRST so the input/baton priority
+    // shortcuts below also honour it — otherwise a due shell (pid 1) baton would
+    // schedule the shell engine alongside a foreground app, which is exactly the
+    // two-VM concurrency that crashes the launched app.
+    let fg = crate::wm::focus_pid();
+    let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
+    let exclusive = fg_group > 1;
+
+    let focus = fg;
     let input_target = if focus != 0 { focus } else { 1 };
-    if input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
+    // Only honour the input shortcut when the target belongs to the foreground
+    // group (or nothing is exclusive). Prevents jumping to a backgrounded host.
+    let input_ok = !exclusive || get_group_leader_locked(input_target) == fg_group;
+    if input_ok && input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
         if current != input_target {
             let target = unsafe { &mut PTABLE[idx_of(input_target)] };
             if target.pid == input_target && target.state == ProcState::Running {
@@ -873,7 +890,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
         }
     }
 
-    if current != 1 && crate::wm::embedder_baton_due() {
+    // Shell (pid 1) baton shortcut — SUPPRESSED while an app is foreground, so the
+    // shell engine cannot run concurrently with the launched app.
+    if !exclusive && current != 1 && crate::wm::embedder_baton_due() {
         let embedder = unsafe { &mut PTABLE[idx_of(1)] };
         if embedder.pid == 1 && embedder.state == ProcState::Running {
             if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
@@ -887,19 +906,6 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     if current == 0 {
         start = 0;
     }
-
-    // FOREGROUND-EXCLUSIVE SCHEDULING. When an app is foreground (focus is not the
-    // shell pid 1), run ONLY that app's thread group and leave the backgrounded
-    // shell suspended. Two concurrent heavy Flutter VMs overwhelm the cooperative
-    // scheduler's context save/restore — a backgrounded host's thread gets switched
-    // in with a corrupted resume RIP and #GPs. Serialising to one VM group at a time
-    // keeps the (reliable) single-host path. focus=1 means the shell is foreground
-    // and fg_group=1 covers the whole system as before (no behavioural change until
-    // an app is launched). Idle (pid 0) and the launcher are never starved because
-    // input/baton priority above already handled the focus pid.
-    let fg = crate::wm::focus_pid();
-    let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
-    let exclusive = fg_group > 1;
 
     let mut res = None;
     for off in 0..MAX_PROCS {
