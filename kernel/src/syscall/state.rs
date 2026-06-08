@@ -28,12 +28,6 @@ pub(crate) static SYSCALL_TRACE_HEAD: AtomicU32 = AtomicU32::new(0);
 pub(crate) static FUTEX_WAITERS: Mutex<BTreeMap<u64, Vec<u32>>> = Mutex::new(BTreeMap::new());
 pub(crate) static FUTEX_PENDING_WAKES: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
 
-/// Pending signals for cond variables: cond_addr → count of undelivered signals.
-/// When cond_broadcast/signal fires with no current waiters, we record the signal
-/// here so the *next* cond_wait on the same condvar sees it immediately instead of
-/// blocking forever. This is the standard "lost wakeup" fix.
-pub(crate) static COND_PENDING_SIGNALS: Mutex<BTreeMap<u64, u32>> = Mutex::new(BTreeMap::new());
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CondWaitState {
     Waiting { cond: u64, mutex: u64, seq: u32, timeout_ns: u64 },
