@@ -341,13 +341,10 @@ fn handle_mouse_byte(byte: u8) {
             if SCROLL_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
                 log::warn!("[PS2 MOUSE] scroll x={} y={} dz={}", x, y, dz);
             }
-            // Deliver the wheel delta to the foreground host. The kernel side of
-            // the scroll channel (`wm::push_scroll` → `EV_SCROLL` → embedder
-            // `FlutterPointerEvent` with `signal_kind = kScroll`) is the only
-            // remaining wiring; once it lands, replace this with:
-            //     crate::wm::push_scroll(x, y, dz);
-            // The PS/2 detection + 4-byte parse above is complete and correct.
-            let _ = dz;
+            // Deliver the wheel delta to the foreground host via the scroll
+            // channel: `wm::push_scroll` → `EV_SCROLL` → embedder
+            // `FlutterPointerEvent` with `signal_kind = kScroll`.
+            crate::wm::push_scroll(x, y, dz);
         }
     }
 }

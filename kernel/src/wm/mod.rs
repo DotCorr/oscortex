@@ -10,7 +10,7 @@ use spin::Mutex;
 
 pub const EVENT_CAP: usize = 256;
 
-pub use eabi::{EV_APP, EV_FOCUS, EV_KEY, EV_POINTER, EV_VSYNC};
+pub use eabi::{EV_APP, EV_FOCUS, EV_KEY, EV_POINTER, EV_SCROLL, EV_VSYNC};
 pub type WmEvent = eabi::WmEvent;
 
 #[inline(always)]
@@ -512,7 +512,7 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
     // pid 1 stays frozen mid cooperative-yield and the engine threads hog the
     // single core. Mirror push_vsync (which unconditionally wakes pid 1) so
     // clicks and keystrokes are never lost.
-    if kind == EV_POINTER || kind == EV_KEY {
+    if kind == EV_POINTER || kind == EV_KEY || kind == EV_SCROLL {
         let target = if owner_pid != 0 {
             owner_pid
         } else {
@@ -625,6 +625,28 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
         // to the engine host (pid 1) so Flutter reliably receives clicks.
         push_event_for(1, EV_POINTER, buttons, packed, b_val);
     }
+}
+
+/// Deliver a mouse scroll-wheel tick. `dz` is the signed wheel delta
+/// (negative = scroll toward the user / content down, positive = away / up).
+pub fn push_scroll(x: i32, y: i32, dz: i32) {
+    let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
+    let dz_bits = dz as u32 as u64; // preserve sign through i32→u32→u64
+
+    let focus = focus_pid();
+    if focus != 0 {
+        push_event_for(focus, EV_SCROLL, 0, packed, dz_bits);
+        return;
+    }
+
+    if !crate::compositor::is_fb_bypass() {
+        if let Some((_surf_id, owner_pid)) = crate::compositor::surface_at_point(x, y) {
+            push_event_for(owner_pid, EV_SCROLL, 0, packed, dz_bits);
+            return;
+        }
+    }
+
+    push_event_for(1, EV_SCROLL, 0, packed, dz_bits);
 }
 
 pub fn push_key(scancode: u32, pressed: bool) {

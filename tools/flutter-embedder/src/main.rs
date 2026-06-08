@@ -1955,6 +1955,75 @@ extern "C" fn main_embedder() {
                     write(b"\n");
                 }
             }
+            EV_SCROLL => {
+                // Mouse wheel. a = packed (x<<32 | y), b = signed dz (low 32 bits).
+                if engine_out != 0 && proctable.send_pointer_event != 0 {
+                    let x = ((ev.a >> 32) as i32) as f64;
+                    let y = (ev.a as u32) as f64;
+                    let dz = (ev.b as u32) as i32; // sign-preserved through u32
+
+                    // One wheel notch → a chunk of logical pixels. Wheel up (+dz)
+                    // scrolls content up, which is a negative scroll_delta_y in
+                    // Flutter's convention, so the base sign is negative.
+                    let base = 50.0_f64;
+                    let scroll_dy = -(dz as f64) * base;
+
+                    let engine_now_us = || -> u64 {
+                        if get_current_time_va != 0 {
+                            let get_time: GetCurrentTimeFn =
+                                unsafe { core::mem::transmute(get_current_time_va) };
+                            unsafe { get_time() / 1000 }
+                        } else {
+                            rdtsc_ns() / 1000
+                        }
+                    };
+
+                    static SCROLL_TS: AtomicU64 = AtomicU64::new(0);
+                    let mut timestamp = engine_now_us();
+                    loop {
+                        let last = SCROLL_TS.load(Ordering::SeqCst);
+                        let next = if timestamp <= last { last + 1 } else { timestamp };
+                        if SCROLL_TS
+                            .compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            timestamp = next;
+                            break;
+                        }
+                    }
+
+                    let f: SendPointerEventFn =
+                        unsafe { core::mem::transmute(proctable.send_pointer_event) };
+                    let evt = FlutterPointerEvent {
+                        struct_size: core::mem::size_of::<FlutterPointerEvent>(),
+                        phase: 6, // kHover — scroll while not dragging
+                        _pad0: 0,
+                        timestamp,
+                        x,
+                        y,
+                        device: 0,
+                        signal_kind: 1, // kFlutterPointerSignalKindScroll
+                        scroll_delta_x: 0.0,
+                        scroll_delta_y: scroll_dy,
+                        device_kind: 1,
+                        _pad1: 0,
+                        buttons: 0,
+                        pan_x: 0.0,
+                        pan_y: 0.0,
+                        scale: 1.0,
+                        rotation: 0.0,
+                        view_id: 0,
+                    };
+                    let rc = unsafe { f(engine_out, &evt as *const _, 1) };
+                    write(b"[embedder/scroll] dz=");
+                    write_dec(dz as u64);
+                    write(b" dy=");
+                    write_dec(scroll_dy as i64 as u64);
+                    write(b" rc=");
+                    write_dec(rc as u64);
+                    write(b"\n");
+                }
+            }
             EV_KEY => {
                 let scancode = ev.a as u32;
                 let pressed = (ev.flags & 1) != 0;
