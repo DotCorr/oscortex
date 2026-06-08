@@ -656,21 +656,895 @@ unsafe extern "C" fn platform_message_callback(
         write(b"\n");
     }
 
-    if channel_slice == APPS_REQUEST_CHANNEL {
-        respond_platform_message(msg, METHOD_SUCCESS_NULL);
+    dispatch_platform_channel(channel_slice, msg);
+}
+
+/// JSONMethodCodec success envelope carrying a `null` result: a one-element
+/// JSON list `[null]`. Distinct from `METHOD_SUCCESS_NULL` (StandardMethodCodec,
+/// the `[0x00, 0x00]` two-byte form). Sending the wrong codec's null makes the
+/// framework throw "Expected envelope List" on JSON channels.
+const JSON_SUCCESS_NULL: &[u8] = b"[null]";
+
+/// Real channel dispatcher. Every channel Flutter reaches for is routed to a
+/// concrete handler that either does the platform work or returns a correctly
+/// typed ack. The final catch-all logs the channel name so nothing stays an
+/// invisible stub — `[embedder/chan] unbound: <name>` on serial.
+fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
+    match channel {
+        // ── OSCortex app channels (custom string codec) ──────────────────
+        b"oscortex/apps/request" => {
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"oscortex/shell" => {
+            handle_shell_platform_message(msg);
+        }
+
+        // ── Text input (JSONMethodCodec) — THE critical channel ──────────
+        b"flutter/textinput" => {
+            handle_textinput_channel(msg);
+        }
+
+        // ── Mouse cursor (JSONMethodCodec) ───────────────────────────────
+        b"flutter/mousecursor" => {
+            handle_mousecursor_channel(msg);
+        }
+
+        // ── Platform services (JSONMethodCodec): clipboard, nav, sound… ──
+        b"flutter/platform" => {
+            handle_platform_channel(msg);
+        }
+
+        // ── Graceful-ack JSON channels: the framework only needs a valid
+        //    `[null]` envelope back. We still route them explicitly so the
+        //    catch-all log only ever fires for something genuinely new.
+        b"flutter/navigation"
+        | b"flutter/system"
+        | b"flutter/accessibility"
+        | b"flutter/spellcheck"
+        | b"flutter/processtext"
+        | b"flutter/menu"
+        | b"flutter/contextmenu"
+        | b"flutter/scribe"
+        | b"flutter/restoration"
+        | b"flutter/keyevent"
+        | b"flutter/platform_views"
+        | b"flutter/isolate"
+        | b"flutter/lifecycle" => {
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+        }
+
+        // ── Anything else: reply with the codec-correct null AND log it so
+        //    an unbound channel is never silent. ─────────────────────────
+        _ => {
+            write(b"[embedder/chan] unbound: ");
+            write(channel);
+            write(b"\n");
+            if msg.response_handle != 0 {
+                respond_platform_message(msg, default_platform_reply(msg));
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Flutter framework platform channels (text input, cursor, clipboard, …)
+//
+// These all use JSONMethodCodec: a message is the JSON text of a 2-element list
+// `["MethodName", arguments]`; a success reply is `[result]` and an error reply
+// is `[code, message, details]`. We implement just enough of a JSON
+// reader/writer to decode method calls and the editing-state map, and to encode
+// the `TextInputClient.updateEditingState` call we push back to the framework.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Minimal JSON scanning helpers (no allocation, byte-slice based) ──────────
+
+/// Skip ASCII JSON whitespace, returning the index of the next significant byte.
+fn json_skip_ws(buf: &[u8], mut i: usize) -> usize {
+    while i < buf.len() {
+        match buf[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            _ => break,
+        }
+    }
+    i
+}
+
+/// Parse a JSON string starting at `buf[start]` (which must be the opening `"`).
+/// Decodes into `out`, returning (bytes_written, index_after_closing_quote).
+/// Handles the escape sequences Flutter's JSON codec emits: \" \\ \/ \b \f \n
+/// \r \t and \uXXXX (BMP). Returns None on malformed input.
+fn json_parse_string(buf: &[u8], start: usize, out: &mut [u8]) -> Option<(usize, usize)> {
+    if start >= buf.len() || buf[start] != b'"' {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut w = 0usize;
+    while i < buf.len() {
+        let c = buf[i];
+        if c == b'"' {
+            return Some((w, i + 1));
+        }
+        if c == b'\\' {
+            i += 1;
+            if i >= buf.len() {
+                return None;
+            }
+            let e = buf[i];
+            let decoded: u32 = match e {
+                b'"' => b'"' as u32,
+                b'\\' => b'\\' as u32,
+                b'/' => b'/' as u32,
+                b'b' => 0x08,
+                b'f' => 0x0c,
+                b'n' => b'\n' as u32,
+                b'r' => b'\r' as u32,
+                b't' => b'\t' as u32,
+                b'u' => {
+                    if i + 4 >= buf.len() {
+                        return None;
+                    }
+                    let mut cp = 0u32;
+                    for k in 1..=4 {
+                        cp = (cp << 4) | hex_nyb(buf[i + k])? as u32;
+                    }
+                    i += 4;
+                    cp
+                }
+                _ => return None,
+            };
+            i += 1;
+            w += encode_utf8(decoded, &mut out[w..]);
+        } else {
+            if w < out.len() {
+                out[w] = c;
+                w += 1;
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn hex_nyb(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Encode a Unicode scalar value as UTF-8 into `out`, returning byte count.
+fn encode_utf8(cp: u32, out: &mut [u8]) -> usize {
+    if cp < 0x80 {
+        if !out.is_empty() {
+            out[0] = cp as u8;
+            return 1;
+        }
+        0
+    } else if cp < 0x800 {
+        if out.len() >= 2 {
+            out[0] = 0xC0 | (cp >> 6) as u8;
+            out[1] = 0x80 | (cp & 0x3F) as u8;
+            return 2;
+        }
+        0
+    } else if cp < 0x10000 {
+        if out.len() >= 3 {
+            out[0] = 0xE0 | (cp >> 12) as u8;
+            out[1] = 0x80 | ((cp >> 6) & 0x3F) as u8;
+            out[2] = 0x80 | (cp & 0x3F) as u8;
+            return 3;
+        }
+        0
+    } else {
+        if out.len() >= 4 {
+            out[0] = 0xF0 | (cp >> 18) as u8;
+            out[1] = 0x80 | ((cp >> 12) & 0x3F) as u8;
+            out[2] = 0x80 | ((cp >> 6) & 0x3F) as u8;
+            out[3] = 0x80 | (cp & 0x3F) as u8;
+            return 4;
+        }
+        0
+    }
+}
+
+/// Extract the method name from a JSONMethodCodec message `["Method", args]`.
+/// Returns (method_bytes_in_scratch_len, index_just_past_the_method_string).
+/// `scratch` receives the decoded method name.
+fn json_method_name(buf: &[u8], scratch: &mut [u8]) -> Option<(usize, usize)> {
+    let mut i = json_skip_ws(buf, 0);
+    if i >= buf.len() || buf[i] != b'[' {
+        return None;
+    }
+    i = json_skip_ws(buf, i + 1);
+    let (len, next) = json_parse_string(buf, i, scratch)?;
+    Some((len, next))
+}
+
+/// Locate the value following the first occurrence of an object key `"key":`
+/// within `buf`. Returns the index of the first byte of the value, or None.
+/// This is a flat scan — adequate for the small, well-formed maps the framework
+/// sends (editing state, cursor args, clipboard payload).
+fn json_find_value(buf: &[u8], key: &[u8]) -> Option<usize> {
+    // Build the search pattern: "key"
+    let mut i = 0usize;
+    while i + key.len() + 2 <= buf.len() {
+        if buf[i] == b'"'
+            && buf[i + 1..].starts_with(key)
+            && buf.get(i + 1 + key.len()) == Some(&b'"')
+        {
+            // Found the key string; skip to ':' then to the value.
+            let mut j = i + 2 + key.len();
+            j = json_skip_ws(buf, j);
+            if j < buf.len() && buf[j] == b':' {
+                return Some(json_skip_ws(buf, j + 1));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse a (possibly negative) JSON integer at `buf[start]`. Returns the value.
+fn json_parse_int(buf: &[u8], start: usize) -> Option<i64> {
+    let mut i = start;
+    let mut neg = false;
+    if i < buf.len() && buf[i] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    let mut v: i64 = 0;
+    let mut any = false;
+    while i < buf.len() && buf[i].is_ascii_digit() {
+        v = v.saturating_mul(10).saturating_add((buf[i] - b'0') as i64);
+        i += 1;
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    Some(if neg { -v } else { v })
+}
+
+/// Append `s` to `out` at `*pos`, advancing `*pos`. Truncates on overflow.
+fn json_push(out: &mut [u8], pos: &mut usize, s: &[u8]) {
+    let n = s.len().min(out.len().saturating_sub(*pos));
+    out[*pos..*pos + n].copy_from_slice(&s[..n]);
+    *pos += n;
+}
+
+/// Append `v` formatted as decimal to `out` at `*pos`.
+fn json_push_int(out: &mut [u8], pos: &mut usize, v: i64) {
+    let mut tmp = [0u8; 20];
+    let mut neg = false;
+    let mut uv = if v < 0 {
+        neg = true;
+        (v as i128).unsigned_abs() as u64
+    } else {
+        v as u64
+    };
+    let mut n = 0usize;
+    if uv == 0 {
+        tmp[0] = b'0';
+        n = 1;
+    } else {
+        while uv > 0 {
+            tmp[n] = b'0' + (uv % 10) as u8;
+            uv /= 10;
+            n += 1;
+        }
+    }
+    if neg {
+        json_push(out, pos, b"-");
+    }
+    while n > 0 {
+        n -= 1;
+        json_push(out, pos, core::slice::from_ref(&tmp[n]));
+    }
+}
+
+/// Append `s` as a JSON string literal (with quotes + escaping) to `out`.
+fn json_push_str_escaped(out: &mut [u8], pos: &mut usize, s: &[u8]) {
+    json_push(out, pos, b"\"");
+    for &b in s {
+        if *pos + 6 >= out.len() {
+            break;
+        }
+        match b {
+            b'"' => json_push(out, pos, b"\\\""),
+            b'\\' => json_push(out, pos, b"\\\\"),
+            b'\n' => json_push(out, pos, b"\\n"),
+            b'\r' => json_push(out, pos, b"\\r"),
+            b'\t' => json_push(out, pos, b"\\t"),
+            0x00..=0x1f => {
+                // Control char → \u00XX
+                json_push(out, pos, b"\\u00");
+                let hi = b >> 4;
+                let lo = b & 0xf;
+                let digits = b"0123456789abcdef";
+                json_push(out, pos, core::slice::from_ref(&digits[hi as usize]));
+                json_push(out, pos, core::slice::from_ref(&digits[lo as usize]));
+            }
+            _ => json_push(out, pos, core::slice::from_ref(&b)),
+        }
+    }
+    json_push(out, pos, b"\"");
+}
+
+// ── Text input state ─────────────────────────────────────────────────────────
+
+const TEXT_BUF_CAP: usize = 1024;
+
+/// The framework's active text-input client and its editing state, maintained
+/// entirely in the embedder. `selection_base`/`selection_extent` are byte
+/// offsets into `text[..text_len]` (we keep text as UTF-8, no multi-byte input
+/// from a US PS/2 keyboard so offsets stay byte == codepoint here).
+struct TextInputState {
+    client_id: i64,
+    active: bool,
+    focused: bool,
+    text: [u8; TEXT_BUF_CAP],
+    text_len: usize,
+    selection_base: i64,
+    selection_extent: i64,
+}
+
+static mut TEXT_INPUT: TextInputState = TextInputState {
+    client_id: -1,
+    active: false,
+    focused: false,
+    text: [0; TEXT_BUF_CAP],
+    text_len: 0,
+    selection_base: 0,
+    selection_extent: 0,
+};
+static TEXT_INPUT_LOCK: Spinlock = Spinlock::new();
+
+fn handle_textinput_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        respond_platform_message(msg, JSON_SUCCESS_NULL);
+        return;
+    };
+
+    let mut method = [0u8; 64];
+    let (mlen, args_start) = match json_method_name(payload, &mut method) {
+        Some(v) => v,
+        None => {
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+            return;
+        }
+    };
+    let method = &method[..mlen];
+
+    let _guard = TEXT_INPUT_LOCK.lock();
+    let st = unsafe { &mut *core::ptr::addr_of_mut!(TEXT_INPUT) };
+
+    static TI_LOG: AtomicU32 = AtomicU32::new(0);
+    if TI_LOG.fetch_add(1, Ordering::Relaxed) < 24 {
+        write(b"[embedder/textinput] ");
+        write(method);
+        write(b"\n");
+    }
+
+    match method {
+        b"TextInput.setClient" => {
+            // args = [clientId, config]
+            if let Some(cid) = json_parse_int(payload, json_skip_ws(payload, args_start + 1)) {
+                st.client_id = cid;
+                st.active = true;
+            }
+        }
+        b"TextInput.setEditingState" => {
+            // args = { text, selectionBase, selectionExtent, ... }
+            apply_editing_state(st, &payload[args_start..]);
+        }
+        b"TextInput.show" => {
+            st.focused = true;
+        }
+        b"TextInput.hide" => {
+            st.focused = false;
+        }
+        b"TextInput.clearClient" => {
+            st.active = false;
+            st.focused = false;
+            st.client_id = -1;
+            st.text_len = 0;
+            st.selection_base = 0;
+            st.selection_extent = 0;
+        }
+        // setEditableSizeAndTransform, setStyle, requestAutofill,
+        // setCaretRect, finishAutofillContext, etc. — no platform work needed.
+        _ => {}
+    }
+
+    respond_platform_message(msg, JSON_SUCCESS_NULL);
+}
+
+/// Load `text`/`selectionBase`/`selectionExtent` from a JSON editing-state map
+/// into the embedder's state.
+fn apply_editing_state(st: &mut TextInputState, map: &[u8]) {
+    if let Some(vi) = json_find_value(map, b"text") {
+        if map.get(vi) == Some(&b'"') {
+            let mut tmp = [0u8; TEXT_BUF_CAP];
+            if let Some((len, _)) = json_parse_string(map, vi, &mut tmp) {
+                let len = len.min(TEXT_BUF_CAP);
+                st.text[..len].copy_from_slice(&tmp[..len]);
+                st.text_len = len;
+            }
+        }
+    }
+    if let Some(vi) = json_find_value(map, b"selectionBase") {
+        if let Some(v) = json_parse_int(map, vi) {
+            st.selection_base = v;
+        }
+    }
+    if let Some(vi) = json_find_value(map, b"selectionExtent") {
+        if let Some(v) = json_parse_int(map, vi) {
+            st.selection_extent = v;
+        }
+    }
+    clamp_selection(st);
+}
+
+fn clamp_selection(st: &mut TextInputState) {
+    let max = st.text_len as i64;
+    if st.selection_base < 0 || st.selection_base > max {
+        st.selection_base = max;
+    }
+    if st.selection_extent < 0 || st.selection_extent > max {
+        st.selection_extent = max;
+    }
+}
+
+static mut UPDATE_EDITING_BUF: [u8; 2048] = [0; 2048];
+static UPDATE_EDITING_CH: &[u8] = b"flutter/textinput\0";
+
+/// Encode and send `TextInputClient.updateEditingState` back to the framework
+/// over flutter/textinput. Must be called with the engine running and the
+/// TEXT_INPUT_LOCK held by the caller (it reads `st`).
+fn send_update_editing_state(st: &TextInputState) {
+    let send_fn_va = SEND_PLATFORM_MESSAGE_FN.load(Ordering::SeqCst);
+    let engine = ENGINE.load(Ordering::SeqCst);
+    if send_fn_va == 0 || engine == 0 || !st.active {
         return;
     }
 
-    if channel_slice == SHELL_CHANNEL {
-        handle_shell_platform_message(msg);
+    let out = unsafe { &mut *core::ptr::addr_of_mut!(UPDATE_EDITING_BUF) };
+    let mut pos = 0usize;
+    // ["TextInputClient.updateEditingState", [clientId, {state}]]
+    json_push(out, &mut pos, b"[\"TextInputClient.updateEditingState\",[");
+    json_push_int(out, &mut pos, st.client_id);
+    json_push(out, &mut pos, b",{\"text\":");
+    json_push_str_escaped(out, &mut pos, &st.text[..st.text_len.min(TEXT_BUF_CAP)]);
+    json_push(out, &mut pos, b",\"selectionBase\":");
+    json_push_int(out, &mut pos, st.selection_base);
+    json_push(out, &mut pos, b",\"selectionExtent\":");
+    json_push_int(out, &mut pos, st.selection_extent);
+    json_push(
+        out,
+        &mut pos,
+        b",\"selectionAffinity\":\"TextAffinity.downstream\",\"selectionIsDirectional\":false,\"composingBase\":-1,\"composingExtent\":-1}]]",
+    );
+
+    let msg = FlutterPlatformMessage {
+        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+        channel: UPDATE_EDITING_CH.as_ptr() as u64,
+        message: out.as_ptr() as u64,
+        message_size: pos,
+        response_handle: 0,
+    };
+    let send: SendPlatformMessageFn = unsafe { core::mem::transmute(send_fn_va) };
+    let _ = unsafe { send(engine, &msg as *const _) };
+}
+
+// ── PS/2 set-1 scancode → editing action ─────────────────────────────────────
+
+/// What a key should do to the editing state.
+enum KeyAction {
+    Insert(u32), // unicode codepoint
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    None,
+}
+
+/// Modifier latch state for the keyboard, tracked across EV_KEY events.
+struct KbdMods {
+    shift: bool,
+    caps: bool,
+    ctrl: bool,
+}
+
+static mut KBD_MODS: KbdMods = KbdMods {
+    shift: false,
+    caps: false,
+    ctrl: false,
+};
+
+/// Map a PS/2 set-1 scancode (as delivered by the kernel: low 7 bits of the
+/// make code, extended keys carrying the 0xE000 prefix) plus current modifiers
+/// to an editing action. Only handles a make (press); the caller gates on
+/// `pressed`.
+fn scancode_to_action(scancode: u32, mods: &KbdMods) -> KeyAction {
+    // Extended (E0) navigation keys.
+    match scancode {
+        0xE04B => return KeyAction::Left,  // arrow left
+        0xE04D => return KeyAction::Right, // arrow right
+        0xE047 => return KeyAction::Home,  // Home
+        0xE04F => return KeyAction::End,   // End
+        0xE053 => return KeyAction::Delete, // Delete
+        _ => {}
+    }
+    match scancode {
+        0x0E => return KeyAction::Backspace, // Backspace
+        0x1C => return KeyAction::Insert(b'\n' as u32), // Enter
+        0x0F => return KeyAction::Insert(b'\t' as u32), // Tab
+        0x39 => return KeyAction::Insert(b' ' as u32),  // Space
+        0x4B => return KeyAction::Left,  // keypad-translated left (some sets)
+        0x4D => return KeyAction::Right,
+        0x47 => return KeyAction::Home,
+        0x4F => return KeyAction::End,
+        0x53 => return KeyAction::Delete,
+        _ => {}
+    }
+    // Ctrl chords don't produce text here.
+    if mods.ctrl {
+        return KeyAction::None;
+    }
+    if let Some(ch) = scancode_to_char(scancode, mods.shift, mods.caps) {
+        return KeyAction::Insert(ch as u32);
+    }
+    KeyAction::None
+}
+
+/// Map a PS/2 set-1 scancode to an ASCII character given shift/caps. Returns
+/// None for non-printable / unmapped keys (US QWERTY layout).
+fn scancode_to_char(sc: u32, shift: bool, caps: bool) -> Option<u8> {
+    // (unshifted, shifted)
+    let pair: (u8, u8) = match sc {
+        0x02 => (b'1', b'!'),
+        0x03 => (b'2', b'@'),
+        0x04 => (b'3', b'#'),
+        0x05 => (b'4', b'$'),
+        0x06 => (b'5', b'%'),
+        0x07 => (b'6', b'^'),
+        0x08 => (b'7', b'&'),
+        0x09 => (b'8', b'*'),
+        0x0A => (b'9', b'('),
+        0x0B => (b'0', b')'),
+        0x0C => (b'-', b'_'),
+        0x0D => (b'=', b'+'),
+        0x10 => (b'q', b'Q'),
+        0x11 => (b'w', b'W'),
+        0x12 => (b'e', b'E'),
+        0x13 => (b'r', b'R'),
+        0x14 => (b't', b'T'),
+        0x15 => (b'y', b'Y'),
+        0x16 => (b'u', b'U'),
+        0x17 => (b'i', b'I'),
+        0x18 => (b'o', b'O'),
+        0x19 => (b'p', b'P'),
+        0x1A => (b'[', b'{'),
+        0x1B => (b']', b'}'),
+        0x1E => (b'a', b'A'),
+        0x1F => (b's', b'S'),
+        0x20 => (b'd', b'D'),
+        0x21 => (b'f', b'F'),
+        0x22 => (b'g', b'G'),
+        0x23 => (b'h', b'H'),
+        0x24 => (b'j', b'J'),
+        0x25 => (b'k', b'K'),
+        0x26 => (b'l', b'L'),
+        0x27 => (b';', b':'),
+        0x28 => (b'\'', b'"'),
+        0x29 => (b'`', b'~'),
+        0x2B => (b'\\', b'|'),
+        0x2C => (b'z', b'Z'),
+        0x2D => (b'x', b'X'),
+        0x2E => (b'c', b'C'),
+        0x2F => (b'v', b'V'),
+        0x30 => (b'b', b'B'),
+        0x31 => (b'n', b'N'),
+        0x32 => (b'm', b'M'),
+        0x33 => (b',', b'<'),
+        0x34 => (b'.', b'>'),
+        0x35 => (b'/', b'?'),
+        _ => return None,
+    };
+    let is_alpha = pair.0.is_ascii_lowercase();
+    // Letters: caps XOR shift selects upper. Symbols/digits: shift only.
+    let upper = if is_alpha { shift ^ caps } else { shift };
+    Some(if upper { pair.1 } else { pair.0 })
+}
+
+/// Update the modifier latches from a key event. Returns true if the scancode
+/// was a pure modifier key (no further text handling required).
+fn update_modifiers(scancode: u32, pressed: bool, mods: &mut KbdMods) -> bool {
+    match scancode {
+        0x2A | 0x36 => {
+            // Left / right shift
+            mods.shift = pressed;
+            true
+        }
+        0x1D | 0xE01D => {
+            // Left / right ctrl
+            mods.ctrl = pressed;
+            true
+        }
+        0x3A => {
+            // Caps lock toggles on press only
+            if pressed {
+                mods.caps = !mods.caps;
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Apply a key action to the editing state. Returns true if the state changed
+/// (so the caller should push updateEditingState).
+fn apply_key_to_editing(st: &mut TextInputState, action: KeyAction) -> bool {
+    if !st.active {
+        return false;
+    }
+    clamp_selection(st);
+    let base = st.selection_base.max(0) as usize;
+    let extent = st.selection_extent.max(0) as usize;
+    let (sel_lo, sel_hi) = if base <= extent { (base, extent) } else { (extent, base) };
+    let has_sel = sel_lo != sel_hi;
+
+    match action {
+        KeyAction::Insert(cp) => {
+            let mut enc = [0u8; 4];
+            let n = encode_utf8(cp, &mut enc);
+            if n == 0 {
+                return false;
+            }
+            // Replace any selection, then insert.
+            delete_range(st, sel_lo, sel_hi);
+            if st.text_len + n > TEXT_BUF_CAP {
+                return false;
+            }
+            // Shift tail right by n.
+            let tail = st.text_len - sel_lo;
+            for k in (0..tail).rev() {
+                st.text[sel_lo + n + k] = st.text[sel_lo + k];
+            }
+            st.text[sel_lo..sel_lo + n].copy_from_slice(&enc[..n]);
+            st.text_len += n;
+            let caret = (sel_lo + n) as i64;
+            st.selection_base = caret;
+            st.selection_extent = caret;
+            true
+        }
+        KeyAction::Backspace => {
+            if has_sel {
+                delete_range(st, sel_lo, sel_hi);
+                st.selection_base = sel_lo as i64;
+                st.selection_extent = sel_lo as i64;
+                true
+            } else if sel_lo > 0 {
+                // Delete one byte before caret (ASCII == 1 codepoint here).
+                delete_range(st, sel_lo - 1, sel_lo);
+                st.selection_base = (sel_lo - 1) as i64;
+                st.selection_extent = (sel_lo - 1) as i64;
+                true
+            } else {
+                false
+            }
+        }
+        KeyAction::Delete => {
+            if has_sel {
+                delete_range(st, sel_lo, sel_hi);
+                st.selection_base = sel_lo as i64;
+                st.selection_extent = sel_lo as i64;
+                true
+            } else if sel_lo < st.text_len {
+                delete_range(st, sel_lo, sel_lo + 1);
+                st.selection_base = sel_lo as i64;
+                st.selection_extent = sel_lo as i64;
+                true
+            } else {
+                false
+            }
+        }
+        KeyAction::Left => {
+            let caret = if has_sel { sel_lo } else { sel_lo.saturating_sub(1) };
+            st.selection_base = caret as i64;
+            st.selection_extent = caret as i64;
+            true
+        }
+        KeyAction::Right => {
+            let caret = if has_sel {
+                sel_hi
+            } else {
+                (sel_hi + 1).min(st.text_len)
+            };
+            st.selection_base = caret as i64;
+            st.selection_extent = caret as i64;
+            true
+        }
+        KeyAction::Home => {
+            st.selection_base = 0;
+            st.selection_extent = 0;
+            true
+        }
+        KeyAction::End => {
+            st.selection_base = st.text_len as i64;
+            st.selection_extent = st.text_len as i64;
+            true
+        }
+        KeyAction::None => false,
+    }
+}
+
+/// Remove `text[lo..hi]`, compacting the tail. Caller ensures lo<=hi<=text_len.
+fn delete_range(st: &mut TextInputState, lo: usize, hi: usize) {
+    if lo >= hi || hi > st.text_len {
         return;
     }
+    let n = hi - lo;
+    let tail = st.text_len - hi;
+    for k in 0..tail {
+        st.text[lo + k] = st.text[hi + k];
+    }
+    st.text_len -= n;
+}
 
-    // Flutter framework MethodChannels (text input, mouse cursor, etc.) expect
-    // a StandardMethodCodec reply; without one BasicMessageChannel/MethodChannel
-    // `.send()` / `.invokeMethod()` calls hang forever.
-    if msg.response_handle != 0 {
-        respond_platform_message(msg, METHOD_SUCCESS_NULL);
+/// Entry point called from the EV_KEY handler: feed one raw PS/2 key event into
+/// the text-input pipeline. Returns true if it consumed the key as text (so the
+/// caller still sends the hard key event, but knows text was handled).
+fn textinput_feed_key(scancode: u32, pressed: bool) {
+    let _guard = TEXT_INPUT_LOCK.lock();
+    let mods = unsafe { &mut *core::ptr::addr_of_mut!(KBD_MODS) };
+    if update_modifiers(scancode, pressed, mods) {
+        return;
+    }
+    if !pressed {
+        return;
+    }
+    let st = unsafe { &mut *core::ptr::addr_of_mut!(TEXT_INPUT) };
+    if !st.active {
+        return;
+    }
+    let action = scancode_to_action(scancode, mods);
+    if apply_key_to_editing(st, action) {
+        send_update_editing_state(st);
+    }
+}
+
+// ── Mouse cursor channel ─────────────────────────────────────────────────────
+
+fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        respond_platform_message(msg, JSON_SUCCESS_NULL);
+        return;
+    };
+    let mut method = [0u8; 64];
+    if let Some((mlen, _)) = json_method_name(payload, &mut method) {
+        if &method[..mlen] == b"MouseCursor.activateSystemCursor" {
+            // args = { device, kind }. There is no kernel set-cursor-shape
+            // syscall yet (out of scope for this worktree), so record the
+            // requested kind on serial and ack success.
+            if let Some(vi) = json_find_value(payload, b"kind") {
+                if payload.get(vi) == Some(&b'"') {
+                    let mut kind = [0u8; 32];
+                    if let Some((klen, _)) = json_parse_string(payload, vi, &mut kind) {
+                        static CUR_LOG: AtomicU32 = AtomicU32::new(0);
+                        if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+                            write(b"[embedder/cursor] kind=");
+                            write(&kind[..klen]);
+                            write(b"\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    respond_platform_message(msg, JSON_SUCCESS_NULL);
+}
+
+// ── flutter/platform channel: clipboard, navigation, sound, chrome ───────────
+
+const CLIPBOARD_CAP: usize = 4096;
+static mut CLIPBOARD_BUF: [u8; CLIPBOARD_CAP] = [0; CLIPBOARD_CAP];
+static CLIPBOARD_LEN: AtomicU32 = AtomicU32::new(0);
+static mut CLIPBOARD_REPLY: [u8; CLIPBOARD_CAP + 64] = [0; CLIPBOARD_CAP + 64];
+
+fn handle_platform_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        respond_platform_message(msg, JSON_SUCCESS_NULL);
+        return;
+    };
+    let mut method = [0u8; 64];
+    let mlen = match json_method_name(payload, &mut method) {
+        Some((l, _)) => l,
+        None => {
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+            return;
+        }
+    };
+    let method = &method[..mlen];
+
+    match method {
+        b"Clipboard.setData" => {
+            // args = { text: "..." }
+            if let Some(vi) = json_find_value(payload, b"text") {
+                if payload.get(vi) == Some(&b'"') {
+                    let buf = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_BUF) };
+                    let mut tmp = [0u8; CLIPBOARD_CAP];
+                    if let Some((len, _)) = json_parse_string(payload, vi, &mut tmp) {
+                        let len = len.min(CLIPBOARD_CAP);
+                        buf[..len].copy_from_slice(&tmp[..len]);
+                        CLIPBOARD_LEN.store(len as u32, Ordering::Release);
+                    }
+                }
+            }
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+        }
+        b"Clipboard.getData" => {
+            // Reply [{"text": "..."}]
+            let len = CLIPBOARD_LEN.load(Ordering::Acquire) as usize;
+            let src = unsafe { &*core::ptr::addr_of!(CLIPBOARD_BUF) };
+            let out = unsafe { &mut *core::ptr::addr_of_mut!(CLIPBOARD_REPLY) };
+            let mut pos = 0usize;
+            json_push(out, &mut pos, b"[{\"text\":");
+            json_push_str_escaped(out, &mut pos, &src[..len.min(CLIPBOARD_CAP)]);
+            json_push(out, &mut pos, b"}]");
+            let reply =
+                unsafe { core::slice::from_raw_parts(CLIPBOARD_REPLY.as_ptr(), pos) };
+            respond_platform_message(msg, reply);
+        }
+        b"Clipboard.hasStrings" => {
+            let has = CLIPBOARD_LEN.load(Ordering::Acquire) > 0;
+            respond_platform_message(
+                msg,
+                if has {
+                    b"[{\"value\":true}]" as &[u8]
+                } else {
+                    b"[{\"value\":false}]" as &[u8]
+                },
+            );
+        }
+        b"SystemNavigator.pop" => {
+            // Request to close the foreground app / pop the route. If a kernel
+            // app-close mechanism exists it would go here; for now ack success
+            // (the framework handles the in-app route pop itself).
+            write(b"[embedder/platform] SystemNavigator.pop\n");
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+        }
+        // No-op acknowledgements — correct typed null keeps the framework happy.
+        b"SystemSound.play"
+        | b"HapticFeedback.vibrate"
+        | b"SystemChrome.setApplicationSwitcherDescription"
+        | b"SystemChrome.setSystemUIOverlayStyle"
+        | b"SystemChrome.setPreferredOrientations"
+        | b"SystemChrome.setEnabledSystemUIMode"
+        | b"SystemChrome.setEnabledSystemUIOverlays"
+        | b"SystemChrome.restoreSystemUIOverlays"
+        | b"SystemChrome.setSystemUIChangeListener" => {
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+        }
+        _ => {
+            static PLAT_LOG: AtomicU32 = AtomicU32::new(0);
+            if PLAT_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+                write(b"[embedder/platform] unhandled method: ");
+                write(method);
+                write(b"\n");
+            }
+            respond_platform_message(msg, JSON_SUCCESS_NULL);
+        }
     }
 }
 
@@ -1974,6 +2848,11 @@ extern "C" fn main_embedder() {
                         unsafe { core::mem::transmute(proctable.send_key_event) };
                     unsafe { f(engine_out, &evt as *const _, 0, 0) };
                 }
+                // Route the same key into the text-input pipeline: when a text
+                // client is active this mutates the editing state and pushes
+                // TextInputClient.updateEditingState back to the framework. It
+                // tracks modifier latches even when no client is focused.
+                textinput_feed_key(scancode, pressed);
             }
             EV_PLATFORM_MSG => {
                 // A native kernel module sent us a platform-channel message.
