@@ -21,6 +21,12 @@ global_asm!(
 .section .text.boot, "ax"
 .globl _start
 _start:
+    // QEMU `-kernel` passes the Flattened Device Tree (DTB) pointer in x0 at
+    // entry. Preserve it in x20 (callee-saved, untouched by the bring-up asm)
+    // so we can stash it once the BSS — which holds the DTB-pointer static — is
+    // zeroed. The MPIDR check below clobbers x0.
+    mov     x20, x0
+
     // ── Park secondary CPUs: only MPIDR.Aff0==0 proceeds ──────────────────
     mrs     x0, mpidr_el1
     and     x0, x0, #0xFF
@@ -76,6 +82,8 @@ _start:
     b       3b
 4:
     // ── Into Rust ─────────────────────────────────────────────────────────
+    // AAPCS64: pass the saved DTB pointer (x20) to aarch64_start as arg0 (x0).
+    mov     x0, x20
     bl      {aarch64_start}
     // aarch64_start never returns; park if it does.
 5:  wfe
@@ -115,8 +123,16 @@ extern "C" {
 }
 
 /// First Rust function on the aarch64 boot path. Runs identity-mapped, MMU off,
-/// at EL1, on the boot stack. Hands off to the bring-up sequence.
+/// at EL1, on the boot stack. `dtb_ptr` is the value QEMU placed in x0 (the
+/// Flattened Device Tree blob's physical address).
+///
+/// Hands off to the production boot path (`aarch64_kernel_boot`), which records
+/// the DTB pointer, runs the minimal ARM early-init (serial + MMU), then enters
+/// the SHARED `kernel_main`. The self-contained bring-up demo is still reachable
+/// via [`crate::arch::aarch64::bringup::run`] for platform-primitive validation.
 #[no_mangle]
-pub extern "C" fn aarch64_start() -> ! {
-    crate::arch::aarch64::bringup::run()
+pub extern "C" fn aarch64_start(dtb_ptr: u64) -> ! {
+    // Record the DTB pointer now that BSS is zeroed (the static lives in BSS).
+    crate::arch::aarch64::fdt::set_dtb_ptr(dtb_ptr);
+    crate::arch::aarch64::boot_prod::aarch64_kernel_boot(dtb_ptr)
 }

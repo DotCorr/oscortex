@@ -3,8 +3,6 @@
 //! Uses a static bitmap where each bit represents a 4 KiB physical frame.
 //! The bitmap itself is placed in the first usable memory region.
 
-use limine::memmap::MEMMAP_USABLE;
-use limine::request::MemmapResponse;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -109,17 +107,19 @@ impl FrameBitmap {
     }
 }
 
-pub fn init(mmap: &MemmapResponse, hhdm_offset: u64) {
+/// Initialise the frame bitmap from an arch-neutral usable-region list.
+///
+/// Both the x86_64 (Limine) and aarch64 (device-tree) boot paths funnel through
+/// here via [`crate::mm::init_from_regions`].
+pub fn init_from_regions(map: &crate::mm::BootMemMap, hhdm_offset: u64) {
     set_hhdm_offset(hhdm_offset);
     let mut bm = BITMAP.lock();
     bm.hhdm = hhdm_offset;
-    for entry in mmap.entries() {
-        if entry.type_ == MEMMAP_USABLE {
-            let start_frame = (entry.base as usize) / FRAME_SIZE;
-            let end_frame = ((entry.base + entry.length) as usize) / FRAME_SIZE;
-            for frame in start_frame.max(MIN_ALLOC_FRAME)..end_frame.min(MAX_FRAMES) {
-                bm.mark_free(frame);
-            }
+    for region in map.regions() {
+        let start_frame = (region.base as usize) / FRAME_SIZE;
+        let end_frame = ((region.base + region.len) as usize) / FRAME_SIZE;
+        for frame in start_frame.max(MIN_ALLOC_FRAME)..end_frame.min(MAX_FRAMES) {
+            bm.mark_free(frame);
         }
     }
     log::info!("[MM::FrameAlloc] {} MiB usable physical memory",

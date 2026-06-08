@@ -54,25 +54,37 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// Global kernel initialisation lock — prevents double-init on SMP wake-up.
 pub static KERNEL_INIT_DONE: AtomicBool = AtomicBool::new(false);
 
-// ── Limine boot requests ─────────────────────────────────────────────────────
+// ── Limine boot requests (x86_64 boot protocol) ──────────────────────────────
+//
+// Only the x86_64 production path boots via Limine. The aarch64 path boots via
+// `qemu-system-aarch64 -M virt -kernel` (no bootloader) and discovers hardware
+// from the device tree — see `arch::aarch64::boot_prod`. The Limine request
+// statics are therefore compiled only for x86_64 so the ARM kernel carries no
+// dead Limine boot section.
+#[cfg(target_arch = "x86_64")]
 use limine::request::{
     FramebufferRequest, HhdmRequest, ExecutableAddressRequest, MemmapRequest, MpRequest,
     ModulesRequest,
 };
+#[cfg(target_arch = "x86_64")]
 use limine::BaseRevision;
 
 /// Limine base revision — required for Limine 9+ to recognise this kernel.
+#[cfg(target_arch = "x86_64")]
 #[used]
 static BASE_REVISION: BaseRevision = BaseRevision::new();
 
+#[cfg(target_arch = "x86_64")]
 static FB_REQUEST: FramebufferRequest = FramebufferRequest::new();
+#[cfg(target_arch = "x86_64")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+#[cfg(target_arch = "x86_64")]
 static MMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+#[cfg(target_arch = "x86_64")]
 static KADDR_REQUEST: ExecutableAddressRequest = ExecutableAddressRequest::new();
 #[cfg(target_arch = "x86_64")]
 static SMP_REQUEST: MpRequest = MpRequest::new(limine::mp::MP_FLAG_X2APIC);
-#[cfg(not(target_arch = "x86_64"))]
-static SMP_REQUEST: MpRequest = MpRequest::new(0);
+#[cfg(target_arch = "x86_64")]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
 /// Slice of libflutter_engine.so as provided by Limine, stored once at boot.
@@ -95,6 +107,7 @@ pub static FLUTTER_ENGINE_BYTES: spin::Mutex<Option<&'static [u8]>> =
 ///   7. AI Cortex init  ← the magic
 ///   8. SMP wake-up (other cores join here after KERNEL_INIT_DONE)
 ///   9. Idle loop (Cortex takes over scheduling from here)
+#[cfg(target_arch = "x86_64")]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     // ── 0. Early serial — must be first so any crash below is visible ─────
@@ -192,6 +205,56 @@ pub extern "C" fn kernel_main() -> ! {
         log::warn!("[BOOT] No Limine modules response — libflutter_engine.so unavailable");
     }
 
+    // The architecture-neutral subsystem init + process spawn + idle loop is
+    // shared with the aarch64 boot path.
+    shared_init_and_run()
+}
+
+/// aarch64 production kernel entry.
+///
+/// Called from `arch::aarch64::boot_prod::aarch64_kernel_boot` after the ARM
+/// platform primitives (serial, MMU, EL1 vectors, GIC) are live and the device
+/// tree has been parsed into the neutral [`mm::BootMemMap`]. This mirrors the
+/// x86 `kernel_main` prologue using arch-provided inputs instead of Limine, then
+/// joins the same `shared_init_and_run`.
+#[cfg(target_arch = "aarch64")]
+pub fn kernel_main_arch(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
+    logger::early_print("[OSCORTEX] kernel_main_arch reached (aarch64)\r\n");
+
+    // HHDM offset is 0 on aarch64 (RAM is identity-mapped → VA == PA).
+    mm::frame_allocator::set_hhdm_offset(hhdm_offset);
+
+    // ── 1. Architecture early init (FPU/SIMD, syscall/SVC readiness) ──────
+    // The interrupt controller + exception vectors are already live (set up in
+    // boot_prod), but early_init also enables FP/SIMD and logs syscall setup.
+    arch::early_init();
+    logger::early_print("[OSCORTEX] arch::early_init done (aarch64)\r\n");
+
+    // ── 2. Memory management from the device-tree region list ────────────
+    mm::init_from_regions(&map, hhdm_offset);
+
+    // ── 3. Logger (serial only — no Limine framebuffer on ARM yet) ───────
+    logger::init(None);
+
+    log::warn!(
+        "[MM::FrameAlloc] capacity at boot: total_usable_frames={} ({} MiB), used_at_boot={} ({} MiB)",
+        mm::frame_allocator::frames_total(),
+        (mm::frame_allocator::frames_total() * 4096) / (1024 * 1024),
+        mm::frame_allocator::frames_used(),
+        (mm::frame_allocator::frames_used() * 4096) / (1024 * 1024)
+    );
+    log::info!("OSCortex kernel {} booting (aarch64)...", env!("CARGO_PKG_VERSION"));
+    log::warn!("[BOOT] No framebuffer / Flutter engine on aarch64 yet (follow-on).");
+
+    shared_init_and_run()
+}
+
+/// Architecture-neutral subsystem init, init-process spawn, and idle loop.
+///
+/// Runs after each arch's boot prologue has brought up serial, the memory
+/// manager, and the logger. This is the part of `kernel_main` that does not
+/// touch any boot protocol directly.
+fn shared_init_and_run() -> ! {
     // ── 4. Platform drivers (input probe) ───────────────────────────────
     let qemu_like = arch::cpu::is_qemu_like_hypervisor();
     drivers::platform::init_early(qemu_like);
@@ -226,7 +289,10 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── 9. Signal APs + bring SMP online ────────────────────────────────
     KERNEL_INIT_DONE.store(true, Ordering::Release);
+    #[cfg(target_arch = "x86_64")]
     arch::smp_init(SMP_REQUEST.response());
+    #[cfg(not(target_arch = "x86_64"))]
+    arch::smp_init(None);
 
     // ── 9b. Spawn init process from initramfs ────────────────────────────
     match fs::lookup("/init") {
