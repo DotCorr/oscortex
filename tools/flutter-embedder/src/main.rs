@@ -1470,20 +1470,33 @@ extern "C" fn main_embedder() {
         write(b"\n");
         configure_app_assets(&mut project_args, app_id);
         if is_aot {
-            configure_aot_snapshots(&mut project_args, aot_va);
+            // Each app has its OWN AOT blob at /Applications/<name>.app/libapp.so.
+            // (The kernel hands aot_va=0 for the JIT-era path, so load by file like
+            // the shell does — NOT the shell's libapp.so, which is the bug that
+            // froze the app host.)
+            let libapp = build_app_libapp_path(app_id);
+            if !libapp.is_empty() {
+                write(b"[host] APP libapp.so: ");
+                write(&libapp[..libapp.len().saturating_sub(1)]);
+                write(b"\n");
+                sys::dlopen(libapp, 0);
+                configure_aot_snapshots(&mut project_args, 0, libapp);
+            } else {
+                write(b"[host] WARNING: no libapp.so path for app\n");
+            }
         }
     } else {
         write(b"[host] SHELL mode\n");
         configure_project_assets(&mut project_args, b"/system/flutter/flutter_assets");
         if is_aot {
             write(b"[embedder] registering shell libapp.so globally...\n");
-            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so", 0);
+            let aot_handle = sys::dlopen(b"/system/flutter/libapp.so\0", 0);
             if aot_handle <= 0 {
                 write(b"[embedder] WARNING: dlopen /system/flutter/libapp.so failed\n");
             } else {
                 write(b"[embedder] shell libapp.so registered globally\n");
             }
-            configure_aot_snapshots(&mut project_args, 0);
+            configure_aot_snapshots(&mut project_args, 0, b"/system/flutter/libapp.so\0");
         }
     }
 
@@ -2226,6 +2239,45 @@ fn configure_project_assets(project_args: &mut FlutterProjectArgsRaw, path: &[u8
     }
 }
 
+/// Build "/Applications/<name>.app/libapp.so\0" for `app_id` (registry lookup).
+/// Returns the NUL-terminated path slice, or empty if the app isn't found.
+fn build_app_libapp_path(app_id: u64) -> &'static [u8] {
+    let mut records = [0u8; 4096];
+    let count = sys::app_list(&mut records) as usize;
+    static mut LIBAPP_PATH_BUF: [u8; 256] = [0; 256];
+    for i in 0..count {
+        let off = i * 88;
+        if off + 88 > records.len() {
+            break;
+        }
+        let id = u32::from_le_bytes(records[off..off + 4].try_into().unwrap_or([0; 4]));
+        if id as u64 == app_id {
+            let name_end = records[off + 4..off + 68]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(64);
+            let name = &records[off + 4..off + 4 + name_end];
+            unsafe {
+                let buf = &mut *core::ptr::addr_of_mut!(LIBAPP_PATH_BUF);
+                let prefix = b"/Applications/";
+                let suffix = b".app/libapp.so";
+                let mut pos = 0usize;
+                buf[pos..pos + prefix.len()].copy_from_slice(prefix);
+                pos += prefix.len();
+                let copy_len = name.len().min(buf.len() - pos - suffix.len() - 1);
+                buf[pos..pos + copy_len].copy_from_slice(&name[..copy_len]);
+                pos += copy_len;
+                buf[pos..pos + suffix.len()].copy_from_slice(suffix);
+                pos += suffix.len();
+                buf[pos] = 0;
+                pos += 1;
+                return core::slice::from_raw_parts(buf.as_ptr(), pos);
+            }
+        }
+    }
+    b""
+}
+
 fn configure_app_assets(project_args: &mut FlutterProjectArgsRaw, app_id: u64) {
     let mut records = [0u8; 4096];
     let count = sys::app_list(&mut records) as usize;
@@ -2275,9 +2327,13 @@ fn configure_app_assets(project_args: &mut FlutterProjectArgsRaw, app_id: u64) {
     }
 }
 
-fn configure_aot_snapshots(project_args: &mut FlutterProjectArgsRaw, aot_va: u64) {
+fn configure_aot_snapshots(
+    project_args: &mut FlutterProjectArgsRaw,
+    aot_va: u64,
+    libapp_path: &[u8],
+) {
     let opt = if aot_va == 0 {
-        aot_loader::load_dart_snapshot(b"/system/flutter/libapp.so")
+        aot_loader::load_dart_snapshot(libapp_path)
     } else {
         aot_loader::load_dart_snapshot_from_mapping(aot_va)
     };
