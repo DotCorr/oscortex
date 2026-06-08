@@ -555,6 +555,24 @@ pub fn present_surface_for(caller_pid: u32, id: u32) -> Result<(), &'static str>
 ///
 /// `payload` must be exactly `surface.width * surface.height * 4` bytes.
 pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'static str> {
+    submit_bgra_impl(caller_pid, id, payload, 0)
+}
+
+/// Unified surface submit: Flutter kN32 = BGRA8888 (little-endian x86) → the
+/// compositor's RGBA back buffer, in a SINGLE u32-wise, stride-aware pass.
+///
+/// `src_row_bytes == 0` means a tight `width*4` stride. This replaces the old
+/// two-pass path — a strided re-pack into a fresh `vec![0u8; w*h*4]` allocated
+/// EVERY frame, followed by a byte-indexed B↔R swap — which cost two full
+/// 1M-pixel passes plus a 4 MB allocation per frame. Reading the source as u32
+/// and swapping bytes 0↔2 with bit ops is ~one memory op per pixel instead of
+/// four, and skips the intermediate buffer entirely.
+fn submit_bgra_impl(
+    caller_pid: u32,
+    id: u32,
+    payload: &[u8],
+    src_row_bytes: usize,
+) -> Result<(), &'static str> {
     let mut c = COMP.lock();
     for (idx, s) in c.surfaces.iter().enumerate() {
         if s.in_use && s.id == id {
@@ -564,28 +582,32 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                     return Err("permission denied");
                 }
             }
-            let pixels = s.width as usize * s.height as usize;
-            let expect = pixels * 4;
-            if payload.len() != expect {
+            let w = s.width as usize;
+            let h = s.height as usize;
+            let pixels = w * h;
+            let row_px = if src_row_bytes == 0 { w } else { src_row_bytes / 4 };
+            if payload.len() < row_px * 4 * h {
                 return Err("bad payload size");
             }
-            // Phase 33-C: write to back buffer, flip at next vsync.
             if c.back_buffers[idx].is_none()
                 || c.back_buffers[idx].as_ref().map(|b| b.len()).unwrap_or(0) != pixels
             {
                 c.back_buffers[idx] = Some(alloc::vec![0u32; pixels]);
             }
             let buf = c.back_buffers[idx].as_mut().ok_or("no back buffer")?;
-            // Flutter's software surface is kN32 (= BGRA8888 on little-endian x86):
-            // payload bytes are [B, G, R, A]. The compositor buffer / blit_rgba32
-            // expect R in the low byte, so swap B and R while packing.
-            for i in 0..pixels {
-                let b = i * 4;
-                let bl = payload[b    ] as u32;
-                let g  = payload[b + 1] as u32;
-                let r  = payload[b + 2] as u32;
-                let a  = payload[b + 3] as u32;
-                buf[i] = r | (g << 8) | (bl << 16) | (a << 24);
+            // payload bytes [B,G,R,A] => little-endian u32 = B | G<<8 | R<<16 | A<<24.
+            // The compositor wants R in the low byte: swap bytes 0 and 2.
+            let src = payload.as_ptr() as *const u32;
+            unsafe {
+                for y in 0..h {
+                    let s_row = src.add(y * row_px);
+                    let d_row = y * w;
+                    for x in 0..w {
+                        let p = core::ptr::read_unaligned(s_row.add(x));
+                        buf[d_row + x] =
+                            (p & 0xFF00_FF00) | ((p & 0x0000_00FF) << 16) | ((p & 0x00FF_0000) >> 16);
+                    }
+                }
             }
             c.back_pending[idx] = true;
             drop(c);
@@ -701,46 +723,9 @@ pub fn gpu_submit_strided_for(
     payload: &[u8],
     row_bytes: usize,
 ) -> Result<(), &'static str> {
-    // Determine the surface dimensions we need for stride validation.
-    let (width, height) = {
-        let c = COMP.lock();
-        let mut dims = None;
-        for s in c.surfaces.iter() {
-            if s.in_use && s.id == id {
-                dims = Some((s.width as usize, s.height as usize));
-                break;
-            }
-        }
-        dims.ok_or("no such surface")?
-    };
-
-    let tight_stride = width * 4;
-
-    // Fast path: no stride conversion needed.
-    if row_bytes == 0 || row_bytes == tight_stride {
-        let expected_bytes = tight_stride * height;
-        if payload.len() < expected_bytes {
-            return Err("bad payload size");
-        }
-        return gpu_submit_for(caller_pid, id, &payload[..expected_bytes]);
-    }
-
-    // Validate that the buffer is large enough for the strided layout.
-    let expected_bytes = row_bytes * height;
-    if payload.len() < expected_bytes {
-        return Err("bad payload size");
-    }
-
-    // Re-pack rows into a tight RGBA32 buffer.
-    let mut tight: Vec<u8> = vec![0u8; tight_stride * height];
-    for row in 0..height {
-        let src_start = row * row_bytes;
-        let dst_start = row * tight_stride;
-        tight[dst_start..dst_start + tight_stride]
-            .copy_from_slice(&payload[src_start..src_start + tight_stride]);
-    }
-
-    gpu_submit_for(caller_pid, id, &tight)
+    // submit_bgra_impl handles the source stride directly in its single packing
+    // pass — no intermediate tight buffer, no per-frame allocation.
+    submit_bgra_impl(caller_pid, id, payload, row_bytes)
 }
 
 /// Packed framebuffer size: `(width << 32) | height`.
@@ -799,7 +784,24 @@ pub fn render_frame() {
 
     if !bypass {
         if let Some((w, h)) = crate::drivers::fb::size_px() {
-            crate::drivers::fb::fill_rect(0, 0, w, h, 0x00101820);
+            // Skip the full-screen clear when a presented surface already covers
+            // the whole screen — it would just be overwritten by the blit below.
+            // Saves a full 1M-pixel pass per frame (the common case: one
+            // full-screen Flutter surface).
+            let covered = {
+                let c = COMP.lock();
+                c.surfaces.iter().enumerate().any(|(idx, s)| {
+                    s.in_use
+                        && c.presented[idx]
+                        && s.x <= 0
+                        && s.y <= 0
+                        && (s.x + s.width as i32) >= w as i32
+                        && (s.y + s.height as i32) >= h as i32
+                })
+            };
+            if !covered {
+                crate::drivers::fb::fill_rect(0, 0, w, h, 0x00101820);
+            }
         }
     }
 
