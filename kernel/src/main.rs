@@ -255,12 +255,18 @@ pub fn kernel_main_arch(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
             // Identity-mapped RAM → the physical framebuffer base is directly
             // writable as a virtual address (VA == PA on aarch64).
             drivers::fb::init_raw(addr, w, h, pitch);
-            log::info!("[BOOT] aarch64 framebuffer online: {}x{} via ramfb", w, h);
             // Paint a visible boot fill so the display is provably driven even
             // before any userspace renders (top band teal, body dark navy).
             drivers::fb::fill_rect(0, 0, w, 48, 0x0014_B8A6);
             drivers::fb::fill_rect(0, 48, w, h - 48, 0x001A_1A2E);
             drivers::fb::write_str("\n  OSCortex aarch64 — ramfb framebuffer up\n");
+            // Stop mirroring kernel logs into the framebuffer console: under TCG,
+            // glyph rendering into the 1280x800 buffer (64 volatile writes/glyph)
+            // is so slow per log line it dwarfs the rest of boot. The serial log
+            // is the lifeline; the fb stays driven (the boot fill is visible) and
+            // userspace/compositor renders into it normally.
+            drivers::fb::disable_fb_logging();
+            log::info!("[BOOT] aarch64 framebuffer online: {}x{} via ramfb", w, h);
         }
         None => {
             log::warn!("[BOOT] aarch64 ramfb unavailable (need -device ramfb); serial-only.");
@@ -318,8 +324,15 @@ fn shared_init_and_run() -> ! {
     // ── 9b. Spawn init process from initramfs ────────────────────────────
     match fs::lookup("/init") {
         Some(elf_bytes) => {
+            // aarch64 bring-up: seed rdi=0 so the init program selects message A
+            // (the x86 shell host uses HOST_MODE_SHELL; the ARM init is the
+            // self-contained preemption test program from build.rs).
+            #[cfg(target_arch = "aarch64")]
+            let first_rdi: u64 = 0;
+            #[cfg(not(target_arch = "aarch64"))]
+            let first_rdi: u64 = crate::app_registry::HOST_MODE_SHELL;
             let bootstrap = process::SpawnBootstrap {
-                rdi: crate::app_registry::HOST_MODE_SHELL,
+                rdi: first_rdi,
                 rsi: 0,
                 rdx: 0,
                 parent_pid: 0,
@@ -334,17 +347,36 @@ fn shared_init_and_run() -> ! {
                     #[cfg(target_arch = "x86_64")]
                     process::schedule_user_launch(pid);
 
-                    // aarch64: the ARM scheduler's preemptive tick (GIC + generic
-                    // timer ISR frame save) is a follow-on, so the timer-driven
-                    // hand-off used on x86 isn't wired yet. Enter the init process
-                    // DIRECTLY here — this is the real production EL0 entry
-                    // (write_cr3 → enter_user_sysret/ERET) and lets the bring-up
-                    // init run + have its syscalls serviced through the shared
-                    // dispatcher. (Once the ARM timer ISR lands, this collapses to
-                    // the same schedule_user_launch path as x86.)
+                    // aarch64: the generic-timer ISR now drives the SAME shared
+                    // cooperative-scheduler hand-off x86 uses (arch::apic::
+                    // init_bsp armed it + installed the preempting IRQ handler).
+                    // Spawn a SECOND user process so there are two runnable EL0
+                    // threads; both run a pure-compute loop (no syscalls between
+                    // ticks), so the only way both make progress is the timer
+                    // preempting + switching between them. Then enter the first
+                    // directly — the timer takes over from there.
                     #[cfg(target_arch = "aarch64")]
                     {
-                        log::info!("[INIT] aarch64: entering init at EL0 directly");
+                        let bootstrap_b = process::SpawnBootstrap {
+                            rdi: 1, // selects message B in the init program
+                            rsi: 0,
+                            rdx: 0,
+                            parent_pid: 0,
+                        };
+                        match process::spawn_with_bootstrap(elf_bytes, "init-b", bootstrap_b) {
+                            Ok(pid_b) => log::info!(
+                                "[INIT] aarch64: spawned 2nd EL0 thread PID {} (preemption test)",
+                                pid_b
+                            ),
+                            Err(e) => log::warn!("[INIT] aarch64: 2nd thread spawn failed: {}", e),
+                        }
+                        log::info!(
+                            "[INIT] aarch64: entering PID {} at EL0; timer will preempt between threads",
+                            pid
+                        );
+                        // Arm the generic-timer scheduler tick now (kernel fully
+                        // initialised) so preemption begins the moment we drop to EL0.
+                        arch::aarch64::apic::start_scheduler_tick();
                         process::enter_user_by_pid_noreturn(pid);
                     }
                 }

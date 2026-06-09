@@ -98,6 +98,31 @@ pub fn init(
 /// x86_64; 0 on aarch64 where the bring-up identity-maps RAM so VA == PA).
 pub fn init_from_regions(map: &BootMemMap, hhdm_offset: u64) {
     frame_allocator::init_from_regions(map, hhdm_offset);
+
+    // aarch64: the kernel is loaded by `-kernel` INTO the same RAM region the
+    // device tree reports as usable (QEMU virt: image at 0x40080000, RAM from
+    // 0x40000000). The frame allocator just marked all of that free, so without
+    // reserving the kernel image the very first contiguous allocation (the 64 MiB
+    // heap) is handed 0x40000000 and its span overwrites live kernel code — a
+    // latent corruption that surfaces as a hang on the first large heap alloc.
+    // Reserve [RAM base .. __kernel_end] before the heap is carved out.
+    // (x86 gets this for free from the Limine memory-map types.)
+    #[cfg(target_arch = "aarch64")]
+    {
+        extern "C" {
+            static __kernel_end: u8;
+        }
+        const RAM_BASE: u64 = 0x4000_0000;
+        let kernel_end = unsafe { core::ptr::addr_of!(__kernel_end) as u64 };
+        frame_allocator::reserve_range(RAM_BASE, kernel_end.saturating_sub(RAM_BASE));
+        log::info!(
+            "[MM] aarch64: reserved kernel image [{:#x}..{:#x}] ({} KiB)",
+            RAM_BASE,
+            kernel_end,
+            (kernel_end - RAM_BASE) / 1024
+        );
+    }
+
     paging::init(hhdm_offset);
     heap::init();
     log::info!("[MM] Memory management online");
