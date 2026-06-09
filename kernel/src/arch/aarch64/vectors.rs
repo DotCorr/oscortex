@@ -431,6 +431,32 @@ fn report_unhandled(f: &TrapFrame, kind: u64, ec: u64) -> ! {
     uart::puts(" pid=");
     uart::puthex(crate::process::current_pid() as u64);
     uart::puts("\n");
+
+    // Frame-pointer chain walk: with ELR=0 and x30=0 the immediate caller is lost
+    // from the registers, but the AArch64 AAPCS frame record ([x29]=saved FP,
+    // [x29+8]=saved LR) lets us recover the call stack from the EL0 stack. TTBR0
+    // is still the faulting thread's during this EL1 handler, so EL0 VAs read
+    // directly. Print the saved-LR chain so the crash can be symbolised.
+    uart::puts("      x29(FP)=");
+    uart::puthex_full(f.x[29]);
+    uart::puts("\n      bt:");
+    {
+        let mut fp = f.x[29];
+        let mut depth = 0u32;
+        // Heuristic validity check for an EL0 user VA (low half, non-tiny).
+        let plausible = |a: u64| a >= 0x1000 && a < 0x0000_8000_0000_0000;
+        while depth < 16 && plausible(fp) && (fp & 0x7) == 0 {
+            let saved_fp = unsafe { core::ptr::read_volatile(fp as *const u64) };
+            let saved_lr = unsafe { core::ptr::read_volatile((fp + 8) as *const u64) };
+            uart::puts(" ");
+            uart::puthex_full(saved_lr);
+            // FP must climb the stack monotonically; stop on any inconsistency.
+            if saved_fp <= fp { break; }
+            fp = saved_fp;
+            depth += 1;
+        }
+    }
+    uart::puts("\n");
     loop {
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
     }
