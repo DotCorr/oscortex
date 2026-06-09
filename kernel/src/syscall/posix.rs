@@ -2304,9 +2304,90 @@ pub fn sys_strerror_r(errnum: i32, buf: u64, n: u64) -> i64 {
     buf as i64
 }
 
+/// Translate an aarch64 Linux syscall number into the kernel's internal
+/// (x86-64-Linux-derived) numbering used by `dispatch_fast`.
+///
+/// The Flutter engine / Dart VM are aarch64 ELF binaries: their glibc named
+/// wrappers reach the kernel through the per-symbol trampolines (which already
+/// use the kernel's numbers), but their RAW `syscall(NR, …)` calls pass the
+/// *aarch64* NR. Those land in `sys_passthrough_syscall`, where the NR must be
+/// remapped or the kernel mis-dispatches (e.g. aarch64 178=gettid vs x86-64
+/// 178=unused → ENOSYS → the VM spins).
+#[cfg(target_arch = "aarch64")]
+fn aarch64_nr_to_kernel(nr: u64) -> Option<u64> {
+    Some(match nr {
+        63 => 0,     // read
+        64 => 1,     // write
+        66 => 20,    // writev
+        57 => 3,     // close
+        80 => 5,     // fstat
+        62 => 8,     // lseek
+        222 => 9,    // mmap
+        226 => 10,   // mprotect
+        215 => 11,   // munmap
+        214 => 12,   // brk
+        134 => 13,   // rt_sigaction
+        135 => 14,   // rt_sigprocmask
+        29 => 16,    // ioctl
+        24 => 24,    // sched_yield (aarch64 124) — see below; placeholder
+        124 => 24,   // sched_yield
+        72 => 23,    // pselect6→select-ish (best effort)
+        233 => 28,   // madvise
+        39 => 39,    // getpid fallthrough
+        172 => 39,   // getpid
+        160 => 63,   // uname
+        98 => 202,   // futex
+        99 => 273,   // set_robust_list
+        96 => 218,   // set_tid_address
+        165 => 98,   // getrusage
+        179 => 99,   // sysinfo
+        113 => 228,  // clock_gettime
+        114 => 229,  // clock_getres
+        115 => 230,  // clock_nanosleep
+        101 => 35,   // nanosleep
+        122 => 203,  // sched_setaffinity
+        123 => 204,  // sched_getaffinity
+        129 => 62,   // kill
+        131 => 234,  // tgkill
+        178 => 186,  // gettid
+        173 => 110,  // getppid
+        174 => 102,  // getuid
+        175 => 107,  // geteuid
+        176 => 104,  // getgid
+        177 => 108,  // getegid
+        261 => 302,  // prlimit64
+        278 => 318,  // getrandom
+        94 => 231,   // exit_group
+        93 => 60,    // exit
+        260 => 61,   // wait4
+        220 => 56,   // clone
+        56 => 257,   // openat
+        79 => 262,   // newfstatat
+        17 => 79,    // getcwd
+        _ => return None,
+    })
+}
+
 pub fn sys_passthrough_syscall(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     // Allow userspace `syscall(NR, ...)` to dispatch to our kernel.
-    crate::syscall::dispatch_fast(nr, a0, a1, a2, 0, 0)
+    //
+    // This trampoline (NR 0x411) is glibc's generic `syscall()` — reached only
+    // by the aarch64 engine/Dart VM, never the embedder (which issues its own
+    // asm SVCs with kernel numbers). So the NR is ALWAYS an aarch64 Linux number
+    // and must be translated to the kernel's numbering BEFORE dispatch — a plain
+    // pass-through would mis-handle the many aarch64 NRs that collide with a
+    // different x86-64 syscall (e.g. aarch64 futex=98 == x86-64 getrusage=98).
+    #[cfg(target_arch = "aarch64")]
+    let nr = aarch64_nr_to_kernel(nr).unwrap_or(nr);
+    let r = crate::syscall::dispatch_fast(nr, a0, a1, a2, 0, 0);
+    if r == -38 {
+        static ENOSYS_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        let n = ENOSYS_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 50 {
+            log::error!("[passthrough-ENOSYS] #{} nr={:#x} a0={:#x} a1={:#x} a2={:#x}", n, nr, a0, a1, a2);
+        }
+    }
+    r
 }
 
 pub fn sys_getenv(_name_ptr: u64, _name_len: u64) -> i64 {
