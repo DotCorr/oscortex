@@ -28,6 +28,7 @@ pub mod enter_user;
 // ── Bare-metal bring-up (direct `-kernel` boot) ─────────────────────────────
 pub mod uart;
 pub mod fdt;
+pub mod ramfb;
 pub mod boot;
 pub mod boot_prod;
 pub mod mmu;
