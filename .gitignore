@@ -46,3 +46,20 @@ docs/goal-general-purpose.md
 # Build/runtime artifacts — regenerated, never track (root-anchored)
 /initramfs.tar
 /vdisk.img
+/qemu-pipe.*
+
+# Scratch / debugging area — experiments only, never track (public repo)
+/scratch/
+
+# Local preview mirror of the Desktop landing page (served by .claude/launch.json)
+/.preview-oscortex-desktop/
+
+# Local agent/session data — never track
+/.claude/
+
+# Downloaded prebuilt engine artifacts (fetch-engine.sh cache)
+/.engine-cache/
+
+# Fetched engine tool binaries (from fetch-engine.sh)
+/tools/flutter-engine/bin/
+initramfs/system/lib/liboscortex_libc.so

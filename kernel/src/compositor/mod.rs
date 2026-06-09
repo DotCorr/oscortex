@@ -7,7 +7,31 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use spin::Mutex;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// The mouse-cursor shape the compositor currently draws. Set from userspace
+/// via `SYS_CURSOR_SHAPE_SET` when the Flutter framework activates a system
+/// cursor (e.g. hovering a button → click/hand, hovering a text field → I-beam).
+/// Values are the `CURSOR_SHAPE_*` constants in `embedder::abi`.
+static ACTIVE_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(0);
+
+/// Set the active mouse-cursor shape drawn by the compositor overlay.
+/// Returns `false` if `shape` is out of range.
+pub fn set_cursor_shape(shape: u32) -> bool {
+    if shape > crate::embedder::abi::CURSOR_SHAPE_MAX {
+        return false;
+    }
+    ACTIVE_CURSOR_SHAPE.store(shape, Ordering::Release);
+    // Repaint so the new pointer shape shows immediately even if Flutter's
+    // surface content has not changed.
+    invalidate();
+    true
+}
+
+/// Current active cursor shape.
+pub fn cursor_shape() -> u32 {
+    ACTIVE_CURSOR_SHAPE.load(Ordering::Acquire)
+}
 
 /// When `true`, a userspace process owns the framebuffer directly.
 /// `render_frame()` skips the background fill and placeholder blits.
@@ -555,6 +579,24 @@ pub fn present_surface_for(caller_pid: u32, id: u32) -> Result<(), &'static str>
 ///
 /// `payload` must be exactly `surface.width * surface.height * 4` bytes.
 pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'static str> {
+    submit_bgra_impl(caller_pid, id, payload, 0)
+}
+
+/// Unified surface submit: Flutter kN32 = BGRA8888 (little-endian x86) → the
+/// compositor's RGBA back buffer, in a SINGLE u32-wise, stride-aware pass.
+///
+/// `src_row_bytes == 0` means a tight `width*4` stride. This replaces the old
+/// two-pass path — a strided re-pack into a fresh `vec![0u8; w*h*4]` allocated
+/// EVERY frame, followed by a byte-indexed B↔R swap — which cost two full
+/// 1M-pixel passes plus a 4 MB allocation per frame. Reading the source as u32
+/// and swapping bytes 0↔2 with bit ops is ~one memory op per pixel instead of
+/// four, and skips the intermediate buffer entirely.
+fn submit_bgra_impl(
+    caller_pid: u32,
+    id: u32,
+    payload: &[u8],
+    src_row_bytes: usize,
+) -> Result<(), &'static str> {
     let mut c = COMP.lock();
     for (idx, s) in c.surfaces.iter().enumerate() {
         if s.in_use && s.id == id {
@@ -564,28 +606,32 @@ pub fn gpu_submit_for(caller_pid: u32, id: u32, payload: &[u8]) -> Result<(), &'
                     return Err("permission denied");
                 }
             }
-            let pixels = s.width as usize * s.height as usize;
-            let expect = pixels * 4;
-            if payload.len() != expect {
+            let w = s.width as usize;
+            let h = s.height as usize;
+            let pixels = w * h;
+            let row_px = if src_row_bytes == 0 { w } else { src_row_bytes / 4 };
+            if payload.len() < row_px * 4 * h {
                 return Err("bad payload size");
             }
-            // Phase 33-C: write to back buffer, flip at next vsync.
             if c.back_buffers[idx].is_none()
                 || c.back_buffers[idx].as_ref().map(|b| b.len()).unwrap_or(0) != pixels
             {
                 c.back_buffers[idx] = Some(alloc::vec![0u32; pixels]);
             }
             let buf = c.back_buffers[idx].as_mut().ok_or("no back buffer")?;
-            // Flutter's software surface is kN32 (= BGRA8888 on little-endian x86):
-            // payload bytes are [B, G, R, A]. The compositor buffer / blit_rgba32
-            // expect R in the low byte, so swap B and R while packing.
-            for i in 0..pixels {
-                let b = i * 4;
-                let bl = payload[b    ] as u32;
-                let g  = payload[b + 1] as u32;
-                let r  = payload[b + 2] as u32;
-                let a  = payload[b + 3] as u32;
-                buf[i] = r | (g << 8) | (bl << 16) | (a << 24);
+            // payload bytes [B,G,R,A] => little-endian u32 = B | G<<8 | R<<16 | A<<24.
+            // The compositor wants R in the low byte: swap bytes 0 and 2.
+            let src = payload.as_ptr() as *const u32;
+            unsafe {
+                for y in 0..h {
+                    let s_row = src.add(y * row_px);
+                    let d_row = y * w;
+                    for x in 0..w {
+                        let p = core::ptr::read_unaligned(s_row.add(x));
+                        buf[d_row + x] =
+                            (p & 0xFF00_FF00) | ((p & 0x0000_00FF) << 16) | ((p & 0x00FF_0000) >> 16);
+                    }
+                }
             }
             c.back_pending[idx] = true;
             drop(c);
@@ -629,7 +675,46 @@ fn blend_pixel(bg: u32, fg: u32, alpha: u8) -> u32 {
     (r_out << 16) | (g_out << 8) | b_out
 }
 
-/// Circular cursor rendering with active click scaling, custom color, and inactivity auto-fade.
+/// Plot one solid cursor pixel with bounds checking.
+#[inline]
+fn cursor_px(x: i32, y: i32, dx: i32, dy: i32, color: u32) {
+    let px = x + dx;
+    let py = y + dy;
+    if px >= 0 && py >= 0 {
+        crate::drivers::fb::set_pixel(px as u32, py as u32, color);
+    }
+}
+
+/// Draw a 1px-thick filled line between two points (Bresenham). Used to build
+/// the vector cursor sprites without per-shape bitmap tables.
+fn cursor_line(x: i32, y: i32, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        cursor_px(x, y, x0, y0, color);
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
+/// Mouse-cursor overlay rendering. The OS draws the pointer in software (Flutter
+/// does not in software-renderer mode). The shape is selected by the Flutter
+/// framework via `SYS_CURSOR_SHAPE_SET` (e.g. button hover → click/hand, text
+/// field hover → I-beam), so hovering interactive widgets actually changes the
+/// cursor — a real platform capability, not a stub.
 fn draw_software_cursor() {
     use core::sync::atomic::Ordering;
     if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
@@ -643,37 +728,60 @@ fn draw_software_cursor() {
         return;
     }
 
+    let shape = cursor_shape();
+    use crate::embedder::abi::*;
+    if shape == CURSOR_SHAPE_NONE {
+        return;
+    }
+
     let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
     let buttons = crate::drivers::ps2::cursor_buttons();
 
-    // Determine scale and color based on click/active state
-    let (r, r_glow, color) = if buttons != 0 {
-        (4i32, 8i32, 0x0038BDF8) // Clicked: 8px diameter, cyan accent
-    } else {
-        (6i32, 10i32, 0x00FFFFFF) // Idle: 12px diameter, white
-    };
-
+    // Keep the sprite fully on-screen (max sprite extent is ~10px from hotspot).
     if let Some((w, h)) = crate::drivers::fb::size_px() {
-        x = x.clamp(r_glow, w as i32 - 1 - r_glow);
-        y = y.clamp(r_glow, h as i32 - 1 - r_glow);
+        x = x.clamp(10, w as i32 - 11);
+        y = y.clamp(10, h as i32 - 11);
     }
 
-    // Draw circular pointer and fading radial glow using integer distance metric
+    // White fill, dark outline — readable on any background.
+    let fill = 0x00FFFFFFu32;
+    let edge = 0x00101820u32;
+    let accent = if buttons != 0 { 0x0038BDF8u32 } else { fill };
+
+    match shape {
+        CURSOR_SHAPE_BASIC => draw_arrow_cursor(x, y, buttons, accent, edge),
+        CURSOR_SHAPE_TEXT => draw_ibeam_cursor(x, y, fill, edge),
+        CURSOR_SHAPE_CLICK => draw_hand_cursor(x, y, fill, edge),
+        CURSOR_SHAPE_FORBIDDEN => draw_forbidden_cursor(x, y),
+        CURSOR_SHAPE_GRAB | CURSOR_SHAPE_GRABBING => {
+            draw_hand_cursor(x, y, fill, edge)
+        }
+        CURSOR_SHAPE_RESIZE_LR => draw_resize_cursor(x, y, true, fill, edge),
+        CURSOR_SHAPE_RESIZE_UD => draw_resize_cursor(x, y, false, fill, edge),
+        // Unknown → fall back to the basic pointer.
+        _ => draw_arrow_cursor(x, y, buttons, accent, edge),
+    }
+}
+
+/// The classic circular pointer (the original OSCortex cursor), kept as the
+/// default `basic` shape with its click scaling + radial glow.
+fn draw_arrow_cursor(x: i32, y: i32, buttons: u32, _accent: u32, _edge: u32) {
+    let (r, r_glow, color) = if buttons != 0 {
+        (4i32, 8i32, 0x0038BDF8) // Clicked: cyan accent
+    } else {
+        (6i32, 10i32, 0x00FFFFFF) // Idle: white
+    };
     for dy in -r_glow..=r_glow {
         for dx in -r_glow..=r_glow {
             let dist2 = dx * dx + dy * dy;
             let px = x + dx;
             let py = y + dy;
-
             if px >= 0 && py >= 0 {
                 let px = px as u32;
                 let py = py as u32;
-
                 if dist2 <= r * r {
-                    // Solid central core
                     crate::drivers::fb::set_pixel(px, py, color);
                 } else if dist2 <= r_glow * r_glow {
-                    // Soft radial shadow/glow
                     let bg = crate::drivers::fb::get_pixel(px, py);
                     let t = (r_glow * r_glow) - dist2;
                     let max_t = (r_glow * r_glow) - (r * r);
@@ -683,6 +791,100 @@ fn draw_software_cursor() {
                     crate::drivers::fb::set_pixel(px, py, blended);
                 }
             }
+        }
+    }
+}
+
+/// I-beam (text cursor): a vertical bar with top/bottom serifs.
+fn draw_ibeam_cursor(x: i32, y: i32, fill: u32, edge: u32) {
+    // Outline first (1px around), then fill, for legibility on any background.
+    for dy in -8..=8 {
+        cursor_px(x, y, -1, dy, edge);
+        cursor_px(x, y, 1, dy, edge);
+        cursor_px(x, y, 0, dy, fill);
+    }
+    // Serifs at the top and bottom.
+    for dx in -3..=3 {
+        cursor_px(x, y, dx, -9, edge);
+        cursor_px(x, y, dx, 9, edge);
+        cursor_px(x, y, dx, -8, fill);
+        cursor_px(x, y, dx, 8, fill);
+    }
+}
+
+/// Hand / link cursor (also used for grab): a pointing-finger silhouette.
+fn draw_hand_cursor(x: i32, y: i32, fill: u32, edge: u32) {
+    // Pointing finger: a vertical column for the finger and a rounded palm.
+    // Finger (extends up from the hotspot).
+    for dy in -9..=2 {
+        for dx in -1..=1 {
+            cursor_px(x, y, dx, dy, fill);
+        }
+    }
+    // Palm (a filled rounded block below the finger).
+    for dy in 2..=9 {
+        for dx in -4..=4 {
+            let edge_block = dy == 9 || dx == -4 || dx == 4;
+            cursor_px(x, y, dx, dy, if edge_block { edge } else { fill });
+        }
+    }
+    // Knuckle lines hinting folded fingers.
+    cursor_px(x, y, -2, 3, edge);
+    cursor_px(x, y, 0, 3, edge);
+    cursor_px(x, y, 2, 3, edge);
+    // Outline the finger.
+    for dy in -9..=2 {
+        cursor_px(x, y, -2, dy, edge);
+        cursor_px(x, y, 2, dy, edge);
+    }
+    cursor_px(x, y, 0, -10, edge);
+}
+
+/// Forbidden / no-drop cursor: a red circle with a diagonal slash.
+fn draw_forbidden_cursor(x: i32, y: i32) {
+    let red = 0x00E02424u32;
+    let r = 8i32;
+    // Ring (distance-based outline, 2px thick).
+    for dy in -r..=r {
+        for dx in -r..=r {
+            let dist2 = dx * dx + dy * dy;
+            if dist2 <= r * r && dist2 >= (r - 2) * (r - 2) {
+                cursor_px(x, y, dx, dy, red);
+            }
+        }
+    }
+    // Diagonal slash (top-left to bottom-right).
+    cursor_line(x, y, -5, -5, 5, 5, red);
+    cursor_line(x, y, -5, -4, 5, 6, red);
+}
+
+/// Resize cursor: a double-headed arrow, horizontal or vertical.
+fn draw_resize_cursor(x: i32, y: i32, horizontal: bool, fill: u32, edge: u32) {
+    if horizontal {
+        // Shaft.
+        for dx in -8..=8 {
+            cursor_px(x, y, dx, 0, fill);
+            cursor_px(x, y, dx, -1, edge);
+            cursor_px(x, y, dx, 1, edge);
+        }
+        // Arrow heads.
+        for i in 0..4 {
+            cursor_px(x, y, -8 + i, -i, fill);
+            cursor_px(x, y, -8 + i, i, fill);
+            cursor_px(x, y, 8 - i, -i, fill);
+            cursor_px(x, y, 8 - i, i, fill);
+        }
+    } else {
+        for dy in -8..=8 {
+            cursor_px(x, y, 0, dy, fill);
+            cursor_px(x, y, -1, dy, edge);
+            cursor_px(x, y, 1, dy, edge);
+        }
+        for i in 0..4 {
+            cursor_px(x, y, -i, -8 + i, fill);
+            cursor_px(x, y, i, -8 + i, fill);
+            cursor_px(x, y, -i, 8 - i, fill);
+            cursor_px(x, y, i, 8 - i, fill);
         }
     }
 }
@@ -701,46 +903,9 @@ pub fn gpu_submit_strided_for(
     payload: &[u8],
     row_bytes: usize,
 ) -> Result<(), &'static str> {
-    // Determine the surface dimensions we need for stride validation.
-    let (width, height) = {
-        let c = COMP.lock();
-        let mut dims = None;
-        for s in c.surfaces.iter() {
-            if s.in_use && s.id == id {
-                dims = Some((s.width as usize, s.height as usize));
-                break;
-            }
-        }
-        dims.ok_or("no such surface")?
-    };
-
-    let tight_stride = width * 4;
-
-    // Fast path: no stride conversion needed.
-    if row_bytes == 0 || row_bytes == tight_stride {
-        let expected_bytes = tight_stride * height;
-        if payload.len() < expected_bytes {
-            return Err("bad payload size");
-        }
-        return gpu_submit_for(caller_pid, id, &payload[..expected_bytes]);
-    }
-
-    // Validate that the buffer is large enough for the strided layout.
-    let expected_bytes = row_bytes * height;
-    if payload.len() < expected_bytes {
-        return Err("bad payload size");
-    }
-
-    // Re-pack rows into a tight RGBA32 buffer.
-    let mut tight: Vec<u8> = vec![0u8; tight_stride * height];
-    for row in 0..height {
-        let src_start = row * row_bytes;
-        let dst_start = row * tight_stride;
-        tight[dst_start..dst_start + tight_stride]
-            .copy_from_slice(&payload[src_start..src_start + tight_stride]);
-    }
-
-    gpu_submit_for(caller_pid, id, &tight)
+    // submit_bgra_impl handles the source stride directly in its single packing
+    // pass — no intermediate tight buffer, no per-frame allocation.
+    submit_bgra_impl(caller_pid, id, payload, row_bytes)
 }
 
 /// Packed framebuffer size: `(width << 32) | height`.
@@ -784,6 +949,9 @@ pub fn render_frame() {
         drop(c);
         if let Some((w, h)) = crate::drivers::fb::size_px() {
             crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
+            // No app has presented a frame yet → we're in the engine warm-up.
+            // Draw the animated loading splash so the screen isn't a dead blank.
+            crate::drivers::fb::draw_boot_splash(frame);
         }
         draw_software_cursor();
         crate::drivers::fb::swap_buffers();
@@ -796,7 +964,24 @@ pub fn render_frame() {
 
     if !bypass {
         if let Some((w, h)) = crate::drivers::fb::size_px() {
-            crate::drivers::fb::fill_rect(0, 0, w, h, 0x00101820);
+            // Skip the full-screen clear when a presented surface already covers
+            // the whole screen — it would just be overwritten by the blit below.
+            // Saves a full 1M-pixel pass per frame (the common case: one
+            // full-screen Flutter surface).
+            let covered = {
+                let c = COMP.lock();
+                c.surfaces.iter().enumerate().any(|(idx, s)| {
+                    s.in_use
+                        && c.presented[idx]
+                        && s.x <= 0
+                        && s.y <= 0
+                        && (s.x + s.width as i32) >= w as i32
+                        && (s.y + s.height as i32) >= h as i32
+                })
+            };
+            if !covered {
+                crate::drivers::fb::fill_rect(0, 0, w, h, 0x00101820);
+            }
         }
     }
 
@@ -873,6 +1058,14 @@ pub fn tick() {
             dirty = true;
             break;
         }
+    }
+
+    // 4. Boot splash animation: while nothing visible has been presented yet,
+    // force a periodic redraw so the loading indicator animates and the user
+    // can see the machine is alive during the engine warm-up. Throttled so it
+    // doesn't steal CPU the JIT warm-up needs.
+    if !dirty && !has_visible_content(&c) && c.frame_counter % 5 == 0 {
+        dirty = true;
     }
 
     if dirty {

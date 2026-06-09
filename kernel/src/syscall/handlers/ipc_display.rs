@@ -376,10 +376,7 @@ fn wm_event_copy_to_user(ev_ptr: u64, ev_len: u64, platform_poll_slack: bool) ->
 
     let consumer = wm_consumer_pid();
     let ev = match crate::wm::pop_event_for(consumer) {
-        Some(e) => {
-            log::warn!("[wm-copy] popped event: kind={} flags={} a={} b={} for consumer={}", e.kind, e.flags, e.a, e.b, consumer);
-            e
-        }
+        Some(e) => e,
         None => return -11, // EAGAIN
     };
 

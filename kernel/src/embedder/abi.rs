@@ -185,6 +185,34 @@ pub const SYS_SURFACE_FULLSCREEN: u64 = 0x381; // surface_fullscreen() → surfa
 pub const SYS_DL_GET_INIT_ARRAY: u64 = 0x382;
 // dl_get_init_array(handle, out_init_fn: *mut u64, out_array_va: *mut u64, out_count: *mut u64) → 0/-EBADF
 
+// Phase 70 — OS platform capabilities backing the Flutter platform contract.
+//
+// These are real kernel-provided capabilities the Flutter framework expects of
+// its host platform: an active mouse-cursor shape (drawn by the compositor), a
+// system-wide clipboard shared across every app/host, a foreground-app close
+// path (return focus to the shell), and a PC-speaker beep for SystemSound.play.
+pub const SYS_CURSOR_SHAPE_SET: u64 = 0x4B2; // cursor_shape_set(shape: u32) → 0 / -EINVAL
+pub const SYS_CLIPBOARD_SET:    u64 = 0x4B3; // clipboard_set(ptr, len) → 0 / -EINVAL
+pub const SYS_CLIPBOARD_GET:    u64 = 0x4B4; // clipboard_get(buf_ptr, buf_len) → bytes (full length, may exceed buf)
+pub const SYS_APP_CLOSE_FOREGROUND: u64 = 0x4B5; // app_close_foreground() → 0  (refocus shell, terminate fg app)
+pub const SYS_BEEP:             u64 = 0x4B6; // beep(freq_hz, duration_ms) → 0  (PC speaker)
+
+/// Mouse-cursor shapes the compositor can draw. Mirrors the subset of Flutter
+/// `SystemMouseCursors` kinds OSCortex maps to a distinct on-screen pointer.
+pub const CURSOR_SHAPE_BASIC:     u32 = 0; // arrow (default)
+pub const CURSOR_SHAPE_TEXT:      u32 = 1; // I-beam (text fields)
+pub const CURSOR_SHAPE_CLICK:     u32 = 2; // hand / link
+pub const CURSOR_SHAPE_FORBIDDEN: u32 = 3; // no-drop / forbidden
+pub const CURSOR_SHAPE_GRAB:      u32 = 4; // open hand / grab
+pub const CURSOR_SHAPE_GRABBING:  u32 = 5; // closed hand / grabbing
+pub const CURSOR_SHAPE_RESIZE_LR: u32 = 6; // horizontal resize
+pub const CURSOR_SHAPE_RESIZE_UD: u32 = 7; // vertical resize
+pub const CURSOR_SHAPE_NONE:      u32 = 8; // hidden cursor
+pub const CURSOR_SHAPE_MAX:       u32 = 8;
+
+/// Maximum bytes retained in the kernel system clipboard.
+pub const CLIPBOARD_MAX: usize = 64 * 1024;
+
 // On-demand package delivery — Fuchsia-inspired ephemeral fetch.
 pub const SYS_PKG_RESOLVE:    u64 = 0x390; // pkg_resolve(name_ptr, name_len) → app_id / -ERRNO
 pub const SYS_PKG_CATALOG:    u64 = 0x391; // pkg_catalog(buf_ptr, buf_len) → count (writes manifest entries)
@@ -205,6 +233,10 @@ pub const ISOLATE_DEAD:    u32 = 3;
 // WM event kind for incoming isolate messages (Phase 36).
 // `flags` = 0, `a` = dst_isolate_id, `b` = message_byte_len.
 pub const EV_ISOLATE_MSG: u32 = 8;
+
+// Mouse scroll-wheel event. `flags` = 0, `a` = packed cursor pos
+// ((x as u32) << 32 | (y as u32)), `b` = signed scroll delta-z (as i32 in low bits).
+pub const EV_SCROLL: u32 = 9;
 
 // Focus transition flags used with EV_FOCUS events.
 pub const FOCUS_LOST:   u32 = 1;

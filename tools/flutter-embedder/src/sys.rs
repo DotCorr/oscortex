@@ -78,6 +78,24 @@ pub const SYS_ISOLATE_MSG_SEND: u64 = 0x36A;
 pub const SYS_ISOLATE_MSG_RECV: u64 = 0x36B;
 pub const SYS_ISOLATE_MSG_PENDING: u64 = 0x36C;
 
+// Phase 70 — Flutter platform-contract OS capabilities (mirrors abi.rs).
+pub const SYS_CURSOR_SHAPE_SET: u64 = 0x4B2;
+pub const SYS_CLIPBOARD_SET: u64 = 0x4B3;
+pub const SYS_CLIPBOARD_GET: u64 = 0x4B4;
+pub const SYS_APP_CLOSE_FOREGROUND: u64 = 0x4B5;
+pub const SYS_BEEP: u64 = 0x4B6;
+
+// Mouse-cursor shapes accepted by SYS_CURSOR_SHAPE_SET (mirrors abi.rs).
+pub const CURSOR_SHAPE_BASIC: u32 = 0;
+pub const CURSOR_SHAPE_TEXT: u32 = 1;
+pub const CURSOR_SHAPE_CLICK: u32 = 2;
+pub const CURSOR_SHAPE_FORBIDDEN: u32 = 3;
+pub const CURSOR_SHAPE_GRAB: u32 = 4;
+pub const CURSOR_SHAPE_GRABBING: u32 = 5;
+pub const CURSOR_SHAPE_RESIZE_LR: u32 = 6;
+pub const CURSOR_SHAPE_RESIZE_UD: u32 = 7;
+pub const CURSOR_SHAPE_NONE: u32 = 8;
+
 // ── WM event kinds ────────────────────────────────────────────────────────────
 
 pub const EV_VSYNC: u32 = 1;
@@ -88,6 +106,7 @@ pub const EV_FOCUS: u32 = 5;
 pub const EV_PLATFORM_MSG: u32 = 6;
 pub const EV_ISOLATE: u32 = 7; // Phase 35
 pub const EV_ISOLATE_MSG: u32 = 8; // Phase 36
+pub const EV_SCROLL: u32 = 9; // mouse scroll wheel; a = packed (x<<32|y), b = signed dz
                                    // Isolate state values (carried in WmEvent.flags on EV_ISOLATE events).
 pub const ISOLATE_RUNNING: u32 = 1;
 pub const ISOLATE_PAUSED: u32 = 2;
@@ -818,5 +837,39 @@ pub fn mprotect(va: u64, size: u64, prot: u64) -> i64 {
     unsafe {
         syscall3(SYS_MPROTECT, va, size, prot)
     }
+}
+
+// ── Phase 70 — Flutter platform-contract OS capabilities ─────────────────────
+
+/// Set the active mouse-cursor shape drawn by the compositor.
+/// `shape` is one of the `CURSOR_SHAPE_*` constants.
+pub fn cursor_shape_set(shape: u32) -> i64 {
+    unsafe { syscall1(SYS_CURSOR_SHAPE_SET, shape as u64) }
+}
+
+/// Replace the system-wide clipboard with `data`.
+pub fn clipboard_set(data: &[u8]) -> i64 {
+    unsafe { syscall2(SYS_CLIPBOARD_SET, data.as_ptr() as u64, data.len() as u64) }
+}
+
+/// Copy the system-wide clipboard into `buf`. Returns the FULL stored length
+/// (may exceed `buf.len()`, signalling truncation), or a negative errno.
+pub fn clipboard_get(buf: &mut [u8]) -> i64 {
+    unsafe { syscall2(SYS_CLIPBOARD_GET, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Query the system clipboard length without copying.
+pub fn clipboard_len() -> i64 {
+    unsafe { syscall2(SYS_CLIPBOARD_GET, 0, 0) }
+}
+
+/// Close the foreground app and return focus to the shell. Returns the shell pid.
+pub fn app_close_foreground() -> i64 {
+    unsafe { syscall0(SYS_APP_CLOSE_FOREGROUND) }
+}
+
+/// Emit a PC-speaker tone (freq 0 = default system beep).
+pub fn beep(freq_hz: u32, duration_ms: u32) -> i64 {
+    unsafe { syscall2(SYS_BEEP, freq_hz as u64, duration_ms as u64) }
 }
 

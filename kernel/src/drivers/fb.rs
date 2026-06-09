@@ -360,6 +360,91 @@ pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
     }
 }
 
+/// Draw one FONT glyph at pixel (px, py), magnified by `scale`, in `color`,
+/// with a transparent background (only lit pixels are painted). Built on
+/// `fill_rect` so it respects the active double buffer.
+fn draw_glyph_px(ch: u8, px: i32, py: i32, scale: u32, color: u32) {
+    if ch < 0x20 || ch >= 0x80 {
+        return;
+    }
+    let glyph = &FONT[(ch - 0x20) as usize];
+    let mut gy = 0u32;
+    while gy < CHAR_H {
+        let bits = glyph[gy as usize];
+        let mut gx = 0u32;
+        while gx < CHAR_W {
+            if (bits >> (7 - gx)) & 1 != 0 {
+                fill_rect(
+                    px + (gx * scale) as i32,
+                    py + (gy * scale) as i32,
+                    scale,
+                    scale,
+                    color,
+                );
+            }
+            gx += 1;
+        }
+        gy += 1;
+    }
+}
+
+/// Draw an ASCII string centered horizontally, with its top at pixel row `py`,
+/// magnified by `scale`, in `color`.
+fn draw_text_centered(s: &[u8], py: i32, scale: u32, color: u32) {
+    let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
+    let cw = (CHAR_W * scale) as i32;
+    let total = s.len() as i32 * cw;
+    let mut x = (width - total) / 2;
+    for &ch in s {
+        draw_glyph_px(ch, x, py, scale, color);
+        x += cw;
+    }
+}
+
+/// Minimal animated loading spinner, drawn by the compositor while no app
+/// surface has presented yet (the Flutter engine's JIT warm-up). Just a ring of
+/// dots with a rotating bright head — enough to show the machine is alive, no
+/// text. A Flutter spinner can't appear until the engine is ready, so this has
+/// to be drawn by the kernel.
+pub fn draw_boot_splash(frame: u64) {
+    let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
+    let height = FB_HEIGHT.load(Ordering::Relaxed) as i32;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let cx = width / 2;
+    let cy = height / 2;
+
+    // 8 dot positions evenly around a circle (radius ~28px), clockwise from right.
+    const OFFS: [(i32, i32); 8] = [
+        (28, 0),
+        (20, 20),
+        (0, 28),
+        (-20, 20),
+        (-28, 0),
+        (-20, -20),
+        (0, -28),
+        (20, -20),
+    ];
+    let head = ((frame / 4) % 8) as i32;
+    let mut i = 0i32;
+    while i < 8 {
+        // Trailing distance behind the rotating head (0 = brightest).
+        let d = ((head - i) & 7) as u32;
+        // Fade teal (0x2D,0xD4,0xBF) by (8-d)/8 down the tail.
+        let f = (8 - d) as u32;
+        let r = (0x2D * f) / 8;
+        let g = (0xD4 * f) / 8;
+        let b = (0xBF * f) / 8;
+        let color = (r << 16) | (g << 8) | b;
+        let size: u32 = if d == 0 { 9 } else { 7 };
+        let off = (size as i32) / 2;
+        let (dx, dy) = OFFS[i as usize];
+        fill_rect(cx + dx - off, cy + dy - off, size, size, color);
+        i += 1;
+    }
+}
+
 /// Blit a 32-bit RGBA source image into the framebuffer at `(x, y)`.
 ///
 /// Source is expected in little-endian RGBA packed in `u32`; alpha is ignored

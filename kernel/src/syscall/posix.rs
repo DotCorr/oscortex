@@ -1253,59 +1253,15 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
     };
 
     if state.is_none() {
-        // Check for a pre-delivered (lost-wakeup-guard) signal before blocking.
-        // If cond_signal/cond_broadcast fired before this wait was entered, we
-        // recorded it in COND_PENDING_SIGNALS. Consume it and return immediately.
-        {
-            let mut pending = super::COND_PENDING_SIGNALS.lock();
-            if let Some(count) = pending.get_mut(&cond) {
-                if *count > 0 {
-                    *count -= 1;
-                    if *count == 0 { pending.remove(&cond); }
-                    drop(pending);
-                    static PENDING_CONSUME_LOG: core::sync::atomic::AtomicU32 =
-                        core::sync::atomic::AtomicU32::new(0);
-                    let n = PENDING_CONSUME_LOG.fetch_add(1, Ordering::Relaxed);
-                    if n < 32 {
-                        log::warn!(
-                            "[cond-pending-consume] #{} pid={} cond={:#x} mutex={:#x} — yield then return",
-                            n, pid, cond, mutex
-                        );
-                    }
-                    // SINGLE-CORE FAIRNESS FIX: yield the CPU to a sibling thread
-                    // before returning. Returning 0 immediately let a hot Dart
-                    // mutator (pid 2) consume pending signals (often ones IT posted
-                    // via cond_signal woke=0 on the same monitor), re-test its
-                    // predicate, and spin — never giving the helper thread (GC /
-                    // JIT compiler / peer waiter) that satisfies the predicate any
-                    // CPU. On one core that is a livelock: first frame never
-                    // completes. By yielding here, the helper runs; when we are
-                    // rescheduled we return 0, the caller re-tests, and (pending now
-                    // consumed) the next cond_wait blocks for real until signalled.
-                    if pid != 0 {
-                        if let Some(next) = super::cooperative_sched_target(pid) {
-                            if next != pid {
-                                let urip = crate::arch::syscall::user_rip();
-                                let ursp = crate::arch::syscall::user_rsp();
-                                // Resume AFTER the syscall (urip, not urip-2) with
-                                // rax=0 so the cond_wait call returns success. Stay
-                                // Running so round-robin reschedules us promptly.
-                                crate::process::save_return_context(pid, urip, ursp);
-                                crate::process::save_full_user_gprs(pid);
-                                crate::process::set_rax(pid, 0);
-                                crate::process::save_xstate(pid);
-                                crate::process::enter_user_by_pid_noreturn(next);
-                            }
-                        }
-                    }
-                    // No sibling to yield to (single runnable thread): the mutex was
-                    // never released, so just return 0 and let the caller re-test.
-                    return 0;
-                }
-            }
-        }
-
         // First time: register waiter, then unlock mutex and enter Waiting state.
+        // NOTE: no "pending signal" pre-check. A pthread_cond_signal with no
+        // waiter parked is a no-op by contract (the predicate is mutex-protected,
+        // so a not-yet-waiting thread sees it under the lock and never waits).
+        // Resurrecting such signals as spurious wakeups caused pid=2 to consume
+        // a fake pending, return 0, find its predicate still false, and re-wait
+        // forever — the cond-pending-consume livelock. The seq protocol below
+        // already delivers every *real* signal race-free under cooperative
+        // single-core scheduling.
         let seq = atom.load(Ordering::Acquire);
         if pid != 0 {
             super::futex_waiter_add(cond, pid);
@@ -1541,11 +1497,6 @@ pub fn sys_pthread_cond_signal(cond: u64) -> i64 {
                 );
             }
         }
-        // If nobody was woken directly on this condvar, record a pending signal.
-        // Record even when bridged > 0 — bridge wakes may be spurious.
-        let mut pending = super::COND_PENDING_SIGNALS.lock();
-        let entry = pending.entry(cond).or_insert(0);
-        *entry = entry.saturating_add(1).min(8);
     }
 
     static COND_SIGNAL_LOG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -1711,17 +1662,6 @@ pub fn sys_pthread_cond_broadcast(cond: u64) -> i64 {
         }
     }
     cond_broadcast_loop_handoff(pid, cond, n, bridged);
-
-    // Lost-wakeup guard: if nobody was woken directly on this condvar, record a
-    // pending signal so the next cond_wait on this condvar returns immediately.
-    // We record even when bridged > 0 because bridge wakes may be spurious —
-    // the intended waiter (thread 1) might not be at the bridge target yet.
-    // Cap at 8 pending to prevent unbounded growth from broadcast storms.
-    if n == 0 && cond >= 0x1000 {
-        let mut pending = super::COND_PENDING_SIGNALS.lock();
-        let entry = pending.entry(cond).or_insert(0);
-        *entry = entry.saturating_add(1).min(8);
-    }
 
     static COND_BROADCAST_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
