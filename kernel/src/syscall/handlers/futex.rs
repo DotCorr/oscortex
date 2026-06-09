@@ -695,16 +695,15 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
 
-            // Give the newborn thread one immediate slice. Without this, the
-            // creator can monopolize userspace and delay child startup long
-            // enough to starve wake-source setup (pipe/timer arming).
-            // x86 gave the newborn an immediate slice by saving the creator's
-            // context and entering the child here (never returning, delivering
-            // r=0 on the creator's later resume). On aarch64 this nested
-            // enter-while-inside-a-syscall re-entrancy corrupted the creator's
-            // resume (the 2nd fml::Thread's pthread_create returned non-zero →
-            // thread.cc:80 FML_CHECK abort). Let the child run via normal
-            // cooperative scheduling instead: return r=0 directly.
+            // x86 gave the newborn an immediate slice by entering the child
+            // from inside the creator's pthread_create syscall (never returning;
+            // delivering r=0 on the creator's later cooperative resume). On
+            // aarch64 that nested enter-while-in-a-syscall corrupts the creator's
+            // resume so the *next* fml::Thread's pthread_create returns non-zero
+            // (thread.cc:80 FML_CHECK abort) — reproducible even with the x30/LR
+            // and 4-byte-svc-rewind fixes in place. Keep it OFF on aarch64: the
+            // child becomes runnable here and is picked up by normal cooperative
+            // scheduling / timer preemption the next time the creator yields.
             #[cfg(not(target_arch = "aarch64"))]
             {
                 let parent = crate::process::current_pid();

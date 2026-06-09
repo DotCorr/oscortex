@@ -468,6 +468,12 @@ pub fn swap_buffers() {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn write_byte(b: u8) {
+    // The text console is a best-effort serial mirror. If the FB geometry is
+    // unpublished or degenerate (e.g. a corrupted FB_ROWS/FB_COLS static), do
+    // nothing rather than risk an arithmetic-overflow panic in the kernel.
+    if FB_ROWS.load(Ordering::Relaxed) == 0 || FB_COLS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     match b {
         b'\r' => {
             CURSOR.lock().0 = 0;
@@ -477,7 +483,7 @@ fn write_byte(b: u8) {
             cur.0 = 0;
             cur.1 += 1;
             let rows = FB_ROWS.load(Ordering::Relaxed);
-            if cur.1 >= rows {
+            if rows > 0 && cur.1 >= rows {
                 drop(cur);
                 scroll_up();
                 CURSOR.lock().1 = rows - 1;
@@ -559,6 +565,13 @@ fn scroll_up() {
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed);
     let height   = FB_HEIGHT  .load(Ordering::Relaxed);
     let rows     = FB_ROWS    .load(Ordering::Relaxed);
+
+    // Guard against an unpublished/degenerate FB geometry: the serial-mirror
+    // console must never panic the kernel (subtract-with-overflow on height or
+    // rows). Bail out cleanly if there is nothing safe to scroll.
+    if addr == 0 || height < CHAR_H || rows == 0 || pitch_px == 0 {
+        return;
+    }
 
     // Number of pixel rows to copy.
     let copy_rows = height - CHAR_H;
