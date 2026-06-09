@@ -1610,7 +1610,16 @@ fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
                     let mut kind = [0u8; 32];
                     if let Some((klen, _)) = json_parse_string(payload, vi, &mut kind) {
                         let shape = cursor_kind_to_shape(&kind[..klen]);
-                        sys::cursor_shape_set(shape);
+                        // De-dupe: Flutter spams activateSystemCursor on every
+                        // hover move. The kernel syscall redraws the cursor
+                        // (invalidate → composite), so calling it per-event is a
+                        // redraw STORM that freezes the cooperative core. Only hit
+                        // the kernel when the shape actually CHANGES.
+                        static LAST_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(u32::MAX);
+                        let changed = LAST_CURSOR_SHAPE.swap(shape, Ordering::Relaxed) != shape;
+                        if changed {
+                            sys::cursor_shape_set(shape);
+                        }
                         static CUR_LOG: AtomicU32 = AtomicU32::new(0);
                         if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
                             write(b"[embedder/cursor] kind=");
@@ -2695,7 +2704,12 @@ extern "C" fn main_embedder() {
         if sem_va != 0 {
             let update_semantics_enabled: unsafe extern "C" fn(u64, bool) -> i32 =
                 unsafe { core::mem::transmute(sem_va) };
-            let rc_sem = unsafe { update_semantics_enabled(engine_out, true) };
+            // DISABLED for now (pass `false`): enabling semantics makes the engine
+            // rebuild the FULL accessibility tree on every frame/hover-change, which
+            // is far too expensive on the cooperative single core — it froze the
+            // shell on hover. The callback + channel stay wired, so re-enabling is a
+            // one-flag change once it's throttled / moved off the hot path.
+            let rc_sem = unsafe { update_semantics_enabled(engine_out, false) };
             if rc_sem == 0 {
                 SEMANTICS_ENABLED.store(true, Ordering::Release);
                 write(b"[embedder] semantics enabled\n");
