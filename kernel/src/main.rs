@@ -244,7 +244,28 @@ pub fn kernel_main_arch(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
         (mm::frame_allocator::frames_used() * 4096) / (1024 * 1024)
     );
     log::info!("OSCortex kernel {} booting (aarch64)...", env!("CARGO_PKG_VERSION"));
-    log::warn!("[BOOT] No framebuffer / Flutter engine on aarch64 yet (follow-on).");
+
+    // ── 3b. Framebuffer via QEMU ramfb (fw_cfg) ──────────────────────────
+    // `-M virt` has no Limine framebuffer; configure QEMU's `-device ramfb`
+    // through fw_cfg and publish the buffer to the shared fb console so the
+    // compositor path works unchanged.  Requires the frame allocator (online
+    // after `mm::init_from_regions`).
+    match arch::aarch64::ramfb::init() {
+        Some((addr, w, h, pitch)) => {
+            // Identity-mapped RAM → the physical framebuffer base is directly
+            // writable as a virtual address (VA == PA on aarch64).
+            drivers::fb::init_raw(addr, w, h, pitch);
+            log::info!("[BOOT] aarch64 framebuffer online: {}x{} via ramfb", w, h);
+            // Paint a visible boot fill so the display is provably driven even
+            // before any userspace renders (top band teal, body dark navy).
+            drivers::fb::fill_rect(0, 0, w, 48, 0x0014_B8A6);
+            drivers::fb::fill_rect(0, 48, w, h - 48, 0x001A_1A2E);
+            drivers::fb::write_str("\n  OSCortex aarch64 — ramfb framebuffer up\n");
+        }
+        None => {
+            log::warn!("[BOOT] aarch64 ramfb unavailable (need -device ramfb); serial-only.");
+        }
+    }
 
     shared_init_and_run()
 }

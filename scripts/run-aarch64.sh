@@ -30,10 +30,35 @@ cargo build --target "$TARGET" -p oscortex-kernel \
     -Z build-std-features=compiler-builtins-mem
 
 SMP=1
-[[ "${1:-}" == "smp2" ]] && SMP=2
+DISPLAY_MODE="${DISPLAY_MODE:-none}"   # none | gtk | cocoa | sdl
+for arg in "$@"; do
+    case "$arg" in
+        smp2)          SMP=2 ;;
+        gtk|cocoa|sdl) DISPLAY_MODE="$arg" ;;
+        graphical)     DISPLAY_MODE="cocoa" ;;  # macOS default backend
+    esac
+done
 
-echo "[run-aarch64] booting (smp=$SMP) — Ctrl-A X to quit ..."
-exec qemu-system-aarch64 \
-    -M virt -cpu cortex-a72 -smp "$SMP" -m 2G \
-    -nographic -kernel "$KERNEL" \
-    -serial mon:stdio
+# `-device ramfb`: QEMU's software framebuffer, configured by the guest through
+# fw_cfg (kernel/src/arch/aarch64/ramfb.rs). With DISPLAY_MODE=none the kernel
+# still drives the buffer (capture it via the QEMU monitor `screendump`); a real
+# display backend (cocoa/gtk/sdl) shows it on screen.
+COMMON=(
+    -M virt -cpu cortex-a72 -smp "$SMP" -m 2G
+    -kernel "$KERNEL"
+    -device ramfb
+)
+
+if [[ "$DISPLAY_MODE" == "none" ]]; then
+    echo "[run-aarch64] booting (smp=$SMP, headless ramfb) — Ctrl-A X to quit ..."
+    echo "[run-aarch64] monitor: /tmp/qemu-arm-monitor.sock (screendump to capture the fb)"
+    exec qemu-system-aarch64 "${COMMON[@]}" \
+        -display none \
+        -serial mon:stdio \
+        -monitor unix:/tmp/qemu-arm-monitor.sock,server,nowait
+else
+    echo "[run-aarch64] booting (smp=$SMP, display=$DISPLAY_MODE) — close window or Ctrl-A X to quit ..."
+    exec qemu-system-aarch64 "${COMMON[@]}" \
+        -display "$DISPLAY_MODE" \
+        -serial mon:stdio
+fi
