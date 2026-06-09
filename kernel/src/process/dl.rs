@@ -13,6 +13,17 @@
 //! | `R_X86_64_GLOB_DAT`| 6        | `S`       |
 //! | `R_X86_64_JUMP_SLOT`| 7       | `S`       |
 //!
+//! ## Supported aarch64 relocation types
+//! | Type                  | Encoding | Formula |
+//! |-----------------------|----------|---------|
+//! | `R_AARCH64_ABS64`     | 257      | `S + A` |
+//! | `R_AARCH64_GLOB_DAT`  | 1025     | `S + A` |
+//! | `R_AARCH64_JUMP_SLOT` | 1026     | `S + A` |
+//! | `R_AARCH64_RELATIVE`  | 1027     | `B + A` |
+//!
+//! The loader selects the relocation set from the ELF `e_machine`, so a single
+//! `dlopen` path loads both the x86 and the ARM `libflutter_engine.so`.
+//!
 //! Undefined externals (`st_shndx == SHN_UNDEF`) are left at zero.  The
 //! Flutter engine fills all mandatory platform callbacks through the
 //! `FlutterEngineProcTable` struct passed during `FlutterEngineInitialize`,
@@ -36,6 +47,7 @@ const ELFCLASS64:   u8      = 2;
 const ELFDATA2LSB:  u8      = 1;
 const ET_DYN:       u16     = 3;
 const EM_X86_64:    u16     = 62;
+const EM_AARCH64:   u16     = 183;
 
 const PT_LOAD:      u32     = 1;
 const PT_DYNAMIC:   u32     = 2;
@@ -58,6 +70,12 @@ const R_X86_64_64:         u32 = 1;
 const R_X86_64_GLOB_DAT:   u32 = 6;
 const R_X86_64_JUMP_SLOT:  u32 = 7;
 const R_X86_64_RELATIVE:   u32 = 8;
+
+// aarch64 dynamic relocation types (ELF for the Arm 64-bit Architecture).
+const R_AARCH64_ABS64:     u32 = 257;
+const R_AARCH64_GLOB_DAT:  u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+const R_AARCH64_RELATIVE:  u32 = 1027;
 
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK:   u8 = 2;
@@ -461,11 +479,22 @@ fn apply_rela_table(
         let sym_idx = (rela.r_info >> 32) as usize;
         let target  = load_base.wrapping_add(rela.r_offset);
 
+        // Both x86_64 and aarch64 use the same RELA encoding (r_offset/r_info/
+        // r_addend) and identical formulas; only the type *numbers* differ. We
+        // accept both sets so a single loader handles either engine .so. On
+        // aarch64, GLOB_DAT/JUMP_SLOT add the addend (S + A); on x86 the addend
+        // is conventionally zero for those, so `S + A` is also correct there.
         let value = match rtype {
+            // ── x86_64 ──
             R_X86_64_RELATIVE  => { n_rel += 1; load_base.wrapping_add(rela.r_addend as u64) },
             R_X86_64_64        => { n_64 += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
             R_X86_64_GLOB_DAT  => { n_glob += 1; sym_vaddr(sym_idx) },
             R_X86_64_JUMP_SLOT => { n_jmp += 1; sym_vaddr(sym_idx) },
+            // ── aarch64 ──
+            R_AARCH64_RELATIVE  => { n_rel += 1; load_base.wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_ABS64     => { n_64 += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_GLOB_DAT  => { n_glob += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_JUMP_SLOT => { n_jmp += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
             0                  => continue,
             _                  => { n_other += 1; continue; },
         };
@@ -616,7 +645,14 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
     if hdr.e_ident[4] != ELFCLASS64    { return Err("not ELF64"); }
     if hdr.e_ident[5] != ELFDATA2LSB   { return Err("not little-endian"); }
     if hdr.e_type    != ET_DYN          { return Err("not a shared object (ET_DYN required)"); }
+    // Accept only the machine type matching the kernel build: the loaded code
+    // executes natively in the process, so a foreign-arch .so would fault.
+    #[cfg(target_arch = "x86_64")]
     if hdr.e_machine != EM_X86_64       { return Err("not x86_64"); }
+    #[cfg(target_arch = "aarch64")]
+    if hdr.e_machine != EM_AARCH64      { return Err("not aarch64"); }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { let _ = (EM_X86_64, EM_AARCH64); }
 
     // ── Allocate load base ────────────────────────────────────────────────
     // Key the bump cursor on pml4_phys, not pid, so threads sharing an
@@ -832,9 +868,13 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
         h
     };
 
-    // ── Runtime patch: libflutter_engine.so ──────────────────────────────
-    // Identified by ELF size > 50 MiB (the engine is ~91 MiB; no other
-    // library we load comes close).
+    // ── Runtime patch: libflutter_engine.so (x86_64 only) ────────────────
+    // These patches rewrite specific *x86 instruction byte sequences* in the
+    // engine (e.g. ImageReader::GetInstructionsAt sign-extension). They are
+    // inherently architecture-specific and must NOT run against the aarch64
+    // engine (different opcodes, different offsets). Gate the whole block.
+    // Identified by ELF size > 50 MiB (the x86 engine is ~91 MiB).
+    #[cfg(target_arch = "x86_64")]
     if elf_bytes.len() > 50 * 1024 * 1024 {
         // Helper: write N bytes at a virtual address via HHDM.
         let mut write_va = |va: u64, data: &[u8]| -> bool {

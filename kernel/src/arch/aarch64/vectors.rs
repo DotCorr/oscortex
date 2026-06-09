@@ -302,9 +302,21 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
                 } else {
                     report_unhandled(f, kind, ec);
                 }
+            } else if ec == EC_DABT_LOWER || ec == EC_IABT_LOWER {
+                // EL0 data/instruction abort. The Flutter engine relies on
+                // demand-paged anonymous memory (mmap'd Dart heaps, executable
+                // AOT regions) and the kernel's VA-mirror window. Route the fault
+                // through the shared `demand_page` pager exactly like the x86
+                // page-fault handler does; if it resolves, `eret` retries the
+                // faulting instruction. Otherwise surface the fault.
+                if try_demand_page_el0(f, ec) {
+                    // Resolved — return; the vector restore path will eret and
+                    // re-execute the faulting access against the new mapping.
+                } else {
+                    report_unhandled(f, kind, ec);
+                }
             } else {
-                // User fault (data/instruction abort etc.) — report and, for
-                // bring-up, advance past it would be wrong; surface it.
+                // Other EL0 synchronous fault — surface it.
                 report_unhandled(f, kind, ec);
             }
         }
@@ -332,6 +344,39 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
         }
         _ => report_unhandled(f, kind, ec),
     }
+}
+
+/// Attempt to resolve an EL0 data/instruction abort via the shared demand pager.
+///
+/// Reads the faulting address from FAR_EL1 and decodes the ESR fault-status code
+/// to distinguish a *translation* fault (page not mapped → demand-page it) from a
+/// *permission* fault (page mapped but access not allowed). Returns true if the
+/// pager mapped the page (the caller should eret and retry the access).
+///
+/// The shared `demand_page(addr, error)` mirrors the x86 page-fault ABI where
+/// `error` bit0 = "page present" (a permission, not a translation, fault). We
+/// synthesise that bit from the ARM DFSC so the shared pager's
+/// `if error & 0x1 != 0 { return false }` early-out behaves identically.
+fn try_demand_page_el0(f: &mut TrapFrame, ec: u64) -> bool {
+    // FAR_EL1 holds the faulting virtual address for aborts.
+    let far: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack));
+    }
+
+    // Decode the fault status. For data aborts (EC=0x24) the DFSC is ESR[5:0];
+    // for instruction aborts (EC=0x20) the IFSC is likewise ESR[5:0].
+    let fsc = f.esr & 0x3f;
+    // DFSC/IFSC 0b0001xx = translation fault (levels 0..3). 0b0011xx = access
+    // flag fault, 0b0010xx... ; permission faults are 0b0011xx (0xC..0xF).
+    let is_translation = matches!(fsc, 0x04 | 0x05 | 0x06 | 0x07);
+    let is_permission = matches!(fsc, 0x0C | 0x0D | 0x0E | 0x0F);
+
+    // Mirror the x86 error encoding: bit0 = present (permission fault).
+    let error: u64 = if is_permission { 0x1 } else { 0x0 };
+    let _ = (ec, is_translation);
+
+    crate::mm::paging::demand_page(far, error)
 }
 
 /// Print an unhandled-exception report over serial. For bring-up we park after

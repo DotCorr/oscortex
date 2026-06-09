@@ -737,6 +737,18 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
         unsafe {
             core::arch::asm!("invlpg [{}]", in(reg) page_va, options(nostack, preserves_flags));
         }
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            // Invalidate the stale TLB entry for this VA (EL1, inner-shareable),
+            // then re-execute the faulting access.
+            core::arch::asm!(
+                "dsb ishst",
+                "tlbi vmalle1is",
+                "dsb ish",
+                "isb",
+                options(nostack, preserves_flags),
+            );
+        }
         return true;
     }
 
