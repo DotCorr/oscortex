@@ -44,11 +44,18 @@ fn read_mpidr() -> u64 {
 
 /// Return this CPU's ID (by matching MPIDR_EL1 against the per-CPU table).
 pub fn current_cpu_id() -> u32 {
-    let mpidr = read_mpidr();
     let n = CPU_COUNT.load(Ordering::Relaxed) as usize;
+    // Single-core fast path: the BSP is always CPU 0. This also makes the timer
+    // ISR's per-CPU lookup robust against a transiently-inconsistent PER_CPU_DATA
+    // read (the lookup result indexes PTABLE_LOCK_RECURSION/PER_CPU_DATA, and a
+    // garbage index would panic the kernel from inside the IRQ handler).
+    if n <= 1 {
+        return 0;
+    }
+    let mpidr = read_mpidr();
     unsafe {
         let table = &*core::ptr::addr_of!(PER_CPU_DATA);
-        for i in 0..n {
+        for i in 0..n.min(MAX_CPUS) {
             if table[i].mpidr == mpidr {
                 return i as u32;
             }

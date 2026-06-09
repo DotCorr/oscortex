@@ -81,6 +81,16 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     // EOI now so the GIC can deliver the next timer interrupt right after eret.
     super::gic::eoi(intid);
 
+    // Wake threads whose timerfd deadlines have elapsed, and deliver any pending
+    // cross-thread wakes — exactly as the x86 APIC-timer ISR does (idt.rs). On
+    // aarch64 this was missing, so the engine's UI/raster/IO worker threads that
+    // epoll_wait on a timerfd went Blocked and were NEVER transitioned back to
+    // Running → the cooperative scheduler found no runnable thread and the whole
+    // engine deadlocked right after spawning its worker pool. The try_-variants
+    // are ISR-safe (skip on lock contention rather than deadlock).
+    crate::syscall::check_timerfds_and_wake_try();
+    crate::process::handle_pending_wakes_try();
+
     // Only preempt interrupts taken FROM EL0 (a running user thread). SPSR_EL1
     // M[3:0] == 0 means the interrupted context was EL0t. Kernel-mode ticks
     // (idle/cortex loop) just return — there is no user frame to switch.
@@ -105,6 +115,16 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
             && cur != target
             && (crate::wm::input_pending_for(target) > 0
                 || (target == 1 && crate::wm::embedder_baton_due())));
+    {
+        static PREEMPT_TICK_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = PREEMPT_TICK_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 80 && (n % 8 == 0 || should_preempt) {
+            log::warn!(
+                "[arm-preempt-tick] #{} cur={} slice_expired={} should={} focus={}",
+                n, cur, slice_expired, should_preempt, focus
+            );
+        }
+    }
     if !should_preempt {
         return;
     }
@@ -122,8 +142,19 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         return;
     }
 
-    if let Some((next_pid, next_regs, ttbr0)) =
-        crate::process::timer_preempt_switch_try(cur, &cur_regs)
+    let switch = crate::process::timer_preempt_switch_try(cur, &cur_regs);
+    {
+        static SWITCH_LOG: AtomicU32 = AtomicU32::new(0);
+        let n = SWITCH_LOG.fetch_add(1, Ordering::Relaxed);
+        if n < 60 {
+            log::warn!(
+                "[arm-preempt-switch] #{} cur={} -> next={:?} states={}",
+                n, cur, switch.as_ref().map(|s| s.0),
+                crate::process::debug_runnable_states()
+            );
+        }
+    }
+    if let Some((next_pid, next_regs, ttbr0)) = switch
     {
         // Switch the low-half translation base to the next thread's space.
         crate::arch::memory::write_cr3(ttbr0);

@@ -385,12 +385,13 @@ fn shared_init_and_run() -> ! {
                         }
                         // Arm the generic-timer scheduler tick now (kernel fully
                         // initialised) so preemption begins the moment we drop to EL0.
-                        // DIAGNOSTIC: skip arming for the engine host to isolate a
-                        // timer-IRQ-during-eret interaction; the host drives its own
-                        // frame pump cooperatively via sched_yield.
-                        if !engine_present {
-                            arch::aarch64::apic::start_scheduler_tick();
-                        }
+                        // The engine NEEDS preemption: pid 1 busy-spins in EL0 after
+                        // creating its UI/raster/IO worker threads (it waits on a
+                        // userspace flag the workers set), and with the nested
+                        // immediate-child-enter disabled on arm those workers only
+                        // get the CPU when a timer tick preempts pid 1.
+                        let _ = engine_present;
+                        arch::aarch64::apic::start_scheduler_tick();
                         process::enter_user_by_pid_noreturn(pid);
                     }
                 }

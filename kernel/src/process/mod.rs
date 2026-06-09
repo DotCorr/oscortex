@@ -342,6 +342,18 @@ pub struct PTableLock {
     holder: AtomicU32,
 }
 
+/// CPU index used to key PTABLE_LOCK_RECURSION / the holder atomic. Always a
+/// valid in-range index. We use the computed `current_cpu_id()` (which on
+/// aarch64 short-circuits to 0 for single-core) rather than reading the
+/// `PerCpuData.cpu_id` *field*, and hard-clamp to the recursion-array bound so
+/// the timer ISR can never index out of bounds and panic the kernel even if a
+/// per-CPU struct read is momentarily inconsistent.
+#[inline(always)]
+fn ptable_cpu_idx() -> u32 {
+    let id = crate::arch::smp::current_cpu_id();
+    if (id as usize) < crate::arch::smp::MAX_CPUS { id } else { 0 }
+}
+
 impl PTableLock {
     pub const fn new() -> Self {
         Self {
@@ -351,7 +363,7 @@ impl PTableLock {
     }
 
     pub fn lock(&self) -> PTableGuard {
-        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        let my_cpu = ptable_cpu_idx();
         if self.holder.load(Ordering::Acquire) == my_cpu {
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
@@ -369,7 +381,7 @@ impl PTableLock {
     }
 
     pub fn try_lock(&self) -> Option<PTableGuard> {
-        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        let my_cpu = ptable_cpu_idx();
         if self.holder.load(Ordering::Acquire) == my_cpu {
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
@@ -393,14 +405,14 @@ impl PTableLock {
 impl Drop for PTableGuard {
     fn drop(&mut self) {
         if self.is_outer {
-            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            let my_cpu = ptable_cpu_idx();
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] = 0;
                 PTABLE_LOCK.holder.store(0xFFFF_FFFF, Ordering::Release);
                 PTABLE_LOCK_GUARD = None;
             }
         } else {
-            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            let my_cpu = ptable_cpu_idx();
             unsafe {
                 if PTABLE_LOCK_RECURSION[my_cpu as usize] > 0 {
                     PTABLE_LOCK_RECURSION[my_cpu as usize] -= 1;
@@ -948,6 +960,30 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
         }
     }
     out
+}
+
+/// Compact debug string of pid/state/current_cpu for the first few PIDs, for
+/// diagnosing why the timer-preempt scheduler can't find a runnable thread.
+pub fn debug_runnable_states() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        for pid in 1u32..=6 {
+            let p = unsafe { &PTABLE[idx_of(pid)] };
+            if p.pid == pid {
+                let st = match p.state {
+                    ProcState::Running => 'R',
+                    ProcState::Blocked => 'B',
+                    ProcState::Zombie(_) => 'Z',
+                    ProcState::Dead => 'D',
+                };
+                let _ = write!(s, "{}:{}{:?} ", pid, st, p.current_cpu);
+            }
+        }
+    } else {
+        s.push_str("(locked)");
+    }
+    s
 }
 
 pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
@@ -1527,7 +1563,7 @@ fn user_launch_task() {
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
 pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
-    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
     let _g = PTABLE_LOCK.lock();
@@ -1586,7 +1622,7 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
 
 /// Try-lock variant of `timer_preempt_switch` to avoid ISR deadlocks.
 pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
-    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
     if let Some(_g) = PTABLE_LOCK.try_lock() {
