@@ -185,6 +185,13 @@ pub struct Process {
     /// snapshot to restore (vs. a fresh/syscall-entered thread).
     #[cfg(target_arch = "aarch64")]
     pub arch_frame_valid: bool,
+    /// aarch64 only: the user link register (x30) captured at the last SVC
+    /// boundary. AArch64 keeps return addresses in LR, not on the stack, so a
+    /// thread that yields mid-syscall must have x30 restored on resume — without
+    /// it the cooperative `build_image` re-entry leaves x30=0 and the thread's
+    /// next `ret` branches to address 0.
+    #[cfg(target_arch = "aarch64")]
+    pub user_lr: u64,
 }
 
 impl Process {
@@ -221,6 +228,8 @@ impl Process {
             arch_trapframe: [0u64; 36],
             #[cfg(target_arch = "aarch64")]
             arch_frame_valid: false,
+            #[cfg(target_arch = "aarch64")]
+            user_lr: 0,
         }
     }
 }
@@ -1341,6 +1350,17 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         }
     }
 
+    // aarch64: carry the user link register (x30) in the otherwise-unused
+    // `rflags` slot (build_image maps rflags→x30 on aarch64; SPSR is constant
+    // there). Without this the cooperative SYSRET resume leaves x30=0 and the
+    // resuming thread's next `ret` branches to address 0.
+    #[cfg(target_arch = "aarch64")]
+    let rflags = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid { p.user_lr } else { rflags }
+    };
+
     // Assemble the full user register state for the arch entry hook. The
     // arch backend owns the actual ring-3 transition asm (IRETQ vs SYSRETQ on
     // x86_64); the shared code above owns all the PTABLE/CR3/errno logic.
@@ -1401,6 +1421,12 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
          syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = context;
 
     crate::process::set_current_pid(pid);
+    if rip == 0 || rip < 0x1000 {
+        log::error!(
+            "[enter-user-ZEROPC] pid={} rip={:#x} rsp={:#x} rax={:#x} fs={:#x} preempted={}",
+            pid, rip, rsp, rax, fs_base, preempted_by_timer
+        );
+    }
     if pid == 8 || pid == 9 {
         static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
         let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
@@ -1432,6 +1458,18 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
             );
         }
     }
+
+    // aarch64: carry the user link register (x30) in the otherwise-unused
+    // `rflags` slot. build_image maps rflags→x30 on aarch64; SPSR is a constant
+    // there, so rflags is free. (The timer-preempt/IRET path restores x30 from
+    // arch_trapframe instead, so this only matters for the SYSRET/cooperative
+    // resume below.)
+    #[cfg(target_arch = "aarch64")]
+    let rflags = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid { p.user_lr } else { rflags }
+    };
 
     let enter_regs = crate::arch::EnterUserRegs {
         rip, rsp, rflags,
@@ -1630,6 +1668,12 @@ pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
     let fs = crate::arch::cpu::get_fs_base();
+    // aarch64: capture the user link register (x30) from the SVC-entry snapshot
+    // BEFORE taking the lock. AArch64 return addresses live in LR, not on the
+    // stack, so a thread that yields inside this syscall must resume with x30
+    // intact or its next `ret` jumps to whatever build_image left there (0).
+    #[cfg(target_arch = "aarch64")]
+    let lr = crate::arch::syscall::user_lr();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid {
@@ -1639,6 +1683,8 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
         p.preempted_by_timer = false;
         p.fs_base = fs;
+        #[cfg(target_arch = "aarch64")]
+        { p.user_lr = lr; }
     }
 }
 
@@ -1678,6 +1724,10 @@ pub fn save_full_user_gprs(pid: u32) {
     p.regs.r13 = snap.r13;
     p.regs.r14 = snap.r14;
     p.regs.r15 = snap.r15;
+    // aarch64: persist the user link register (x30) so the thread can `ret`
+    // correctly after resuming from this syscall yield.
+    #[cfg(target_arch = "aarch64")]
+    { p.user_lr = snap.lr; }
 }
 
 /// Set the `rax` return value that will be delivered when this process is

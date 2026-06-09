@@ -30,12 +30,18 @@ struct CpuScratch {
     r10: u64, r8:  u64, r9:  u64,
     rbx: u64, rbp: u64,
     r12: u64, r13: u64, r14: u64, r15: u64,
+    // aarch64-only: the user link register (x30) at SVC entry. AArch64 has no
+    // on-stack return address — a function that yields inside a syscall must
+    // have its LR restored, or its later `ret` branches to whatever build_image
+    // leaves in x30 (previously hardwired to 0 → branch-to-0 crash).
+    lr: u64,
 }
 
 const ZERO_SCRATCH: CpuScratch = CpuScratch {
     user_rsp: 0, user_rip: 0, syscall_stack_top: 0,
     rdi: 0, rsi: 0, rdx: 0, r10: 0, r8: 0, r9: 0,
     rbx: 0, rbp: 0, r12: 0, r13: 0, r14: 0, r15: 0,
+    lr: 0,
 };
 
 static mut CPU_SCRATCHES: [CpuScratch; MAX_CPUS] = [ZERO_SCRATCH; MAX_CPUS];
@@ -54,6 +60,8 @@ pub struct UserGprSnapshot {
     pub r10: u64, pub r8:  u64, pub r9:  u64,
     pub rbx: u64, pub rbp: u64,
     pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
+    /// aarch64 user link register (x30) at SVC entry. Unused on x86.
+    pub lr: u64,
 }
 
 #[inline]
@@ -90,6 +98,7 @@ pub fn capture_from_trap(frame: &super::vectors::TrapFrame) {
         s.r14 = frame.x[22];
         s.r15 = frame.x[23];
         s.rbp = frame.x[29];
+        s.lr  = frame.x[30];
     }
 }
 
@@ -191,6 +200,12 @@ pub fn user_gprs() -> UserGprSnapshot {
             r10: s.r10, r8: s.r8, r9: s.r9,
             rbx: s.rbx, rbp: s.rbp,
             r12: s.r12, r13: s.r13, r14: s.r14, r15: s.r15,
+            lr: s.lr,
         }
     }
+}
+
+/// User link register (x30) captured at SVC entry. AArch64-only.
+pub fn user_lr() -> u64 {
+    unsafe { (*core::ptr::addr_of!(CPU_SCRATCHES))[cpu_idx()].lr }
 }

@@ -72,7 +72,13 @@ fn build_image(regs: &EnterUserRegs) -> [u64; 34] {
     img[22] = regs.r14; // x22
     img[23] = regs.r15; // x23
     img[29] = regs.rbp; // x29 (frame pointer)
-    // x30 (LR) zero on first entry.
+    // x30 (LR): the shared enter path stashes the user link register captured at
+    // the SVC boundary in the otherwise-unused `rflags` slot (SPSR is a constant
+    // here). A thread that yields mid-syscall MUST resume with x30 intact or its
+    // next `ret` branches to whatever was here (was hardwired 0 → crash). On the
+    // very first entry of a fresh thread user_lr is 0, which is correct (the
+    // thread-return trampoline address sits at [SP], not in LR).
+    img[30] = regs.rflags; // x30 (LR)
     img[31] = regs.rsp; // SP_EL0
     img[32] = regs.rip; // PC → ELR_EL1
     img[33] = SPSR_EL0T; // SPSR_EL1
