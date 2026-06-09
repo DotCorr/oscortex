@@ -144,6 +144,7 @@ pub fn spawn_kernel_task(name: &'static str, f: fn()) -> u64 {
     //   [r13 = 0]
     //   [r14 = 0]
     //   [r15 = 0]            ← kernel_sp points here
+    #[cfg(not(target_arch = "aarch64"))]
     let kernel_sp = unsafe {
         let stack_top = stack_base.add(STACK_SIZE) as *mut u64;
         let mut sp = stack_top;
@@ -156,6 +157,30 @@ pub fn spawn_kernel_task(name: &'static str, f: fn()) -> u64 {
         sp = sp.sub(1); sp.write(0); // rbp
         sp = sp.sub(1); sp.write(0); // rbx
         sp as u64
+    };
+
+    // aarch64 uses a different context_switch/task_entry ABI (AAPCS64 callee-saved
+    // pairs x19..x30, then `ret` to x30; task_entry pops the fn ptr via
+    // `ldr x9,[sp],#16` then `blr x9`). Build a matching first-run frame.
+    //
+    // Layout (low → high address):
+    //   sp+0   x19  sp+8   x20
+    //   sp+16  x21  sp+24  x22
+    //   sp+32  x23  sp+40  x24
+    //   sp+48  x25  sp+56  x26
+    //   sp+64  x27  sp+72  x28
+    //   sp+80  x29  sp+88  x30  ← x30 = task_entry (context_switch `ret`s here)
+    //   sp+96  fn ptr        ← read by task_entry's `ldr x9,[sp],#16`
+    #[cfg(target_arch = "aarch64")]
+    let kernel_sp = unsafe {
+        let stack_top = stack_base.add(STACK_SIZE) as *mut u64;
+        // Reserve the fn-ptr slot at the very top, then the 12-word save area.
+        let fn_slot = stack_top.sub(1);
+        fn_slot.write(f as u64);
+        let frame = fn_slot.sub(12); // 12 u64 = x19..x30
+        for i in 0..12 { frame.add(i).write(0); }
+        frame.add(11).write(crate::arch::task_entry as unsafe extern "C" fn() as u64); // x30
+        frame as u64
     };
 
     let task = Task { pid, state: TaskState::Ready, priority: 128, name, kernel_sp, stack_base };

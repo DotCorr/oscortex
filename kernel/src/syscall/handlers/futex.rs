@@ -486,13 +486,13 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
                         let urip = crate::arch::syscall::user_rip();
                         let ursp = crate::arch::syscall::user_rsp();
-                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_return_context_reexec(pid, urip, ursp);
                         crate::process::save_full_user_gprs(pid);
                         crate::process::set_rax(pid, sys_nr);
                         crate::process::save_xstate(pid);
@@ -585,13 +585,13 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
                         let urip = crate::arch::syscall::user_rip();
                         let ursp = crate::arch::syscall::user_rsp();
-                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_return_context_reexec(pid, urip, ursp);
                         crate::process::save_full_user_gprs(pid);
                         crate::process::set_rax(pid, sys_nr);
                         crate::process::save_xstate(pid);
@@ -649,6 +649,8 @@ pub(crate) fn sys_pty_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
 ///   writes `*out = tid`, returns `0` on success.
 pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let parent_pid = crate::process::current_pid();
+    log::error!("[thread-create] ENTER pid={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        parent_pid, arg0, arg1, arg2, arg3);
     if parent_pid == 0 {
         return -1; // EPERM
     }
@@ -682,29 +684,43 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
                 unsafe { *(arg0 as *mut u64) = fs_base; }
                 (0_i64, Some(tid))
             }
-            Err(errno) => (-errno, None),
+            Err(errno) => {
+                log::error!("[thread-create] POSIX spawn FAILED entry={:#x} arg={:#x} stk={:#x} errno={}",
+                    arg2, arg3, stack_size, errno);
+                (-errno, None)
+            }
         };
-        log::trace!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
+        log::warn!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
             arg0, arg1, arg2, arg3, stack_size, r);
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
 
-            // Give the newborn thread one immediate slice. Without this, the
-            // creator can monopolize userspace and delay child startup long
-            // enough to starve wake-source setup (pipe/timer arming).
-            let parent = crate::process::current_pid();
-            if parent != 0 && child_pid != parent {
-                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
-                if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
-                    let urip = crate::arch::syscall::user_rip();
-                    let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(parent, urip, ursp);
-                    crate::process::save_full_user_gprs(parent);
-                    crate::process::set_rax(parent, 0);
-                    crate::process::save_xstate(parent);
-                    crate::process::enter_user_by_pid_noreturn(child_pid);
+            // x86 gave the newborn an immediate slice by entering the child
+            // from inside the creator's pthread_create syscall (never returning;
+            // delivering r=0 on the creator's later cooperative resume). On
+            // aarch64 that nested enter-while-in-a-syscall corrupts the creator's
+            // resume so the *next* fml::Thread's pthread_create returns non-zero
+            // (thread.cc:80 FML_CHECK abort) — reproducible even with the x30/LR
+            // and 4-byte-svc-rewind fixes in place. Keep it OFF on aarch64: the
+            // child becomes runnable here and is picked up by normal cooperative
+            // scheduling / timer preemption the next time the creator yields.
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let parent = crate::process::current_pid();
+                if parent != 0 && child_pid != parent {
+                    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                    if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(parent, urip, ursp);
+                        crate::process::save_full_user_gprs(parent);
+                        crate::process::set_rax(parent, 0);
+                        crate::process::save_xstate(parent);
+                        crate::process::enter_user_by_pid_noreturn(child_pid);
+                    }
                 }
             }
+            let _ = child_pid;
         }
         r
     } else {
@@ -767,7 +783,7 @@ pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
                     if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
                     return 0;
                 }
-                unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+                crate::arch::spin_pause();
             }
             Err(_) => {
                 if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }

@@ -551,7 +551,11 @@ pub fn check_timerfds_and_wake_try() {
             exps
         };
         for (pid, mutex, cond) in expired {
-            super::futex_waiter_remove(cond, pid);
+            // ISR-safe: never block on FUTEX_WAITERS here. An interrupted syscall
+            // (e.g. spawn_thread, a futex op) may hold it; a non-try lock would
+            // self-deadlock this single core with IRQs masked. On contention the
+            // removal is simply retried on the next timer tick.
+            super::futex_waiter_remove_try(cond, pid);
             static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
             let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
             if n < 32 {
@@ -613,10 +617,7 @@ pub fn monotonic_ns() -> u64 {
     //   1_700_000_000 * 10^9 + tsc_ns
     // timerfd_settime with TFD_TIMER_ABSTIME passes this value, so our
     // "now" must use the same epoch or timers will never fire.
-    let lo: u32;
-    let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
-    let tsc_ns = (((hi as u64) << 32) | lo as u64) / 3;
+    let tsc_ns = crate::arch::rdtsc() / 3;
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
 }
 
@@ -1002,7 +1003,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 if crate::process::try_claim_cpu_for(target, my_cpu) {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                    crate::process::save_return_context_reexec(cur, urip, ursp);
                     crate::process::save_full_user_gprs(cur);
                     crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
                     crate::process::save_xstate(cur);
@@ -1136,7 +1137,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             if crate::process::try_claim_cpu_for(focus, my_cpu) {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1294,7 +1295,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 // blocking again — exactly like sys_wm_event_wait does.
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1320,7 +1321,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 crate::process::set_state(1, crate::process::ProcState::Running);
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B);
                 crate::process::save_xstate(cur);
@@ -1330,7 +1331,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
 
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            { crate::arch::enable_and_halt(); }
         }
     }
 }

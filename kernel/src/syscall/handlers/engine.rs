@@ -20,24 +20,35 @@ pub(crate) fn sys_dlopen(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
         Some(ctx) => ctx.pml4_phys,
         None => return -9, // EBADF
     };
-    // Serve libflutter_engine.so from the Limine module if available.
-    let engine_guard;
+    // Serve libflutter_engine.so from the Limine module if available (x86 ships
+    // the 33 MB engine as a Limine boot module to keep it out of the initramfs).
+    // On aarch64 there is NO Limine — the engine travels INSIDE the initramfs at
+    // /system/lib/libflutter_engine.so — so when the module is absent we fall
+    // through to the normal VFS lookup instead of failing.
+    let engine_guard = if path.contains("libflutter_engine") {
+        Some(crate::FLUTTER_ENGINE_BYTES.lock())
+    } else {
+        None
+    };
     let elf: &[u8] = if path.contains("libflutter_engine") {
-        engine_guard = crate::FLUTTER_ENGINE_BYTES.lock();
-        if let Some(data) = engine_guard.as_ref() {
-            log::info!("[dlopen] Serving libflutter_engine.so from Limine module ({} bytes)", data.len());
-            data
-        } else {
-            log::warn!("[dlopen] libflutter_engine.so requested but not available as Limine module");
-            return -2; // ENOENT
+        // Prefer the Limine module (x86); fall back to the initramfs VFS (aarch64).
+        match engine_guard.as_ref().and_then(|g| g.as_ref()) {
+            Some(data) => {
+                log::info!("[dlopen] Serving libflutter_engine.so from Limine module ({} bytes)", data.len());
+                data
+            }
+            None => match crate::fs::lookup(path) {
+                Some(data) => {
+                    log::info!("[dlopen] Serving libflutter_engine.so from initramfs ({} bytes)", data.len());
+                    data
+                }
+                None => {
+                    log::warn!("[dlopen] libflutter_engine.so not in Limine module nor initramfs");
+                    return -2; // ENOENT
+                }
+            },
         }
     } else {
-        drop({
-            // Need to satisfy borrow checker — create a temporary guard that we immediately drop.
-            // We don't actually use it here.
-            let _unused = crate::FLUTTER_ENGINE_BYTES.lock();
-            _unused
-        });
         match crate::fs::lookup(path) {
             Some(data) => data,
             None => return -2, // ENOENT
@@ -1359,12 +1370,12 @@ pub(crate) fn sys_sched_yield() -> i64 {
         } else if cur == 1 {
             // OnVsync posts work to runner threads — sleep briefly so they can run (SMP or IRQ wake).
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
         } else {
             // No other runnable process — sleep until the next IRQ (timerfd, vsync…).
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
         }
     }
