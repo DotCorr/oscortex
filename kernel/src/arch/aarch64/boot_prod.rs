@@ -54,9 +54,39 @@ pub fn aarch64_kernel_boot(dtb_ptr: u64) -> ! {
     // The generic timer (scheduler tick) is armed later by the shared kernel via
     // `arch::apic::init_bsp`; IRQ delivery stays masked until then.
 
+    // ── Locate the DTB ──────────────────────────────────────────────────────
+    // QEMU passes the DTB pointer in x0 when booting a flat image, but when it
+    // loads an *ELF* kernel on `-M virt` it instead places the generated DTB at
+    // the base of RAM (0x4000_0000) and may leave x0 = 0. If x0 didn't point at a
+    // valid DTB, probe the RAM base for the FDT magic before falling back.
+    let dtb_at = if dtb_ptr != 0 && unsafe { fdt::parse(dtb_ptr).is_some() } {
+        dtb_ptr
+    } else {
+        const QEMU_VIRT_DTB: u64 = 0x4000_0000;
+        if unsafe { fdt::parse(QEMU_VIRT_DTB).is_some() } {
+            uart::puts("[arm-boot] DTB not in x0; found FDT at RAM base 0x40000000\n");
+            QEMU_VIRT_DTB
+        } else if let Some(found) =
+            // QEMU's exact DTB placement for an ELF `-kernel` depends on the image;
+            // probe a small bounded window just past the RAM base (cheap under TCG).
+            // When the bootloader DOES pass a valid x0 (flat-image boot, real HW),
+            // the first branch above already used it. Otherwise we fall through to
+            // the architecture default below — equivalent to `-m` on QEMU virt.
+            unsafe { fdt::scan_for_dtb(0x4000_0000, 0x4400_0000) }
+        {
+            uart::puts("[arm-boot] DTB located by RAM scan @ ");
+            uart::puthex_full(found);
+            uart::puts("\n");
+            found
+        } else {
+            dtb_ptr // keep original; parse() below will fail → fallback map
+        }
+    };
+    fdt::set_dtb_ptr(dtb_at);
+
     // ── Discover RAM from the device tree → neutral BootMemMap ──────────────
     let mut map = crate::mm::BootMemMap::new();
-    match unsafe { fdt::parse(dtb_ptr) } {
+    match unsafe { fdt::parse(dtb_at) } {
         Some(info) => {
             for i in 0..info.mem_count {
                 let r = info.mem[i];

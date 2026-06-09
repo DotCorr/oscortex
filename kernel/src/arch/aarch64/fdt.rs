@@ -255,6 +255,28 @@ pub unsafe fn parse(dtb_pa: u64) -> Option<FdtInfo> {
     }
 }
 
+/// Scan a physical address range for the FDT magic on an 8-byte stride and
+/// return the first address whose blob parses to a valid `/memory` node.
+///
+/// QEMU's `-M virt` ELF-kernel boot does not reliably pass the DTB pointer in x0
+/// and may place the generated blob at a position that depends on the kernel
+/// image size. As a robust last resort, we scan a bounded window of RAM for it.
+///
+/// # Safety
+/// `[start, end)` must be readable (identity-mapped) physical RAM.
+pub unsafe fn scan_for_dtb(start: u64, end: u64) -> Option<u64> {
+    let mut p = start & !0x7;
+    while p < end {
+        if read_be32(p as *const u8) == FDT_MAGIC {
+            if parse(p).is_some() {
+                return Some(p);
+            }
+        }
+        p += 8;
+    }
+    None
+}
+
 /// Read a 1- or 2-cell big-endian value (cells beyond 2 are ignored / unsupported).
 #[inline]
 unsafe fn read_cells(p: *const u8, cells: u32) -> u64 {
