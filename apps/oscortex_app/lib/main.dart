@@ -5,7 +5,7 @@ import 'package:flutter/services.dart';
 
 const _shell = BasicMessageChannel<String>('oscortex/shell', StringCodec());
 
-const _bg = Color(0xFF0C1C26);
+const _bg = Colors.black;
 const _accent = Color(0xFF2DD4BF);
 
 void main() {
@@ -313,7 +313,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 SwitchListTile(
                   value: _naturalScroll,
                   onChanged: _setNaturalScroll,
-                  activeColor: _accent,
+                  activeThumbColor: _accent,
                   title: const Text('Natural scrolling'),
                   subtitle: Text(
                     _naturalScroll
@@ -444,3 +444,4 @@ class _AppCard extends StatelessWidget {
     );
   }
 }
+
