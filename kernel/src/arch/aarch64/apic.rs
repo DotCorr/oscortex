@@ -160,6 +160,14 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         // Switch the low-half translation base to the next thread's space.
         crate::arch::memory::write_cr3(ttbr0);
 
+        // Set the next thread's TLS base (TPIDR_EL0). The cooperative
+        // enter_user_by_pid_noreturn path does this via set_fs_base, but the
+        // timer-preempt path did NOT — so a thread first scheduled by a timer
+        // tick (e.g. a freshly-spawned Dart VM worker) ran with TPIDR_EL0 left
+        // at the previous thread's value (or 0), and its first thread-local
+        // access (dart::ThreadRegistry::GetFreeThreadLocked) faulted near null.
+        crate::arch::cpu::set_fs_base(crate::process::get_proc_fs_base(next_pid));
+
         // Restore the next thread's frame. Prefer its full ARM snapshot (taken
         // when IT was last timer-preempted); fall back to rebuilding from the
         // shared `UserRegs` for a thread that last yielded via a syscall / is
