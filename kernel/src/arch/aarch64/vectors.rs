@@ -250,14 +250,16 @@ pub const KIND_LOWER_SERROR: u64 = 8;
 
 // ESR_EL1 exception classes we care about.
 const EC_SVC64: u64 = 0x15; // SVC instruction from AArch64
-// EC encodings (ARM ARM D17.2.37). Lower-EL aborts (faulting at EL0) use the
-// *_LOWER values; 0x24/0x21 are the same-EL variants. The Flutter engine faults
-// from EL0, so the demand pager must match the LOWER values:
-//   0x20 = Instruction Abort, lower EL
-//   0x21 = Instruction Abort, same EL
-//   0x24 = Data Abort, same EL
-//   0x25 = Data Abort, lower EL   ← EL0 mmap/heap demand faults land here
-const EC_DABT_LOWER: u64 = 0x25; // Data abort, lower EL (was wrongly 0x24)
+// EC encodings (ARM ARM D17.2.37):
+//   0x20 = Instruction Abort from a lower EL
+//   0x21 = Instruction Abort taken without a change in EL (same EL)
+//   0x24 = Data Abort from a lower EL          (EL0 user fault → KIND_LOWER_SYNC)
+//   0x25 = Data Abort without a change in EL   (EL1 kernel fault → KIND_CURR_SYNC)
+// The Flutter engine demand-faults from BOTH: EL0 when its own code touches an
+// unmapped Dart heap page (0x24), and EL1 when a syscall handler dereferences a
+// not-yet-paged user pointer (0x25). Both must route to the demand pager.
+const EC_DABT_LOWER: u64 = 0x24; // Data abort, lower EL (EL0)
+const EC_DABT_CURR:  u64 = 0x25; // Data abort, same EL (EL1 touching a user VA)
 const EC_IABT_LOWER: u64 = 0x20; // Instruction abort, lower EL
 
 /// Optional override for synchronous-from-EL0 handling, installed by the
@@ -336,6 +338,16 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
                 if h != 0 {
                     let func: SvcFn = unsafe { core::mem::transmute(h as usize) };
                     func(f);
+                }
+            } else if ec == EC_DABT_CURR {
+                // Kernel (EL1) touched a demand-paged user VA — e.g. a syscall
+                // handler dereferencing a not-yet-faulted Dart heap pointer. Run
+                // the SAME pager as the EL0 path; on success eret re-executes the
+                // faulting kernel access against the freshly mapped page.
+                if try_demand_page_el0(f, ec) {
+                    // resolved — fall through to restore + eret
+                } else {
+                    report_unhandled(f, kind, ec);
                 }
             } else if ec == 0 {
                 // EC=0 "Unknown reason" at EL1 = an Undefined instruction. This
