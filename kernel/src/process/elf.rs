@@ -2,6 +2,7 @@
 //! into a process's user address space.
 
 use crate::mm::{frame_allocator, paging};
+use alloc::collections::BTreeMap;
 
 // ── ELF64 constants ───────────────────────────────────────────────────────────
 
@@ -98,6 +99,19 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
     let ph_num  = hdr.e_phnum  as usize;
     let ph_size = hdr.e_phentsize as usize;
 
+    // Pages this call has already backed with a freshly-allocated frame, keyed by
+    // page VA → frame PA. We MUST NOT use the page table to detect "already
+    // mapped" pages: on aarch64 the per-process root is seeded with the kernel
+    // identity map (block descriptors), and splitting a block to overlay one user
+    // page leaves the *other* pages of that block populated with valid identity
+    // sub-page descriptors. Querying the page table would then report those
+    // identity pages as already-mapped and the loader would reuse the identity PA
+    // (device/0xFF memory) instead of allocating a real frame. Tracking only the
+    // frames WE allocated in this load keeps the genuine code+rodata-overlap reuse
+    // (two PT_LOADs sharing one 4 KiB page) while always allocating fresh frames
+    // for identity-block pages.
+    let mut mapped: BTreeMap<u64, u64> = BTreeMap::new();
+
     // ── Walk PT_LOAD segments ─────────────────────────────────────────────
     for i in 0..ph_num {
         let ph_base = ph_off + i * ph_size;
@@ -121,16 +135,17 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
         for p in 0..num_pages {
             let page_virt  = page_start + (p * 4096) as u64;
 
-            // Check whether this virtual page was already mapped by a previous
-            // PT_LOAD segment (common when code and rodata share a 4 KiB page).
-            // If so, reuse the existing physical frame so we don't lose the
-            // bytes written by the earlier segment, and preserve the more-
-            // permissive (exec) permission that the earlier segment set.
-            let existing_phys = crate::mm::paging::translate_user_page(pml4_phys, page_virt);
+            // Check whether THIS load already backed this virtual page (common
+            // when code and rodata share a 4 KiB page across two PT_LOADs). If so,
+            // reuse that frame so we don't lose the earlier segment's bytes and we
+            // keep the more-permissive (exec) permission. We intentionally consult
+            // our own `mapped` table, not the page table — see the note above.
+            let existing_phys = mapped.get(&page_virt).copied();
             let (page_phys, is_new_frame) = if let Some(phys) = existing_phys {
                 (phys, false)
             } else {
                 let phys = frame_allocator::alloc_frame().ok_or("OOM: elf segment")?;
+                mapped.insert(page_virt, phys);
                 (phys, true)
             };
 

@@ -588,13 +588,30 @@ mod aarch64_impl {
     }
 
     /// Walk to the L3 descriptor for `virt`; returns (l3_slot, descriptor) if the
-    /// full path is present, else None.
+    /// full path to a 4 KiB page is present, else None.
+    ///
+    /// CRITICAL: each per-process root is seeded with a copy of the kernel
+    /// identity map, whose low L1 entries are 1 GiB **block** descriptors (and L2
+    /// could be 2 MiB blocks). A block is VALID but is NOT a table pointer — its
+    /// `ADDR_MASK` bits are an *output PA*, not a child-table PA. The earlier walk
+    /// dereferenced that output PA as if it were a table, reading garbage that
+    /// often had DESC_VALID set, so `translate_user_page` reported low user VAs
+    /// (e.g. the Flutter host's 0x40xxxx .rodata) as "already mapped to identity"
+    /// — which made the ELF loader REUSE the identity PA instead of allocating a
+    /// real frame, so the kernel then read 0xFF device/identity memory for those
+    /// pages. We must therefore treat a block descriptor at L1/L2 as "no 4 KiB
+    /// leaf here" (return None); the caller allocates a frame and `map_page_in`
+    /// splits the block into a real table before overlaying the page.
     unsafe fn walk(root_pa: u64, virt: u64) -> Option<(*mut u64, u64)> {
         let l1d = core::ptr::read_volatile(entry(root_pa, idx_l1(virt)));
         if l1d & DESC_VALID == 0 { return None; }
+        // VALID but not a table ⇒ a 1 GiB block: no L3 leaf for this VA.
+        if l1d & DESC_TABLE == 0 { return None; }
         let l2 = l1d & ADDR_MASK;
         let l2d = core::ptr::read_volatile(entry(l2, idx_l2(virt)));
         if l2d & DESC_VALID == 0 { return None; }
+        // VALID but not a table ⇒ a 2 MiB block: no L3 leaf for this VA.
+        if l2d & DESC_TABLE == 0 { return None; }
         let l3 = l2d & ADDR_MASK;
         let slot = entry(l3, idx_l3(virt));
         let d = core::ptr::read_volatile(slot);

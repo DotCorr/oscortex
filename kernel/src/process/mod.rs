@@ -750,6 +750,18 @@ pub fn current_pid() -> u32 {
     crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
 }
 
+/// Physical address of the current process's top-level page table (the L1 / TTBR0
+/// root on aarch64, the PML4 on x86). Used by diagnostics / kernel-side user-VA
+/// translation. Returns 0 if there is no current process.
+pub fn current_user_root() -> u64 {
+    let pid = current_pid();
+    if pid == 0 { return 0; }
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx] };
+    if p.pid == pid { p.pml4_phys } else { 0 }
+}
+
 /// Wait for `pid` to become zombie, then reap it and return exit code.
 ///
 /// Returns:

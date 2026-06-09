@@ -285,6 +285,24 @@ pub(crate) fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
             "[sys_write] fd={} non-utf8 len={} first={:?}",
             fd, len, &bytes[..bytes.len().min(8)]
         );
+        #[cfg(target_arch = "aarch64")]
+        {
+            let root = crate::process::current_user_root();
+            match crate::mm::paging::translate_user_page(root, buf_ptr) {
+                Some(pa) => {
+                    let hh = (pa + crate::mm::frame_allocator::hhdm_offset()) as *const u8;
+                    let b0 = unsafe { core::ptr::read_volatile(hh) };
+                    log::warn!(
+                        "[sys_write/dbg] root={:#x} va={:#x} -> pa={:#x} hhdm_b0={:#x}",
+                        root, buf_ptr, pa, b0
+                    );
+                }
+                None => log::warn!(
+                    "[sys_write/dbg] root={:#x} va={:#x} -> walk failed",
+                    root, buf_ptr
+                ),
+            }
+        }
     }
     len as i64
 }
