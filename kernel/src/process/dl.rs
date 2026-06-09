@@ -76,6 +76,18 @@ const R_AARCH64_ABS64:     u32 = 257;
 const R_AARCH64_GLOB_DAT:  u32 = 1025;
 const R_AARCH64_JUMP_SLOT: u32 = 1026;
 const R_AARCH64_RELATIVE:  u32 = 1027;
+// TLS relocations. The engine's C++ `thread_local`s use the TLSDESC model.
+const R_AARCH64_TLS_DTPMOD64: u32 = 1028;
+const R_AARCH64_TLS_DTPREL64: u32 = 1029;
+const R_AARCH64_TLS_TPREL64:  u32 = 1030;
+const R_AARCH64_TLSDESC:      u32 = 1031;
+
+/// AArch64 variant-I TLS: TPIDR_EL0 points at the TCB; the static TLS block of
+/// the (single, statically-loaded) module begins after a 16-byte TCB reserve,
+/// rounded up to the TLS alignment. The engine's PT_TLS is 8-byte aligned, so
+/// the block starts at TP + 16. A TLSDESC/TPREL variable at module offset `A`
+/// therefore lives at `TP + TLS_TP_OFFSET + A`.
+const TLS_TP_OFFSET: u64 = 16;
 
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK:   u8 = 2;
@@ -469,6 +481,7 @@ fn apply_rela_table(
     let mut n_jmp = 0usize;
     let mut n_other = 0usize;
     let mut n_oob = 0usize;
+    let mut n_tls = 0usize;
 
     for i in 0..count {
         let rela: Elf64Rela = match read_pod(bytes, rela_file + i * ent_sz) {
@@ -478,6 +491,47 @@ fn apply_rela_table(
         let rtype   = (rela.r_info & 0xFFFF_FFFF) as u32;
         let sym_idx = (rela.r_info >> 32) as usize;
         let target  = load_base.wrapping_add(rela.r_offset);
+
+        // ── aarch64 TLS relocations (handled specially: they may write a PAIR
+        //    and encode a TP-relative offset, not an absolute VA) ─────────────
+        // The module's TLS offset of the referenced variable is `st_value+A`
+        // for a symbol, or just `A` for a local (sym_idx==0) reloc. The
+        // TP-relative offset is then TLS_TP_OFFSET + that (variant-I layout).
+        if rtype == R_AARCH64_TLSDESC
+            || rtype == R_AARCH64_TLS_TPREL64
+            || rtype == R_AARCH64_TLS_DTPREL64
+            || rtype == R_AARCH64_TLS_DTPMOD64
+        {
+            n_tls += 1;
+            let module_off = if sym_idx != 0 {
+                // sym_vaddr = load_base + st_value; recover st_value, add addend.
+                sym_vaddr(sym_idx)
+                    .wrapping_sub(load_base)
+                    .wrapping_add(rela.r_addend as u64)
+            } else {
+                rela.r_addend as u64
+            };
+            let tp_off = TLS_TP_OFFSET.wrapping_add(module_off);
+            unsafe {
+                match rtype {
+                    R_AARCH64_TLSDESC => {
+                        // Descriptor pair: [+0]=static resolver, [+8]=TP offset.
+                        write_user_u64(
+                            target,
+                            crate::process::posix_trampolines::TLSDESC_RESOLVER_VA,
+                        );
+                        write_user_u64(target.wrapping_add(8), tp_off);
+                    }
+                    R_AARCH64_TLS_TPREL64 => write_user_u64(target, tp_off),
+                    // Single-module static image: DTPMOD is always module 1,
+                    // DTPREL is the in-block offset (no TCB reserve).
+                    R_AARCH64_TLS_DTPMOD64 => write_user_u64(target, 1),
+                    R_AARCH64_TLS_DTPREL64 => write_user_u64(target, module_off),
+                    _ => {}
+                }
+            }
+            continue;
+        }
 
         // Both x86_64 and aarch64 use the same RELA encoding (r_offset/r_info/
         // r_addend) and identical formulas; only the type *numbers* differ. We
@@ -510,8 +564,8 @@ fn apply_rela_table(
     }
 
     log::info!(
-        "[dl] rela table sz={} count={} applied: REL={} _64={} GLOB={} JMP={} other={} oob={}",
-        table_sz, count, n_rel, n_64, n_glob, n_jmp, n_other, n_oob
+        "[dl] rela table sz={} count={} applied: REL={} _64={} GLOB={} JMP={} TLS={} other={} oob={}",
+        table_sz, count, n_rel, n_64, n_glob, n_jmp, n_tls, n_other, n_oob
     );
 }
 

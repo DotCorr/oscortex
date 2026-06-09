@@ -25,6 +25,20 @@ use crate::mm::{frame_allocator, paging};
 /// VA(i) = TRAMPOLINE_PAGES_VA + i * 16.  Max 512 stubs.
 pub const TRAMPOLINE_PAGES_VA: u64 = 0x7FFF_E000;
 
+/// VA of the aarch64 static TLSDESC resolver `_dl_tlsdesc_return`.
+///
+/// The Flutter engine's C++ `thread_local` accesses on aarch64 use the TLSDESC
+/// relocation model: the compiler emits `ldr x1,[desc#0]; blr x1` where the
+/// descriptor's first word is a resolver function and the second word its
+/// argument. For a statically-loaded module the resolver simply returns the
+/// (TP-relative) offset stored in the descriptor's second word, i.e.
+///   `ldr x0, [x0, #8]; ret`
+/// `dl::apply_aarch64_tlsdesc` points every R_AARCH64_TLSDESC descriptor's
+/// first word at this stub and writes the static TP offset into the second.
+/// It lives in the last 16-byte slot of the (executable) trampoline pages.
+#[cfg(target_arch = "aarch64")]
+pub const TLSDESC_RESOLVER_VA: u64 = TRAMPOLINE_PAGES_VA + 511 * 16;
+
 /// 1-page system data region (0x7FFF_C000 – 0x7FFF_CFFF).
 pub const SYSDATA_VA: u64 = 0x7FFF_C000;
 
@@ -727,6 +741,18 @@ fn map_trampoline_pages(pml4_phys: u64) -> Result<(), &'static str> {
                 name, i, va, &page[off..off + 16]
             );
         }
+    }
+
+    // aarch64: emit the static TLSDESC resolver into the last 16-byte slot
+    // (TLSDESC_RESOLVER_VA). It is `ldr x0,[x0,#8]; ret`: given a TLSDESC
+    // descriptor pointer in x0, return the TP-relative offset stored at +8.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Last slot of page1 = byte offset 0xFF0 (slot 511, 511%256=255 -> 255*16).
+        let off = 255 * 16;
+        emit32(page1, off,     0xF940_0400); // ldr x0, [x0, #8]
+        emit32(page1, off + 4, a64::ret());  // ret
+        // remaining 8 bytes of the slot stay RET-padded (harmless).
     }
 
     // aarch64: we just wrote instructions through the data path (HHDM). Before
