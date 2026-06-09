@@ -9,6 +9,55 @@ use crate::mm::frame_allocator;
 
 pub(crate) static PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Re-entrancy depth for the page-table critical section on this (single) core.
+///
+/// The page-fault / demand-pager path can be entered *while the page-table lock
+/// is already held by an outer map/translate on the same core*: on aarch64 the
+/// SVC handler now runs with IRQs unmasked (so a syscall can be preempted/woken
+/// like on x86), and a fault taken during a page-table operation re-enters
+/// `demand_page` → `map_user_page_with_flags`. A plain spin `Mutex` is NOT
+/// re-entrant, so the nested acquire spins forever against the held lock with
+/// IRQs masked (in the abort handler) — an instant single-core self-deadlock
+/// (observed freezing the engine's 3rd worker-thread stack setup).
+///
+/// `lock_page_table()` makes the section re-entrant on a single core: the outer
+/// acquire takes the real spin lock; nested acquires just bump a depth counter
+/// and hand back a guard that releases nothing until depth returns to zero. This
+/// is sound because all writers run on one core (the scheduler is cooperative /
+/// single-CPU) — there is no second core to race the page-table structure.
+static PAGE_TABLE_LOCK_DEPTH: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) struct PageTableGuard {
+    outer: Option<spin::MutexGuard<'static, ()>>,
+}
+
+impl Drop for PageTableGuard {
+    fn drop(&mut self) {
+        if self.outer.is_some() {
+            // Outermost guard: clear depth, then release the real lock.
+            PAGE_TABLE_LOCK_DEPTH.store(0, core::sync::atomic::Ordering::Release);
+            // `outer` drops here, releasing PAGE_TABLE_LOCK.
+        } else {
+            PAGE_TABLE_LOCK_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Acquire the page-table critical section, re-entrant on a single core.
+#[inline]
+pub(crate) fn lock_page_table() -> PageTableGuard {
+    let prev = PAGE_TABLE_LOCK_DEPTH.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+    if prev == 0 {
+        // First (outer) acquisition on this core: take the real lock.
+        let g = PAGE_TABLE_LOCK.lock();
+        PageTableGuard { outer: Some(g) }
+    } else {
+        // Nested acquisition: the outer guard already holds the lock.
+        PageTableGuard { outer: None }
+    }
+}
+
 // ─── Page-table entry flags (shared across architectures) ─────────────────────
 
 bitflags! {
@@ -756,7 +805,7 @@ pub fn init(hhdm_offset: u64) {
 /// * `set_hhdm_offset()` must have run before this.
 /// * `virt` and `phys` must be 4-KiB aligned.
 pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_page(virt, phys, flags) }
     #[cfg(target_arch = "aarch64")]
@@ -770,7 +819,7 @@ pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
 /// # Safety
 /// Same preconditions as [`map_page`].
 pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_mmio(phys, virt, size) }
     #[cfg(target_arch = "aarch64")]
@@ -872,7 +921,7 @@ pub fn alloc_user_pml4() -> Option<u64> {
 pub unsafe fn map_user_page(pml4_phys: u64, virt: u64, phys: u64)
     -> Result<(), &'static str>
 {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     return unsafe {
         x86_64_impl::map_page_in(
@@ -899,7 +948,7 @@ pub unsafe fn map_user_page_with_flags(
     pml4_phys: u64, virt: u64, phys: u64,
     writable: bool, exec: bool,
 ) -> Result<(), &'static str> {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     {
         let mut flags = PageFlags::PRESENT | PageFlags::USER;
@@ -921,7 +970,7 @@ pub unsafe fn map_user_page_with_flags(
 /// Walk a user PML4 and return the physical frame already mapped at `virt`,
 /// or `None` if the page is not yet mapped.
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
     #[cfg(target_arch = "aarch64")]
@@ -933,7 +982,7 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
 /// Walk a user PML4 and return the physical frame mapped at `virt` along with
 /// its writable and executable flags.
 pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
     #[cfg(target_arch = "aarch64")]
@@ -944,7 +993,7 @@ pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool
 
 /// Free all frames in a user PML4 and the PML4 itself.
 pub fn free_user_pml4(pml4_phys: u64) {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::free_user_pml4(pml4_phys);
     #[cfg(target_arch = "aarch64")]
@@ -963,7 +1012,7 @@ pub unsafe fn update_user_page(
     writable: bool,
     exec: bool,
 ) -> Result<(), &'static str> {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { x86_64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
@@ -984,7 +1033,7 @@ pub unsafe fn update_user_page(
 /// # Safety
 /// `pml4_phys` must be a valid allocated PML4.
 pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
-    let _lock = PAGE_TABLE_LOCK.lock();
+    let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     {
         unsafe { x86_64_impl::unmap_user_page(pml4_phys, virt) }
