@@ -250,7 +250,14 @@ pub const KIND_LOWER_SERROR: u64 = 8;
 
 // ESR_EL1 exception classes we care about.
 const EC_SVC64: u64 = 0x15; // SVC instruction from AArch64
-const EC_DABT_LOWER: u64 = 0x24; // Data abort, lower EL
+// EC encodings (ARM ARM D17.2.37). Lower-EL aborts (faulting at EL0) use the
+// *_LOWER values; 0x24/0x21 are the same-EL variants. The Flutter engine faults
+// from EL0, so the demand pager must match the LOWER values:
+//   0x20 = Instruction Abort, lower EL
+//   0x21 = Instruction Abort, same EL
+//   0x24 = Data Abort, same EL
+//   0x25 = Data Abort, lower EL   ← EL0 mmap/heap demand faults land here
+const EC_DABT_LOWER: u64 = 0x25; // Data abort, lower EL (was wrongly 0x24)
 const EC_IABT_LOWER: u64 = 0x20; // Instruction abort, lower EL
 
 /// Optional override for synchronous-from-EL0 handling, installed by the

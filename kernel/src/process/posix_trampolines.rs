@@ -701,13 +701,59 @@ fn map_trampoline_pages(pml4_phys: u64) -> Result<(), &'static str> {
     let page1 = unsafe {
         core::slice::from_raw_parts_mut((phys1 + hhdm) as *mut u8, 4096)
     };
-    page0.fill(0x90); // nop
-    page1.fill(0x90); // nop
+    // x86 pads with NOP (0x90) so fall-through reaches the trailing ret. aarch64
+    // is fixed-width, so pad with RET (0xD65F03C0, LE) — any stray slot entry
+    // returns cleanly instead of executing leftover bytes as a bad instruction.
+    #[cfg(target_arch = "x86_64")]
+    { page0.fill(0x90); page1.fill(0x90); }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ret = 0xD65F_03C0u32.to_le_bytes();
+        for p in [&mut *page0, &mut *page1] {
+            for chunk in p.chunks_exact_mut(4) { chunk.copy_from_slice(&ret); }
+        }
+    }
 
-    for (i, &(_, kind)) in STUBS.iter().enumerate() {
+    for (i, &(name, kind)) in STUBS.iter().enumerate() {
         let page = if i < 256 { &mut *page0 } else { &mut *page1 };
         let off = (i % 256) * 16;
         encode_stub(page, off, kind);
+        // DIAGNOSTIC: confirm the fallback stub encoding (the engine init array
+        // jumps here for unresolved symbols; a bad encoding faults at EL0).
+        if name == "__oscortex_fallback_stub" {
+            let va = TRAMPOLINE_PAGES_VA + (i as u64) * 16;
+            log::warn!(
+                "[tramp/dbg] '{}' idx={} va={:#x} bytes={:02x?}",
+                name, i, va, &page[off..off + 16]
+            );
+        }
+    }
+
+    // aarch64: we just wrote instructions through the data path (HHDM). Before
+    // EL0 executes them the data cache must be cleaned to the point of unification
+    // and the instruction cache invalidated, or stale/garbage may be fetched on
+    // real hardware (and under HVF). Sweep both freshly-written frames by VA via
+    // the HHDM mirror (which is what the data writes touched).
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        for &base in &[phys0 + hhdm, phys1 + hhdm] {
+            let mut a = base;
+            let end = base + 4096;
+            while a < end {
+                core::arch::asm!("dc cvau, {0}", in(reg) a, options(nostack, preserves_flags));
+                a += 64; // cache line granule (CTR_EL0 min is 64 on cortex-a72/Apple)
+            }
+        }
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        for &base in &[phys0 + hhdm, phys1 + hhdm] {
+            let mut a = base;
+            let end = base + 4096;
+            while a < end {
+                core::arch::asm!("ic ivau, {0}", in(reg) a, options(nostack, preserves_flags));
+                a += 64;
+            }
+        }
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 
     // Map as read-execute (not writable) for user.
@@ -718,6 +764,161 @@ fn map_trampoline_pages(pml4_phys: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Write a 32-bit aarch64 instruction (little-endian) into the trampoline page.
+#[cfg(target_arch = "aarch64")]
+fn emit32(page: &mut [u8], off: usize, insn: u32) {
+    page[off..off + 4].copy_from_slice(&insn.to_le_bytes());
+}
+
+// AArch64 instruction encoders for the fixed shapes we need. All registers are
+// 64-bit (X) unless noted. `imm16`/`shift` follow the MOVZ/MOVK encoding.
+#[cfg(target_arch = "aarch64")]
+mod a64 {
+    /// MOVZ Xd, #imm16, LSL #(shift*16)   (zero other bits)
+    pub fn movz(rd: u32, imm16: u16, shift: u32) -> u32 {
+        0xD280_0000 | (shift << 21) | ((imm16 as u32) << 5) | rd
+    }
+    /// MOVK Xd, #imm16, LSL #(shift*16)   (keep other bits)
+    pub fn movk(rd: u32, imm16: u16, shift: u32) -> u32 {
+        0xF280_0000 | (shift << 21) | ((imm16 as u32) << 5) | rd
+    }
+    /// MOVZ Wd, #imm16, LSL #(shift*16)   (32-bit dest)
+    pub fn movz_w(rd: u32, imm16: u16, shift: u32) -> u32 {
+        0x5280_0000 | (shift << 21) | ((imm16 as u32) << 5) | rd
+    }
+    /// MOVK Wd, #imm16, LSL #(shift*16)
+    pub fn movk_w(rd: u32, imm16: u16, shift: u32) -> u32 {
+        0x7280_0000 | (shift << 21) | ((imm16 as u32) << 5) | rd
+    }
+    /// SVC #0
+    pub const fn svc0() -> u32 { 0xD400_0001 }
+    /// RET (uses X30)
+    pub const fn ret() -> u32 { 0xD65F_03C0 }
+    /// BRK #0 (trap)
+    pub const fn brk0() -> u32 { 0xD420_0000 }
+    /// FMOV Dd, Xn  (GPR -> SIMD scalar double)
+    pub fn fmov_d_x(dd: u32, xn: u32) -> u32 { 0x9E67_0000 | (xn << 5) | dd }
+    /// FMOV Xd, Dn  (SIMD scalar double -> GPR)
+    pub fn fmov_x_d(xd: u32, dn: u32) -> u32 { 0x9E66_0000 | (dn << 5) | xd }
+    /// FMOV Dd, XZR  (zero a double)  — FMOV Dd, #0.0 isn't encodable, use xzr.
+    pub fn fmov_d_zero(dd: u32) -> u32 { fmov_d_x(dd, 31) }
+}
+
+/// Load a full 64-bit immediate into Xd using up to 4 MOVZ/MOVK instructions.
+/// Returns the number of *instructions* written.
+#[cfg(target_arch = "aarch64")]
+fn emit_mov_imm64(page: &mut [u8], off: usize, rd: u32, val: u64) -> usize {
+    // First non-trivial half goes via MOVZ, the rest via MOVK. Always emit at
+    // least one instruction (MOVZ #0) so x0 is defined.
+    let halves = [
+        (val & 0xFFFF) as u16,
+        ((val >> 16) & 0xFFFF) as u16,
+        ((val >> 32) & 0xFFFF) as u16,
+        ((val >> 48) & 0xFFFF) as u16,
+    ];
+    let mut n = 0usize;
+    let mut first = true;
+    for (i, &h) in halves.iter().enumerate() {
+        if h == 0 && !(first && i == 3) { continue; }
+        let insn = if first { a64::movz(rd, h, i as u32) } else { a64::movk(rd, h, i as u32) };
+        emit32(page, off + n * 4, insn);
+        n += 1;
+        first = false;
+    }
+    if n == 0 {
+        emit32(page, off, a64::movz(rd, 0, 0));
+        n = 1;
+    }
+    n
+}
+
+#[cfg(target_arch = "aarch64")]
+fn encode_stub(page: &mut [u8], off: usize, kind: StubKind) {
+    // The kernel's aarch64 SVC path reads the syscall number from x8 and args
+    // from x0..x5 (AAPCS64 already places the C args there). So a "syscall stub"
+    // is simply: movz x8,#nr ; svc #0 ; ret. 16-byte slots hold 4 instructions.
+    match kind {
+        StubKind::Syscall(nr) => {
+            // nr < 0x10000 for every entry → a single MOVZ suffices.
+            emit32(page, off,      a64::movz(8, nr as u16, 0));
+            emit32(page, off + 4,  a64::svc0());
+            emit32(page, off + 8,  a64::ret());
+            emit32(page, off + 12, a64::ret()); // pad (harmless)
+        }
+        StubKind::FloatZero => {
+            emit32(page, off,     a64::fmov_d_zero(0)); // d0 = 0.0
+            emit32(page, off + 4, a64::ret());
+        }
+        StubKind::RetAddr(va) => {
+            let n = emit_mov_imm64(page, off, 0, va); // x0 = va
+            emit32(page, off + n * 4, a64::ret());
+        }
+        StubKind::RetU32(v) => {
+            // w0 = v (32-bit). Up to two halves.
+            emit32(page, off, a64::movz_w(0, (v & 0xFFFF) as u16, 0));
+            let mut nxt = off + 4;
+            if (v >> 16) != 0 {
+                emit32(page, nxt, a64::movk_w(0, ((v >> 16) & 0xFFFF) as u16, 1));
+                nxt += 4;
+            }
+            emit32(page, nxt, a64::ret());
+        }
+        StubKind::SyscallRetAsArg0(nr) => {
+            // x0 already holds the caller's return value (the "arg0"); issue the
+            // syscall and trap if it returns (noreturn).
+            emit32(page, off,     a64::movz(8, nr as u16, 0));
+            emit32(page, off + 4, a64::svc0());
+            emit32(page, off + 8, a64::brk0());
+        }
+        StubKind::MathSyscall1(nr) => {
+            // d0 -> x0 ; svc nr ; x0 -> d0 ; ret
+            emit32(page, off,      a64::fmov_x_d(0, 0));
+            emit32(page, off + 4,  a64::movz(8, nr as u16, 0));
+            emit32(page, off + 8,  a64::svc0());
+            emit32(page, off + 12, a64::fmov_d_x(0, 0));
+            emit32(page, off + 16, a64::ret());
+        }
+        StubKind::MathSyscall2(nr) => {
+            emit32(page, off,      a64::fmov_x_d(0, 0)); // x0 = d0
+            emit32(page, off + 4,  a64::fmov_x_d(1, 1)); // x1 = d1
+            emit32(page, off + 8,  a64::movz(8, nr as u16, 0));
+            emit32(page, off + 12, a64::svc0());
+            emit32(page, off + 16, a64::fmov_d_x(0, 0)); // d0 = x0
+            emit32(page, off + 20, a64::ret());
+        }
+        StubKind::MathSyscall3(nr) => {
+            emit32(page, off,      a64::fmov_x_d(0, 0)); // x0 = d0
+            emit32(page, off + 4,  a64::fmov_x_d(1, 1)); // x1 = d1
+            emit32(page, off + 8,  a64::fmov_x_d(2, 2)); // x2 = d2
+            emit32(page, off + 12, a64::movz(8, nr as u16, 0));
+            emit32(page, off + 16, a64::svc0());
+            emit32(page, off + 20, a64::fmov_d_x(0, 0)); // d0 = x0
+            emit32(page, off + 24, a64::ret());
+        }
+        StubKind::Qsort => {
+            // Route to the kernel qsort syscall (0x3CB) like a normal stub rather
+            // than inlining x86 machine code. The kernel handler does the sort.
+            emit32(page, off,     a64::movz(8, 0x3CB, 0));
+            emit32(page, off + 4, a64::svc0());
+            emit32(page, off + 8, a64::ret());
+        }
+        StubKind::Setjmp => {
+            // Minimal setjmp: store the caller-saved state needed to resume.
+            // For bring-up we provide a non-unwinding stub: zero x0 and return
+            // (engine setjmp use is limited; full impl can follow if exercised).
+            emit32(page, off,     a64::movz(0, 0, 0)); // x0 = 0 (first return)
+            emit32(page, off + 4, a64::ret());
+        }
+        StubKind::Longjmp => {
+            // Minimal longjmp stub: return the value (x1) — cannot truly unwind
+            // without a real jmp_buf, but avoids illegal-instruction faults.
+            emit32(page, off,     a64::ret());
+        }
+        StubKind::Padding => {}
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn encode_stub(page: &mut [u8], off: usize, kind: StubKind) {
     match kind {
         StubKind::Syscall(nr) => {

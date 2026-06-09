@@ -571,11 +571,11 @@ pub fn spawn_with_bootstrap(
         }
     }
 
-    // Map POSIX trampoline + sysdata pages so glibc symbols resolve correctly.
-    // These are x86_64 glibc/musl shims; the aarch64 bring-up init is a bare EL0
-    // program with no libc, so they are skipped on ARM (follow-on once an ARM
-    // userland links a C library).
-    #[cfg(not(target_arch = "aarch64"))]
+    // Map POSIX trampoline + sysdata pages so libc/glibc symbols the Flutter
+    // engine imports resolve to in-process syscall stubs. encode_stub() emits
+    // native machine code per arch (x86 on x86_64, AArch64 on aarch64), so this
+    // is required on BOTH arches once a dynamically-linked host (the Flutter
+    // embedder) runs — the engine's DT_INIT_ARRAY jumps into these stubs.
     posix_trampolines::map_system_pages(pml4_phys)?;
 
     let idx = idx_of(pid);
