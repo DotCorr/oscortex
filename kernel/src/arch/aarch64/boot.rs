@@ -104,7 +104,7 @@ core::arch::global_asm!(
 .section .bss.boot_stack, "aw", @nobits
 .balign 16
 BOOT_STACK_BOTTOM:
-    .skip 65536
+    .skip 2097152
 .globl BOOT_STACK_TOP
 BOOT_STACK_TOP:
 "#
