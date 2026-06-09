@@ -306,8 +306,27 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
             if ec == EC_SVC64 {
                 let h = SVC_HANDLER.load(Ordering::Acquire);
                 if h != 0 {
+                    // Unmask IRQs for the duration of the syscall, mirroring x86
+                    // where the SYSCALL entry stub runs handlers with interrupts
+                    // ENABLED. Exception entry masked DAIF.I; without re-enabling
+                    // it the generic-timer scheduler tick cannot fire while a
+                    // syscall runs. The Flutter engine's cooperative bring-up
+                    // makes long, spinning syscalls (epoll_wait bootstrap-spin,
+                    // condvar waits) that hand off between sibling threads WITHIN
+                    // the syscall — if the timer is masked the whole time, a
+                    // thread that spins waiting for a sibling can never be
+                    // preempted and the engine deadlocks with the timer frozen.
+                    // The timer ISR uses try-locks throughout (ISR-safe), so
+                    // taking a tick mid-syscall is safe. Re-mask on the way out
+                    // so the vector restore/eret sees the same DAIF it expects.
+                    unsafe {
+                        core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack));
+                    }
                     let func: SvcFn = unsafe { core::mem::transmute(h as usize) };
                     func(f);
+                    unsafe {
+                        core::arch::asm!("msr daifset, #0b0010", options(nomem, nostack));
+                    }
                 } else {
                     report_unhandled(f, kind, ec);
                 }
