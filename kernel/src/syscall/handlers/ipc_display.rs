@@ -612,7 +612,7 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         // Save return context and registers so we can be resumed.
         let urip = crate::arch::syscall::user_rip();
         let ursp = crate::arch::syscall::user_rsp();
-        crate::process::save_return_context(cur, urip - 2, ursp);
+        crate::process::save_return_context_reexec(cur, urip, ursp);
         crate::process::save_full_user_gprs(cur);
         crate::process::set_rax(cur, eabi::SYS_WM_EVENT_WAIT);
         if block_log_n < 32 {

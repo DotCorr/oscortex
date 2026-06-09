@@ -1345,10 +1345,16 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     // layer (livelock). Strategy: make the heap large enough that NO GC fires during
     // the first frame — no safepoint, no livelock. (Do NOT use --marker_tasks=0 /
     // --scavenger_tasks=0: the debug VM asserts num_tasks>0 and SIGABRTs.)
-    static ARG8: &[u8] =
-        b"--dart-flags=--old_gen_heap_size=512,--new_gen_semi_max_size=64,--no_background_compilation\0";
+    // NOTE: we deliberately do NOT pass a `--dart-flags=...` switch. The engine's
+    // SettingsFromCommandLine (shell/common/switches.cc) runs every comma-split
+    // entry through IsAllowedDartVMFlag against a tiny allowlist and FML_LOG(FATAL)s
+    // on anything else — `--old_gen_heap_size` / `--new_gen_semi_max_size` /
+    // `--no_background_compilation` are NOT on that list, so passing them via
+    // --dart-flags aborts the engine (switches.cc:478). The original GC-heap sizing
+    // was a workaround for an x86-TCG/JIT livelock that the later diagnosis traced
+    // to font fallback + slow JIT; under AOT on ARM we let the VM use its defaults.
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 9]);
+    struct ArgvPtrs([*const u8; 8]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
         ArgvPtrs([
@@ -1360,7 +1366,6 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
-            ARG8.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {

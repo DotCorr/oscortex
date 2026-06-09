@@ -516,10 +516,19 @@ fn blit_char(ch: u8, col: u32, row: u32) {
     let height   = FB_HEIGHT  .load(Ordering::Relaxed);
 
     let glyph_idx = ch.wrapping_sub(0x20) as usize;
+    if glyph_idx >= FONT.len() { return; }
     let glyph = &FONT[glyph_idx];
 
-    let px0 = col * CHAR_W;
-    let py0 = row * CHAR_H;
+    // Bound the cell to the framebuffer. A corrupted/overlarge col or row (e.g.
+    // before the FB geometry is published, or if the CURSOR static is clobbered)
+    // must NOT panic the kernel via an arithmetic overflow in `col * CHAR_W` —
+    // the text console is only a serial mirror and is never worth a panic.
+    let cols = if width  != 0 { width  / CHAR_W } else { 0 };
+    let rows = if height != 0 { height / CHAR_H } else { 0 };
+    if col >= cols || row >= rows { return; }
+
+    let px0 = col.saturating_mul(CHAR_W);
+    let py0 = row.saturating_mul(CHAR_H);
 
     let mut gy = 0;
     while gy < CHAR_H {

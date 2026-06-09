@@ -952,7 +952,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
                 if crate::process::try_claim_cpu_for(owner_candidate, my_cpu) {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_return_context_reexec(pid, urip, ursp);
                     crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, sys_nr);
                     crate::process::save_xstate(pid);
@@ -994,7 +994,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
                 // Save context pointing to the syscall instruction itself so we retry on re-entry.
-                crate::process::save_return_context(pid, urip - 2, ursp);
+                crate::process::save_return_context_reexec(pid, urip, ursp);
                 crate::process::save_full_user_gprs(pid);
                 crate::process::set_rax(pid, sys_nr); // Restore the original syscall number
                 crate::process::save_xstate(pid);
@@ -1026,7 +1026,7 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
                 if next != pid {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_return_context_reexec(pid, urip, ursp);
                     crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, sys_nr);
                     crate::process::save_xstate(pid);
@@ -1173,7 +1173,7 @@ pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
                 // Save context pointing to the syscall instruction itself so we retry on re-entry.
-                crate::process::save_return_context(pid, urip - 2, ursp);
+                crate::process::save_return_context_reexec(pid, urip, ursp);
                 crate::process::save_full_user_gprs(pid);
                 crate::process::set_rax(pid, sys_nr); // sys_pthread_once syscall number
                 crate::process::save_xstate(pid);
@@ -1192,7 +1192,7 @@ pub fn sys_pthread_once(once: u64, func: u64, sys_nr: u64) -> i64 {
                 if next != pid {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(pid, urip - 2, ursp);
+                    crate::process::save_return_context_reexec(pid, urip, ursp);
                     crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, sys_nr);
                     crate::process::save_xstate(pid);
@@ -1364,7 +1364,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                         if next != pid {
                             let urip = crate::arch::syscall::user_rip();
                             let ursp = crate::arch::syscall::user_rsp();
-                            crate::process::save_return_context(pid, urip - 2, ursp);
+                            crate::process::save_return_context_reexec(pid, urip, ursp);
                             crate::process::save_full_user_gprs(pid);
                             crate::process::set_rax(pid, sys_nr); // Restore the original syscall number
                             crate::process::save_xstate(pid);
@@ -1400,7 +1400,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                         if next != pid {
                             let urip = crate::arch::syscall::user_rip();
                             let ursp = crate::arch::syscall::user_rsp();
-                            crate::process::save_return_context(pid, urip - 2, ursp);
+                            crate::process::save_return_context_reexec(pid, urip, ursp);
                             crate::process::save_full_user_gprs(pid);
                             crate::process::set_rax(pid, sys_nr);
                             crate::process::save_xstate(pid);

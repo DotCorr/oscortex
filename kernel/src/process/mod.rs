@@ -1666,6 +1666,26 @@ pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
 
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
+/// Length in bytes of the user syscall-entry instruction. On x86_64 `syscall`
+/// is 2 bytes; on aarch64 `svc #0` is 4 bytes. After a syscall the user PC
+/// (ELR_EL1 / the saved RIP) points at the *next* instruction, so to make a
+/// blocked thread RE-EXECUTE its syscall on resume the kernel rewinds the saved
+/// PC by exactly one syscall instruction.
+#[cfg(target_arch = "x86_64")]
+pub const SYSCALL_INSN_LEN: u64 = 2;
+#[cfg(target_arch = "aarch64")]
+pub const SYSCALL_INSN_LEN: u64 = 4;
+
+/// Save a thread's resume context rewound to RE-EXECUTE the syscall it is
+/// currently in (used by the blocking syscalls — epoll_wait/poll/wm_event_wait/
+/// futex — which resume by re-entering the kernel and re-checking readiness).
+/// Rewinds the saved PC by one syscall instruction (arch-correct length).
+/// Using a hardcoded `-2` here mis-rewinds aarch64's 4-byte `svc` into the
+/// middle of the instruction → a PC-alignment fault (EC=0x22) on resume.
+pub fn save_return_context_reexec(pid: u32, urip: u64, ursp: u64) {
+    save_return_context(pid, urip.wrapping_sub(SYSCALL_INSN_LEN), ursp);
+}
+
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
     let fs = crate::arch::cpu::get_fs_base();
     // aarch64: capture the user link register (x30) from the SVC-entry snapshot

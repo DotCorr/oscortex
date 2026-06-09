@@ -999,7 +999,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 if crate::process::try_claim_cpu_for(target, my_cpu) {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                    crate::process::save_return_context_reexec(cur, urip, ursp);
                     crate::process::save_full_user_gprs(cur);
                     crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
                     crate::process::save_xstate(cur);
@@ -1133,7 +1133,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             if crate::process::try_claim_cpu_for(focus, my_cpu) {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1291,7 +1291,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 // blocking again — exactly like sys_wm_event_wait does.
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1317,7 +1317,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 crate::process::set_state(1, crate::process::ProcState::Running);
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B);
                 crate::process::save_xstate(cur);
