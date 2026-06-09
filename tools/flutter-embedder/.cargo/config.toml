@@ -13,3 +13,16 @@ rustflags = [
     "-C", "code-model=small",
 ]
 
+[target.aarch64-unknown-none]
+# Same rationale as x86_64: the kernel ELF loader maps the embedder at its
+# link-time VA but does not run a userspace `ld.so`, so it never populates the
+# GOT/PLT. Static relocation avoids GOT-indirect references that would
+# dereference an unpopulated (zero) GOT slot at runtime. The aarch64-unknown-none
+# spec is already non-PIC, but we set it explicitly to keep the contract obvious
+# and match the x86 path. `code-model=small` keeps the binary in the low VA
+# window the loader maps at 0x400000.
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=small",
+]
+
