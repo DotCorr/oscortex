@@ -551,7 +551,11 @@ pub fn check_timerfds_and_wake_try() {
             exps
         };
         for (pid, mutex, cond) in expired {
-            super::futex_waiter_remove(cond, pid);
+            // ISR-safe: never block on FUTEX_WAITERS here. An interrupted syscall
+            // (e.g. spawn_thread, a futex op) may hold it; a non-try lock would
+            // self-deadlock this single core with IRQs masked. On contention the
+            // removal is simply retried on the next timer tick.
+            super::futex_waiter_remove_try(cond, pid);
             static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
             let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
             if n < 32 {
