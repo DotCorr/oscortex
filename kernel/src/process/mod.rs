@@ -968,18 +968,22 @@ pub fn debug_runnable_states() -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::new();
     if let Some(_g) = PTABLE_LOCK.try_lock() {
-        for pid in 1u32..=12 {
-            let p = unsafe { &PTABLE[idx_of(pid)] };
-            if p.pid == pid {
-                let st = match p.state {
-                    ProcState::Running => 'R',
-                    ProcState::Blocked => 'B',
-                    ProcState::Zombie(_) => 'Z',
-                    ProcState::Dead => 'D',
-                };
-                let cpu = match p.current_cpu { Some(c) => c as i32, None => -1 };
-                let _ = write!(s, "{}:{}c{} ", pid, st, cpu);
-            }
+        // Print the RAW slot contents for indices 1..=12 (the slot's own .pid
+        // field, not the loop var) so a slot whose .pid != index reveals a
+        // reused/cleared entry — the mechanism behind a worker thread that runs
+        // yet never appears under its expected index.
+        for idx in 1usize..=12 {
+            let p = unsafe { &PTABLE[idx] };
+            if p.pid == 0 { continue; }
+            let st = match p.state {
+                ProcState::Running => 'R',
+                ProcState::Blocked => 'B',
+                ProcState::Zombie(_) => 'Z',
+                ProcState::Dead => 'D',
+            };
+            let cpu = match p.current_cpu { Some(c) => c as i32, None => -1 };
+            // slot[idx]=pid:state c cpu
+            let _ = write!(s, "s{}={}{}{} ", idx, p.pid, st, cpu);
         }
     } else {
         s.push_str("(locked)");
