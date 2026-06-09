@@ -24,9 +24,10 @@ pub struct BootMemRegion {
     pub len: u64,
 }
 
-/// Maximum distinct usable regions we retain. Limine emits a handful; QEMU virt
-/// reports one or two. 32 is comfortable headroom.
-pub const MAX_BOOT_REGIONS: usize = 32;
+/// Maximum distinct usable regions we retain. Limine typically emits well under
+/// a dozen usable entries (and QEMU virt one or two), but a fragmented memory map
+/// can have more; 128 is generous headroom so no usable RAM is ever dropped.
+pub const MAX_BOOT_REGIONS: usize = 128;
 
 /// A fixed-capacity list of usable physical RAM regions, built by the arch boot
 /// path and consumed by `frame_allocator::init_from_regions`.
