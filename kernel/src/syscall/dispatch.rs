@@ -26,6 +26,21 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         return crate::process::posix_trampolines::libm_call(number, arg0, arg1, arg2);
     }
 
+    // DIAGNOSTIC (aarch64 shell bring-up): trace pid=1's first syscalls so we can
+    // see exactly what the Flutter host issues (and what fails) at startup.
+    {
+        static PID1_TRACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if crate::process::current_pid() == 1 {
+            let n = PID1_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 40 {
+                log::warn!(
+                    "[pid1-trace] #{} nr={:#x} a0={:#x} a1={:#x} a2={:#x}",
+                    n, number, arg0, arg1, arg2
+                );
+            }
+        }
+    }
+
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
 

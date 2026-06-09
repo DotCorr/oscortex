@@ -278,6 +278,13 @@ pub(crate) fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
     };
     if let Ok(s) = core::str::from_utf8(bytes) {
         crate::logger::early_print(s);
+    } else {
+        // DIAGNOSTIC: a non-UTF8 stdout write would silently vanish. Log its
+        // length + first bytes so we can see writes that aren't text.
+        log::warn!(
+            "[sys_write] fd={} non-utf8 len={} first={:?}",
+            fd, len, &bytes[..bytes.len().min(8)]
+        );
     }
     len as i64
 }

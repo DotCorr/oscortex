@@ -1120,6 +1120,10 @@ const HOST_MODE_APP: u64 = 2;
 /// the first three C arguments (x86: rdi/rsi/rdx, aarch64: x0/x1/x2):
 ///   `host_mode` (1 = shell, 2 = launched app), `app_id`, `aot_va`.
 extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
+    // DIAGNOSTIC (aarch64 bring-up): emit a raw breadcrumb via the syscall
+    // wrapper so we can confirm main_embedder is entered and `write()` works
+    // against a .rodata buffer before the heavier init runs.
+    write(b"[host] main_embedder entered\n");
     CURRENT_HOST_MODE.store(host_mode, Ordering::Release);
     CURRENT_APP_ID.store(app_id, Ordering::Release);
     write(b"[host] starting\n");

@@ -488,10 +488,48 @@ mod aarch64_impl {
 
     /// Ensure the next-level table referenced by `*slot` exists, allocating it if
     /// the descriptor is empty. Returns the child table's physical address.
-    unsafe fn ensure_table(slot: *mut u64) -> Option<u64> {
+    ///
+    /// `level_shift` is the VA shift of the *child* block size at this level:
+    /// 21 when `slot` is an L1 entry (children are 2 MiB L2 blocks), 12 when it is
+    /// an L2 entry (children are 4 KiB L3 pages). It is used only when this slot
+    /// currently holds a *block* descriptor and must be split into a table.
+    ///
+    /// CRITICAL (user low-VA mapping): each per-process root is seeded with a copy
+    /// of the kernel identity map, whose low L1 slots are 1 GiB *block* descriptors
+    /// (device MMIO at slot 0, RAM at slots 1..). The Flutter host loads at
+    /// USER_ELF_BASE = 0x400000, which lives inside the slot-0 block. Mapping a
+    /// 4 KiB user page there requires splitting that block into a table WITHOUT
+    /// losing the original identity mapping (the kernel runs from this same root
+    /// after the CR3 switch and still needs the UART/GIC MMIO + its own RAM). We
+    /// therefore expand the block into a full table of next-level blocks that
+    /// reproduce the original output addresses + attributes, then return it so the
+    /// caller can overlay the finer user mapping on top.
+    unsafe fn ensure_table(slot: *mut u64, level_shift: u32) -> Option<u64> {
         let desc = core::ptr::read_volatile(slot);
         if desc & DESC_VALID != 0 {
-            return Some(desc & ADDR_MASK);
+            if desc & DESC_TABLE != 0 {
+                // Already a table descriptor.
+                return Some(desc & ADDR_MASK);
+            }
+            // VALID but not a table → a block descriptor. Split it.
+            let child = alloc_table()?;
+            let block_base = desc & ADDR_MASK; // output PA of the block
+            // Lower + upper attribute bits to carry into each sub-block. Keep
+            // everything except the output address and the table/page bit[1];
+            // re-add bit[1]=0 (block at L1/L2) below.
+            let attrs = desc & !ADDR_MASK & !DESC_TABLE;
+            let child_size: u64 = 1u64 << level_shift; // 2 MiB at L2, 4 KiB at L3
+            // At L3 a valid descriptor MUST be a page (bit[1]=1); at L2 a block
+            // has bit[1]=0. `level_shift==12` ⇒ the children are L3 pages.
+            let child_is_page = level_shift == 12;
+            for i in 0..512usize {
+                let sub_pa = block_base + (i as u64) * child_size;
+                let mut sub_desc = (sub_pa & ADDR_MASK) | attrs | DESC_VALID;
+                if child_is_page { sub_desc |= DESC_TABLE; } // page bit at L3
+                core::ptr::write_volatile(entry(child, i), sub_desc);
+            }
+            core::ptr::write_volatile(slot, (child & ADDR_MASK) | DESC_VALID | DESC_TABLE);
+            return Some(child);
         }
         let child = alloc_table()?;
         core::ptr::write_volatile(slot, (child & ADDR_MASK) | DESC_VALID | DESC_TABLE);
@@ -533,8 +571,10 @@ mod aarch64_impl {
         flags: PageFlags,
     ) -> Result<(), &'static str> {
         let l1 = root_pa;
-        let l2 = ensure_table(entry(l1, idx_l1(virt))).ok_or("OOM: l2 table")?;
-        let l3 = ensure_table(entry(l2, idx_l2(virt))).ok_or("OOM: l3 table")?;
+        // L1 entry → L2 table (children are 2 MiB blocks: shift 21).
+        let l2 = ensure_table(entry(l1, idx_l1(virt)), 21).ok_or("OOM: l2 table")?;
+        // L2 entry → L3 table (children are 4 KiB pages: shift 12).
+        let l3 = ensure_table(entry(l2, idx_l2(virt)), 12).ok_or("OOM: l3 table")?;
         core::ptr::write_volatile(entry(l3, idx_l3(virt)), page_desc(phys, flags));
         // Publish the new mapping + flush this VA in the EL0 space.
         core::arch::asm!(

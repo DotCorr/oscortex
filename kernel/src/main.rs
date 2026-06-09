@@ -324,12 +324,11 @@ fn shared_init_and_run() -> ! {
     // ── 9b. Spawn init process from initramfs ────────────────────────────
     match fs::lookup("/init") {
         Some(elf_bytes) => {
-            // aarch64 bring-up: seed rdi=0 so the init program selects message A
-            // (the x86 shell host uses HOST_MODE_SHELL; the ARM init is the
-            // self-contained preemption test program from build.rs).
-            #[cfg(target_arch = "aarch64")]
-            let first_rdi: u64 = 0;
-            #[cfg(not(target_arch = "aarch64"))]
+            // The init/host process is the Flutter shell host on BOTH arches now:
+            // seed rdi = HOST_MODE_SHELL so `_start`/`main_embedder` boots the
+            // shell host (registers as the engine host, dlopen's the engine, runs
+            // the shell). When the staged `/init` is the preemption self-test
+            // (no engine present), HOST_MODE_SHELL is ignored by that program.
             let first_rdi: u64 = crate::app_registry::HOST_MODE_SHELL;
             let bootstrap = process::SpawnBootstrap {
                 rdi: first_rdi,
@@ -347,36 +346,51 @@ fn shared_init_and_run() -> ! {
                     #[cfg(target_arch = "x86_64")]
                     process::schedule_user_launch(pid);
 
-                    // aarch64: the generic-timer ISR now drives the SAME shared
-                    // cooperative-scheduler hand-off x86 uses (arch::apic::
-                    // init_bsp armed it + installed the preempting IRQ handler).
-                    // Spawn a SECOND user process so there are two runnable EL0
-                    // threads; both run a pure-compute loop (no syscalls between
-                    // ticks), so the only way both make progress is the timer
-                    // preempting + switching between them. Then enter the first
-                    // directly — the timer takes over from there.
+                    // aarch64: the generic-timer ISR drives the SAME shared
+                    // cooperative-scheduler hand-off the x86 APIC timer uses.
                     #[cfg(target_arch = "aarch64")]
                     {
-                        let bootstrap_b = process::SpawnBootstrap {
-                            rdi: 1, // selects message B in the init program
-                            rsi: 0,
-                            rdx: 0,
-                            parent_pid: 0,
-                        };
-                        match process::spawn_with_bootstrap(elf_bytes, "init-b", bootstrap_b) {
-                            Ok(pid_b) => log::info!(
-                                "[INIT] aarch64: spawned 2nd EL0 thread PID {} (preemption test)",
-                                pid_b
-                            ),
-                            Err(e) => log::warn!("[INIT] aarch64: 2nd thread spawn failed: {}", e),
+                        // Detect whether the staged `/init` is the real Flutter
+                        // shell host (engine .so present) or the bring-up
+                        // preemption self-test (engine absent). The host runs as a
+                        // single foreground EL0 process and spawns its own engine
+                        // threads via SYS_THREAD_CREATE; the self-test needs a
+                        // SECOND compute-loop thread to prove timer preemption.
+                        let engine_present =
+                            fs::lookup("/system/lib/libflutter_engine.so").is_some();
+
+                        if engine_present {
+                            log::info!(
+                                "[INIT] aarch64: Flutter engine present — entering shell host PID {} (single foreground)",
+                                pid
+                            );
+                        } else {
+                            let bootstrap_b = process::SpawnBootstrap {
+                                rdi: 1, // selects message B in the self-test program
+                                rsi: 0,
+                                rdx: 0,
+                                parent_pid: 0,
+                            };
+                            match process::spawn_with_bootstrap(elf_bytes, "init-b", bootstrap_b) {
+                                Ok(pid_b) => log::info!(
+                                    "[INIT] aarch64: spawned 2nd EL0 thread PID {} (preemption test)",
+                                    pid_b
+                                ),
+                                Err(e) => log::warn!("[INIT] aarch64: 2nd thread spawn failed: {}", e),
+                            }
+                            log::info!(
+                                "[INIT] aarch64: entering PID {} at EL0; timer will preempt between threads",
+                                pid
+                            );
                         }
-                        log::info!(
-                            "[INIT] aarch64: entering PID {} at EL0; timer will preempt between threads",
-                            pid
-                        );
                         // Arm the generic-timer scheduler tick now (kernel fully
                         // initialised) so preemption begins the moment we drop to EL0.
-                        arch::aarch64::apic::start_scheduler_tick();
+                        // DIAGNOSTIC: skip arming for the engine host to isolate a
+                        // timer-IRQ-during-eret interaction; the host drives its own
+                        // frame pump cooperatively via sched_yield.
+                        if !engine_present {
+                            arch::aarch64::apic::start_scheduler_tick();
+                        }
                         process::enter_user_by_pid_noreturn(pid);
                     }
                 }

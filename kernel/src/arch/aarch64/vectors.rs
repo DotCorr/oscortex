@@ -397,6 +397,10 @@ fn report_unhandled(f: &TrapFrame, kind: u64, ec: u64) -> ! {
     uart::puthex_full(f.sp_el0);
     uart::puts(" x0=");
     uart::puthex_full(f.x[0]);
+    let far: u64;
+    unsafe { core::arch::asm!("mrs {}, far_el1", out(reg) far, options(nomem, nostack)); }
+    uart::puts("\n      FAR_EL1=");
+    uart::puthex_full(far);
     uart::puts("\n");
     loop {
         unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };

@@ -48,15 +48,19 @@ fn main() {
     ));
 
     // aarch64 port: provide a native EL0 `/init` so the production kernel_main can
-    // spawn a userspace process + service its first syscalls on ARM. The x86 build
-    // ships the Flutter host as `/init` (staged by scripts/build-iso.sh); on ARM
-    // that host doesn't exist yet (engine is a follow-on), so without this there is
-    // no native `/init` to spawn. This minimal program issues a couple of `write`
-    // syscalls, a `getpid`, then `exit` — exercising the full spawn → SVC dispatch
-    // → exit path through the SHARED syscall layer.
+    // spawn a userspace process + service its first syscalls on ARM.
+    //
+    // When `scripts/build-aarch64-shell.sh` has staged the real Flutter host as
+    // `initramfs/init` (it is then already in `entries`), we KEEP it — that path
+    // boots the actual shell. Only when no `init` was collected do we inject the
+    // self-contained preemption self-test (a couple of `write` syscalls, a
+    // `getpid`, then `exit`) so a bare `cargo build` + `run-aarch64.sh` still has
+    // something to spawn and exercises the spawn → SVC dispatch → exit path.
     if arch == "aarch64" {
-        entries.retain(|(n, _)| n != "init");
-        entries.push(("init".to_string(), generate_aarch64_init_elf()));
+        let has_real_init = entries.iter().any(|(n, _)| n == "init");
+        if !has_real_init {
+            entries.push(("init".to_string(), generate_aarch64_init_elf()));
+        }
     }
 
     // Write the USTAR tar to OUT_DIR.
@@ -99,7 +103,15 @@ fn collect_dir(
                 && name != "system/flutter/flutter_assets/kernel_blob.bin"
                 && !(name.starts_with("Applications/") && name.ends_with(".app/flutter_assets/kernel_blob.bin"))
             { continue; }
-            if fname == "libflutter_engine.so" || fname.ends_with(".bak") { continue; }
+            // The Flutter engine .so is delivered as a Limine MODULE on x86
+            // (iso_root/boot/libflutter_engine.so), so it is excluded from the
+            // initramfs there. On aarch64 there is NO Limine — the kernel boots
+            // via `-kernel` and the engine MUST travel in the initramfs, so we
+            // KEEP it. (collect_dir runs in build.rs; CARGO_CFG_TARGET_ARCH is
+            // the kernel's build target.)
+            let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+            if fname == "libflutter_engine.so" && target_arch != "aarch64" { continue; }
+            if fname.ends_with(".bak") { continue; }
             println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {
                 Ok(b) => b,
