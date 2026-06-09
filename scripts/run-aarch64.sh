@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # Build + boot the OSCortex aarch64 kernel directly under qemu-system-aarch64.
 #
-# This is the ARM bring-up path: a direct `-kernel` boot (no Limine) that runs
-# the platform-primitive milestones — EL1, MMU, exception vectors, GIC + generic
-# timer, SVC syscalls, and an EL0 user process — printing progress over PL011
-# serial. See kernel/src/arch/aarch64/bringup*.rs.
+# Direct `-kernel` boot (no Limine — that is the x86_64 boot protocol). The ARM
+# `_start` (kernel/src/arch/aarch64/boot.rs) saves the device-tree pointer from
+# x0 and routes into the PRODUCTION boot path (boot_prod.rs): PL011 serial → MMU
+# → EL1 exception vectors → GIC → device-tree RAM discovery → the SHARED
+# `kernel_main`. That runs the real subsystem init (heap, scheduler, VFS, process
+# table, Cortex runtime, …) and spawns the `/init` process at EL0, whose syscalls
+# are serviced through the shared dispatcher — all over PL011 serial.
+#
+# The self-contained platform-primitive bring-up (EL1/MMU/vectors/GIC/timer/SVC/
+# EL0 self-test, kernel/src/arch/aarch64/bringup*.rs) is still present and was the
+# proving ground for these primitives; the production path above now reuses them.
 #
 # Usage:
 #   scripts/run-aarch64.sh           # single-core boot
