@@ -516,10 +516,15 @@ fn apply_rela_table(
                 match rtype {
                     R_AARCH64_TLSDESC => {
                         // Descriptor pair: [+0]=static resolver, [+8]=TP offset.
-                        write_user_u64(
-                            target,
-                            crate::process::posix_trampolines::TLSDESC_RESOLVER_VA,
-                        );
+                        // The resolver trampoline only exists on aarch64 (a TLSDESC
+                        // reloc can only appear in an aarch64 object); on x86 this
+                        // arm is unreachable, so fall back to 0 to keep that build
+                        // green without pulling in the arch-gated symbol.
+                        #[cfg(target_arch = "aarch64")]
+                        let resolver = crate::process::posix_trampolines::TLSDESC_RESOLVER_VA;
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let resolver = 0u64;
+                        write_user_u64(target, resolver);
                         write_user_u64(target.wrapping_add(8), tp_off);
                     }
                     R_AARCH64_TLS_TPREL64 => write_user_u64(target, tp_off),
