@@ -1749,6 +1749,49 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
     }
 }
 
+/// Guards against a since-clobbered per-CPU user-GPR snapshot leaking into a
+/// thread's saved context.
+///
+/// The user GPR snapshot lives in a PER-CPU scratch area, written at syscall
+/// entry from the trapping thread's frame. It is shared by every thread on that
+/// core, so once a syscall hands off the CPU (a cooperative `epoll`/`futex`/
+/// `cond` yield, or — on aarch64 — a generic-timer preempt that lands a
+/// sibling's SVC mid-handler), another thread's syscall entry OVERWRITES it. A
+/// later `save_full_user_gprs` would then read the *other* thread's callee-saved
+/// regs / link register and store them into our context → on resume rbx/rbp/
+/// r12–15 (x19–x23/x29) or x30 are garbage, and the next `ret` branches to a
+/// stale address (observed on aarch64: x30=0 → `ret` to 0 → EL0 UDF after
+/// `FlutterEngineRunInitialized`; the x86 analogue corrupted `MessageLoop::Run`'s
+/// `this`).
+///
+/// Fix: capture ONCE, eagerly, at syscall entry (`capture_user_gprs_at_entry`),
+/// while the snapshot is still fresh for THIS thread (x86: interrupts masked
+/// until the handler `sti`s; aarch64: from inside the IRQ-masked SVC window in
+/// the vector dispatch). This flag makes every subsequent yield-time
+/// `save_full_user_gprs` in the same syscall a no-op, so a clobbered per-CPU
+/// snapshot can never leak into our saved context.
+const GPR_CAP_MAX_CPUS: usize = 64;
+static GPRS_CAPTURED: [core::sync::atomic::AtomicBool; GPR_CAP_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; GPR_CAP_MAX_CPUS];
+
+#[inline]
+fn gpr_cap_cpu_idx() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    { (crate::arch::aarch64::smp::current_cpu_id() as usize).min(GPR_CAP_MAX_CPUS - 1) }
+    #[cfg(not(target_arch = "aarch64"))]
+    { (crate::arch::smp::this_cpu().cpu_id as usize).min(GPR_CAP_MAX_CPUS - 1) }
+}
+
+/// Capture the user GPRs into `pid`'s PTABLE slot at syscall ENTRY, while the
+/// per-CPU snapshot is guaranteed fresh for this thread. Marks them captured so
+/// later `save_full_user_gprs` calls this syscall don't re-read the (possibly
+/// since-clobbered) shared per-CPU snapshot. MUST be invoked while the snapshot
+/// cannot yet be overwritten by a sibling (IRQs masked / pre-`sti`).
+pub fn capture_user_gprs_at_entry(pid: u32) {
+    GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
+    save_full_user_gprs(pid);
+}
+
 /// Snapshot the full user GPR set (as captured at SYSCALL entry) into the
 /// process's register file. Must be called from inside a syscall handler
 /// before yielding the CPU to another process via
@@ -1756,20 +1799,13 @@ pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
 /// with stale rbx/rbp/r12–r15/rdi/rsi/etc. and corrupt its C++ caller's
 /// `this` pointer and locals.
 pub fn save_full_user_gprs(pid: u32) {
-    let snap = crate::arch::syscall::user_gprs();
-    if pid == 2 {
-        log::warn!(
-            "[save_full_user_gprs] pid=2 rdi={:#x} rsi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-            snap.rdi,
-            snap.rsi,
-            snap.rbx,
-            snap.rbp,
-            snap.r12,
-            snap.r13,
-            snap.r14,
-            snap.r15
-        );
+    // Only the first call per syscall (the eager entry capture) reads the
+    // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops so a
+    // since-clobbered snapshot cannot leak into our saved context.
+    if GPRS_CAPTURED[gpr_cap_cpu_idx()].swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
     }
+    let snap = crate::arch::syscall::user_gprs();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid { return; }

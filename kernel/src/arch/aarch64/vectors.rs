@@ -306,6 +306,20 @@ extern "C" fn dispatch(frame: *mut TrapFrame, kind: u64) {
             if ec == EC_SVC64 {
                 let h = SVC_HANDLER.load(Ordering::Acquire);
                 if h != 0 {
+                    // EAGER user-GPR capture while IRQs are STILL MASKED. Snapshot
+                    // this thread's callee-saved regs (x19–x23/x29) + link
+                    // register (x30) from the trap frame into its PTABLE slot
+                    // now, before we unmask below. Once IRQs are on, a generic-
+                    // timer tick can switch to a sibling thread whose own SVC
+                    // overwrites the shared per-CPU snapshot; gating the later
+                    // yield-time `save_full_user_gprs` on this capture stops that
+                    // stale snapshot from leaking back as our resume context
+                    // (the bug: x30 captured stale → on resume `ret` branches to
+                    // 0 → EL0 UDF right after FlutterEngineRunInitialized). This
+                    // is the aarch64 counterpart of the x86 SYSCALL-entry capture
+                    // (interrupts there stay masked until the handler `sti`s).
+                    crate::arch::aarch64::syscall::capture_from_trap(f);
+                    crate::process::capture_user_gprs_at_entry(crate::process::current_pid());
                     // Unmask IRQs for the duration of the syscall, mirroring x86
                     // where the SYSCALL entry stub runs handlers with interrupts
                     // ENABLED. Exception entry masked DAIF.I; without re-enabling
@@ -473,6 +487,31 @@ fn report_unhandled(f: &TrapFrame, kind: u64, ec: u64) -> ! {
             if saved_fp <= fp { break; }
             fp = saved_fp;
             depth += 1;
+        }
+    }
+    // Raw stack scan: with x30=0/FP=0 the call chain is lost from registers and
+    // the frame walk yields nothing, but non-leaf callers still pushed their LR
+    // onto the EL0 stack. Scan upward from SP_EL0 and print any word that lands
+    // in the engine .so code window [0x1_4100_0000, 0x1_4300_0000) — those are
+    // almost certainly saved return addresses. addr2line them against
+    // libflutter_engine.so (base 0x141000000) to recover where the `ret` to 0
+    // originated.
+    uart::puts("      stkscan:");
+    {
+        let sp = f.sp_el0;
+        let plausible_sp = sp >= 0x1000 && sp < 0x0000_8000_0000_0000 && (sp & 0x7) == 0;
+        if plausible_sp {
+            let mut printed = 0u32;
+            let mut off = 0u64;
+            while off < 0x2000 && printed < 24 {
+                let w = unsafe { core::ptr::read_volatile((sp + off) as *const u64) };
+                if w >= 0x1_4100_0000 && w < 0x1_4300_0000 {
+                    uart::puts(" ");
+                    uart::puthex_full(w);
+                    printed += 1;
+                }
+                off += 8;
+            }
         }
     }
     uart::puts("\n");

@@ -30,14 +30,24 @@ static PAGE_TABLE_LOCK_DEPTH: core::sync::atomic::AtomicU32 =
 
 pub(crate) struct PageTableGuard {
     outer: Option<spin::MutexGuard<'static, ()>>,
+    /// aarch64 only: DAIF captured by the OUTER acquisition before it masked
+    /// IRQs. Restored when the outer guard drops. Unused on nested guards (IRQs
+    /// stay masked for the whole outer section).
+    #[cfg(target_arch = "aarch64")]
+    saved_daif: u64,
 }
 
 impl Drop for PageTableGuard {
     fn drop(&mut self) {
         if self.outer.is_some() {
-            // Outermost guard: clear depth, then release the real lock.
+            // Outermost guard: clear depth, release the real lock, THEN re-enable
+            // IRQs. The lock byte must be released before IRQs come back on, or a
+            // freshly-unmasked timer tick could switch to a thread that spins on
+            // the still-held lock with IRQs masked → single-core deadlock.
             PAGE_TABLE_LOCK_DEPTH.store(0, core::sync::atomic::Ordering::Release);
-            // `outer` drops here, releasing PAGE_TABLE_LOCK.
+            let _ = self.outer.take(); // drop the MutexGuard now (IRQs still masked)
+            #[cfg(target_arch = "aarch64")]
+            crate::arch::aarch64::cpu::interrupts_restore(self.saved_daif);
         } else {
             PAGE_TABLE_LOCK_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Release);
         }
@@ -45,16 +55,43 @@ impl Drop for PageTableGuard {
 }
 
 /// Acquire the page-table critical section, re-entrant on a single core.
+///
+/// On aarch64 the outer acquisition also MASKS IRQs for the whole critical
+/// section. The reentrant depth counter is only sound if the section cannot be
+/// interleaved by another thread; but syscalls run with IRQs unmasked, so a
+/// generic-timer tick can preempt a lock holder mid-section and switch to a
+/// sibling, which then sees a non-zero depth and proceeds as a bogus "nested"
+/// writer — desynchronising the depth counter from the real lock and eventually
+/// stranding the lock held while depth reads 0 (a later outer acquire then spins
+/// forever with IRQs masked in the demand-abort handler). Masking IRQs around
+/// the outer section makes it genuinely uninterruptible, so nesting only ever
+/// means true same-stack re-entry (e.g. a demand fault during a page-table walk,
+/// which already runs IRQs-masked). x86 keeps its original behaviour.
 #[inline]
 pub(crate) fn lock_page_table() -> PageTableGuard {
+    // Mask IRQs BEFORE touching the depth counter so the fetch_add → lock
+    // sequence cannot be preempted. On a nested call IRQs are already masked
+    // (the outer masked them); this is then an idempotent no-op.
+    #[cfg(target_arch = "aarch64")]
+    let saved_daif = crate::arch::aarch64::cpu::interrupts_save_and_disable();
     let prev = PAGE_TABLE_LOCK_DEPTH.fetch_add(1, core::sync::atomic::Ordering::Acquire);
     if prev == 0 {
         // First (outer) acquisition on this core: take the real lock.
         let g = PAGE_TABLE_LOCK.lock();
-        PageTableGuard { outer: Some(g) }
+        PageTableGuard {
+            outer: Some(g),
+            #[cfg(target_arch = "aarch64")]
+            saved_daif,
+        }
     } else {
-        // Nested acquisition: the outer guard already holds the lock.
-        PageTableGuard { outer: None }
+        // Nested acquisition: the outer guard already holds the lock (and already
+        // masked IRQs). `saved_daif` here is "already masked" and is discarded on
+        // drop — only the outer guard restores DAIF.
+        PageTableGuard {
+            outer: None,
+            #[cfg(target_arch = "aarch64")]
+            saved_daif,
+        }
     }
 }
 
