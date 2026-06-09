@@ -1150,6 +1150,24 @@ pub fn count() -> usize {
 /// * process-table slot (the scheduler treats it identically to a process)
 ///
 /// Returns the thread ID (a PID-space value), or an error string.
+/// aarch64: eagerly back a single anonymous user page with a zeroed frame and
+/// map it, so a subsequent kernel write to that VA does not take a nested EL1
+/// demand fault. No-op if the page is already mapped.
+#[cfg(target_arch = "aarch64")]
+fn eager_map_anon_page(pml4_phys: u64, va: u64) {
+    let page_va = va & !0xFFF;
+    if crate::mm::paging::translate_user_page(pml4_phys, page_va).is_some() {
+        return;
+    }
+    if let Some(phys) = crate::mm::frame_allocator::alloc_frame() {
+        let hhdm = (phys + crate::mm::frame_allocator::hhdm_offset()) as *mut u8;
+        unsafe { core::ptr::write_bytes(hhdm, 0, 4096); }
+        let _ = unsafe {
+            crate::mm::paging::map_user_page_with_flags(pml4_phys, page_va, phys, true, true)
+        };
+    }
+}
+
 pub fn spawn_thread(
     parent_pid: u32,
     entry_fn: u64,
@@ -1207,6 +1225,13 @@ pub fn spawn_thread(
     // The parent's PML4 is active here (we are in the parent's syscall
     // context), and `stack_va..stack_top` was just mmap'd RW into it, so
     // we can write to the user VA directly.
+    // aarch64: pre-map the exact page we are about to write so the kernel write
+    // does NOT take a nested EL1 demand-page fault. Every nested abort pushes a
+    // ~288-byte TrapFrame onto the (single, shared) EL1 kernel stack and runs the
+    // whole pager on it; pre-mapping the two pages spawn_thread writes removes
+    // two nested fault chains per spawn and keeps the EL1 stack shallow.
+    #[cfg(target_arch = "aarch64")]
+    eager_map_anon_page(parent_pml4_phys, stack_top - 8);
     unsafe {
         core::ptr::write_volatile(
             (stack_top - 8) as *mut u64,
@@ -1234,6 +1259,8 @@ pub fn spawn_thread(
         return Err("OOM: thread TLS");
     }
     log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, tls_va, arg);
+    #[cfg(target_arch = "aarch64")]
+    eager_map_anon_page(parent_pml4_phys, tls_va);
     unsafe { core::ptr::write_volatile(tls_va as *mut u64, tls_va); }
 
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
@@ -1255,6 +1282,14 @@ pub fn spawn_thread(
         p.user_stack_base    = stack_va;
         p.user_stack_size    = stack_size as u64;
         p.current_cpu        = None;
+        // aarch64: the return address lives in the link register (x30), NOT on
+        // the stack as on x86. A fresh thread is entered via build_image which
+        // maps the saved LR from `user_lr`; seed it with the thread-return
+        // trampoline so a worker start routine that RETURNS (instead of calling
+        // pthread_exit) lands in the trampoline (which turns x0 into the thread
+        // exit code) rather than branching to the leftover rflags value 0x0202.
+        #[cfg(target_arch = "aarch64")]
+        { p.user_lr = crate::process::posix_trampolines::thread_return_trampoline_va(); }
     }
 
     log::info!("[Process] Thread tid={} spawned in pid={} entry={:#x} tls={:#x}",
