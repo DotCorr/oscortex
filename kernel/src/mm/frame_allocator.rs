@@ -3,8 +3,6 @@
 //! Uses a static bitmap where each bit represents a 4 KiB physical frame.
 //! The bitmap itself is placed in the first usable memory region.
 
-use limine::memmap::MEMMAP_USABLE;
-use limine::request::MemmapResponse;
 use spin::Mutex;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -117,21 +115,51 @@ impl FrameBitmap {
     }
 }
 
-pub fn init(mmap: &MemmapResponse, hhdm_offset: u64) {
+/// Initialise the frame bitmap from an arch-neutral usable-region list.
+///
+/// Both the x86_64 (Limine) and aarch64 (device-tree) boot paths funnel through
+/// here via [`crate::mm::init_from_regions`].
+pub fn init_from_regions(map: &crate::mm::BootMemMap, hhdm_offset: u64) {
     set_hhdm_offset(hhdm_offset);
     let mut bm = BITMAP.lock();
     bm.hhdm = hhdm_offset;
-    for entry in mmap.entries() {
-        if entry.type_ == MEMMAP_USABLE {
-            let start_frame = (entry.base as usize) / FRAME_SIZE;
-            let end_frame = ((entry.base + entry.length) as usize) / FRAME_SIZE;
-            for frame in start_frame.max(MIN_ALLOC_FRAME)..end_frame.min(MAX_FRAMES) {
-                bm.mark_free(frame);
-            }
+    for region in map.regions() {
+        let start_frame = (region.base as usize) / FRAME_SIZE;
+        let end_frame = ((region.base + region.len) as usize) / FRAME_SIZE;
+        for frame in start_frame.max(MIN_ALLOC_FRAME)..end_frame.min(MAX_FRAMES) {
+            bm.mark_free(frame);
         }
     }
     log::info!("[MM::FrameAlloc] {} MiB usable physical memory",
         (bm.total * FRAME_SIZE) / (1024 * 1024));
+}
+
+/// Reserve a physical address range `[base, base+len)` so the allocator never
+/// hands it out (e.g. the loaded kernel image, the DTB, or a device-claimed
+/// buffer). Frames are rounded outward to 4 KiB boundaries. Idempotent.
+///
+/// Must be called AFTER `init_from_regions` (which marks RAM free) and BEFORE
+/// the first allocation, otherwise a free-marked frame inside the range could be
+/// handed out — on aarch64 the kernel is loaded into the same RAM region the
+/// device tree reports as usable, so without this the heap can overlap the
+/// kernel image.
+pub fn reserve_range(base: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let start_frame = (base / FRAME_SIZE as u64) as usize;
+    let end_frame = (((base + len + FRAME_SIZE as u64 - 1) / FRAME_SIZE as u64) as usize)
+        .min(MAX_FRAMES);
+    let mut bm = BITMAP.lock();
+    for frame in start_frame..end_frame {
+        let mask = 1u64 << (frame % 64);
+        let idx = frame / 64;
+        // Only flip frames currently free (bit set) so `used`/`total` stay sane.
+        if (bm.bits[idx] & mask) != 0 {
+            bm.bits[idx] &= !mask;
+            bm.used += 1;
+        }
+    }
 }
 
 /// Allocate a single 4 KiB physical frame. Returns the physical address.

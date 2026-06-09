@@ -27,11 +27,19 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     }
 
     // Eagerly snapshot this thread's user GPRs NOW, while the per-CPU entry
-    // snapshot (gs:[..]) is still fresh for us — before any handler runs, yields,
-    // or opens an interrupt window in which another thread's syscall entry could
-    // clobber the shared per-CPU snapshot. This is what makes a thread that
-    // yields inside a syscall (e.g. epoll_wait) resume with its OWN callee-saved
-    // registers intact, instead of leaking another thread's rbx/rbp/r12-15.
+    // snapshot is still fresh for us — before any handler runs, yields, or opens
+    // an interrupt window in which another thread's syscall entry could clobber
+    // the shared per-CPU snapshot. This is what makes a thread that yields inside
+    // a syscall (e.g. epoll_wait) resume with its OWN callee-saved registers
+    // intact, instead of leaking another thread's rbx/rbp/r12-15 (or, on
+    // aarch64, x30 → `ret` to a stale address).
+    //
+    // x86 reaches here with interrupts still masked (the SYSCALL entry stub
+    // hasn't sti'd yet), so the snapshot is fresh. aarch64 UNMASKS IRQs in the
+    // vector dispatch BEFORE the handler runs, so an unmasked capture here could
+    // already be clobbered — the aarch64 eager capture is therefore done earlier,
+    // inside the IRQ-masked SVC window in `vectors.rs`. Don't redo it here.
+    #[cfg(not(target_arch = "aarch64"))]
     {
         let cur = crate::process::current_pid();
         if cur != 0 {
@@ -715,7 +723,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             if buf == 0 || len == 0 { return 0; }
             // Best-effort: cap at 256 MiB to avoid runaway.
             let n = len.min(256 * 1024 * 1024);
-            let mut s: u64 = unsafe { core::arch::x86_64::_rdtsc() } ^ 0xA5A5_F00D_DEAD_BEEFu64;
+            let mut s: u64 = crate::arch::rdtsc() ^ 0xA5A5_F00D_DEAD_BEEFu64;
             unsafe {
                 let p = buf as *mut u8;
                 let mut i = 0usize;
