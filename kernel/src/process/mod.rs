@@ -192,6 +192,16 @@ pub struct Process {
     /// next `ret` branches to address 0.
     #[cfg(target_arch = "aarch64")]
     pub user_lr: u64,
+    /// aarch64 only: the user PC (ELR) and SP (SP_EL0) captured at SVC ENTRY,
+    /// while the per-CPU snapshot is fresh (the eager entry capture). A blocking
+    /// syscall's `save_return_context` rewinds/uses THESE rather than the live
+    /// per-CPU scratch, which a timer-preempted sibling's SVC can clobber before
+    /// the yield decision — otherwise the thread resumes on the wrong SP and its
+    /// `ldp x29,x30,[sp,#..]; ret` reads a stale/zero frame record → `ret` to 0.
+    #[cfg(target_arch = "aarch64")]
+    pub entry_user_rip: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub entry_user_rsp: u64,
 }
 
 impl Process {
@@ -230,6 +240,10 @@ impl Process {
             arch_frame_valid: false,
             #[cfg(target_arch = "aarch64")]
             user_lr: 0,
+            #[cfg(target_arch = "aarch64")]
+            entry_user_rip: 0,
+            #[cfg(target_arch = "aarch64")]
+            entry_user_rsp: 0,
         }
     }
 }
@@ -1730,28 +1744,51 @@ pub const SYSCALL_INSN_LEN: u64 = 4;
 /// Using a hardcoded `-2` here mis-rewinds aarch64's 4-byte `svc` into the
 /// middle of the instruction → a PC-alignment fault (EC=0x22) on resume.
 pub fn save_return_context_reexec(pid: u32, urip: u64, ursp: u64) {
-    save_return_context(pid, urip.wrapping_sub(SYSCALL_INSN_LEN), ursp);
+    save_return_context_inner(pid, urip.wrapping_sub(SYSCALL_INSN_LEN), ursp, SYSCALL_INSN_LEN);
 }
 
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
+    save_return_context_inner(pid, rip, rsp, 0);
+}
+
+/// `aarch64_rewind` is how far the resume PC is rewound from the syscall return
+/// point (0 for a plain return, SYSCALL_INSN_LEN to re-execute the `svc`). On
+/// aarch64 the resume PC/SP/LR come from the TARGET thread's eagerly-captured
+/// entry snapshot (`entry_user_rip`/`entry_user_rsp`/`user_lr`, taken in the
+/// IRQ-masked SVC window), NOT from the caller's `rip`/`rsp` — those were read
+/// from the live per-CPU scratch, which on the wake path belongs to the WAKER
+/// (not `pid`) and on a self-yield can be clobbered by a timer-preempted
+/// sibling's SVC. Trusting the scratch there resumed the thread on the wrong SP,
+/// so its `ldp x29,x30,[sp,#..]; ret` read a stale/zero frame record → `ret` 0.
+fn save_return_context_inner(pid: u32, rip: u64, rsp: u64, aarch64_rewind: u64) {
     let fs = crate::arch::cpu::get_fs_base();
-    // aarch64: capture the user link register (x30) from the SVC-entry snapshot
-    // BEFORE taking the lock. AArch64 return addresses live in LR, not on the
-    // stack, so a thread that yields inside this syscall must resume with x30
-    // intact or its next `ret` jumps to whatever build_image left there (0).
-    #[cfg(target_arch = "aarch64")]
-    let lr = crate::arch::syscall::user_lr();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid {
-        p.regs.rip    = rip;
-        p.regs.rsp    = rsp;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Prefer this thread's own entry-captured PC/SP; fall back to the
+            // passed values only if no entry capture exists yet (e.g. a fresh
+            // thread that has not run a syscall). x30 was already persisted by
+            // the eager capture — do NOT overwrite it with the live scratch.
+            if p.entry_user_rip != 0 {
+                p.regs.rip = p.entry_user_rip.wrapping_sub(aarch64_rewind);
+                p.regs.rsp = p.entry_user_rsp;
+            } else {
+                p.regs.rip = rip;
+                p.regs.rsp = rsp;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = aarch64_rewind;
+            p.regs.rip = rip;
+            p.regs.rsp = rsp;
+        }
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
         p.preempted_by_timer = false;
         p.fs_base = fs;
-        #[cfg(target_arch = "aarch64")]
-        { p.user_lr = lr; }
     }
 }
 
@@ -1828,9 +1865,15 @@ pub fn save_full_user_gprs(pid: u32) {
     p.regs.r14 = snap.r14;
     p.regs.r15 = snap.r15;
     // aarch64: persist the user link register (x30) so the thread can `ret`
-    // correctly after resuming from this syscall yield.
+    // correctly after resuming from this syscall yield, plus the entry PC/SP so a
+    // blocking syscall's save_return_context can rewind from the FRESH entry
+    // values rather than the live (clobberable) per-CPU scratch.
     #[cfg(target_arch = "aarch64")]
-    { p.user_lr = snap.lr; }
+    {
+        p.user_lr = snap.lr;
+        p.entry_user_rip = crate::arch::syscall::user_rip();
+        p.entry_user_rsp = crate::arch::syscall::user_rsp();
+    }
 }
 
 /// Set the `rax` return value that will be delivered when this process is
