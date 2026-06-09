@@ -968,7 +968,7 @@ pub fn debug_runnable_states() -> alloc::string::String {
     use core::fmt::Write;
     let mut s = alloc::string::String::new();
     if let Some(_g) = PTABLE_LOCK.try_lock() {
-        for pid in 1u32..=6 {
+        for pid in 1u32..=12 {
             let p = unsafe { &PTABLE[idx_of(pid)] };
             if p.pid == pid {
                 let st = match p.state {
@@ -977,7 +977,8 @@ pub fn debug_runnable_states() -> alloc::string::String {
                     ProcState::Zombie(_) => 'Z',
                     ProcState::Dead => 'D',
                 };
-                let _ = write!(s, "{}:{}{:?} ", pid, st, p.current_cpu);
+                let cpu = match p.current_cpu { Some(c) => c as i32, None => -1 };
+                let _ = write!(s, "{}:{}c{} ", pid, st, cpu);
             }
         }
     } else {

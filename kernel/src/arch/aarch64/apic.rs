@@ -118,10 +118,11 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     {
         static PREEMPT_TICK_LOG: AtomicU32 = AtomicU32::new(0);
         let n = PREEMPT_TICK_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 80 && (n % 8 == 0 || should_preempt) {
+        if n < 4000 && (n % 64 == 0 || should_preempt) {
             log::warn!(
-                "[arm-preempt-tick] #{} cur={} slice_expired={} should={} focus={}",
-                n, cur, slice_expired, should_preempt, focus
+                "[arm-preempt-tick] #{} cur={} slice_expired={} should={} focus={} states={}",
+                n, cur, slice_expired, should_preempt, focus,
+                crate::process::debug_runnable_states()
             );
         }
     }
@@ -146,7 +147,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     {
         static SWITCH_LOG: AtomicU32 = AtomicU32::new(0);
         let n = SWITCH_LOG.fetch_add(1, Ordering::Relaxed);
-        if n < 60 {
+        if n < 400 {
             log::warn!(
                 "[arm-preempt-switch] #{} cur={} -> next={:?} states={}",
                 n, cur, switch.as_ref().map(|s| s.0),
