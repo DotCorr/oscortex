@@ -93,13 +93,58 @@ pub fn capture_from_trap(frame: &super::vectors::TrapFrame) {
     }
 }
 
+/// Production SVC (EL0 synchronous) handler — routes a userspace `svc #0` into
+/// the shared syscall dispatcher.
+///
+/// The Linux aarch64 syscall ABI puts the number in x8 and args in x0..x5; the
+/// OSCortex shared dispatcher (`syscall::dispatch_fast`) takes (nr, a0..a4) and
+/// returns the result in x0. We capture the trapping thread's user GPRs into the
+/// per-CPU snapshot first (so the dispatcher's `user_rip`/`user_rsp`/`user_gprs`
+/// accessors reflect the caller), dispatch, then write the return value back into
+/// x0 of the saved frame so the vector stub's `eret` resumes EL0 with it.
+///
+/// The faulting instruction is `svc #0`; ELR_EL1 already points at the *next*
+/// instruction on a synchronous SVC, so no manual advance is needed.
+///
+/// If the call terminated the process (exit / exit_group), the EL0 context is no
+/// longer valid to resume, so we hand off to the next runnable user process via
+/// the shared scheduler instead of returning to the vector stub.
+fn production_svc_handler(f: &mut super::vectors::TrapFrame) {
+    capture_from_trap(f);
+
+    let nr = f.x[8];
+    let ret = crate::syscall::dispatch_fast(
+        nr, f.x[0], f.x[1], f.x[2], f.x[3], f.x[4],
+    );
+    f.x[0] = ret as u64;
+
+    // exit(60) / exit_group(231): the current process is now a zombie; do not
+    // eret back into it. Pick the next runnable user thread and enter it.
+    if nr == 60 || nr == 231 {
+        let cur = crate::process::current_pid();
+        match crate::process::next_runnable_pid(cur) {
+            Some(next) => crate::process::enter_user_by_pid_noreturn(next),
+            None => {
+                // No more user work — park this core. The shared idle/cortex loop
+                // keeps the kernel alive; an exiting init with nothing to run is a
+                // clean stop for the bring-up.
+                log::info!("[svc] init exited (code={}) — no runnable user process; parking", ret);
+                loop {
+                    crate::arch::halt();
+                }
+            }
+        }
+    }
+}
+
 /// Initialise the SVC fast path on the BSP.
 ///
-/// The EL1 exception vector table (VBAR_EL1) that decodes SVC and captures the
-/// user snapshot is installed by the bring-up (`vectors::install`); this only
-/// logs readiness.
+/// Installs the production SVC handler into the EL1 vector table (VBAR_EL1 was
+/// programmed earlier by `vectors::install`), so a userspace `svc #0` reaches
+/// the shared syscall dispatcher.
 pub fn init() {
-    log::info!("[Syscall] aarch64 SVC entry ready (capture_from_trap wired)");
+    super::vectors::set_svc_handler(production_svc_handler);
+    log::info!("[Syscall] aarch64 SVC entry ready (production dispatch_fast wired)");
 }
 
 /// Per-AP SVC init.

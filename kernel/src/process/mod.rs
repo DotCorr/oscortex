@@ -44,7 +44,14 @@ pub const MAX_PROCS: usize = 256;
 pub const USER_ELF_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 
 /// User stack top (grows downward; bottom = TOP − STACK_SIZE).
+///
+/// x86_64 uses a 47-bit canonical-low address. aarch64's bring-up MMU configures
+/// a 39-bit TTBR0 VA window (T0SZ=25 → max user VA 512 GiB), so the ARM stack top
+/// is placed just under that boundary instead.
+#[cfg(not(target_arch = "aarch64"))]
 pub const USER_STACK_TOP:  u64  = 0x0000_7FFF_FFFF_0000;
+#[cfg(target_arch = "aarch64")]
+pub const USER_STACK_TOP:  u64  = 0x0000_007F_FFF0_0000; // ~512 GiB − 1 MiB (39-bit VA)
 pub const USER_STACK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const XSTATE_SIZE: usize = 4096;
@@ -510,6 +517,10 @@ pub fn spawn_with_bootstrap(
     }
 
     // Map POSIX trampoline + sysdata pages so glibc symbols resolve correctly.
+    // These are x86_64 glibc/musl shims; the aarch64 bring-up init is a bare EL0
+    // program with no libc, so they are skipped on ARM (follow-on once an ARM
+    // userland links a C library).
+    #[cfg(not(target_arch = "aarch64"))]
     posix_trampolines::map_system_pages(pml4_phys)?;
 
     let idx = idx_of(pid);

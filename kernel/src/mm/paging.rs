@@ -404,17 +404,277 @@ mod x86_64_impl {
 
 // ─── Non-x86_64 stubs ─────────────────────────────────────────────────────────
 
-#[cfg(not(target_arch = "x86_64"))]
+// ─── aarch64 implementation ───────────────────────────────────────────────────
+//
+// A 4 KiB-granule, 4-level (L0→L1→L2→L3) translation-table walker for the EL0
+// (TTBR0) low half. Per-process address spaces each get a fresh L0 table from
+// the frame allocator. The bring-up identity-maps RAM (VA == PA), so a table's
+// physical address is also its directly-accessible kernel virtual address
+// (HHDM offset is 0 on aarch64); we read/write tables through their PA.
+//
+// This matches the TCR_EL1 the bring-up programs (T0SZ=25 → 39-bit VA). With a
+// 39-bit VA and 4 KiB granule, translation starts at level 1, so the top table
+// is an L1 (512 entries × 1 GiB). We treat the per-process root as that L1.
+#[cfg(target_arch = "aarch64")]
+mod aarch64_impl {
+    use super::PageFlags;
+    use crate::mm::frame_allocator;
+
+    const PAGE_SIZE: usize = 4096;
+    /// Output-address mask for a table/page descriptor (bits[47:12]).
+    const ADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+    // Descriptor type/attribute bits (ARMv8-A, stage-1).
+    const DESC_VALID: u64 = 1 << 0;
+    const DESC_TABLE: u64 = 1 << 1; // at L1/L2: 1 = table, 0 = block. at L3: must be 1 (page).
+    const DESC_AF: u64 = 1 << 10; // Access Flag
+    const DESC_SH_INNER: u64 = 3 << 8; // inner shareable
+    const DESC_AP_RW_ALL: u64 = 1 << 6; // EL0+EL1 RW (AP[1]=1)
+    const DESC_AP_RO_ALL: u64 = 3 << 6; // EL0+EL1 RO
+    const DESC_UXN: u64 = 1 << 54; // unprivileged execute-never
+    const DESC_PXN: u64 = 1 << 53; // privileged execute-never
+    const ATTR_IDX_NORMAL: u64 = 0 << 2; // MAIR attr0 = Normal WB (matches mmu.rs)
+
+    /// 39-bit VA index extraction. With start level 1: L1[38:30], L2[29:21],
+    /// L3[20:12].
+    #[inline]
+    fn idx_l1(va: u64) -> usize { ((va >> 30) & 0x1FF) as usize }
+    #[inline]
+    fn idx_l2(va: u64) -> usize { ((va >> 21) & 0x1FF) as usize }
+    #[inline]
+    fn idx_l3(va: u64) -> usize { ((va >> 12) & 0x1FF) as usize }
+
+    /// A table is 512 u64 entries at a 4 KiB-aligned physical address. On the
+    /// identity map, the PA is directly dereferenceable.
+    #[inline]
+    unsafe fn entry(table_pa: u64, idx: usize) -> *mut u64 {
+        (table_pa as *mut u64).add(idx)
+    }
+
+    /// Allocate and zero a fresh translation table; returns its physical address.
+    fn alloc_table() -> Option<u64> {
+        let pa = frame_allocator::alloc_frame()?;
+        unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE) };
+        Some(pa)
+    }
+
+    /// Allocate a fresh per-process root table (the L1 for a 39-bit VA space).
+    ///
+    /// CRITICAL: on the aarch64 bring-up the kernel itself runs from the low
+    /// (TTBR0) half — its code, stack, vectors, and the UART/GIC MMIO are in the
+    /// identity map programmed at boot. A per-process TTBR0 that contained only
+    /// user pages would unmap the kernel the instant `write_cr3` loaded it, so
+    /// the very next instruction fetch (and the fault handler) would fault with
+    /// no way to recover. We therefore seed each new root with a copy of the
+    /// kernel's identity-map L1 entries (the 1 GiB block descriptors for the
+    /// device region + RAM). User L1 slots (which the kernel map leaves empty)
+    /// are then filled by `map_page_in` for the process's own pages.
+    pub fn alloc_user_pml4() -> Option<u64> {
+        let root = alloc_table()?;
+        let kernel_l1 = crate::arch::aarch64::mmu::kernel_ttbr0();
+        unsafe {
+            // Copy all 512 L1 entries from the kernel identity map. The kernel
+            // map uses 1 GiB block descriptors at low indices; user VAs live at
+            // higher indices (e.g. ~511 for the stack) which are zero in the
+            // kernel map and get populated per-process.
+            core::ptr::copy_nonoverlapping(
+                kernel_l1 as *const u64,
+                root as *mut u64,
+                512,
+            );
+        }
+        Some(root)
+    }
+
+    /// Ensure the next-level table referenced by `*slot` exists, allocating it if
+    /// the descriptor is empty. Returns the child table's physical address.
+    unsafe fn ensure_table(slot: *mut u64) -> Option<u64> {
+        let desc = core::ptr::read_volatile(slot);
+        if desc & DESC_VALID != 0 {
+            return Some(desc & ADDR_MASK);
+        }
+        let child = alloc_table()?;
+        core::ptr::write_volatile(slot, (child & ADDR_MASK) | DESC_VALID | DESC_TABLE);
+        Some(child)
+    }
+
+    /// Build an L3 page descriptor for a user page.
+    fn page_desc(phys: u64, flags: PageFlags) -> u64 {
+        let mut d = (phys & ADDR_MASK)
+            | DESC_VALID
+            | DESC_TABLE // bit[1]=1 → page at L3
+            | DESC_AF
+            | DESC_SH_INNER
+            | ATTR_IDX_NORMAL;
+        if flags.contains(PageFlags::WRITABLE) {
+            d |= DESC_AP_RW_ALL;
+        } else {
+            d |= DESC_AP_RO_ALL;
+        }
+        // Execution: x86 NO_EXECUTE bit → UXN here. We always set PXN (EL1 must
+        // never execute user pages). When NO_EXECUTE is set, also set UXN.
+        d |= DESC_PXN;
+        if flags.contains(PageFlags::NO_EXECUTE) || !flags.contains(PageFlags::USER) {
+            d |= DESC_UXN;
+        }
+        d
+    }
+
+    /// Map a 4 KiB page `phys` at user VA `virt` in the address space rooted at
+    /// `root_pa` (the L1 table), allocating intermediate tables as needed.
+    ///
+    /// # Safety
+    /// `root_pa` must be a valid table from [`alloc_user_pml4`]; `virt`/`phys`
+    /// must be 4 KiB-aligned.
+    pub unsafe fn map_page_in(
+        root_pa: u64,
+        virt: u64,
+        phys: u64,
+        flags: PageFlags,
+    ) -> Result<(), &'static str> {
+        let l1 = root_pa;
+        let l2 = ensure_table(entry(l1, idx_l1(virt))).ok_or("OOM: l2 table")?;
+        let l3 = ensure_table(entry(l2, idx_l2(virt))).ok_or("OOM: l3 table")?;
+        core::ptr::write_volatile(entry(l3, idx_l3(virt)), page_desc(phys, flags));
+        // Publish the new mapping + flush this VA in the EL0 space.
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+        Ok(())
+    }
+
+    /// Walk to the L3 descriptor for `virt`; returns (l3_slot, descriptor) if the
+    /// full path is present, else None.
+    unsafe fn walk(root_pa: u64, virt: u64) -> Option<(*mut u64, u64)> {
+        let l1d = core::ptr::read_volatile(entry(root_pa, idx_l1(virt)));
+        if l1d & DESC_VALID == 0 { return None; }
+        let l2 = l1d & ADDR_MASK;
+        let l2d = core::ptr::read_volatile(entry(l2, idx_l2(virt)));
+        if l2d & DESC_VALID == 0 { return None; }
+        let l3 = l2d & ADDR_MASK;
+        let slot = entry(l3, idx_l3(virt));
+        let d = core::ptr::read_volatile(slot);
+        if d & DESC_VALID == 0 { return None; }
+        Some((slot, d))
+    }
+
+    pub fn translate_user_page(root_pa: u64, virt: u64) -> Option<u64> {
+        let page = virt & !0xFFF;
+        let off = virt & 0xFFF;
+        unsafe { walk(root_pa, page).map(|(_, d)| (d & ADDR_MASK) | off) }
+    }
+
+    pub fn translate_user_page_flags(root_pa: u64, virt: u64) -> Option<(u64, bool, bool)> {
+        let page = virt & !0xFFF;
+        unsafe {
+            walk(root_pa, page).map(|(_, d)| {
+                let phys = d & ADDR_MASK;
+                let writable = (d & DESC_AP_RW_ALL) == DESC_AP_RW_ALL;
+                let exec = (d & DESC_UXN) == 0;
+                (phys, writable, exec)
+            })
+        }
+    }
+
+    /// Update the permission bits of an already-mapped user page.
+    ///
+    /// # Safety
+    /// `root_pa` must be a valid allocated table.
+    pub unsafe fn update_user_page_flags(
+        root_pa: u64,
+        virt: u64,
+        writable: bool,
+        exec: bool,
+    ) -> Result<(), &'static str> {
+        let page = virt & !0xFFF;
+        let (slot, d) = walk(root_pa, page).ok_or("page not mapped")?;
+        let mut nd = d & !(DESC_AP_RO_ALL | DESC_UXN);
+        nd |= if writable { DESC_AP_RW_ALL } else { DESC_AP_RO_ALL };
+        if !exec { nd |= DESC_UXN; }
+        core::ptr::write_volatile(slot, nd);
+        core::arch::asm!(
+            "dsb ishst", "tlbi vmalle1is", "dsb ish", "isb",
+            options(nostack, preserves_flags),
+        );
+        Ok(())
+    }
+
+    /// Unmap a single page; returns the physical frame it pointed at.
+    ///
+    /// # Safety
+    /// `root_pa` must be a valid allocated table.
+    pub unsafe fn unmap_user_page(root_pa: u64, virt: u64) -> Result<u64, &'static str> {
+        let page = virt & !0xFFF;
+        let (slot, d) = walk(root_pa, page).ok_or("not present")?;
+        let phys = d & ADDR_MASK;
+        core::ptr::write_volatile(slot, 0);
+        core::arch::asm!(
+            "dsb ishst", "tlbi vmalle1is", "dsb ish", "isb",
+            options(nostack, preserves_flags),
+        );
+        Ok(phys)
+    }
+
+    /// Walk all three levels of a user root table and free every backing frame
+    /// (leaf pages + intermediate tables + the root). Best-effort.
+    ///
+    /// IMPORTANT: each per-process root is seeded (in `alloc_user_pml4`) with a
+    /// copy of the kernel's identity-map L1 entries, which are **1 GiB block
+    /// descriptors** (bit[1] == 0), not table pointers. We MUST NOT recurse into
+    /// or free those — their "address" is kernel RAM, not a process-owned table.
+    /// Only L1 entries that are *table* descriptors (bit[1] == 1), i.e. the L2
+    /// tables created for this process's own high-VA pages, are walked and freed.
+    pub fn free_user_pml4(root_pa: u64) {
+        if root_pa == 0 { return; }
+        unsafe {
+            for i1 in 0..512usize {
+                let l1d = core::ptr::read_volatile(entry(root_pa, i1));
+                // Skip invalid AND block descriptors (the shared kernel identity
+                // map). Only table descriptors point at process-owned L2 tables.
+                if l1d & DESC_VALID == 0 || l1d & DESC_TABLE == 0 { continue; }
+                let l2 = l1d & ADDR_MASK;
+                for i2 in 0..512usize {
+                    let l2d = core::ptr::read_volatile(entry(l2, i2));
+                    if l2d & DESC_VALID == 0 || l2d & DESC_TABLE == 0 { continue; }
+                    let l3 = l2d & ADDR_MASK;
+                    for i3 in 0..512usize {
+                        let l3d = core::ptr::read_volatile(entry(l3, i3));
+                        if l3d & DESC_VALID != 0 {
+                            frame_allocator::free_frame(l3d & ADDR_MASK);
+                        }
+                    }
+                    frame_allocator::free_frame(l3);
+                }
+                frame_allocator::free_frame(l2);
+            }
+            frame_allocator::free_frame(root_pa);
+        }
+    }
+
+    // Kernel-space single mappings: the bring-up identity-maps devices + RAM, so
+    // a fresh kernel `map_page`/`map_mmio` is only needed for windows outside the
+    // boot map. For now these are no-ops (everything the kernel touches is in the
+    // identity map); a follow-on can extend the kernel L1 if a new window is
+    // required.
+    pub unsafe fn map_page(_virt: u64, _phys: u64, _flags: PageFlags) {}
+    pub unsafe fn map_mmio(_phys: u64, _virt: u64, _size: usize) {}
+
+    pub fn init(_hhdm_offset: u64) {
+        crate::logger::early_print("[MM::Paging] aarch64 TTBR0 page-table walker online\r\n");
+    }
+}
+
+// ─── non-x86, non-aarch64 stub ────────────────────────────────────────────────
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod stub_impl {
     use super::PageFlags;
 
-    pub unsafe fn map_page(_virt: u64, _phys: u64, _flags: PageFlags) {
-        // Milestone 4b: aarch64/riscv64 page table walker (TTBR0/TTBR1, SATP).
-    }
-
-    pub unsafe fn map_mmio(_phys: u64, _virt: u64, _size: usize) {
-        // Milestone 4b: identity/MMIO map via arch-specific page tables.
-    }
+    pub unsafe fn map_page(_virt: u64, _phys: u64, _flags: PageFlags) {}
+    pub unsafe fn map_mmio(_phys: u64, _virt: u64, _size: usize) {}
 
     pub fn init(_hhdm_offset: u64) {
         crate::logger::early_print("[MM::Paging] Virtual memory manager online (stub — non-x86)\r\n");
@@ -427,7 +687,9 @@ mod stub_impl {
 pub fn init(hhdm_offset: u64) {
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::init(hhdm_offset);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    aarch64_impl::init(hhdm_offset);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     stub_impl::init(hhdm_offset);
 }
 
@@ -440,7 +702,9 @@ pub unsafe fn map_page(virt: u64, phys: u64, flags: PageFlags) {
     let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_page(virt, phys, flags) }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe { aarch64_impl::map_page(virt, phys, flags) }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe { stub_impl::map_page(virt, phys, flags) }
 }
 
@@ -452,7 +716,9 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
     let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     unsafe { x86_64_impl::map_mmio(phys, virt, size) }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    unsafe { aarch64_impl::map_mmio(phys, virt, size) }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe { stub_impl::map_mmio(phys, virt, size) }
 }
 
@@ -524,7 +790,9 @@ pub fn demand_page(cr2: u64, error: u64) -> bool {
 pub fn alloc_user_pml4() -> Option<u64> {
     #[cfg(target_arch = "x86_64")]
     return x86_64_impl::alloc_user_pml4();
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    return aarch64_impl::alloc_user_pml4();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     return None;
 }
 
@@ -543,7 +811,14 @@ pub unsafe fn map_user_page(pml4_phys: u64, virt: u64, phys: u64)
             PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE,
         )
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    return unsafe {
+        aarch64_impl::map_page_in(
+            pml4_phys, virt, phys,
+            PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::USER | PageFlags::NO_EXECUTE,
+        )
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     { let _ = (pml4_phys, virt, phys); Ok(()) }
 }
 
@@ -563,7 +838,14 @@ pub unsafe fn map_user_page_with_flags(
         if !exec    { flags |= PageFlags::NO_EXECUTE; }
         return unsafe { x86_64_impl::map_page_in(pml4_phys, virt, phys, flags) };
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut flags = PageFlags::PRESENT | PageFlags::USER;
+        if writable { flags |= PageFlags::WRITABLE; }
+        if !exec    { flags |= PageFlags::NO_EXECUTE; }
+        return unsafe { aarch64_impl::map_page_in(pml4_phys, virt, phys, flags) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     { let _ = (pml4_phys, virt, phys, writable, exec); Ok(()) }
 }
 
@@ -573,7 +855,9 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
     let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    { aarch64_impl::translate_user_page(pml4_phys, virt) }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     { let _ = (pml4_phys, virt); None }
 }
 
@@ -583,7 +867,9 @@ pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool
     let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    { aarch64_impl::translate_user_page_flags(pml4_phys, virt) }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     { let _ = (pml4_phys, virt); None }
 }
 
@@ -592,7 +878,9 @@ pub fn free_user_pml4(pml4_phys: u64) {
     let _lock = PAGE_TABLE_LOCK.lock();
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::free_user_pml4(pml4_phys);
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    aarch64_impl::free_user_pml4(pml4_phys);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = pml4_phys;
 }
 
@@ -611,7 +899,11 @@ pub unsafe fn update_user_page(
     {
         unsafe { x86_64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { aarch64_impl::update_user_page_flags(pml4_phys, virt, writable, exec) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = (pml4_phys, virt, writable, exec);
         Ok(())
@@ -628,7 +920,11 @@ pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static
     {
         unsafe { x86_64_impl::unmap_user_page(pml4_phys, virt) }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { aarch64_impl::unmap_user_page(pml4_phys, virt) }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = (pml4_phys, virt);
         Err("unsupported")

@@ -11,7 +11,16 @@ const ELFDATA2LSB:    u8 = 1; // little-endian
 const ET_EXEC:        u16 = 2;
 const ET_DYN:         u16 = 3; // PIE
 const EM_X86_64:      u16 = 62;
+const EM_AARCH64:     u16 = 183;
 const PT_LOAD:        u32 = 1;
+
+/// The ELF machine type this kernel build can execute natively.
+#[cfg(target_arch = "x86_64")]
+const EM_NATIVE: u16 = EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const EM_NATIVE: u16 = EM_AARCH64;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const EM_NATIVE: u16 = EM_X86_64;
 const PF_X:           u32 = 1 << 0; // executable
 const PF_W:           u32 = 1 << 1; // writable
 
@@ -76,7 +85,7 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
     if hdr.e_ident[0..4] != ELF_MAGIC           { return Err("bad ELF magic"); }
     if hdr.e_ident[4]    != ELFCLASS64           { return Err("not ELF64"); }
     if hdr.e_ident[5]    != ELFDATA2LSB          { return Err("not little-endian"); }
-    if hdr.e_machine     != EM_X86_64            { return Err("not x86_64"); }
+    if hdr.e_machine     != EM_NATIVE            { return Err("wrong ELF machine for arch"); }
     if hdr.e_type != ET_EXEC && hdr.e_type != ET_DYN {
         return Err("not executable ELF");
     }

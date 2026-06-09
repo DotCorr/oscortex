@@ -305,9 +305,27 @@ fn shared_init_and_run() -> ! {
             };
             match process::spawn_with_bootstrap(elf_bytes, "init", bootstrap) {
                 Ok(pid) => {
-                    process::schedule_user_launch(pid);
                     crate::wm::set_focus_pid(pid);
                     log::info!("[INIT] Spawned shell host as PID {}", pid);
+
+                    // x86: defer the user launch to a scheduler kernel task; the
+                    // APIC-timer-driven cooperative scheduler switches into it.
+                    #[cfg(target_arch = "x86_64")]
+                    process::schedule_user_launch(pid);
+
+                    // aarch64: the ARM scheduler's preemptive tick (GIC + generic
+                    // timer ISR frame save) is a follow-on, so the timer-driven
+                    // hand-off used on x86 isn't wired yet. Enter the init process
+                    // DIRECTLY here — this is the real production EL0 entry
+                    // (write_cr3 → enter_user_sysret/ERET) and lets the bring-up
+                    // init run + have its syscalls serviced through the shared
+                    // dispatcher. (Once the ARM timer ISR lands, this collapses to
+                    // the same schedule_user_launch path as x86.)
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        log::info!("[INIT] aarch64: entering init at EL0 directly");
+                        process::enter_user_by_pid_noreturn(pid);
+                    }
                 }
                 Err(e)  => log::warn!("[INIT] Failed to spawn /init: {}", e),
             }

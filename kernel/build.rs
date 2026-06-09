@@ -47,6 +47,18 @@ fn main() {
         generate_liboscortex_embedder_shim(),
     ));
 
+    // aarch64 port: provide a native EL0 `/init` so the production kernel_main can
+    // spawn a userspace process + service its first syscalls on ARM. The x86 build
+    // ships the Flutter host as `/init` (staged by scripts/build-iso.sh); on ARM
+    // that host doesn't exist yet (engine is a follow-on), so without this there is
+    // no native `/init` to spawn. This minimal program issues a couple of `write`
+    // syscalls, a `getpid`, then `exit` — exercising the full spawn → SVC dispatch
+    // → exit path through the SHARED syscall layer.
+    if arch == "aarch64" {
+        entries.retain(|(n, _)| n != "init");
+        entries.push(("init".to_string(), generate_aarch64_init_elf()));
+    }
+
     // Write the USTAR tar to OUT_DIR.
     let tar_bytes = build_ustar_tar(&entries);
     std::fs::write(&out_tar, &tar_bytes).unwrap();
@@ -438,6 +450,130 @@ fn generate_liboscortex_embedder_shim() -> Vec<u8> {
         "oscortex_embedder_version",
     ];
     generate_ret_stub_elf(SYMS)
+}
+
+// ── aarch64 native `/init` EL0 program ───────────────────────────────────────
+
+/// Build a minimal statically-linked AArch64 ELF64 (ET_EXEC, EM_AARCH64) that
+/// runs at EL0 and issues syscalls through the OSCortex shared dispatcher.
+///
+/// Syscall ABI (OSCortex / x86-numbered, as understood by `dispatch_fast`):
+///   nr in x8, args in x0..x2, return in x0, trap via `svc #0`.
+///     1  = write(fd, buf, len)   → fd 1/2 print to the kernel serial console
+///     39 = getpid()              → returns the process id
+///     60 = exit(code)            → terminate the process
+///
+/// Layout: a single RWX PT_LOAD at vaddr 0x400000 (USER_ELF_BASE). Code starts
+/// at the entry; two NUL-free messages live at fixed offsets in the same page.
+fn generate_aarch64_init_elf() -> Vec<u8> {
+    // Link the init program at 64 GiB (L1 index 64), well clear of the kernel's
+    // low identity map. The bring-up kernel runs from the TTBR0 low half, so each
+    // per-process root is seeded with the kernel's 1 GiB block descriptors for
+    // the device region (index 0) and RAM (indices 1..2). A user page at a low VA
+    // would collide with those blocks; placing the program at a high, otherwise-
+    // empty L1 index lets the page-table walker create fresh L2/L3 tables there.
+    const VBASE: u64 = 0x10_0000_0000; // 64 GiB
+
+    // Messages placed after the code, at page offsets 0x200 / 0x280.
+    let msg1: &[u8] = b"[arm-init] hello from EL0 userspace via svc #0\n";
+    let msg2: &[u8] = b"[arm-init] getpid ok; calling exit(0)\n";
+    let msg1_off: u64 = 0x200;
+    let msg2_off: u64 = 0x280;
+    let msg1_va = VBASE + msg1_off;
+    let msg2_va = VBASE + msg2_off;
+
+    // ── Assemble the code (offset 0) ────────────────────────────────────────
+    let mut code: Vec<u32> = Vec::new();
+
+    // write(1, msg1_va, msg1.len())
+    a64_load_imm(&mut code, 0, 1);
+    a64_load_imm(&mut code, 1, msg1_va);
+    a64_load_imm(&mut code, 2, msg1.len() as u64);
+    a64_load_imm(&mut code, 8, 1);
+    code.push(0xD400_0001); // svc #0
+
+    // getpid()
+    a64_load_imm(&mut code, 8, 39);
+    code.push(0xD400_0001);
+
+    // write(1, msg2_va, msg2.len())
+    a64_load_imm(&mut code, 0, 1);
+    a64_load_imm(&mut code, 1, msg2_va);
+    a64_load_imm(&mut code, 2, msg2.len() as u64);
+    a64_load_imm(&mut code, 8, 1);
+    code.push(0xD400_0001);
+
+    // exit(0)
+    a64_load_imm(&mut code, 0, 0);
+    a64_load_imm(&mut code, 8, 60);
+    code.push(0xD400_0001);
+
+    // Safety net: spin if exit ever returns to EL0.
+    code.push(0x1400_0000); // b .
+
+    // ── Compose the single loadable page image ──────────────────────────────
+    let page_sz = 0x1000usize;
+    let mut img = vec![0u8; page_sz];
+    for (i, w) in code.iter().enumerate() {
+        let o = i * 4;
+        img[o..o + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    img[msg1_off as usize..msg1_off as usize + msg1.len()].copy_from_slice(msg1);
+    img[msg2_off as usize..msg2_off as usize + msg2.len()].copy_from_slice(msg2);
+
+    // ── ELF header + one program header ─────────────────────────────────────
+    let ehsize = 64usize;
+    let phentsize = 56usize;
+    let phoff = ehsize;
+    let data_off = phoff + phentsize; // file offset of the loadable image
+
+    let file_sz = data_off + img.len();
+    let mut elf = vec![0u8; file_sz];
+
+    // e_ident
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    write_u16(&mut elf, 16, 2);   // e_type = ET_EXEC
+    write_u16(&mut elf, 18, 183); // e_machine = EM_AARCH64
+    write_u32(&mut elf, 20, 1);   // e_version
+    write_u64(&mut elf, 24, VBASE); // e_entry
+    write_u64(&mut elf, 32, phoff as u64); // e_phoff
+    write_u16(&mut elf, 52, ehsize as u16);    // e_ehsize
+    write_u16(&mut elf, 54, phentsize as u16); // e_phentsize
+    write_u16(&mut elf, 56, 1);                // e_phnum
+
+    // PT_LOAD program header (RWX).
+    let p = phoff;
+    write_u32(&mut elf, p,      1); // p_type = PT_LOAD
+    write_u32(&mut elf, p + 4,  7); // p_flags = R|W|X
+    write_u64(&mut elf, p + 8,  data_off as u64); // p_offset
+    write_u64(&mut elf, p + 16, VBASE);           // p_vaddr
+    write_u64(&mut elf, p + 24, VBASE);           // p_paddr
+    write_u64(&mut elf, p + 32, img.len() as u64); // p_filesz
+    write_u64(&mut elf, p + 40, img.len() as u64); // p_memsz
+    write_u64(&mut elf, p + 48, 0x1000);           // p_align
+
+    elf[data_off..data_off + img.len()].copy_from_slice(&img);
+    elf
+}
+
+/// Emit a MOVZ/MOVK sequence loading the 64-bit immediate `imm` into x`reg`.
+fn a64_load_imm(code: &mut Vec<u32>, reg: u32, imm: u64) {
+    let mut first = true;
+    for hw in 0..4u32 {
+        let imm16 = ((imm >> (hw * 16)) & 0xFFFF) as u32;
+        if imm16 == 0 && !first {
+            continue; // skip zero halfwords once at least one MOVZ emitted
+        }
+        let base = if first { 0xD280_0000 } else { 0xF280_0000 };
+        code.push(base | (hw << 21) | (imm16 << 5) | reg);
+        first = false;
+    }
+    if first {
+        code.push(0xD280_0000 | reg); // imm == 0 → MOVZ Xreg, #0
+    }
 }
 
 /// Generate a minimal ELF64 ET_DYN where every exported symbol is a
