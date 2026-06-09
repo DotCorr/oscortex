@@ -171,6 +171,20 @@ pub struct Process {
     pub user_stack_size: u64,
     /// CPU core index that currently executes this process context (None if idle/blocked).
     pub current_cpu: Option<u32>,
+    /// aarch64 only: full EL0 trap-frame snapshot (x0..x30, SP_EL0, ELR, SPSR,
+    /// ESR) captured when this thread is timer-preempted at an arbitrary user
+    /// instruction. The shared `UserRegs` carries only the x86-named subset, so
+    /// ARM scratch registers (x6/x7, x11–x18, x24–x28, x30) would otherwise be
+    /// lost across a preemptive switch. The ARM timer ISR saves the live
+    /// `vectors::TrapFrame` here and restores it on resume, giving full-fidelity
+    /// preemption while the shared scheduler still owns the switch *decision*.
+    /// Layout matches `arch::aarch64::vectors::TrapFrame` (36 × u64).
+    #[cfg(target_arch = "aarch64")]
+    pub arch_trapframe: [u64; 36],
+    /// aarch64 only: true once `arch_trapframe` holds a valid timer-preempt
+    /// snapshot to restore (vs. a fresh/syscall-entered thread).
+    #[cfg(target_arch = "aarch64")]
+    pub arch_frame_valid: bool,
 }
 
 impl Process {
@@ -203,7 +217,48 @@ impl Process {
             user_stack_base: 0,
             user_stack_size: 0,
             current_cpu: None,
+            #[cfg(target_arch = "aarch64")]
+            arch_trapframe: [0u64; 36],
+            #[cfg(target_arch = "aarch64")]
+            arch_frame_valid: false,
         }
+    }
+}
+
+/// aarch64: save a full EL0 trap-frame snapshot into `pid`'s arch slot, taken
+/// when the generic-timer ISR preempts the thread. Restored verbatim by
+/// `arch_take_trapframe` so ARM scratch registers survive the switch.
+///
+/// Called from the timer IRQ handler, so it uses `try_lock` and never blocks —
+/// blocking on a contended PTABLE_LOCK from inside an ISR would deadlock. Returns
+/// false if the lock was busy (the caller then skips the switch this tick).
+#[cfg(target_arch = "aarch64")]
+pub fn arch_store_trapframe(pid: u32, frame: &[u64; 36]) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.arch_trapframe = *frame;
+            p.arch_frame_valid = true;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// aarch64: fetch `pid`'s saved trap-frame snapshot (and whether it is valid).
+/// The valid flag is consumed (cleared) so a subsequent syscall-entry re-entry
+/// rebuilds the frame from `regs` instead of replaying a stale snapshot. Uses
+/// `try_lock` for the same ISR-safety reason as `arch_store_trapframe`.
+#[cfg(target_arch = "aarch64")]
+pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 36]> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.arch_frame_valid {
+        p.arch_frame_valid = false;
+        Some(p.arch_trapframe)
+    } else {
+        None
     }
 }
 
@@ -558,6 +613,11 @@ pub fn spawn_with_bootstrap(
         p.sig_handlers       = [0u64; 32];
         p.errno_to_deliver   = 0;
         p.preempted_by_timer = false;
+        // aarch64: start with no stale timer-preempt frame snapshot.
+        #[cfg(target_arch = "aarch64")]
+        {
+            p.arch_frame_valid = false;
+        }
     }
 
     log::info!(

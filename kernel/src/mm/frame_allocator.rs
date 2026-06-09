@@ -126,6 +126,34 @@ pub fn init_from_regions(map: &crate::mm::BootMemMap, hhdm_offset: u64) {
         (bm.total * FRAME_SIZE) / (1024 * 1024));
 }
 
+/// Reserve a physical address range `[base, base+len)` so the allocator never
+/// hands it out (e.g. the loaded kernel image, the DTB, or a device-claimed
+/// buffer). Frames are rounded outward to 4 KiB boundaries. Idempotent.
+///
+/// Must be called AFTER `init_from_regions` (which marks RAM free) and BEFORE
+/// the first allocation, otherwise a free-marked frame inside the range could be
+/// handed out — on aarch64 the kernel is loaded into the same RAM region the
+/// device tree reports as usable, so without this the heap can overlap the
+/// kernel image.
+pub fn reserve_range(base: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let start_frame = (base / FRAME_SIZE as u64) as usize;
+    let end_frame = (((base + len + FRAME_SIZE as u64 - 1) / FRAME_SIZE as u64) as usize)
+        .min(MAX_FRAMES);
+    let mut bm = BITMAP.lock();
+    for frame in start_frame..end_frame {
+        let mask = 1u64 << (frame % 64);
+        let idx = frame / 64;
+        // Only flip frames currently free (bit set) so `used`/`total` stay sane.
+        if (bm.bits[idx] & mask) != 0 {
+            bm.bits[idx] &= !mask;
+            bm.used += 1;
+        }
+    }
+}
+
 /// Allocate a single 4 KiB physical frame. Returns the physical address.
 pub fn alloc_frame() -> Option<u64> {
     let res = BITMAP.lock().alloc();

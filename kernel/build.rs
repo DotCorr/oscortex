@@ -474,41 +474,94 @@ fn generate_aarch64_init_elf() -> Vec<u8> {
     // empty L1 index lets the page-table walker create fresh L2/L3 tables there.
     const VBASE: u64 = 0x10_0000_0000; // 64 GiB
 
-    // Messages placed after the code, at page offsets 0x200 / 0x280.
-    let msg1: &[u8] = b"[arm-init] hello from EL0 userspace via svc #0\n";
-    let msg2: &[u8] = b"[arm-init] getpid ok; calling exit(0)\n";
-    let msg1_off: u64 = 0x200;
-    let msg2_off: u64 = 0x280;
-    let msg1_va = VBASE + msg1_off;
-    let msg2_va = VBASE + msg2_off;
+    // Two messages selected by the bootstrap value the kernel seeds in x0 at
+    // entry: process A (x0==0) prints msg_a, any other value prints msg_b. This
+    // lets two instances of the SAME program emit distinguishable output so an
+    // observer can see the timer round-robining between them.
+    let msg_a: &[u8] = b"[arm-A] tick (EL0 compute loop A)\n";
+    let msg_b: &[u8] = b"[arm-B] tick (EL0 compute loop B)\n";
+    let hello: &[u8] = b"[arm-init] EL0 up; entering compute loop (timer preemption test)\n";
+    let msg_a_off: u64 = 0x200;
+    let msg_b_off: u64 = 0x280;
+    let hello_off: u64 = 0x300;
+    let msg_a_va = VBASE + msg_a_off;
+    let msg_b_va = VBASE + msg_b_off;
+    let hello_va = VBASE + hello_off;
 
     // ── Assemble the code (offset 0) ────────────────────────────────────────
+    //
+    // Pseudocode:
+    //   x19 = (x0 == 0) ? msg_a_va : msg_b_va         // pick this instance's msg
+    //   x20 = (x0 == 0) ? len_a    : len_b
+    //   write(1, hello, hello.len())                   // announce once
+    //   loop:
+    //       x21 = SPIN_ITERS                            // pure-compute busy spin —
+    //       spin: subs x21,x21,#1; b.ne spin            //   NO syscall, so only the
+    //                                                   //   timer can switch us out
+    //       write(1, x19, x20)                          // print this instance's tick
+    //       b loop
+    //
+    // Because the spin does no syscalls, the kernel cannot cooperatively yield
+    // here; if both A and B make progress (interleaved ticks on serial) the
+    // generic-timer ISR MUST be preempting and switching between them.
+    const SPIN_ITERS: u64 = 4_000_000;
+    // Each thread prints this many ticks, then exits — enough to demonstrate the
+    // timer round-robining the two compute-bound threads, after which the system
+    // settles into the kernel idle/cortex loop (rather than spamming forever).
+    const TICK_BUDGET: u64 = 12;
     let mut code: Vec<u32> = Vec::new();
 
-    // write(1, msg1_va, msg1.len())
+    // Select message VA (x19) and length (x20) from x0.
+    a64_load_imm(&mut code, 19, msg_a_va);
+    a64_load_imm(&mut code, 20, msg_a.len() as u64);
+    a64_load_imm(&mut code, 9, msg_b_va);
+    a64_load_imm(&mut code, 10, msg_b.len() as u64);
+    // cmp x0, #0 ; csel x19, x19, x9, eq ; csel x20, x20, x10, eq
+    code.push(0xF100_001F); // subs xzr, x0, #0   (cmp x0,#0)
+    code.push(0x9A89_0273); // csel x19, x19, x9, eq
+    code.push(0x9A8A_0294); // csel x20, x20, x10, eq
+
+    // x22 = TICK_BUDGET (remaining ticks before this thread exits)
+    a64_load_imm(&mut code, 22, TICK_BUDGET);
+
+    // write(1, hello, hello.len())
     a64_load_imm(&mut code, 0, 1);
-    a64_load_imm(&mut code, 1, msg1_va);
-    a64_load_imm(&mut code, 2, msg1.len() as u64);
+    a64_load_imm(&mut code, 1, hello_va);
+    a64_load_imm(&mut code, 2, hello.len() as u64);
     a64_load_imm(&mut code, 8, 1);
     code.push(0xD400_0001); // svc #0
 
-    // getpid()
-    a64_load_imm(&mut code, 8, 39);
-    code.push(0xD400_0001);
-
-    // write(1, msg2_va, msg2.len())
+    // loop:
+    let loop_idx = code.len();
+    // x21 = SPIN_ITERS
+    a64_load_imm(&mut code, 21, SPIN_ITERS);
+    // spin: subs x21, x21, #1 ; b.ne spin   (pure compute — no syscall)
+    let spin_idx = code.len();
+    code.push(0xF100_06B5); // subs x21, x21, #1
+    {
+        let off = (spin_idx as i64 - code.len() as i64) as i32; // negative
+        let imm19 = (off as u32) & 0x7FFFF;
+        code.push(0x5400_0001 | (imm19 << 5)); // b.ne spin
+    }
+    // write(1, x19, x20)
     a64_load_imm(&mut code, 0, 1);
-    a64_load_imm(&mut code, 1, msg2_va);
-    a64_load_imm(&mut code, 2, msg2.len() as u64);
+    code.push(0xAA13_03E1); // mov x1, x19
+    code.push(0xAA14_03E2); // mov x2, x20
     a64_load_imm(&mut code, 8, 1);
-    code.push(0xD400_0001);
-
-    // exit(0)
+    code.push(0xD400_0001); // svc #0
+    // subs x22, x22, #1 ; b.ne loop   (loop until the tick budget is spent)
+    code.push(0xF100_06D6); // subs x22, x22, #1
+    {
+        let off = (loop_idx as i64 - code.len() as i64) as i32; // negative
+        let imm19 = (off as u32) & 0x7FFFF;
+        code.push(0x5400_0001 | (imm19 << 5)); // b.ne loop
+    }
+    // exit(0) — lets the system settle into the kernel idle/cortex loop after
+    // the preemption demonstration rather than spinning forever.
     a64_load_imm(&mut code, 0, 0);
     a64_load_imm(&mut code, 8, 60);
-    code.push(0xD400_0001);
-
-    // Safety net: spin if exit ever returns to EL0.
+    code.push(0xD400_0001); // svc #0
+    // safety net: spin if exit ever returns to EL0.
     code.push(0x1400_0000); // b .
 
     // ── Compose the single loadable page image ──────────────────────────────
@@ -518,8 +571,9 @@ fn generate_aarch64_init_elf() -> Vec<u8> {
         let o = i * 4;
         img[o..o + 4].copy_from_slice(&w.to_le_bytes());
     }
-    img[msg1_off as usize..msg1_off as usize + msg1.len()].copy_from_slice(msg1);
-    img[msg2_off as usize..msg2_off as usize + msg2.len()].copy_from_slice(msg2);
+    img[msg_a_off as usize..msg_a_off as usize + msg_a.len()].copy_from_slice(msg_a);
+    img[msg_b_off as usize..msg_b_off as usize + msg_b.len()].copy_from_slice(msg_b);
+    img[hello_off as usize..hello_off as usize + hello.len()].copy_from_slice(hello);
 
     // ── ELF header + one program header ─────────────────────────────────────
     let ehsize = 64usize;
