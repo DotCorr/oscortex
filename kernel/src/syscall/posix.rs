@@ -2183,7 +2183,7 @@ pub fn sys_gettimeofday(tv: u64, _tz: u64) -> i64 {
         return 0;
     }
     // tv_sec at offset 0, tv_usec at offset 8.
-    let tsc = read_tsc() / 3_000; // ~3 GHz TSC → microseconds
+    let tsc = crate::arch::rdtsc_ns() / 1_000; // arch-correct ns → microseconds
     let sec = 1_700_000_000u64 + tsc / 1_000_000;
     let usec = tsc % 1_000_000;
     unsafe {
@@ -2197,7 +2197,7 @@ pub fn sys_clock_gettime(clock_id: i32, tp: u64) -> i64 {
     if tp == 0 {
         return -22;
     }
-    let tsc_ns = read_tsc() / 3; // ~3 GHz → nanoseconds
+    let tsc_ns = crate::arch::rdtsc_ns(); // arch-correct nanoseconds (matches libc)
     let (sec, nsec) = match clock_id {
         0 | 1 => {
             // CLOCK_REALTIME or CLOCK_MONOTONIC
@@ -2215,7 +2215,7 @@ pub fn sys_clock_gettime(clock_id: i32, tp: u64) -> i64 {
 }
 
 pub fn sys_time(tloc: u64) -> i64 {
-    let tsc = read_tsc() / 3_000_000_000; // seconds
+    let tsc = crate::arch::rdtsc_ns() / 1_000_000_000; // arch-correct ns → seconds
     let t = 1_700_000_000u64 + tsc;
     if tloc != 0 {
         unsafe {

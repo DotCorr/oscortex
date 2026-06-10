@@ -484,7 +484,8 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
                     { crate::arch::enable_and_halt(); }
                 }
@@ -583,7 +584,8 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
                     { crate::arch::enable_and_halt(); }
                 }

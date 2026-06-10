@@ -131,11 +131,41 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         reset_vsync_last_tsc();
     }
 
-    // Only preempt interrupts taken FROM EL0 (a running user thread). SPSR_EL1
-    // M[3:0] == 0 means the interrupted context was EL0t. Kernel-mode ticks
-    // (idle/cortex loop) just return — there is no user frame to switch.
+    // Only the EL0-preempt switch below requires an interrupted EL0 frame. SPSR_EL1
+    // M[3:0] == 0 means the interrupted context was EL0t.
     let from_el0 = (f.spsr & 0xF) == 0;
     if !from_el0 {
+        // KERNEL-MODE WAKE-ASSIST — direct port of the x86 APIC ISR (idt.rs).
+        // The aarch64 engine threads (UI/raster/IO, pids 2-7) spend ~all their time
+        // Blocked in EL1 syscalls (epoll_wait/futex/cond), and pid 1 spins in its
+        // wm_event_wait loop at EL1. So most timer ticks land in kernel mode
+        // (from_el0=false). Without this, those ticks were dropped — the engine's
+        // UI thread Animator never got the CPU to call vsync_callback → no baton →
+        // no frame ever presented; and the bootstrap stalled (~7/8 boots) waiting
+        // for a wake that never re-entered a runnable thread. When a due vsync
+        // baton (pid 1) or queued input exists and the current thread is idle/
+        // blocked, DRIVE the target from kernel context — exactly what x86 does.
+        // enter_user_by_pid_noreturn_try resumes via the cooperative path
+        // (build_image → eret_to_el0, which resets SP_EL1 to the syscall stack, so
+        // the abandoned IRQ frame is reclaimed). EOI already happened above.
+        let cur = crate::process::current_pid();
+        let focus = crate::wm::focus_pid();
+        let target = if focus != 0 { focus } else { 1 };
+        if target != 0
+            && (cur == 0 || crate::process::is_blocked_try(cur))
+            && (crate::wm::input_pending_for(target) > 0
+                || (target == 1 && crate::wm::embedder_baton_due()))
+            && cur != target
+        {
+            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                if crate::process::try_claim_cpu_for_try(target, my_cpu) {
+                    // Noreturn on success (erets to `target`); the half-handled timer
+                    // frame `f` is abandoned, which is fine (already EOI'd).
+                    crate::process::enter_user_by_pid_noreturn_try(target);
+                }
+            }
+        }
         return;
     }
 
