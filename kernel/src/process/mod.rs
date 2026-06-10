@@ -322,9 +322,28 @@ pub fn arch_store_trapframe(pid: u32, frame: &[u64; 102]) -> bool {
 /// The valid flag is consumed (cleared) so a subsequent syscall-entry re-entry
 /// rebuilds the frame from `regs` instead of replaying a stale snapshot. Uses
 /// `try_lock` for the same ISR-safety reason as `arch_store_trapframe`.
+/// ISR-safe (try_lock) variant: returns None on lock contention. Used from the
+/// timer ISR. The COOPERATIVE resume path must use the BLOCKING variant below,
+/// because a try_lock miss there silently drops a timer-preempted thread to the
+/// lossy build_image rebuild (which zeroes the live caller-saved x6/x7/x9..x18
+/// the thread held at its arbitrary preemption point → nondeterministic Dart
+/// corruption: "Invalid UTF8" / EC=0x24 crash).
+#[cfg(target_arch = "aarch64")]
+pub fn arch_take_trapframe_try(pid: u32) -> Option<[u64; 102]> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    arch_take_trapframe_locked(pid)
+}
+
+/// Blocking variant for syscall/cooperative context (where blocking on
+/// PTABLE_LOCK is safe). NEVER misses a timer-preempted thread's full frame.
 #[cfg(target_arch = "aarch64")]
 pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 102]> {
-    let _g = PTABLE_LOCK.try_lock()?;
+    let _g = PTABLE_LOCK.lock();
+    arch_take_trapframe_locked(pid)
+}
+
+#[cfg(target_arch = "aarch64")]
+fn arch_take_trapframe_locked(pid: u32) -> Option<[u64; 102]> {
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid && p.arch_frame_valid {
         p.arch_frame_valid = false;
@@ -1710,7 +1729,12 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // kernel NEON). The full-frame path above already restores FP; this is for
     // the build_image fall-through (no full frame). None for a fresh thread.
     #[cfg(target_arch = "aarch64")]
-    let fp_img = aarch64_take_fp(pid);
+    // Fresh threads (no saved FP) MUST start with ZEROED v0-v31/FPSR/FPCR, not the
+    // kernel's leftover FP garbage — otherwise the new thread's AOT code reads an
+    // uninitialized v-register → garbage value → bad Dart string ptr → "Invalid UTF8"
+    // → crash (nondeterministic, early). Always restore an FP image; zeroed if none.
+    let fp_buf = aarch64_take_fp(pid).unwrap_or([0u64; 66]);
+    let fp_img: Option<&[u64; 66]> = Some(&fp_buf);
 
     if preempted_by_timer {
         // ── IRET path ────────────────────────────────────────────────────────
@@ -1720,7 +1744,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         // set RIP=RCX and RFLAGS=R11, corrupting those registers and losing
         // the real FLAGS state (e.g. CF/ZF from a cmp instruction).
         #[cfg(target_arch = "aarch64")]
-        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img.as_ref()) }
+        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img) }
         #[cfg(not(target_arch = "aarch64"))]
         unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
@@ -1735,7 +1759,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // a function call, and the userspace SYSCALL trampoline is such a call.
     log::trace!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
     #[cfg(target_arch = "aarch64")]
-    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img.as_ref()) }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img) }
     #[cfg(not(target_arch = "aarch64"))]
     unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
@@ -1859,17 +1883,22 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
     };
 
     #[cfg(target_arch = "aarch64")]
-    let fp_img = aarch64_take_fp(pid);
+    // Fresh threads (no saved FP) MUST start with ZEROED v0-v31/FPSR/FPCR, not the
+    // kernel's leftover FP garbage — otherwise the new thread's AOT code reads an
+    // uninitialized v-register → garbage value → bad Dart string ptr → "Invalid UTF8"
+    // → crash (nondeterministic, early). Always restore an FP image; zeroed if none.
+    let fp_buf = aarch64_take_fp(pid).unwrap_or([0u64; 66]);
+    let fp_img: Option<&[u64; 66]> = Some(&fp_buf);
 
     if preempted_by_timer {
         #[cfg(target_arch = "aarch64")]
-        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img.as_ref()) }
+        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img) }
         #[cfg(not(target_arch = "aarch64"))]
         unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img.as_ref()) }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img) }
     #[cfg(not(target_arch = "aarch64"))]
     unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }

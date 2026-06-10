@@ -157,14 +157,10 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
                 || (target == 1 && crate::wm::embedder_baton_due()))
             && cur != target
         {
-            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
-                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
-                if crate::process::try_claim_cpu_for_try(target, my_cpu) {
-                    // Noreturn on success (erets to `target`); the half-handled timer
-                    // frame `f` is abandoned, which is fine (already EOI'd).
-                    crate::process::enter_user_by_pid_noreturn_try(target);
-                }
-            }
+            // BISECT: just wake the target; let normal cooperative scheduling enter
+            // it (the ISR-initiated resume enter_user_by_pid_noreturn_try is the
+            // prime suspect for the residual pid=2 Dart corruption — disabled to test).
+            let _ = crate::process::set_state_try(target, crate::process::ProcState::Running);
         }
         return;
     }
@@ -242,7 +238,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         // when IT was last timer-preempted); fall back to rebuilding from the
         // shared `UserRegs` for a thread that last yielded via a syscall / is
         // entering fresh.
-        if let Some(saved) = crate::process::arch_take_trapframe(next_pid) {
+        if let Some(saved) = crate::process::arch_take_trapframe_try(next_pid) {
             apply_array_to_frame(f, &saved);
         } else {
             userregs_to_trapframe(f, &next_regs);
@@ -280,7 +276,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         // or a later COOPERATIVE resume of `cur` (enter_user_by_pid_noreturn, which
         // now prefers the full frame) would replay this stale frame and branch to
         // a wrong PC / leaked x30. Consume-and-drop clears the valid flag.
-        let _ = crate::process::arch_take_trapframe(cur);
+        let _ = crate::process::arch_take_trapframe_try(cur);
     }
 }
 
