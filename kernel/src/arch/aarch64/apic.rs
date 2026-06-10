@@ -176,7 +176,34 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
             apply_array_to_frame(f, &saved);
         } else {
             userregs_to_trapframe(f, &next_regs);
+            // The shared `UserRegs` carries no slot for the aarch64 callee-saved
+            // x24–x28 or the link register x30, so `userregs_to_trapframe` left
+            // those at the *preempted* thread's values. Patch them from next's
+            // saved snapshot — otherwise a thread resumed here after a cooperative
+            // syscall yield inherits a stale x24–x28 (live Dart heap pointers) or
+            // a stale x30 (its next `ret` branches to a leaked value, e.g. a
+            // screen dimension). Mirrors what `build_image`/EnterUserRegs restore
+            // on the cooperative path, making both resume routes lossless.
+            if let Some((x24, x25, x26, x27, x28, lr)) =
+                crate::process::aarch64_resume_extras_try(next_pid)
+            {
+                f.x[24] = x24;
+                f.x[25] = x25;
+                f.x[26] = x26;
+                f.x[27] = x27;
+                f.x[28] = x28;
+                f.x[30] = lr;
+            }
         }
+    } else {
+        // No switch this tick (no OTHER runnable thread): `cur` keeps running and
+        // erets via the UNMODIFIED live frame `f`, advancing past this PC. But we
+        // already stored a full snapshot above and set `arch_frame_valid` — which
+        // is now STALE (it describes a PC `cur` is about to run past). Discard it,
+        // or a later COOPERATIVE resume of `cur` (enter_user_by_pid_noreturn, which
+        // now prefers the full frame) would replay this stale frame and branch to
+        // a wrong PC / leaked x30. Consume-and-drop clears the valid flag.
+        let _ = crate::process::arch_take_trapframe(cur);
     }
 }
 

@@ -322,6 +322,26 @@ fn callee_saved_x24_x28(pid: u32) -> (u64, u64, u64, u64, u64) {
     }
 }
 
+/// aarch64, ISR-safe: read the callee-saved x24–x28 *and* the saved link
+/// register (x30) for `pid`. Used by the timer-IRQ handler to make the lossy
+/// `userregs_to_trapframe` fallback restore the registers the shared x86-named
+/// `UserRegs` cannot carry (x24–x28, x30). Without this, a thread whose last
+/// suspension was a cooperative syscall yield (so it has no full ARM snapshot)
+/// inherits the *preempted* thread's x24–x28/x30 when the timer ISR resumes it
+/// via the fallback — e.g. a leaked screen dimension lands in x30 and the next
+/// `ret` branches to it. Uses `try_lock`; returns None on contention (caller
+/// then leaves the fallback as-is for this tick).
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64_resume_extras_try(pid: u32) -> Option<(u64, u64, u64, u64, u64, u64)> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid {
+        Some((p.user_x24, p.user_x25, p.user_x26, p.user_x27, p.user_x28, p.user_lr))
+    } else {
+        None
+    }
+}
+
 /// Persist the FS base for `pid` (called on arch_prctl(ARCH_SET_FS) and on
 /// the FS-bootstrap path) so it is restored on the next user entry.
 pub fn set_proc_fs_base(pid: u32, fs: u64) {
@@ -1525,6 +1545,25 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         }
     }
 
+    // aarch64: if this thread was timer-preempted at an arbitrary instruction,
+    // its FULL register file lives in `arch_trapframe`. Resume from that frame
+    // directly — the `EnterUserRegs`/`build_image` reconstruction below rebuilds
+    // from the lossy x86-named `p.regs`, which ZEROES caller-saved x6/x7/x11..x18
+    // and carries stale x24..x28. A Dart worker preempted mid heap-allocation
+    // keeps live pointers (a `this`, a mutex address) in exactly those registers;
+    // when a sibling's cooperative yield then schedules it through this path the
+    // lossy rebuild corrupts them → the nondeterministic near-null deref in the
+    // allocator. (No-op for threads that yielded via a syscall: they have no
+    // valid snapshot — `arch_take_trapframe` returns None — so they fall through
+    // to the register reconstruction, which is correct for that case.) This
+    // mirrors the timer-ISR restore path, which already prefers this frame.
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(frame) = arch_take_trapframe(pid) {
+            unsafe { crate::arch::enter_user_from_frame(&frame) }
+        }
+    }
+
     // aarch64: carry the user link register (x30) in the otherwise-unused
     // `rflags` slot (build_image maps rflags→x30 on aarch64; SPSR is constant
     // there). Without this the cooperative SYSRET resume leaves x30=0 and the
@@ -1643,6 +1682,18 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
                 crate::process::posix_trampolines::SD_ERRNO as *mut u32,
                 errno_to_deliver,
             );
+        }
+    }
+
+    // aarch64: prefer the full saved trap-frame (timer-preempt snapshot) over the
+    // lossy `p.regs` reconstruction — see the matching block in
+    // `enter_user_by_pid_noreturn` for the full rationale (caller-saved
+    // x6/x7/x11..x18 / x24..x28 corruption of a cooperatively-scheduled
+    // timer-preempted Dart worker).
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(frame) = arch_take_trapframe(pid) {
+            unsafe { crate::arch::enter_user_from_frame(&frame) }
         }
     }
 
