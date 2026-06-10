@@ -609,7 +609,7 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         // Save return context and registers so we can be resumed.
         let urip = crate::arch::syscall::user_rip();
         let ursp = crate::arch::syscall::user_rsp();
-        crate::process::save_return_context(cur, urip - 2, ursp);
+        crate::process::save_return_context_reexec(cur, urip, ursp);
         crate::process::save_full_user_gprs(cur);
         crate::process::set_rax(cur, eabi::SYS_WM_EVENT_WAIT);
         if block_log_n < 32 {
@@ -667,9 +667,12 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
         // 16th hlt wake so reentrant wm_event_wait can hit eagain-top for
         // platform-recv without the sched ping-pong that starved pid=2 init.
         while crate::process::is_blocked(cur) {
-            #[cfg(target_arch = "x86_64")]
+            // Sleep with IRQs unmasked so the timer ISR fires (and, on aarch64, its
+            // kernel-mode wake-assist can drive the baton/input target). Was x86-only
+            // → on aarch64 this loop busy-spun in EL1 (the monotonic_ns stall) and the
+            // ISR could never preempt it (preempt only fires from EL0).
             unsafe {
-                core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                { crate::arch::enable_and_halt(); }
             }
 
             if !crate::process::is_blocked(cur) {

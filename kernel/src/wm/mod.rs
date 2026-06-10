@@ -242,10 +242,27 @@ fn irq_save() -> bool {
     (flags & 0x200) != 0
 }
 
+// aarch64 (and others): mask IRQ/FIQ around the event-queue critical section.
+// This was a no-op stub, so `with_queue` ran with IRQs ENABLED — the timer ISR
+// could fire while a thread held Q.lock(), then the ISR's own push_vsync ->
+// with_queue -> Q.lock() spun on the held lock forever (single core, IRQs masked
+// in the ISR) → deadlock (boot hung spinning in wm::push_event_for). Returns the
+// prior DAIF so irq_restore can re-enable only if they were enabled.
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
 fn irq_save() -> bool {
-    false
+    #[cfg(target_arch = "aarch64")]
+    {
+        let daif: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
+            core::arch::asm!("msr daifset, #0b0011", options(nomem, nostack)); // mask IRQ+FIQ
+        }
+        // DAIF.I is bit 7; "was enabled" == I was clear.
+        daif & (1 << 7) == 0
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { false }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -260,7 +277,14 @@ fn irq_restore(was_enabled: bool) {
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn irq_restore(_was_enabled: bool) {}
+fn irq_restore(was_enabled: bool) {
+    #[cfg(target_arch = "aarch64")]
+    if was_enabled {
+        unsafe { core::arch::asm!("msr daifclr, #0b0010", options(nomem, nostack)) }; // unmask IRQ
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    { let _ = was_enabled; }
+}
 
 #[inline(always)]
 fn with_queue<R>(f: impl FnOnce(&mut EventQueue) -> R) -> R {

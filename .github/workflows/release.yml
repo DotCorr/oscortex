@@ -55,6 +55,7 @@ jobs:
           rustup show active-toolchain || rustup toolchain install nightly
           rustup component add rust-src
           rustup target add x86_64-unknown-none
+          rustup target add aarch64-unknown-none
 
       - name: Cache cargo + target
         uses: actions/cache@v4
@@ -78,16 +79,36 @@ jobs:
           echo "LIMINE_DIR=$HOME/limine" >> "$GITHUB_ENV"
           echo "$HOME/limine" >> "$GITHUB_PATH"
 
-      - name: Build bootable ISO
+      - name: Build bootable ISO (x86_64)
         run: cargo xtask iso
 
-      - name: Stage release asset
+      - name: Build kernel (aarch64)
+        # aarch64 boots via QEMU `-kernel` (no Limine/ISO on -M virt), so the
+        # release artifact is the raw kernel ELF. This is platform-scope parity
+        # with the x86 ISO above: the automated build embeds whatever is committed
+        # under initramfs/ (the full render-capable Flutter runtime — engine .so,
+        # AOT shell snapshot, ICU, assets — is gitignored and staged separately by
+        # scripts/build-aarch64-shell.sh, exactly like the x86 full-shell ISO).
+        run: |
+          set -euo pipefail
+          cargo build --release --target aarch64-unknown-none -p oscortex-kernel \
+            --no-default-features --features arch-aarch64 \
+            -Z build-std=core,compiler_builtins,alloc \
+            -Z build-std-features=compiler-builtins-mem
+
+      - name: Stage release assets
         run: |
           set -euo pipefail
           mkdir -p dist
+          # x86_64 bootable ISO
           cp oscortex.iso "dist/oscortex-${{ steps.ver.outputs.tag }}.iso"
           sha256sum "dist/oscortex-${{ steps.ver.outputs.tag }}.iso" \
             > "dist/oscortex-${{ steps.ver.outputs.tag }}.iso.sha256"
+          # aarch64 kernel ELF
+          cp target/aarch64-unknown-none/release/kernel \
+            "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel"
+          sha256sum "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel" \
+            > "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel.sha256"
           ls -lh dist
 
       - name: Publish GitHub Release
@@ -101,12 +122,22 @@ jobs:
           body: |
             Automated production release built from `main`.
 
-            **Artifact:** bootable kernel ISO (Limine BIOS + UEFI), built via
-            `cargo xtask iso`. The full Flutter-shell ISO (engine module + AOT
-            app) is staged separately by `scripts/build-iso.sh` and is not part
-            of this automated asset yet.
+            **Artifacts:**
+            - `oscortex-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS + UEFI),
+              built via `cargo xtask iso`.
+            - `oscortex-aarch64-<tag>.kernel` — aarch64 kernel ELF; boot with
+              `qemu-system-aarch64 -M virt -cpu cortex-a72 -kernel <file> -device ramfb`.
 
-            Verify with the attached `.sha256`.
+            Both are **platform-scope** builds. The full render-capable Flutter shell
+            (engine `.so` + AOT app snapshot + ICU + assets) is gitignored and staged
+            separately — x86 via `scripts/build-iso.sh`, aarch64 via
+            `scripts/build-aarch64-shell.sh` (which pulls the engine + `gen_snapshot`
+            from the `oscortex-engine-1` release). Wiring that runtime into the
+            automated release is a tracked follow-up.
+
+            Verify with the attached `.sha256` files.
           files: |
             dist/oscortex-${{ steps.ver.outputs.tag }}.iso
             dist/oscortex-${{ steps.ver.outputs.tag }}.iso.sha256
+            dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel
+            dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel.sha256

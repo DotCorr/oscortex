@@ -257,6 +257,14 @@ pub fn spin_pause() {
     }
 }
 
+/// Disable interrupts unconditionally (no save/restore).
+#[inline(always)]
+pub fn interrupts_disable() {
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Save RFLAGS and disable interrupts; returns RFLAGS for [`interrupts_restore`].
 #[inline(always)]
 pub fn interrupts_save_and_disable() -> u64 {

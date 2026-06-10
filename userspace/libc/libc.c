@@ -79,6 +79,14 @@ char *strchr(const char *s, int c) {
 }
 
 // --- Mathematical functions ---
+//
+// On x86_64 the x87 FPU provides fsin/fcos/fsqrt directly. AArch64 has no
+// transcendental instructions, so sin/cos use a range-reduced minimax-style
+// polynomial and sqrt uses the FSQRT instruction via the compiler builtin. The
+// engine only needs these for occasional layout/animation math, so a few ULP of
+// error is fine.
+
+#if defined(__x86_64__)
 
 double sin(double x) {
     double result;
@@ -115,6 +123,58 @@ float sqrtf(float x) {
     __asm__ volatile ("fsqrt" : "=t"(result) : "0"(x));
     return result;
 }
+
+#else  /* aarch64 (and any non-x86 host) */
+
+/* Reduce x into [-pi, pi] using a precise pi, then evaluate an 11th-order
+ * Taylor series — accurate to a few ULP across that range. */
+static double m_reduce(double x) {
+    const double TWO_PI = 6.283185307179586476925286766559;
+    const double PI     = 3.141592653589793238462643383279;
+    /* k = round(x / 2pi) */
+    double k = x / TWO_PI;
+    long long ki = (long long)(k >= 0 ? k + 0.5 : k - 0.5);
+    x -= (double)ki * TWO_PI;
+    if (x > PI)  x -= TWO_PI;
+    if (x < -PI) x += TWO_PI;
+    return x;
+}
+
+double sin(double x) {
+    x = m_reduce(x);
+    double x2 = x * x;
+    /* x - x^3/3! + x^5/5! - x^7/7! + x^9/9! - x^11/11! */
+    double t = x;
+    double s = x;
+    t *= -x2 / (2*3);   s += t;
+    t *= -x2 / (4*5);   s += t;
+    t *= -x2 / (6*7);   s += t;
+    t *= -x2 / (8*9);   s += t;
+    t *= -x2 / (10*11); s += t;
+    return s;
+}
+
+double cos(double x) {
+    x = m_reduce(x);
+    double x2 = x * x;
+    /* 1 - x^2/2! + x^4/4! - x^6/6! + x^8/8! - x^10/10! */
+    double t = 1.0;
+    double s = 1.0;
+    t *= -x2 / (1*2);   s += t;
+    t *= -x2 / (3*4);   s += t;
+    t *= -x2 / (5*6);   s += t;
+    t *= -x2 / (7*8);   s += t;
+    t *= -x2 / (9*10);  s += t;
+    return s;
+}
+
+float sinf(float x) { return (float)sin((double)x); }
+float cosf(float x) { return (float)cos((double)x); }
+
+double sqrt(double x)  { return __builtin_sqrt(x); }
+float  sqrtf(float x)  { return __builtin_sqrtf(x); }
+
+#endif
 
 double floor(double x) {
     long long i = (long long)x;

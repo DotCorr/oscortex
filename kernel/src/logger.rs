@@ -85,6 +85,8 @@ impl SerialPort {
 
     /// Initialize UART: 115200 baud, 8-N-1, disable interrupts (x86_64 only).
     fn init_uart(&mut self) {
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::uart::init();
         #[cfg(target_arch = "x86_64")]
         unsafe {
             cpu_out8(self.port + 1, 0x00); // Disable all interrupts
@@ -104,9 +106,13 @@ impl SerialPort {
             while (cpu_in8(self.port + 5) & 0x20) == 0 {}
             cpu_out8(self.port, byte);
         }
-        // On non-x86 arches the serial stub is a no-op until a PL011/UART driver
-        // is implemented. The framebuffer console still receives all output.
-        #[cfg(not(target_arch = "x86_64"))]
+        // aarch64: route bytes to the PL011 UART driver so the shared kernel's
+        // serial output (early_print + the log framework) reaches the host
+        // terminal under QEMU `-M virt`.
+        #[cfg(target_arch = "aarch64")]
+        crate::arch::aarch64::uart::putb(byte);
+        // Other non-x86 arches: no serial backend yet; framebuffer console only.
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let _ = byte;
     }
 }

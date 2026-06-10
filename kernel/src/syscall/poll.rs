@@ -280,6 +280,22 @@ pub(crate) struct EpollEntry {
     pub data: u64,
 }
 
+// `struct epoll_event` ABI differs by arch. glibc marks it `__attribute__((packed))`
+// (`__EPOLL_PACKED`) ONLY on x86_64 → 12 bytes with `data` at offset 4. On aarch64
+// (and most other arches) the attribute is empty → the struct is naturally aligned:
+// 16 bytes with the 8-byte `data` union at offset 8. The engine's
+// EventHandlerImplementation::Poll reads events with a 16-byte stride + data@8 on
+// aarch64; if the kernel writes the 12-byte/offset-4 layout the engine reads a
+// garbage `data` pointer (e.g. 0x100000000) and faults dereferencing it.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 16;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_DATA_OFF: u64 = 8;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 12;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_DATA_OFF: u64 = 4;
+
 pub(crate) static TIMERFD_TABLE: spin::Mutex<BTreeMap<u32, TimerState>> = spin::Mutex::new(BTreeMap::new());
 /// eventfd counters: synth fd → counter (u64). A write adds to the counter;
 /// a read drains it atomically. epoll fires EPOLLIN when counter > 0.
@@ -551,7 +567,11 @@ pub fn check_timerfds_and_wake_try() {
             exps
         };
         for (pid, mutex, cond) in expired {
-            super::futex_waiter_remove(cond, pid);
+            // ISR-safe: never block on FUTEX_WAITERS here. An interrupted syscall
+            // (e.g. spawn_thread, a futex op) may hold it; a non-try lock would
+            // self-deadlock this single core with IRQs masked. On contention the
+            // removal is simply retried on the next timer tick.
+            super::futex_waiter_remove_try(cond, pid);
             static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
             let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
             if n < 32 {
@@ -613,10 +633,7 @@ pub fn monotonic_ns() -> u64 {
     //   1_700_000_000 * 10^9 + tsc_ns
     // timerfd_settime with TFD_TIMER_ABSTIME passes this value, so our
     // "now" must use the same epoch or timers will never fire.
-    let lo: u32;
-    let hi: u32;
-    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
-    let tsc_ns = (((hi as u64) << 32) | lo as u64) / 3;
+    let tsc_ns = crate::arch::rdtsc_ns();
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
 }
 
@@ -816,7 +833,7 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
         1 | 3 => { // ADD or MOD
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + EPOLL_DATA_OFF) as *const u64) };
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -908,10 +925,10 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     );
                 }
                 // Report EPOLLIN; leave pending for the read() call to drain.
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -932,20 +949,20 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                         eventfd_count
                     );
                 }
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
                 continue;
             }
             // Check pipe readability for non-timerfd fds.
             if pipe_readable_for_fd(entry.fd) {
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -1002,7 +1019,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 if crate::process::try_claim_cpu_for(target, my_cpu) {
                     let urip = crate::arch::syscall::user_rip();
                     let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                    crate::process::save_return_context_reexec(cur, urip, ursp);
                     crate::process::save_full_user_gprs(cur);
                     crate::process::set_rax(cur, 0x47B); // re-execute epoll_wait on resume
                     crate::process::save_xstate(cur);
@@ -1136,7 +1153,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             if crate::process::try_claim_cpu_for(focus, my_cpu) {
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1294,7 +1311,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 // blocking again — exactly like sys_wm_event_wait does.
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
                 crate::process::save_xstate(cur);
@@ -1320,7 +1337,7 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                 crate::process::set_state(1, crate::process::ProcState::Running);
                 let urip = crate::arch::syscall::user_rip();
                 let ursp = crate::arch::syscall::user_rsp();
-                crate::process::save_return_context(cur, urip.wrapping_sub(2), ursp);
+                crate::process::save_return_context_reexec(cur, urip, ursp);
                 crate::process::save_full_user_gprs(cur);
                 crate::process::set_rax(cur, 0x47B);
                 crate::process::save_xstate(cur);
@@ -1328,9 +1345,10 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
+        // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) its
+        // kernel-mode wake-assist can run. Was x86-only → aarch64 busy-spun in EL1.
         unsafe {
-            core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+            { crate::arch::enable_and_halt(); }
         }
     }
 }

@@ -484,15 +484,16 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
                         let urip = crate::arch::syscall::user_rip();
                         let ursp = crate::arch::syscall::user_rsp();
-                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_return_context_reexec(pid, urip, ursp);
                         crate::process::save_full_user_gprs(pid);
                         crate::process::set_rax(pid, sys_nr);
                         crate::process::save_xstate(pid);
@@ -583,15 +584,16 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
-                    core::arch::asm!("sti; hlt; cli", options(nomem, nostack));
+                    { crate::arch::enable_and_halt(); }
                 }
                 if let Some(next) = crate::process::next_runnable_pid(pid) {
                     if next != pid {
                         let urip = crate::arch::syscall::user_rip();
                         let ursp = crate::arch::syscall::user_rsp();
-                        crate::process::save_return_context(pid, urip - 2, ursp);
+                        crate::process::save_return_context_reexec(pid, urip, ursp);
                         crate::process::save_full_user_gprs(pid);
                         crate::process::set_rax(pid, sys_nr);
                         crate::process::save_xstate(pid);
@@ -649,6 +651,8 @@ pub(crate) fn sys_pty_ioctl(fd: u64, cmd: u64, arg: u64) -> i64 {
 ///   writes `*out = tid`, returns `0` on success.
 pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     let parent_pid = crate::process::current_pid();
+    log::error!("[thread-create] ENTER pid={} a0={:#x} a1={:#x} a2={:#x} a3={:#x}",
+        parent_pid, arg0, arg1, arg2, arg3);
     if parent_pid == 0 {
         return -1; // EPERM
     }
@@ -682,29 +686,50 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
                 unsafe { *(arg0 as *mut u64) = fs_base; }
                 (0_i64, Some(tid))
             }
-            Err(errno) => (-errno, None),
+            Err(errno) => {
+                log::error!("[thread-create] POSIX spawn FAILED entry={:#x} arg={:#x} stk={:#x} errno={}",
+                    arg2, arg3, stack_size, errno);
+                (-errno, None)
+            }
         };
-        log::trace!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
+        log::warn!("[trace] sys_thread_create POSIX out={:#x} attr={:#x} entry={:#x} arg={:#x} stk={:#x} -> {}",
             arg0, arg1, arg2, arg3, stack_size, r);
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
 
-            // Give the newborn thread one immediate slice. Without this, the
-            // creator can monopolize userspace and delay child startup long
-            // enough to starve wake-source setup (pipe/timer arming).
-            let parent = crate::process::current_pid();
-            if parent != 0 && child_pid != parent {
-                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
-                if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
-                    let urip = crate::arch::syscall::user_rip();
-                    let ursp = crate::arch::syscall::user_rsp();
-                    crate::process::save_return_context(parent, urip, ursp);
-                    crate::process::save_full_user_gprs(parent);
-                    crate::process::set_rax(parent, 0);
-                    crate::process::save_xstate(parent);
-                    crate::process::enter_user_by_pid_noreturn(child_pid);
+            // Give the newborn an IMMEDIATE slice by entering the child from inside
+            // the creator's pthread_create syscall (never returning here; the
+            // creator gets r=0 on its later cooperative resume). The Flutter engine
+            // bootstrap depends on this ordering: FlutterEngineRunInitialized posts
+            // the root-isolate-launch task to the freshly-created UI thread, and the
+            // platform thread (pid 1) then blocks waiting for it. If the UI thread
+            // is only marked Running and left for "later" pickup, main()/runApp may
+            // never run promptly → no frame is ever scheduled → nothing presents.
+            //
+            // This was OFF on aarch64 because the nested enter-while-in-a-syscall
+            // corrupted the creator's resume (next pthread_create FML_CHECK abort).
+            // That corruption was the cooperative-resume register/stack loss since
+            // FIXED: callee-saved x24-x28 + x30/LR, FP/SIMD (vector-stub save), the
+            // RETURN-mode x0=rax delivery, and the SP_EL1 syscall-stack reset. The
+            // creator resumes via build_image, which is now lossless for a syscall
+            // boundary (caller-saved x6/x7/x9-x18 are dead across the svc per the
+            // ABI; everything live is preserved), so re-enabling is safe.
+            {
+                let parent = crate::process::current_pid();
+                if parent != 0 && child_pid != parent {
+                    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+                    if crate::process::try_claim_cpu_for(child_pid, my_cpu) {
+                        let urip = crate::arch::syscall::user_rip();
+                        let ursp = crate::arch::syscall::user_rsp();
+                        crate::process::save_return_context(parent, urip, ursp);
+                        crate::process::save_full_user_gprs(parent);
+                        crate::process::set_rax(parent, 0);
+                        crate::process::save_xstate(parent);
+                        crate::process::enter_user_by_pid_noreturn(child_pid);
+                    }
                 }
             }
+            let _ = child_pid;
         }
         r
     } else {
@@ -767,7 +792,29 @@ pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
                     if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
                     return 0;
                 }
-                unsafe { core::arch::asm!("pause", options(nomem, nostack, preserves_flags)); }
+                // Cooperatively yield so the join TARGET (or another runnable
+                // thread) can run and exit. A bare spin_pause never makes progress
+                // on aarch64: a thread spinning here at EL1 can't be timer-preempted
+                // (the tick returns early when taken from EL1), so the join target
+                // would never be scheduled and this would spin to the 2e9 cap. Hand
+                // the core to a runnable thread and RE-EXEC this join syscall on
+                // resume to re-check waitpid. (x86 relied on kernel-mode preemption
+                // running the target; aarch64 must yield explicitly.)
+                let me = crate::process::current_pid();
+                if me != 0 {
+                    if let Some(next) = crate::syscall::cooperative_sched_target(me) {
+                        if next != me {
+                            let urip = crate::arch::syscall::user_rip();
+                            let ursp = crate::arch::syscall::user_rsp();
+                            crate::process::save_return_context_reexec(me, urip, ursp);
+                            crate::process::save_full_user_gprs(me);
+                            crate::process::set_rax(me, crate::embedder::abi::SYS_THREAD_JOIN);
+                            crate::process::save_xstate(me);
+                            crate::process::enter_user_by_pid_noreturn(next);
+                        }
+                    }
+                }
+                crate::arch::spin_pause();
             }
             Err(_) => {
                 if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }

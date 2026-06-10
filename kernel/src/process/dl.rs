@@ -13,6 +13,17 @@
 //! | `R_X86_64_GLOB_DAT`| 6        | `S`       |
 //! | `R_X86_64_JUMP_SLOT`| 7       | `S`       |
 //!
+//! ## Supported aarch64 relocation types
+//! | Type                  | Encoding | Formula |
+//! |-----------------------|----------|---------|
+//! | `R_AARCH64_ABS64`     | 257      | `S + A` |
+//! | `R_AARCH64_GLOB_DAT`  | 1025     | `S + A` |
+//! | `R_AARCH64_JUMP_SLOT` | 1026     | `S + A` |
+//! | `R_AARCH64_RELATIVE`  | 1027     | `B + A` |
+//!
+//! The loader selects the relocation set from the ELF `e_machine`, so a single
+//! `dlopen` path loads both the x86 and the ARM `libflutter_engine.so`.
+//!
 //! Undefined externals (`st_shndx == SHN_UNDEF`) are left at zero.  The
 //! Flutter engine fills all mandatory platform callbacks through the
 //! `FlutterEngineProcTable` struct passed during `FlutterEngineInitialize`,
@@ -24,6 +35,7 @@
 //! continue from wherever the bump currently sits, keeping the address ranges
 //! non-overlapping inside each process's 128 TiB lower half.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -36,9 +48,11 @@ const ELFCLASS64:   u8      = 2;
 const ELFDATA2LSB:  u8      = 1;
 const ET_DYN:       u16     = 3;
 const EM_X86_64:    u16     = 62;
+const EM_AARCH64:   u16     = 183;
 
 const PT_LOAD:      u32     = 1;
 const PT_DYNAMIC:   u32     = 2;
+const PT_TLS:       u32     = 7;
 const PF_W:         u32     = 1 << 1;
 const PF_X:         u32     = 1 << 0;
 
@@ -58,6 +72,58 @@ const R_X86_64_64:         u32 = 1;
 const R_X86_64_GLOB_DAT:   u32 = 6;
 const R_X86_64_JUMP_SLOT:  u32 = 7;
 const R_X86_64_RELATIVE:   u32 = 8;
+
+// aarch64 dynamic relocation types (ELF for the Arm 64-bit Architecture).
+const R_AARCH64_ABS64:     u32 = 257;
+const R_AARCH64_GLOB_DAT:  u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
+const R_AARCH64_RELATIVE:  u32 = 1027;
+// TLS relocations. The engine's C++ `thread_local`s use the TLSDESC model.
+const R_AARCH64_TLS_DTPMOD64: u32 = 1028;
+const R_AARCH64_TLS_DTPREL64: u32 = 1029;
+const R_AARCH64_TLS_TPREL64:  u32 = 1030;
+const R_AARCH64_TLSDESC:      u32 = 1031;
+
+/// AArch64 variant-I TLS: TPIDR_EL0 points at the TCB; the static TLS block of
+/// the (single, statically-loaded) module begins after a 16-byte TCB reserve,
+/// rounded up to the TLS alignment. The engine's PT_TLS is 8-byte aligned, so
+/// the block starts at TP + 16. A TLSDESC/TPREL variable at module offset `A`
+/// therefore lives at `TP + TLS_TP_OFFSET + A`.
+const TLS_TP_OFFSET: u64 = 16;
+
+/// Captured PT_TLS template of a loaded module (the engine), so a kernel-spawned
+/// thread can be given a real variant-I TLS block (TCB + .tdata copy + .tbss)
+/// instead of a single zeroed page. Keyed by the address space (pml4_phys) the
+/// module was loaded into; threads share that space with the loader.
+#[derive(Clone, Copy)]
+pub struct TlsTemplate {
+    /// VA of the .tdata initial-data image inside the loaded module.
+    pub image_va: u64,
+    /// Initialized bytes (.tdata) to copy.
+    pub filesz: u64,
+    /// Total TLS size (.tdata + .tbss); the rest is zeroed.
+    pub memsz: u64,
+    /// Alignment of the TLS block.
+    pub align: u64,
+}
+
+static TLS_TEMPLATES: Mutex<BTreeMap<u64, TlsTemplate>> = Mutex::new(BTreeMap::new());
+
+/// Look up the TLS template captured for an address space (by group-leader's
+/// pml4_phys). Used by `spawn_thread` to initialise a new thread's TLS block.
+pub fn get_tls_template(pml4_phys: u64) -> Option<TlsTemplate> {
+    TLS_TEMPLATES.lock().get(&pml4_phys).copied()
+}
+
+/// Record a module's PT_TLS template. Keeps the LARGEST per address space — the
+/// engine's TLS dominates; tiny-TLS helper libs must not shadow it.
+fn record_tls_template(pml4_phys: u64, t: TlsTemplate) {
+    let mut m = TLS_TEMPLATES.lock();
+    let keep = m.get(&pml4_phys).map_or(true, |e| t.memsz > e.memsz);
+    if keep {
+        m.insert(pml4_phys, t);
+    }
+}
 
 const STB_GLOBAL: u8 = 1;
 const STB_WEAK:   u8 = 2;
@@ -451,6 +517,7 @@ fn apply_rela_table(
     let mut n_jmp = 0usize;
     let mut n_other = 0usize;
     let mut n_oob = 0usize;
+    let mut n_tls = 0usize;
 
     for i in 0..count {
         let rela: Elf64Rela = match read_pod(bytes, rela_file + i * ent_sz) {
@@ -461,11 +528,68 @@ fn apply_rela_table(
         let sym_idx = (rela.r_info >> 32) as usize;
         let target  = load_base.wrapping_add(rela.r_offset);
 
+        // ── aarch64 TLS relocations (handled specially: they may write a PAIR
+        //    and encode a TP-relative offset, not an absolute VA) ─────────────
+        // The module's TLS offset of the referenced variable is `st_value+A`
+        // for a symbol, or just `A` for a local (sym_idx==0) reloc. The
+        // TP-relative offset is then TLS_TP_OFFSET + that (variant-I layout).
+        if rtype == R_AARCH64_TLSDESC
+            || rtype == R_AARCH64_TLS_TPREL64
+            || rtype == R_AARCH64_TLS_DTPREL64
+            || rtype == R_AARCH64_TLS_DTPMOD64
+        {
+            n_tls += 1;
+            let module_off = if sym_idx != 0 {
+                // sym_vaddr = load_base + st_value; recover st_value, add addend.
+                sym_vaddr(sym_idx)
+                    .wrapping_sub(load_base)
+                    .wrapping_add(rela.r_addend as u64)
+            } else {
+                rela.r_addend as u64
+            };
+            let tp_off = TLS_TP_OFFSET.wrapping_add(module_off);
+            unsafe {
+                match rtype {
+                    R_AARCH64_TLSDESC => {
+                        // Descriptor pair: [+0]=static resolver, [+8]=TP offset.
+                        // The resolver trampoline only exists on aarch64 (a TLSDESC
+                        // reloc can only appear in an aarch64 object); on x86 this
+                        // arm is unreachable, so fall back to 0 to keep that build
+                        // green without pulling in the arch-gated symbol.
+                        #[cfg(target_arch = "aarch64")]
+                        let resolver = crate::process::posix_trampolines::TLSDESC_RESOLVER_VA;
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let resolver = 0u64;
+                        write_user_u64(target, resolver);
+                        write_user_u64(target.wrapping_add(8), tp_off);
+                    }
+                    R_AARCH64_TLS_TPREL64 => write_user_u64(target, tp_off),
+                    // Single-module static image: DTPMOD is always module 1,
+                    // DTPREL is the in-block offset (no TCB reserve).
+                    R_AARCH64_TLS_DTPMOD64 => write_user_u64(target, 1),
+                    R_AARCH64_TLS_DTPREL64 => write_user_u64(target, module_off),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        // Both x86_64 and aarch64 use the same RELA encoding (r_offset/r_info/
+        // r_addend) and identical formulas; only the type *numbers* differ. We
+        // accept both sets so a single loader handles either engine .so. On
+        // aarch64, GLOB_DAT/JUMP_SLOT add the addend (S + A); on x86 the addend
+        // is conventionally zero for those, so `S + A` is also correct there.
         let value = match rtype {
+            // ── x86_64 ──
             R_X86_64_RELATIVE  => { n_rel += 1; load_base.wrapping_add(rela.r_addend as u64) },
             R_X86_64_64        => { n_64 += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
             R_X86_64_GLOB_DAT  => { n_glob += 1; sym_vaddr(sym_idx) },
             R_X86_64_JUMP_SLOT => { n_jmp += 1; sym_vaddr(sym_idx) },
+            // ── aarch64 ──
+            R_AARCH64_RELATIVE  => { n_rel += 1; load_base.wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_ABS64     => { n_64 += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_GLOB_DAT  => { n_glob += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
+            R_AARCH64_JUMP_SLOT => { n_jmp += 1; sym_vaddr(sym_idx).wrapping_add(rela.r_addend as u64) },
             0                  => continue,
             _                  => { n_other += 1; continue; },
         };
@@ -481,8 +605,8 @@ fn apply_rela_table(
     }
 
     log::info!(
-        "[dl] rela table sz={} count={} applied: REL={} _64={} GLOB={} JMP={} other={} oob={}",
-        table_sz, count, n_rel, n_64, n_glob, n_jmp, n_other, n_oob
+        "[dl] rela table sz={} count={} applied: REL={} _64={} GLOB={} JMP={} TLS={} other={} oob={}",
+        table_sz, count, n_rel, n_64, n_glob, n_jmp, n_tls, n_other, n_oob
     );
 }
 
@@ -616,7 +740,14 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
     if hdr.e_ident[4] != ELFCLASS64    { return Err("not ELF64"); }
     if hdr.e_ident[5] != ELFDATA2LSB   { return Err("not little-endian"); }
     if hdr.e_type    != ET_DYN          { return Err("not a shared object (ET_DYN required)"); }
+    // Accept only the machine type matching the kernel build: the loaded code
+    // executes natively in the process, so a foreign-arch .so would fault.
+    #[cfg(target_arch = "x86_64")]
     if hdr.e_machine != EM_X86_64       { return Err("not x86_64"); }
+    #[cfg(target_arch = "aarch64")]
+    if hdr.e_machine != EM_AARCH64      { return Err("not aarch64"); }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    { let _ = (EM_X86_64, EM_AARCH64); }
 
     // ── Allocate load base ────────────────────────────────────────────────
     // Key the bump cursor on pml4_phys, not pid, so threads sharing an
@@ -633,6 +764,18 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
 
     for i in 0..ph_num {
         let ph: Elf64Phdr = read_pod(elf_bytes, ph_off + i * ph_size).ok_or("phdr OOB")?;
+        // Capture the TLS template so kernel-spawned threads get a real variant-I
+        // TLS block. The image VA (load_base + p_vaddr) lands inside a PT_LOAD
+        // segment that is mapped by this same loop, so it is readable once the
+        // module is fully loaded (which is the case by the time a thread spawns).
+        if ph.p_type == PT_TLS && ph.p_memsz > 0 {
+            record_tls_template(pml4_phys, TlsTemplate {
+                image_va: load_base + ph.p_vaddr,
+                filesz: ph.p_filesz,
+                memsz: ph.p_memsz,
+                align: ph.p_align.max(16),
+            });
+        }
         if ph.p_type != PT_LOAD || ph.p_memsz == 0 { continue; }
 
         let seg_va    = load_base + ph.p_vaddr;
@@ -832,9 +975,13 @@ pub fn dlopen(pid: u32, pml4_phys: u64, elf_bytes: &[u8], path: &[u8]) -> Result
         h
     };
 
-    // ── Runtime patch: libflutter_engine.so ──────────────────────────────
-    // Identified by ELF size > 50 MiB (the engine is ~91 MiB; no other
-    // library we load comes close).
+    // ── Runtime patch: libflutter_engine.so (x86_64 only) ────────────────
+    // These patches rewrite specific *x86 instruction byte sequences* in the
+    // engine (e.g. ImageReader::GetInstructionsAt sign-extension). They are
+    // inherently architecture-specific and must NOT run against the aarch64
+    // engine (different opcodes, different offsets). Gate the whole block.
+    // Identified by ELF size > 50 MiB (the x86 engine is ~91 MiB).
+    #[cfg(target_arch = "x86_64")]
     if elf_bytes.len() > 50 * 1024 * 1024 {
         // Helper: write N bytes at a virtual address via HHDM.
         let mut write_va = |va: u64, data: &[u8]| -> bool {

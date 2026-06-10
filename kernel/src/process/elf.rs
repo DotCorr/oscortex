@@ -2,6 +2,7 @@
 //! into a process's user address space.
 
 use crate::mm::{frame_allocator, paging};
+use alloc::collections::BTreeMap;
 
 // ── ELF64 constants ───────────────────────────────────────────────────────────
 
@@ -11,7 +12,16 @@ const ELFDATA2LSB:    u8 = 1; // little-endian
 const ET_EXEC:        u16 = 2;
 const ET_DYN:         u16 = 3; // PIE
 const EM_X86_64:      u16 = 62;
+const EM_AARCH64:     u16 = 183;
 const PT_LOAD:        u32 = 1;
+
+/// The ELF machine type this kernel build can execute natively.
+#[cfg(target_arch = "x86_64")]
+const EM_NATIVE: u16 = EM_X86_64;
+#[cfg(target_arch = "aarch64")]
+const EM_NATIVE: u16 = EM_AARCH64;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const EM_NATIVE: u16 = EM_X86_64;
 const PF_X:           u32 = 1 << 0; // executable
 const PF_W:           u32 = 1 << 1; // writable
 
@@ -76,7 +86,7 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
     if hdr.e_ident[0..4] != ELF_MAGIC           { return Err("bad ELF magic"); }
     if hdr.e_ident[4]    != ELFCLASS64           { return Err("not ELF64"); }
     if hdr.e_ident[5]    != ELFDATA2LSB          { return Err("not little-endian"); }
-    if hdr.e_machine     != EM_X86_64            { return Err("not x86_64"); }
+    if hdr.e_machine     != EM_NATIVE            { return Err("wrong ELF machine for arch"); }
     if hdr.e_type != ET_EXEC && hdr.e_type != ET_DYN {
         return Err("not executable ELF");
     }
@@ -88,6 +98,19 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
     let ph_off  = hdr.e_phoff  as usize;
     let ph_num  = hdr.e_phnum  as usize;
     let ph_size = hdr.e_phentsize as usize;
+
+    // Pages this call has already backed with a freshly-allocated frame, keyed by
+    // page VA → frame PA. We MUST NOT use the page table to detect "already
+    // mapped" pages: on aarch64 the per-process root is seeded with the kernel
+    // identity map (block descriptors), and splitting a block to overlay one user
+    // page leaves the *other* pages of that block populated with valid identity
+    // sub-page descriptors. Querying the page table would then report those
+    // identity pages as already-mapped and the loader would reuse the identity PA
+    // (device/0xFF memory) instead of allocating a real frame. Tracking only the
+    // frames WE allocated in this load keeps the genuine code+rodata-overlap reuse
+    // (two PT_LOADs sharing one 4 KiB page) while always allocating fresh frames
+    // for identity-block pages.
+    let mut mapped: BTreeMap<u64, u64> = BTreeMap::new();
 
     // ── Walk PT_LOAD segments ─────────────────────────────────────────────
     for i in 0..ph_num {
@@ -112,16 +135,17 @@ pub fn load(bytes: &[u8], pml4_phys: u64) -> Result<u64, &'static str> {
         for p in 0..num_pages {
             let page_virt  = page_start + (p * 4096) as u64;
 
-            // Check whether this virtual page was already mapped by a previous
-            // PT_LOAD segment (common when code and rodata share a 4 KiB page).
-            // If so, reuse the existing physical frame so we don't lose the
-            // bytes written by the earlier segment, and preserve the more-
-            // permissive (exec) permission that the earlier segment set.
-            let existing_phys = crate::mm::paging::translate_user_page(pml4_phys, page_virt);
+            // Check whether THIS load already backed this virtual page (common
+            // when code and rodata share a 4 KiB page across two PT_LOADs). If so,
+            // reuse that frame so we don't lose the earlier segment's bytes and we
+            // keep the more-permissive (exec) permission. We intentionally consult
+            // our own `mapped` table, not the page table — see the note above.
+            let existing_phys = mapped.get(&page_virt).copied();
             let (page_phys, is_new_frame) = if let Some(phys) = existing_phys {
                 (phys, false)
             } else {
                 let phys = frame_allocator::alloc_frame().ok_or("OOM: elf segment")?;
+                mapped.insert(page_virt, phys);
                 (phys, true)
             };
 
