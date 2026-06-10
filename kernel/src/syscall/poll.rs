@@ -280,6 +280,22 @@ pub(crate) struct EpollEntry {
     pub data: u64,
 }
 
+// `struct epoll_event` ABI differs by arch. glibc marks it `__attribute__((packed))`
+// (`__EPOLL_PACKED`) ONLY on x86_64 → 12 bytes with `data` at offset 4. On aarch64
+// (and most other arches) the attribute is empty → the struct is naturally aligned:
+// 16 bytes with the 8-byte `data` union at offset 8. The engine's
+// EventHandlerImplementation::Poll reads events with a 16-byte stride + data@8 on
+// aarch64; if the kernel writes the 12-byte/offset-4 layout the engine reads a
+// garbage `data` pointer (e.g. 0x100000000) and faults dereferencing it.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 16;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_DATA_OFF: u64 = 8;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 12;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_DATA_OFF: u64 = 4;
+
 pub(crate) static TIMERFD_TABLE: spin::Mutex<BTreeMap<u32, TimerState>> = spin::Mutex::new(BTreeMap::new());
 /// eventfd counters: synth fd → counter (u64). A write adds to the counter;
 /// a read drains it atomically. epoll fires EPOLLIN when counter > 0.
@@ -817,7 +833,7 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
         1 | 3 => { // ADD or MOD
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + EPOLL_DATA_OFF) as *const u64) };
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -909,10 +925,10 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     );
                 }
                 // Report EPOLLIN; leave pending for the read() call to drain.
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -933,20 +949,20 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                         eventfd_count
                     );
                 }
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
                 continue;
             }
             // Check pipe readability for non-timerfd fds.
             if pipe_readable_for_fd(entry.fd) {
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }

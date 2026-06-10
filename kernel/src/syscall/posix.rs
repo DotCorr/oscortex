@@ -2959,6 +2959,77 @@ pub fn sys_snprintf(
     })
 }
 
+#[cfg(target_arch = "aarch64")]
+pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
+    // AArch64 AAPCS64 va_list layout (NOT the x86_64 System V struct):
+    //   off 0:  void *__stack    next stack (overflow) arg
+    //   off 8:  void *__gr_top   one-past-end of the GP register save area
+    //   off 16: void *__vr_top   one-past-end of the FP register save area
+    //   off 24: int   __gr_offs  negative byte offset from __gr_top to next GP arg
+    //                            (0 once the 8 GP arg regs x0..x7 are exhausted)
+    //   off 28: int   __vr_offs  negative byte offset from __vr_top to next FP arg
+    //
+    // `format_into` only ever requests integer/pointer args (it has no %f/%g
+    // conversions), so we only decode the GP path. Decoding this as if it were
+    // the x86_64 va_list (gp_offset/reg_save/overflow) reads garbage — the low
+    // 32 bits of __stack become a bogus gp_offset → every arg is junk → bad
+    // Dart string pointers → "Invalid UTF8 sequence encountered" + crash.
+    let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
+    let (mut stack, gr_top, mut gr_offs): (u64, u64, i32) = if plausible_user(ap) {
+        unsafe {
+            let s = core::ptr::read_unaligned(ap as *const u64);
+            let gt = core::ptr::read_unaligned((ap as *const u64).offset(1));
+            let go = core::ptr::read_unaligned((ap as *const i32).offset(6)); // off 24
+            (s, gt, go)
+        }
+    } else {
+        (0, 0, 0)
+    };
+
+    static VSNPRINTF_DEBUG_LOG: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+    let dbg_n = VSNPRINTF_DEBUG_LOG.fetch_add(1, Ordering::Relaxed);
+    if dbg_n < 8 {
+        log::warn!(
+            "[vsnprintf-debug] #{} pid={} ap={:#x} stack={:#x} gr_top={:#x} gr_offs={}",
+            dbg_n,
+            crate::process::current_pid(),
+            ap,
+            stack,
+            gr_top,
+            gr_offs
+        );
+    }
+
+    let next_int = || -> u64 {
+        // GP register save area first (gr_offs is negative until exhausted),
+        // then the overflow stack area.
+        let val = if gr_offs < 0 && plausible_user(gr_top) {
+            let addr = gr_top.wrapping_add(gr_offs as i64 as u64);
+            let v = if plausible_user(addr) {
+                unsafe { core::ptr::read_unaligned(addr as *const u64) }
+            } else {
+                0
+            };
+            gr_offs += 8;
+            v
+        } else if plausible_user(stack) {
+            let v = unsafe { core::ptr::read_unaligned(stack as *const u64) };
+            stack = stack.wrapping_add(8);
+            v
+        } else {
+            0
+        };
+        if dbg_n < 8 {
+            log::warn!("[vsnprintf-debug] arg={:#x}", val);
+        }
+        val
+    };
+
+    format_into(buf, size, fmt_ptr, next_int)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 pub fn sys_vsnprintf(buf: u64, size: u64, fmt_ptr: u64, ap: u64) -> i64 {
     let plausible_user = |p: u64| p != 0 && p < 0x0000_8000_0000_0000;
     let (mut gp_off, reg_save, mut ovf): (u32, u64, u64) = if plausible_user(ap) {
