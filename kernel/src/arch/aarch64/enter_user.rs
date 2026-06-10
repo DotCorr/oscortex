@@ -165,6 +165,31 @@ pub unsafe fn enter_user_sysret(regs: &EnterUserRegs) -> ! {
     eret_to_el0(&img)
 }
 
+/// Resume a thread from its full saved trap-frame snapshot — the 36-word image
+/// the timer-preempt path stores in `Process::arch_trapframe`.
+///
+/// Unlike [`enter_user_iret`]/[`enter_user_sysret`] (which rebuild the context
+/// from the lossy x86-named `EnterUserRegs` and therefore zero x6/x7/x11..x18
+/// and can carry stale x24..x28), this restores EVERY register exactly as
+/// captured at the preemption point. It MUST be used whenever a timer-preempted
+/// thread is resumed through the cooperative handoff path: a Dart worker
+/// preempted mid heap-allocation keeps live pointers in caller-saved temporaries
+/// that the `build_image` path would silently drop → near-null deref.
+///
+/// Frame layout (matches `apic.rs::frame_as_array`):
+///   `[0..31]=x0..x30, 31=SP_EL0, 32=ELR(PC), 33=SPSR, 34=ESR, 35=pad`.
+/// The first 34 words are exactly the `img` layout [`eret_to_el0`] consumes.
+///
+/// # Safety
+/// TTBR0_EL1 must already point at the target thread's address space and the
+/// frame must describe a valid EL0 context.
+#[inline(never)]
+pub unsafe fn enter_user_from_frame(frame: &[u64; 36]) -> ! {
+    let mut img = [0u64; 34];
+    img.copy_from_slice(&frame[..34]);
+    eret_to_el0(&img)
+}
+
 /// Directly enter EL0 at a given PC/SP with seeded x0..x2 (bring-up helper).
 ///
 /// The minimal path the aarch64 bring-up uses to launch a self-contained EL0

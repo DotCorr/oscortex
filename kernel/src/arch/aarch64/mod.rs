@@ -43,7 +43,7 @@ pub mod bringup_irq;
 pub mod bringup_user;
 pub mod bringup_smp;
 
-pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
+pub use enter_user::{enter_user_from_frame, enter_user_iret, enter_user_sysret, EnterUserRegs};
 
 use core::arch::asm;
 
