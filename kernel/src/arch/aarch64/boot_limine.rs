@@ -106,6 +106,12 @@ _limine_aarch64_entry:
     orr     x0, x0, #(3 << 20)
     msr     cpacr_el1, x0
     isb
+    // Force EL1h (SPSel=1): the kernel must run on SP_EL1. Limine enters us at
+    // EL1t (SPSel=0), where `sp` aliases SP_EL0 — every kernel stack write then
+    // goes through SP_EL0, and enter_user's kernel-stack reset (`mov sp, ...`)
+    // clobbers the user SP it just delivered: pid1 entered EL0 with SP = the
+    // kernel syscall-stack top and its first push faulted into kernel RAM.
+    msr     spsel, #1
     // Switch to our own boot stack (Limine's stack is reclaimable).
     adrp    x0, {boot_stack_top}
     add     x0, x0, :lo12:{boot_stack_top}
