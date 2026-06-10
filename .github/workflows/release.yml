@@ -82,15 +82,38 @@ jobs:
       - name: Build bootable ISO (x86_64)
         run: cargo xtask iso
 
-      - name: Build kernel (aarch64)
+      - name: Build kernel (aarch64, render-capable)
         # aarch64 boots via QEMU `-kernel` (no Limine/ISO on -M virt), so the
-        # release artifact is the raw kernel ELF. This is platform-scope parity
-        # with the x86 ISO above: the automated build embeds whatever is committed
-        # under initramfs/ (the full render-capable Flutter runtime — engine .so,
-        # AOT shell snapshot, ICU, assets — is gitignored and staged separately by
-        # scripts/build-aarch64-shell.sh, exactly like the x86 full-shell ISO).
+        # release artifact is the raw kernel ELF. Unlike the x86 ISO (still
+        # platform-scope), the aarch64 kernel is RENDER-CAPABLE: we fetch the
+        # prebuilt Flutter shell runtime (engine .so + AOT shell snapshot + ICU +
+        # fonts/assets + embedder /init + libc + seed) from the `oscortex-engine-1`
+        # release and stage it into initramfs/ before building, so kernel/build.rs
+        # embeds it. The runtime is gitignored (large, prebuilt), hence the fetch.
+        # NOTE: refresh `oscortex-arm64-shell-runtime.tar.gz` on that release when
+        # the shell Dart/app or engine changes — it is a prebuilt snapshot.
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Fetch + verify the render runtime bundle.
+          gh release download oscortex-engine-1 --repo "$GITHUB_REPOSITORY" \
+            -p 'oscortex-arm64-shell-runtime.tar.gz' \
+            -p 'oscortex-arm64-shell-runtime.tar.gz.sha256' -O /tmp/rt.tar.gz \
+            --clobber || gh release download oscortex-engine-1 --repo "$GITHUB_REPOSITORY" \
+            -p 'oscortex-arm64-shell-runtime.tar.gz' -O /tmp/rt.tar.gz --clobber
+          if [ -f oscortex-arm64-shell-runtime.tar.gz.sha256 ]; then
+            exp=$(awk '{print $1}' oscortex-arm64-shell-runtime.tar.gz.sha256)
+            got=$(sha256sum /tmp/rt.tar.gz | awk '{print $1}')
+            [ "$exp" = "$got" ] || { echo "runtime sha256 mismatch"; exit 1; }
+          fi
+          # Stage into initramfs/ (kernel/build.rs embeds it).
+          mkdir -p initramfs
+          tar -xzf /tmp/rt.tar.gz -C initramfs
+          ls -lh initramfs/init initramfs/system/lib/libflutter_engine.so \
+                 initramfs/system/flutter/libapp.so
+          # Build the render-capable kernel (embeds the staged runtime).
+          touch kernel/src/fs/initramfs.rs
           cargo build --release --target aarch64-unknown-none -p oscortex-kernel \
             --no-default-features --features arch-aarch64 \
             -Z build-std=core,compiler_builtins,alloc \
@@ -124,16 +147,19 @@ jobs:
 
             **Artifacts:**
             - `oscortex-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS + UEFI),
-              built via `cargo xtask iso`.
-            - `oscortex-aarch64-<tag>.kernel` — aarch64 kernel ELF; boot with
-              `qemu-system-aarch64 -M virt -cpu cortex-a72 -kernel <file> -device ramfb`.
-
-            Both are **platform-scope** builds. The full render-capable Flutter shell
-            (engine `.so` + AOT app snapshot + ICU + assets) is gitignored and staged
-            separately — x86 via `scripts/build-iso.sh`, aarch64 via
-            `scripts/build-aarch64-shell.sh` (which pulls the engine + `gen_snapshot`
-            from the `oscortex-engine-1` release). Wiring that runtime into the
-            automated release is a tracked follow-up.
+              built via `cargo xtask iso`. **Platform-scope** (the full x86 Flutter
+              shell is staged separately by `scripts/build-iso.sh`).
+            - `oscortex-aarch64-<tag>.kernel` — **render-capable** aarch64 kernel: it
+              embeds the full Flutter shell runtime (engine + AOT shell snapshot + ICU
+              + fonts/assets), fetched from the `oscortex-engine-1` release at build
+              time. Boot it directly:
+              ```
+              qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 2G \
+                -kernel oscortex-aarch64-<tag>.kernel -device ramfb \
+                -device virtio-tablet-device -device virtio-keyboard-device
+              ```
+              Wait ~60–90s (TCG warm-up) for the shell to paint; the virtio-tablet
+              gives mouse hover/click.
 
             Verify with the attached `.sha256` files.
           files: |
