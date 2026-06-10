@@ -137,6 +137,19 @@ rm -f "$SHELL_ASSETS/kernel_blob.bin" \
       "$SHELL_ASSETS/vm_snapshot_data" \
       "$SHELL_ASSETS/isolate_snapshot_data"
 
+# Seed bundle for the shell's "Install demo" button (install:/system/seed/demo.osx).
+# Arch-neutral .osx bundle; reuse the x86 checkout's copy if present.
+SEED_SRC="${SEED_SRC:-$ROOT/../../../initramfs/system/seed/demo.osx}"
+if [ -f "$ROOT/initramfs/system/seed/demo.osx" ]; then
+    : # already staged
+elif [ -f "$SEED_SRC" ]; then
+    mkdir -p "$ROOT/initramfs/system/seed"
+    cp "$SEED_SRC" "$ROOT/initramfs/system/seed/demo.osx"
+    echo "[arm-shell]   staged demo.osx seed bundle"
+else
+    echo "[arm-shell]   note: no demo.osx seed found — Install demo will have nothing to install" >&2
+fi
+
 echo "[arm-shell] 6/6 building the aarch64 kernel (embeds the initramfs)..."
 # Force a rebuild of the initramfs (kernel/build.rs reads the initramfs/ dir).
 touch "$ROOT/kernel/src/fs/initramfs.rs" 2>/dev/null || true
