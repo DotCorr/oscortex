@@ -182,10 +182,26 @@ pub fn init() {
 /// TODO(arm): point this core's VBAR_EL1 at the shared vector table.
 pub fn init_ap(_cpu_idx: u32) {}
 
+/// Active EL0 syscall-stack top for the current thread (smp=1 bring-up: one
+/// slot). The cooperative-yield resume (`enter_user::eret_to_el0`) resets SP_EL1
+/// to this before `eret`, reclaiming the EL1 exception frame it would otherwise
+/// abandon. Without it SP_EL1 leaks ~one frame per yield and eventually
+/// underflows the boot stack, corrupting kernel memory (the dispatch handler-ptr
+/// → 1 → PC=1 crash). This is the aarch64 analogue of x86's `mov rsp, gs:[24]`.
+pub static ACTIVE_EL1_SP: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Read the current thread's active syscall-stack top (0 if not yet set).
+#[inline]
+pub fn active_el1_sp() -> u64 {
+    ACTIVE_EL1_SP.load(Ordering::Acquire)
+}
+
 /// Set the active kernel syscall-stack top for the current CPU.
 pub fn set_active_stack_top(stack_top: u64) {
     let i = cpu_idx();
     ACTIVE_STACK_TOP[i].store(stack_top, Ordering::Release);
+    ACTIVE_EL1_SP.store(stack_top, Ordering::Release);
     unsafe {
         let s = &mut (*core::ptr::addr_of_mut!(CPU_SCRATCHES))[i];
         s.syscall_stack_top = stack_top;
