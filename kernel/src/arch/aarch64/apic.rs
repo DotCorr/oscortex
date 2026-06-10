@@ -12,8 +12,12 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// from `CNTFRQ_EL0` once the generic timer is programmed).
 pub static APIC_TICKS_PER_MS: AtomicU32 = AtomicU32::new(62500);
 
-/// Requested vsync cadence in Hz (0 = off).
-static VSYNC_HZ: AtomicU32 = AtomicU32::new(0);
+/// Requested vsync cadence in Hz. Default 60 so the vsync boundary fires (and the
+/// embedder's posted baton is delivered → FlutterEngineOnVsync → a frame is
+/// produced & presented) even before/without the embedder calling set_vsync_hz.
+/// Without a non-zero cadence, vsync_due() is always false, push_vsync is never
+/// called, and the engine schedules frames forever without ever presenting one.
+static VSYNC_HZ: AtomicU32 = AtomicU32::new(60);
 
 /// Tick rate of the production scheduler timer (Hz). Mirrors the x86 APIC-timer
 /// 1 ms cadence closely enough for the cooperative scheduler's quantum logic.
