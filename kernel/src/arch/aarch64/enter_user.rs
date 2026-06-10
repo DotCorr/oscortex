@@ -106,7 +106,18 @@ fn build_image(regs: &EnterUserRegs) -> [u64; 34] {
 /// must describe a valid EL0 context (mapped PC/SP).
 #[inline(never)]
 unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
+    let reset_sp = crate::arch::aarch64::syscall::active_el1_sp();
     core::arch::asm!(
+        // Reclaim the EL1 kernel stack. This is a cooperative-yield resume: we
+        // eret straight to EL0 WITHOUT RESTORE_FRAME, so the SVC's EL1 exception
+        // frame is abandoned. Reset SP_EL1 to the thread's syscall-stack top so it
+        // does not leak (every yield would otherwise drop SP_EL1 ~one frame until
+        // it underflows the boot stack and corrupts kernel memory). `img` lives on
+        // the old stack but its memory stays valid until the next EL1 entry pushes.
+        // Skip if unset (very early boot, before any user entry).
+        "cbz {reset}, 1f",
+        "mov sp, {reset}",
+        "1:",
         // x18 = base pointer to the image. It is the last GPR we load, so it
         // can serve as the base for every prior load without clobbering a value
         // we still need.
@@ -141,6 +152,7 @@ unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
         "ldr x18,      [x18, #(18 * 8)]",
         "eret",
         base = in(reg) img.as_ptr(),
+        reset = in(reg) reset_sp,
         options(noreturn),
     )
 }
@@ -156,7 +168,14 @@ unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
 /// As [`eret_to_el0`], plus `fp` must be a valid 66-word FP image.
 #[inline(never)]
 unsafe fn eret_to_el0_fp(img: &[u64; 34], fp: &[u64; 66]) -> ! {
+    let reset_sp = crate::arch::aarch64::syscall::active_el1_sp();
     core::arch::asm!(
+        // Reclaim the abandoned EL1 frame (cooperative-yield resume) — see
+        // eret_to_el0. img/fp live on the old stack; their memory stays valid
+        // until the next EL1 entry pushes.
+        "cbz {reset}, 1f",
+        "mov sp, {reset}",
+        "1:",
         // FP first: x1 = &fp[0]. Restore v0..v31 then FPSR/FPCR.
         "mov x1, {fp}",
         "ld1 {{v0.2d,  v1.2d,  v2.2d,  v3.2d}},  [x1], #64",
@@ -200,6 +219,7 @@ unsafe fn eret_to_el0_fp(img: &[u64; 34], fp: &[u64; 66]) -> ! {
         "eret",
         base = in(reg) img.as_ptr(),
         fp   = in(reg) fp.as_ptr(),
+        reset = in(reg) reset_sp,
         options(noreturn),
     )
 }
