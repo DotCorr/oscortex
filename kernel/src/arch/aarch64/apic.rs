@@ -91,6 +91,25 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     crate::syscall::check_timerfds_and_wake_try();
     crate::process::handle_pending_wakes_try();
 
+    // Periodic deferred task-runner kick (mirrors the x86 APIC ISR, idt.rs
+    // ~586-596). The cooperative engine reaches a fully-parked bootstrap state
+    // during FlutterEngineRunInitialized: every thread waits on a cond/epoll and
+    // the wake that would un-park the isolate-bootstrap worker comes from a thread
+    // that is itself parked (wake-before-anyone-can-wake). x86 breaks this with a
+    // periodic KICK_REQUESTED pulse that the in-syscall wait/unlock loops consume
+    // to call force_wake_all_task_runners (which pokes EVERY timerfd/eventfd, armed
+    // or not, releasing every epoll waiter). aarch64 never set this flag, so the
+    // engine deadlocked deterministically. We only set the flag here (ISR-safe);
+    // force_wake_all_task_runners itself takes blocking locks and must run in
+    // syscall context, where the wait loops consume the flag.
+    {
+        static TR_KICK_CTR: AtomicU32 = AtomicU32::new(0);
+        let k = TR_KICK_CTR.fetch_add(1, Ordering::Relaxed);
+        if k % 256 == 0 {
+            crate::syscall::KICK_REQUESTED.store(true, Ordering::Release);
+        }
+    }
+
     // Only preempt interrupts taken FROM EL0 (a running user thread). SPSR_EL1
     // M[3:0] == 0 means the interrupted context was EL0t. Kernel-mode ticks
     // (idle/cortex loop) just return — there is no user frame to switch.

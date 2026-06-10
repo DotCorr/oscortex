@@ -1503,6 +1503,21 @@ pub fn schedule_user_launch(pid: u32) {
     log::info!("[Process] user-init kernel task registered for pid={}", pid);
 }
 
+/// Clear the pending-init guard. `next_runnable_pid` (the wrapper) returns None
+/// while `PENDING_INIT_PID != 0`, which suppresses scheduling until the very first
+/// user process is launched. On x86 `user_launch_task` clears it as part of the
+/// SYSRET launch; on aarch64 the boot enters the init process DIRECTLY via
+/// `enter_user_by_pid_noreturn` (main.rs) and never runs `user_launch_task`, so
+/// the guard stayed at its initial 1 forever — making `next_runnable_pid` always
+/// return None. That is invisible during normal operation (cooperative yields and
+/// the timer use `next_runnable_pid_locked`, which has no guard) but freezes
+/// `sys_exit`: when any thread exits it calls the wrapper, gets None, and halts
+/// forever even though siblings are runnable. The aarch64 launch path MUST call
+/// this immediately before entering the init process.
+pub fn mark_init_launched() {
+    PENDING_INIT_PID.store(0, Ordering::Release);
+}
+
 pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     let old_pid = current_pid();
