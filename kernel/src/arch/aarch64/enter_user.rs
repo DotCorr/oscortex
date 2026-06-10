@@ -43,6 +43,14 @@ pub struct EnterUserRegs {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    /// aarch64 callee-saved x24–x28 (no x86 equivalent). Preserved across the
+    /// cooperative/re-exec resume so the Dart VM's live pointers in these
+    /// registers survive a blocking-syscall yield.
+    pub x24: u64,
+    pub x25: u64,
+    pub x26: u64,
+    pub x27: u64,
+    pub x28: u64,
 }
 
 /// SPSR_EL1 value for "return to EL0t (SP_EL0), all interrupts unmasked".
@@ -71,6 +79,11 @@ fn build_image(regs: &EnterUserRegs) -> [u64; 34] {
     img[21] = regs.r13; // x21
     img[22] = regs.r14; // x22
     img[23] = regs.r15; // x23
+    img[24] = regs.x24; // x24 (callee-saved)
+    img[25] = regs.x25; // x25
+    img[26] = regs.x26; // x26
+    img[27] = regs.x27; // x27
+    img[28] = regs.x28; // x28
     img[29] = regs.rbp; // x29 (frame pointer)
     // x30 (LR): the shared enter path stashes the user link register captured at
     // the SVC boundary in the otherwise-unused `rflags` slot (SPSR is a constant
