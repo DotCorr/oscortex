@@ -123,24 +123,36 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     if cur_pid != 0 {
         let fs = crate::arch::cpu::get_fs_base();
         if fs == 0 {
-            let user_rsp = crate::arch::syscall::user_rsp();
-            // Place FS near current user stack top; keep room for small offsets.
-            let bootstrap_fs = user_rsp.saturating_sub(0x200);
-            if bootstrap_fs != 0 {
-                crate::arch::cpu::set_fs_base(bootstrap_fs);
-                crate::process::set_proc_fs_base(cur_pid, bootstrap_fs);
-                // Log per-pid bootstrap so we can verify each pthread gets a
-                // distinct TLS area. Cap at first 8 to keep logs small.
-                static FS_BOOT_COUNT: core::sync::atomic::AtomicU32 =
-                    core::sync::atomic::AtomicU32::new(0);
-                let n = FS_BOOT_COUNT.fetch_add(1, Ordering::AcqRel);
-                if n < 8 {
-                    log::warn!(
-                        "[syscall] bootstrapped FS base pid={} fs={:#x} rsp={:#x}",
-                        cur_pid,
-                        bootstrap_fs,
-                        user_rsp
-                    );
+            // If this thread already HAS a TLS base (every kernel-spawned thread
+            // gets a real variant-I TLS block from spawn_thread, recorded in
+            // p.fs_base), the register is merely not loaded on this core right
+            // now — restore it. Do NOT fall through to the stack-region bootstrap
+            // below, which would clobber the thread's real TLS block (and, via
+            // set_proc_fs_base, PERMANENTLY): the Dart VM reads its current-thread
+            // __thread var (OSThread::current_vm_thread_) at TP+0x68, so a
+            // stack-region TP sends every __thread access to stack garbage and
+            // the first VM thread-registration faults.
+            let saved = crate::process::get_proc_fs_base(cur_pid);
+            if saved != 0 {
+                crate::arch::cpu::set_fs_base(saved);
+            } else {
+                let user_rsp = crate::arch::syscall::user_rsp();
+                // No TLS base yet (the main/exec'd process before any runtime set
+                // one). Bootstrap a non-zero FS near the stack top so early libc/
+                // libstdc++ ctors don't do null fs:offset accesses.
+                let bootstrap_fs = user_rsp.saturating_sub(0x200);
+                if bootstrap_fs != 0 {
+                    crate::arch::cpu::set_fs_base(bootstrap_fs);
+                    crate::process::set_proc_fs_base(cur_pid, bootstrap_fs);
+                    static FS_BOOT_COUNT: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = FS_BOOT_COUNT.fetch_add(1, Ordering::AcqRel);
+                    if n < 8 {
+                        log::warn!(
+                            "[syscall] bootstrapped FS base pid={} fs={:#x} rsp={:#x}",
+                            cur_pid, bootstrap_fs, user_rsp
+                        );
+                    }
                 }
             }
         }
