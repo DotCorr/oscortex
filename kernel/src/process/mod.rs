@@ -1246,22 +1246,64 @@ pub fn spawn_thread(
                                  // at [RSP] is the thread-return trampoline.
     regs.rflags = 0x0202;      // IF=1, reserved=1
 
-    // Allocate a 4 KiB TLS/TCB page so the new thread has a valid FS base.
-    // x86_64 musl/glibc TCB head layout: fs:0 must point at the TCB itself
-    // (self-pointer). Without this, pthread_self() reads garbage and
-    // start_routine bails immediately via pthread_exit.
-    // The rest of the page is zeroed by mmap_anon, satisfying the common
-    // fs:[+offset] reads used by setname/getspecific in early thread setup.
-    let tls_va = dl::mmap_anon(parent_pid, parent_pml4_phys, 0, 1, 0x3 /* RW */);
-    if tls_va == u64::MAX {
-        log::error!("[spawn_thread] mmap_anon TLS failed");
-        free_syscall_stack(sys_stack_base);
-        return Err("OOM: thread TLS");
-    }
-    log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, tls_va, arg);
+    // ── Thread TLS block ──────────────────────────────────────────────────────
+    // The engine calls a custom pthread_create that bypasses glibc's user-space
+    // TLS setup, so the kernel builds the thread's TLS block itself. `tls_va` is
+    // the value loaded into the thread's TLS-base register (FS_BASE / TPIDR_EL0).
     #[cfg(target_arch = "aarch64")]
-    eager_map_anon_page(parent_pml4_phys, tls_va);
-    unsafe { core::ptr::write_volatile(tls_va as *mut u64, tls_va); }
+    let tls_va = {
+        // aarch64 = variant-I TLS: TPIDR_EL0 -> TCB (16 bytes: dtv, private); the
+        // static TLS block (.tdata copy + .tbss zero) sits at TP+16, and a
+        // __thread var at module offset A lives at TP+16+A — exactly where the
+        // dl resolves its TLSDESC/TPREL relocations. A single zeroed page makes
+        // the Dart VM's __thread vars read 0 → near-null deref in ThreadRegistry.
+        // Build a real block initialised from the engine's captured PT_TLS image.
+        const TLS_TCB_SIZE: u64 = 16;
+        let tmpl = dl::get_tls_template(parent_pml4_phys);
+        let memsz = tmpl.map_or(0, |t| t.memsz);
+        let pages = ((TLS_TCB_SIZE as usize + memsz as usize) + 4095) / 4096;
+        let va = dl::mmap_anon(parent_pid, parent_pml4_phys, 0, pages.max(1), 0x3 /* RW */);
+        if va == u64::MAX {
+            log::error!("[spawn_thread] mmap_anon TLS failed");
+            free_syscall_stack(sys_stack_base);
+            return Err("OOM: thread TLS");
+        }
+        for pg in 0..pages.max(1) {
+            eager_map_anon_page(parent_pml4_phys, va + (pg * 4096) as u64);
+        }
+        unsafe {
+            // TCB head at TP+0 (variant-I tcbhead_t: dtv, private). Static TLS
+            // needs no DTV; zero both words.
+            core::ptr::write_volatile(va as *mut u64, 0);
+            core::ptr::write_volatile((va + 8) as *mut u64, 0);
+            if let Some(t) = tmpl {
+                let dst = (va + TLS_TCB_SIZE) as *mut u8;
+                core::ptr::write_bytes(dst, 0, memsz as usize); // .tbss
+                if t.filesz > 0 {
+                    core::ptr::copy_nonoverlapping(
+                        t.image_va as *const u8, dst, t.filesz as usize,
+                    ); // .tdata initial image
+                }
+            }
+        }
+        log::warn!("[spawn_thread] tid={} tls_va={:#x} tls_memsz={:#x} arg={:#x}", tid, va, memsz, arg);
+        va
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    let tls_va = {
+        // x86_64 = variant-II TLS (block before the TCB, __thread at negative
+        // offsets from fs:0); a single page whose [0] self-points as the TCB head
+        // is sufficient for the engine's thread use here.
+        let va = dl::mmap_anon(parent_pid, parent_pml4_phys, 0, 1, 0x3 /* RW */);
+        if va == u64::MAX {
+            log::error!("[spawn_thread] mmap_anon TLS failed");
+            free_syscall_stack(sys_stack_base);
+            return Err("OOM: thread TLS");
+        }
+        unsafe { core::ptr::write_volatile(va as *mut u64, va); }
+        log::warn!("[spawn_thread] tid={} tls_va={:#x} arg={:#x}", tid, va, arg);
+        va
+    };
 
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     {
