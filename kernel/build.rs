@@ -3,7 +3,15 @@ fn main() {
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let out  = std::env::var("OUT_DIR").unwrap();
 
+    // The aarch64 port has TWO mutually-exclusive boot layouts:
+    //   * `-kernel`/DTB boot  → physical link @ 0x40080000, entry `_start`, MMU off
+    //     (aarch64.ld, the default).
+    //   * Limine UEFI boot    → higher-half link @ -2 GiB, entry the Limine
+    //     trampoline, MMU/HHDM/framebuffer already set up by the bootloader
+    //     (aarch64-limine.ld), selected by the `limine-boot` feature.
+    let limine_boot = std::env::var("CARGO_FEATURE_LIMINE_BOOT").is_ok();
     let ld = match arch.as_str() {
+        "aarch64" if limine_boot => "aarch64-limine.ld",
         "aarch64" => "aarch64.ld",
         "riscv64" => "riscv64.ld",
         _         => "x86_64.ld",   // default / x86_64
@@ -15,6 +23,7 @@ fn main() {
     println!("cargo:rerun-if-changed=linker/{ld}");
     println!("cargo:rerun-if-changed=linker/x86_64.ld");
     println!("cargo:rerun-if-changed=linker/aarch64.ld");
+    println!("cargo:rerun-if-changed=linker/aarch64-limine.ld");
     println!("cargo:rerun-if-changed=linker/riscv64.ld");
     println!("cargo:rerun-if-changed=build.rs");
 
