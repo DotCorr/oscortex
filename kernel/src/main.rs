@@ -301,6 +301,11 @@ fn shared_init_and_run() -> ! {
     // ── 7a. Window-manager event bridge ──────────────────────────────────
     wm::init();
 
+    // aarch64: bring up virtio-input (pointer) now that the WM queue + GIC are
+    // live. On `-M virt` there is no PS/2; pointer input arrives via virtio-mmio.
+    #[cfg(target_arch = "aarch64")]
+    crate::drivers::virtio_input::init();
+
     // ── 7b. Virtual filesystem (initramfs) ───────────────────────────────
     fs::init();
 

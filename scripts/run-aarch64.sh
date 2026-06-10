@@ -47,6 +47,11 @@ COMMON=(
     -M virt -cpu cortex-a72 -smp "$SMP" -m 2G
     -kernel "$KERNEL"
     -device ramfb
+    # virtio-mmio input: absolute pointer (tablet) + keyboard. -M virt has no PS/2,
+    # so these are how the Flutter shell receives mouse/keyboard (see
+    # kernel/src/drivers/virtio_input.rs). Attached to the virtio-mmio bus.
+    -device virtio-tablet-device
+    -device virtio-keyboard-device
 )
 
 if [[ "$DISPLAY_MODE" == "none" ]]; then

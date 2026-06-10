@@ -72,8 +72,13 @@ pub fn start_scheduler_tick() {
 fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     let intid = super::gic::acknowledge();
 
-    // Spurious / non-timer interrupts: EOI (if real) and return.
+    // Non-timer interrupts. virtio-mmio input SPIs (slot i → INTID 48+i) drive the
+    // pointer/keyboard; drain them into the WM queue, then EOI. Everything else is
+    // spurious/unhandled: EOI (if real) and return.
     if intid != super::timer::TIMER_PPI {
+        if crate::drivers::virtio_input::owns_intid(intid) {
+            crate::drivers::virtio_input::handle_irq();
+        }
         if intid < 1020 {
             super::gic::eoi(intid);
         }
