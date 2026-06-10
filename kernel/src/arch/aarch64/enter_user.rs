@@ -11,9 +11,11 @@
 //! arguments in the right places:
 //!
 //!   rip → ELR_EL1 (user PC)      rsp → SP_EL0 (user SP)
-//!   rdi → x0   rsi → x1   rdx → x2   rcx → x3   r8 → x4   r9 → x5
+//!   rdi → x0   rsi → x1   rdx → x2   r10 → x3   r8 → x4   r9 → x5
+//!   (syscall arg3 lives in the r10 slot — the x86 syscall ABI uses r10 for arg3,
+//!    NOT rcx; `capture_from_trap` stores user x3 there.)
 //!   rax → x8  (syscall-nr / return register, matching the Linux ABI)
-//!   rbx → x19  rbp → x29  r10 → x9  r11 → x10
+//!   rbx → x19  rbp → x29  r11 → x10
 //!   r12 → x20  r13 → x21  r14 → x22  r15 → x23
 //!
 //! The exact mapping only matters for the *first* entry of a fresh process
@@ -63,15 +65,23 @@ const SPSR_EL0T: u64 = 0;
 #[inline(always)]
 fn build_image(regs: &EnterUserRegs) -> [u64; 34] {
     let mut img = [0u64; 34];
-    img[0] = regs.rdi; // x0
-    img[1] = regs.rsi; // x1
-    img[2] = regs.rdx; // x2
-    img[3] = regs.rcx; // x3
-    img[4] = regs.r8; // x4
-    img[5] = regs.r9; // x5
+    img[0] = regs.rdi; // x0  (syscall arg0)
+    img[1] = regs.rsi; // x1  (syscall arg1)
+    img[2] = regs.rdx; // x2  (syscall arg2)
+    // x3 = syscall arg3. The SVC entry (`capture_from_trap`) stores the user's x3
+    // into the `r10` slot (the x86 syscall ABI puts arg3 in r10, not rcx — rcx is
+    // the sysret return address). The previous `img[3] = regs.rcx` restored x3 from
+    // a stale/garbage rcx, so any syscall re-executed via this lossy build_image
+    // path resumed with a corrupt 4th argument. For the Flutter engine's fml
+    // MessageLoop this corrupted epoll_wait's `timeout` (-1 → garbage → finite),
+    // so epoll_wait returned 0, the loop treated it as fatal, and the UI/raster/IO
+    // runner thread exited → no frames (the ~60% bootstrap stall). Restore from r10.
+    img[3] = regs.r10; // x3  (syscall arg3, captured into the r10 slot)
+    img[4] = regs.r8; // x4  (syscall arg4)
+    img[5] = regs.r9; // x5  (syscall arg5)
     // x6, x7 unused by the seed path — leave zero.
     img[8] = regs.rax; // x8 (syscall nr / return)
-    img[9] = regs.r10; // x9
+    // x9 is a caller-saved scratch reg (dead across a syscall re-exec); leave 0.
     img[10] = regs.r11; // x10
     // x11..x18 zero.
     img[19] = regs.rbx; // x19 (callee-saved)
