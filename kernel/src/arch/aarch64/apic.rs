@@ -194,6 +194,13 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
                 f.x[28] = x28;
                 f.x[30] = lr;
             }
+            // RETURN-mode threads (resumed *after* the svc) must receive the
+            // syscall result in x0; userregs_to_trapframe wrote x0 = rdi (arg0).
+            // next_regs.rax holds the result (set via set_rax). RE-EXEC threads
+            // keep x0 = arg0 (the flag is false), so this is a no-op for them.
+            if crate::process::aarch64_ret_in_x0_try(next_pid) == Some(true) {
+                f.x[0] = next_regs.rax;
+            }
         }
     } else {
         // No switch this tick (no OTHER runnable thread): `cur` keeps running and

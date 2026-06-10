@@ -216,6 +216,17 @@ pub struct Process {
     pub user_x27: u64,
     #[cfg(target_arch = "aarch64")]
     pub user_x28: u64,
+    /// aarch64 only: true if this thread's saved context is a syscall RETURN
+    /// (resume PC is *after* the `svc`, so the syscall's return value must land in
+    /// x0) rather than a RE-EXEC (resume PC rewound to the `svc`, so x0 must hold
+    /// the original arg0 and x8 the syscall nr). On x86 the return value and the
+    /// re-exec nr share one register (rax) so no distinction is needed; on aarch64
+    /// they are x0 vs x8, so a RETURN-mode resume must override x0 ← rax. Without
+    /// this a cooperatively-resumed `pthread_cond_broadcast` (return 0) delivered
+    /// x0 = arg0 = the cond pointer, which Dart read as a nonzero pthread error
+    /// and aborted (synchronization_posix.cc:164).
+    #[cfg(target_arch = "aarch64")]
+    pub aarch64_ret_in_x0: bool,
 }
 
 impl Process {
@@ -268,6 +279,8 @@ impl Process {
             user_x27: 0,
             #[cfg(target_arch = "aarch64")]
             user_x28: 0,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_ret_in_x0: false,
         }
     }
 }
@@ -340,6 +353,16 @@ pub fn aarch64_resume_extras_try(pid: u32) -> Option<(u64, u64, u64, u64, u64, u
     } else {
         None
     }
+}
+
+/// aarch64, ISR-safe: true if `pid`'s saved context is a syscall RETURN (so the
+/// timer-ISR fallback must deliver the syscall result in x0, not the stale
+/// arg0). Returns None on lock contention. See `aarch64_ret_in_x0`.
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64_ret_in_x0_try(pid: u32) -> Option<bool> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid { Some(p.aarch64_ret_in_x0) } else { None }
 }
 
 /// Persist the FS base for `pid` (called on arch_prctl(ARCH_SET_FS) and on
@@ -1578,6 +1601,15 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // Assemble the full user register state for the arch entry hook. The
     // arch backend owns the actual ring-3 transition asm (IRETQ vs SYSRETQ on
     // x86_64); the shared code above owns all the PTABLE/CR3/errno logic.
+    // aarch64: in RETURN mode the syscall's result (in rax) must be delivered in
+    // x0; build_image maps rdi→x0, so override the rdi we pass. RE-EXEC mode keeps
+    // rdi=arg0 (x8=rax carries the nr). See `aarch64_ret_in_x0`.
+    #[cfg(target_arch = "aarch64")]
+    let rdi = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid && p.aarch64_ret_in_x0 { rax } else { rdi }
+    };
     #[cfg(target_arch = "aarch64")]
     let cs = callee_saved_x24_x28(pid);
     let enter_regs = crate::arch::EnterUserRegs {
@@ -1709,6 +1741,15 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         if p.pid == pid { p.user_lr } else { rflags }
     };
 
+    // aarch64: in RETURN mode the syscall's result (in rax) must be delivered in
+    // x0; build_image maps rdi→x0, so override the rdi we pass. RE-EXEC mode keeps
+    // rdi=arg0 (x8=rax carries the nr). See `aarch64_ret_in_x0`.
+    #[cfg(target_arch = "aarch64")]
+    let rdi = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid && p.aarch64_ret_in_x0 { rax } else { rdi }
+    };
     #[cfg(target_arch = "aarch64")]
     let cs = callee_saved_x24_x28(pid);
     let enter_regs = crate::arch::EnterUserRegs {
@@ -1967,6 +2008,11 @@ fn save_return_context_inner(pid: u32, rip: u64, rsp: u64, aarch64_rewind: u64) 
                 p.regs.rip = rip;
                 p.regs.rsp = rsp;
             }
+            // rewind==0 → RETURN mode (PC after the `svc`): the syscall's return
+            // value (set via set_rax) must be delivered in x0 on resume. rewind!=0
+            // → RE-EXEC mode (PC at the `svc`): x0 must stay arg0 and x8 carry the
+            // nr, so do NOT override x0. See the field doc on `aarch64_ret_in_x0`.
+            p.aarch64_ret_in_x0 = aarch64_rewind == 0;
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
