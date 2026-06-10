@@ -6,7 +6,7 @@
 //! compilable stubs preserving the public surface the shared kernel calls; real
 //! GICv2/GICv3 + CNTV_CTL programming comes later.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Approximate timer ticks per millisecond (placeholder; real value is read
 /// from `CNTFRQ_EL0` once the generic timer is programmed).
@@ -108,6 +108,18 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         if k % 256 == 0 {
             crate::syscall::KICK_REQUESTED.store(true, Ordering::Release);
         }
+    }
+
+    // Drive the vsync boundary on every tick (even kernel-mode ticks), mirroring
+    // the x86 APIC ISR (idt.rs). wm::tick()/compositor::tick() advance the window
+    // manager + compositor and arm the embedder's vsync baton; without this the
+    // engine schedules frames forever (schedule_frame label=idle) but the baton is
+    // never delivered, so FlutterEngineOnVsync is never called and no frame is
+    // ever produced or presented. (aarch64 had only a no-op vsync_due() scaffold.)
+    if vsync_due() {
+        crate::wm::tick();
+        crate::compositor::tick();
+        reset_vsync_last_tsc();
     }
 
     // Only preempt interrupts taken FROM EL0 (a running user thread). SPSR_EL1
@@ -345,15 +357,46 @@ pub fn set_vsync_hz(hz: u32) {
     VSYNC_HZ.store(hz, Ordering::Release);
 }
 
-/// Returns true when a vsync interval has elapsed since the last reset.
-///
-/// TODO(arm): compare CNTVCT_EL0 against the last fired timestamp scaled by
-/// CNTFRQ_EL0 / VSYNC_HZ. Always returns false in the scaffold.
-pub fn vsync_due() -> bool {
-    false
+/// CNTVCT_EL0 snapshot at the last fired vsync boundary.
+static VSYNC_LAST_CNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn read_cntvct() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
+    v
 }
 
-/// Reset the vsync interval reference timestamp.
+#[inline]
+fn read_cntfrq() -> u64 {
+    let v: u64;
+    unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) v, options(nomem, nostack)) };
+    v
+}
+
+/// Returns true when a vsync interval has elapsed since the last reset.
 ///
-/// TODO(arm): snapshot CNTVCT_EL0. No-op stub.
-pub fn reset_vsync_last_tsc() {}
+/// Mirrors the x86 rdtsc-based cadence using the generic timer: the period in
+/// counter ticks is CNTFRQ_EL0 / VSYNC_HZ. Self-advances the reference on a hit
+/// (like x86) so the caller's explicit reset is idempotent.
+pub fn vsync_due() -> bool {
+    let hz = VSYNC_HZ.load(Ordering::Relaxed);
+    if hz == 0 { return false; }
+    let freq = read_cntfrq();
+    if freq == 0 { return false; }
+    let period = freq / hz as u64;
+    if period == 0 { return false; }
+    let now = read_cntvct();
+    let last = VSYNC_LAST_CNT.load(Ordering::Relaxed);
+    if now.wrapping_sub(last) >= period {
+        VSYNC_LAST_CNT.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Reset the vsync interval reference timestamp to now.
+pub fn reset_vsync_last_tsc() {
+    VSYNC_LAST_CNT.store(read_cntvct(), Ordering::Relaxed);
+}
