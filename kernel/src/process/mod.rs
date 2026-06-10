@@ -202,6 +202,20 @@ pub struct Process {
     pub entry_user_rip: u64,
     #[cfg(target_arch = "aarch64")]
     pub entry_user_rsp: u64,
+    /// aarch64 only: callee-saved x24–x28 captured at SVC entry. The shared
+    /// x86-named UserRegs has no slots for these (x86 only has r8–r15), so the
+    /// cooperative/re-exec resume (`build_image`) would otherwise lose them
+    /// (→ 0) and the Dart VM, which keeps live pointers there, faults near-null.
+    #[cfg(target_arch = "aarch64")]
+    pub user_x24: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub user_x25: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub user_x26: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub user_x27: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub user_x28: u64,
 }
 
 impl Process {
@@ -244,6 +258,16 @@ impl Process {
             entry_user_rip: 0,
             #[cfg(target_arch = "aarch64")]
             entry_user_rsp: 0,
+            #[cfg(target_arch = "aarch64")]
+            user_x24: 0,
+            #[cfg(target_arch = "aarch64")]
+            user_x25: 0,
+            #[cfg(target_arch = "aarch64")]
+            user_x26: 0,
+            #[cfg(target_arch = "aarch64")]
+            user_x27: 0,
+            #[cfg(target_arch = "aarch64")]
+            user_x28: 0,
         }
     }
 }
@@ -282,6 +306,19 @@ pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 36]> {
         Some(p.arch_trapframe)
     } else {
         None
+    }
+}
+
+/// aarch64: read the callee-saved x24–x28 captured for `pid` (used to populate
+/// EnterUserRegs so the cooperative/re-exec resume restores them).
+#[cfg(target_arch = "aarch64")]
+fn callee_saved_x24_x28(pid: u32) -> (u64, u64, u64, u64, u64) {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid {
+        (p.user_x24, p.user_x25, p.user_x26, p.user_x27, p.user_x28)
+    } else {
+        (0, 0, 0, 0, 0)
     }
 }
 
@@ -1502,10 +1539,22 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // Assemble the full user register state for the arch entry hook. The
     // arch backend owns the actual ring-3 transition asm (IRETQ vs SYSRETQ on
     // x86_64); the shared code above owns all the PTABLE/CR3/errno logic.
+    #[cfg(target_arch = "aarch64")]
+    let cs = callee_saved_x24_x28(pid);
     let enter_regs = crate::arch::EnterUserRegs {
         rip, rsp, rflags,
         rax, rbx, rcx, rdx, rsi, rdi, rbp,
         r8, r9, r10, r11, r12, r13, r14, r15,
+        #[cfg(target_arch = "aarch64")]
+        x24: cs.0,
+        #[cfg(target_arch = "aarch64")]
+        x25: cs.1,
+        #[cfg(target_arch = "aarch64")]
+        x26: cs.2,
+        #[cfg(target_arch = "aarch64")]
+        x27: cs.3,
+        #[cfg(target_arch = "aarch64")]
+        x28: cs.4,
     };
 
     if preempted_by_timer {
@@ -1609,10 +1658,22 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         if p.pid == pid { p.user_lr } else { rflags }
     };
 
+    #[cfg(target_arch = "aarch64")]
+    let cs = callee_saved_x24_x28(pid);
     let enter_regs = crate::arch::EnterUserRegs {
         rip, rsp, rflags,
         rax, rbx, rcx, rdx, rsi, rdi, rbp,
         r8, r9, r10, r11, r12, r13, r14, r15,
+        #[cfg(target_arch = "aarch64")]
+        x24: cs.0,
+        #[cfg(target_arch = "aarch64")]
+        x25: cs.1,
+        #[cfg(target_arch = "aarch64")]
+        x26: cs.2,
+        #[cfg(target_arch = "aarch64")]
+        x27: cs.3,
+        #[cfg(target_arch = "aarch64")]
+        x28: cs.4,
     };
 
     if preempted_by_timer {
@@ -1950,6 +2011,11 @@ pub fn save_full_user_gprs(pid: u32) {
         p.user_lr = snap.lr;
         p.entry_user_rip = crate::arch::syscall::user_rip();
         p.entry_user_rsp = crate::arch::syscall::user_rsp();
+        p.user_x24 = snap.x24;
+        p.user_x25 = snap.x25;
+        p.user_x26 = snap.x26;
+        p.user_x27 = snap.x27;
+        p.user_x28 = snap.x28;
     }
 }
 
