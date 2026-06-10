@@ -39,10 +39,14 @@ cfg_if::cfg_if! {
         pub fn interrupts_disable() {
             unsafe { core::arch::asm!("msr daifset, #3", options(nomem, nostack, preserves_flags)); }
         }
-        pub fn interrupts_save_and_disable() -> u64 {
-            0
-        }
-        pub fn interrupts_restore(_rflags: u64) {}
+        // Wire to the REAL DAIF save/restore in aarch64::cpu. These were no-op
+        // stubs (return 0 / do nothing), so every critical section built on
+        // interrupts_save_and_disable()/interrupts_restore() ran with IRQs still
+        // ENABLED on aarch64 — the timer ISR could preempt mid-update and corrupt
+        // whatever the section guarded (e.g. the kernel heap's hole list, surfacing
+        // as nondeterministic linked_list_allocator panics). The real versions
+        // mask IRQ+FIQ and restore the prior DAIF.
+        pub use aarch64::cpu::{interrupts_save_and_disable, interrupts_restore};
     } else {
         pub fn memory_fence() {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);

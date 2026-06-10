@@ -1313,6 +1313,18 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
                     continue;
                 }
 
+                // Consume the periodic deferred kick (set by the timer ISR) BEFORE
+                // the cooperative-yield decision below. The inner while-loop also
+                // consumes it, but on aarch64 a parked thread almost always finds a
+                // cooperative target here and yields, bypassing the inner loop — so
+                // without this the engine's bootstrap deadlock-breaker pulse would
+                // never reach a consumer and RunInitialized would hang forever.
+                // force_wake_all_task_runners pokes every timerfd/eventfd, releasing
+                // the epoll-parked task runner that must run the isolate bootstrap.
+                if super::KICK_REQUESTED.swap(false, Ordering::AcqRel) {
+                    let _ = super::force_wake_all_task_runners("cond-wait-kick");
+                }
+
                 // Otherwise, we must wait (yield or hlt)
                 if pid != 0 {
                     super::futex_waiter_add(cond, pid);

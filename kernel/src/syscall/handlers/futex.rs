@@ -783,6 +783,28 @@ pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
                     if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
                     return 0;
                 }
+                // Cooperatively yield so the join TARGET (or another runnable
+                // thread) can run and exit. A bare spin_pause never makes progress
+                // on aarch64: a thread spinning here at EL1 can't be timer-preempted
+                // (the tick returns early when taken from EL1), so the join target
+                // would never be scheduled and this would spin to the 2e9 cap. Hand
+                // the core to a runnable thread and RE-EXEC this join syscall on
+                // resume to re-check waitpid. (x86 relied on kernel-mode preemption
+                // running the target; aarch64 must yield explicitly.)
+                let me = crate::process::current_pid();
+                if me != 0 {
+                    if let Some(next) = crate::syscall::cooperative_sched_target(me) {
+                        if next != me {
+                            let urip = crate::arch::syscall::user_rip();
+                            let ursp = crate::arch::syscall::user_rsp();
+                            crate::process::save_return_context_reexec(me, urip, ursp);
+                            crate::process::save_full_user_gprs(me);
+                            crate::process::set_rax(me, crate::embedder::abi::SYS_THREAD_JOIN);
+                            crate::process::save_xstate(me);
+                            crate::process::enter_user_by_pid_noreturn(next);
+                        }
+                    }
+                }
                 crate::arch::spin_pause();
             }
             Err(_) => {

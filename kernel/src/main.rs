@@ -391,6 +391,13 @@ fn shared_init_and_run() -> ! {
                         // immediate-child-enter disabled on arm those workers only
                         // get the CPU when a timer tick preempts pid 1.
                         let _ = engine_present;
+                        // Clear the pending-init guard: aarch64 launches the init
+                        // process directly (below) instead of via the x86
+                        // user_launch_task, which is the only other site that clears
+                        // it. Left set, next_runnable_pid (the wrapper) returns None
+                        // forever → sys_exit halts the whole engine when any thread
+                        // exits. See process::mark_init_launched.
+                        process::mark_init_launched();
                         arch::aarch64::apic::start_scheduler_tick();
                         process::enter_user_by_pid_noreturn(pid);
                     }
