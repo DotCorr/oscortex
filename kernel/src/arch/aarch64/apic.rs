@@ -175,12 +175,20 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     let slice_expired = crate::process::account_tick_try(cur).unwrap_or(false);
     let focus = crate::wm::focus_pid();
     let target = if focus != 0 { focus } else { 1 };
-    let should_preempt = slice_expired
-        || (cur != 0
-            && target != 0
-            && cur != target
-            && (crate::wm::input_pending_for(target) > 0
-                || (target == 1 && crate::wm::embedder_baton_due())));
+    // Cooperative-only scheduling (matches x86, which never preempts user threads
+    // and renders reliably). The timer ISR still drives vsync/timerfd-wake/kick
+    // above; we only suppress the preemptive *thread switch*. Preempting an engine
+    // thread mid-execution was the cause of the residual Dart EventHandler crash;
+    // now that the syscall-arg3 re-exec corruption is fixed, the engine is driven
+    // entirely by cooperative syscall yields and no longer needs preemption.
+    let preempt_enabled = false;
+    let should_preempt = preempt_enabled
+        && (slice_expired
+            || (cur != 0
+                && target != 0
+                && cur != target
+                && (crate::wm::input_pending_for(target) > 0
+                    || (target == 1 && crate::wm::embedder_baton_due()))));
     {
         static PREEMPT_TICK_LOG: AtomicU32 = AtomicU32::new(0);
         let n = PREEMPT_TICK_LOG.fetch_add(1, Ordering::Relaxed);
