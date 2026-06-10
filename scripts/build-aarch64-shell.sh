@@ -72,17 +72,70 @@ docker run --rm --platform linux/arm64 \
     -o "$ROOT/initramfs/system/lib/liboscortex_libc.so" \
     "$ROOT/userspace/libc/libc.c"
 
-# Arch-neutral shell assets (fonts, FontManifest, AssetManifest). Under AOT we do
-# NOT ship kernel_blob.bin (the libapp.so snapshot carries the program). If the
-# x86 build already prepared them, reuse; otherwise the embedder still boots with
-# just the engine-default fonts (text may be blank until fonts land).
-if [ -d "$X86_ASSETS_SRC" ] && [ "$X86_ASSETS_SRC" != "$ROOT/initramfs/system/flutter/flutter_assets" ]; then
-    cp -R "$X86_ASSETS_SRC/." "$ROOT/initramfs/system/flutter/flutter_assets/"
+# Arch-neutral shell assets (fonts, FontManifest, AssetManifest). These data files
+# are IDENTICAL across architectures — the engine reads them the same way on x86
+# and ARM. Under AOT we do NOT ship the JIT blobs (kernel_blob.bin / *_snapshot_data);
+# the libapp.so snapshot carries the program. Without these assets the shell renders
+# a blank (background-only) frame: no fonts → no text, no MaterialIcons → no icons.
+APP_DIR="$ROOT/apps/oscortex_app"
+APP_ASSETS_DIR="$APP_DIR/build/flutter_assets"
+SHELL_ASSETS="$ROOT/initramfs/system/flutter/flutter_assets"
+
+# Build the Flutter asset bundle if it is missing (produces build/flutter_assets:
+# FontManifest.json, AssetManifest.bin, fonts/, packages/, shaders/, assets/, …).
+if [ ! -f "$APP_ASSETS_DIR/FontManifest.json" ]; then
+    echo "[arm-shell]   building Flutter asset bundle (flutter build bundle)..."
+    if command -v flutter >/dev/null 2>&1; then
+        ( cd "$APP_DIR" && flutter --suppress-analytics build bundle --debug )
+    else
+        echo "[arm-shell]   WARN: flutter not on PATH and no prebuilt bundle — text/icons will be blank" >&2
+    fi
 fi
-# Remove any JIT-only blobs that may have been copied in (AOT carries the program).
-rm -f "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin" \
-      "$ROOT/initramfs/system/flutter/flutter_assets/vm_snapshot_data" \
-      "$ROOT/initramfs/system/flutter/flutter_assets/isolate_snapshot_data"
+
+if [ -f "$APP_ASSETS_DIR/FontManifest.json" ]; then
+    echo "[arm-shell]   staging arch-neutral assets + fonts from $APP_ASSETS_DIR"
+    mkdir -p "$SHELL_ASSETS"
+    for f in AssetManifest.bin AssetManifest.json FontManifest.json NOTICES.Z \
+             NativeAssetsManifest.json version.json; do
+        [ -f "$APP_ASSETS_DIR/$f" ] && cp "$APP_ASSETS_DIR/$f" "$SHELL_ASSETS/$f"
+    done
+    for d in fonts packages shaders assets; do
+        if [ -d "$APP_ASSETS_DIR/$d" ]; then
+            rm -rf "$SHELL_ASSETS/$d"
+            cp -R "$APP_ASSETS_DIR/$d" "$SHELL_ASSETS/$d"
+        fi
+    done
+    # CRITICAL (bare metal): Flutter has NO system font provider and the bundle ships
+    # no default/Roboto family, so Material's default-font text would loop forever in
+    # font fallback (or render blank). Alias the common default families to the bundled
+    # NotoSans so every Text (incl. Material widgets) resolves to a real glyph set.
+    NOTO_SRC="$APP_DIR/assets/fonts/NotoSans.ttf"
+    mkdir -p "$SHELL_ASSETS/assets/fonts"
+    [ -f "$NOTO_SRC" ] && cp "$NOTO_SRC" "$SHELL_ASSETS/assets/fonts/NotoSans.ttf"
+    FONT_MANIFEST="$SHELL_ASSETS/FontManifest.json"
+    if [ -f "$FONT_MANIFEST" ]; then
+        python3 - "$FONT_MANIFEST" <<'PYFONT'
+import json, sys, os
+p = sys.argv[1]
+m = json.load(open(p)) if os.path.exists(p) else []
+have = {e["family"] for e in m}
+noto = [{"asset": "assets/fonts/NotoSans.ttf"}]
+if "NotoSans" not in have:
+    m.append({"family": "NotoSans", "fonts": noto})
+for fam in ["Roboto", "sans-serif", "Arial", "Helvetica", ".SF UI Text", "DejaVu Sans"]:
+    if fam not in have:
+        m.append({"family": fam, "fonts": noto})
+json.dump(m, open(p, "w"))
+print("[fonts] aliased default families -> NotoSans:", sorted(e["family"] for e in m))
+PYFONT
+    fi
+else
+    echo "[arm-shell]   WARN: no Flutter asset bundle — shell will render blank (no fonts/icons)" >&2
+fi
+# Remove any JIT-only blobs (AOT carries the program in libapp.so).
+rm -f "$SHELL_ASSETS/kernel_blob.bin" \
+      "$SHELL_ASSETS/vm_snapshot_data" \
+      "$SHELL_ASSETS/isolate_snapshot_data"
 
 echo "[arm-shell] 6/6 building the aarch64 kernel (embeds the initramfs)..."
 # Force a rebuild of the initramfs (kernel/build.rs reads the initramfs/ dir).
