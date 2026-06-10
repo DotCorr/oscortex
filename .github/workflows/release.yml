@@ -123,15 +123,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # x86_64 bootable ISO
-          cp oscortex.iso "dist/oscortex-${{ steps.ver.outputs.tag }}.iso"
-          sha256sum "dist/oscortex-${{ steps.ver.outputs.tag }}.iso" \
-            > "dist/oscortex-${{ steps.ver.outputs.tag }}.iso.sha256"
-          # aarch64 kernel ELF
-          cp target/aarch64-unknown-none/release/kernel \
-            "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel"
-          sha256sum "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel" \
-            > "dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel.sha256"
+          tag="${{ steps.ver.outputs.tag }}"
+          # Arch-labelled names so the two artifacts are unambiguous:
+          #   x86_64 → bootable ISO (Limine);  aarch64 → raw kernel ELF (-kernel).
+          cp oscortex.iso "dist/oscortex-x86_64-${tag}.iso"
+          cp target/aarch64-unknown-none/release/kernel "dist/oscortex-aarch64-${tag}.kernel"
+          # Checksums computed from inside dist/ so each .sha256 lists a bare
+          # filename and `sha256sum -c` works after downloading just the pair.
+          ( cd dist
+            sha256sum "oscortex-x86_64-${tag}.iso"     > "oscortex-x86_64-${tag}.iso.sha256"
+            sha256sum "oscortex-aarch64-${tag}.kernel" > "oscortex-aarch64-${tag}.kernel.sha256" )
           ls -lh dist
 
       - name: Publish GitHub Release
@@ -145,10 +146,15 @@ jobs:
           body: |
             Automated production release built from `main`.
 
+            Two artifacts (one per architecture); they differ in type because the
+            arches boot differently — x86_64 via the Limine bootloader (a bootable
+            **ISO**), aarch64 via QEMU `-M virt -kernel` (a raw **kernel ELF**, no
+            bootloader/ISO).
+
             **Artifacts:**
-            - `oscortex-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS + UEFI),
-              built via `cargo xtask iso`. **Platform-scope** (the full x86 Flutter
-              shell is staged separately by `scripts/build-iso.sh`).
+            - `oscortex-x86_64-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS +
+              UEFI), built via `cargo xtask iso`. **Platform-scope** (the full x86
+              Flutter shell is staged separately by `scripts/build-iso.sh`).
             - `oscortex-aarch64-<tag>.kernel` — **render-capable** aarch64 kernel: it
               embeds the full Flutter shell runtime (engine + AOT shell snapshot + ICU
               + fonts/assets), fetched from the `oscortex-engine-1` release at build
@@ -163,7 +169,7 @@ jobs:
 
             Verify with the attached `.sha256` files.
           files: |
-            dist/oscortex-${{ steps.ver.outputs.tag }}.iso
-            dist/oscortex-${{ steps.ver.outputs.tag }}.iso.sha256
+            dist/oscortex-x86_64-${{ steps.ver.outputs.tag }}.iso
+            dist/oscortex-x86_64-${{ steps.ver.outputs.tag }}.iso.sha256
             dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel
             dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel.sha256
