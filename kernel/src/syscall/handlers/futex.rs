@@ -697,16 +697,23 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
 
-            // x86 gave the newborn an immediate slice by entering the child
-            // from inside the creator's pthread_create syscall (never returning;
-            // delivering r=0 on the creator's later cooperative resume). On
-            // aarch64 that nested enter-while-in-a-syscall corrupts the creator's
-            // resume so the *next* fml::Thread's pthread_create returns non-zero
-            // (thread.cc:80 FML_CHECK abort) — reproducible even with the x30/LR
-            // and 4-byte-svc-rewind fixes in place. Keep it OFF on aarch64: the
-            // child becomes runnable here and is picked up by normal cooperative
-            // scheduling / timer preemption the next time the creator yields.
-            #[cfg(not(target_arch = "aarch64"))]
+            // Give the newborn an IMMEDIATE slice by entering the child from inside
+            // the creator's pthread_create syscall (never returning here; the
+            // creator gets r=0 on its later cooperative resume). The Flutter engine
+            // bootstrap depends on this ordering: FlutterEngineRunInitialized posts
+            // the root-isolate-launch task to the freshly-created UI thread, and the
+            // platform thread (pid 1) then blocks waiting for it. If the UI thread
+            // is only marked Running and left for "later" pickup, main()/runApp may
+            // never run promptly → no frame is ever scheduled → nothing presents.
+            //
+            // This was OFF on aarch64 because the nested enter-while-in-a-syscall
+            // corrupted the creator's resume (next pthread_create FML_CHECK abort).
+            // That corruption was the cooperative-resume register/stack loss since
+            // FIXED: callee-saved x24-x28 + x30/LR, FP/SIMD (vector-stub save), the
+            // RETURN-mode x0=rax delivery, and the SP_EL1 syscall-stack reset. The
+            // creator resumes via build_image, which is now lossless for a syscall
+            // boundary (caller-saved x6/x7/x9-x18 are dead across the svc per the
+            // ABI; everything live is preserved), so re-enabling is safe.
             {
                 let parent = crate::process::current_pid();
                 if parent != 0 && child_pid != parent {
