@@ -134,6 +134,14 @@ pub fn capture_from_trap(frame: &super::vectors::TrapFrame) {
 fn production_svc_handler(f: &mut super::vectors::TrapFrame) {
     capture_from_trap(f);
 
+    // Persist this thread's FP/SIMD file — captured into the trap frame by the
+    // vector stub at SVC entry, BEFORE any kernel NEON ran — into its process
+    // slot. A blocking syscall (epoll_wait/futex/cond) yields cooperatively and
+    // is later resumed via enter_user_sysret/from_frame, which restores FP from
+    // this slot. Without it the resumed Dart worker inherits kernel-clobbered
+    // v0..v31 → nondeterministic wild-pointer faults.
+    crate::process::aarch64_store_fp_from_frame(crate::process::current_pid(), f);
+
     let nr = f.x[8];
     let ret = crate::syscall::dispatch_fast(
         nr, f.x[0], f.x[1], f.x[2], f.x[3], f.x[4],

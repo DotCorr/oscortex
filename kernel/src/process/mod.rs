@@ -178,13 +178,20 @@ pub struct Process {
     /// lost across a preemptive switch. The ARM timer ISR saves the live
     /// `vectors::TrapFrame` here and restores it on resume, giving full-fidelity
     /// preemption while the shared scheduler still owns the switch *decision*.
-    /// Layout matches `arch::aarch64::vectors::TrapFrame` (36 × u64).
+    /// Layout matches `arch::aarch64::vectors::TrapFrame` (102 × u64):
+    /// [0..35]=GPRs/sysregs/pad, [36..100)=v0..v31, 100=FPSR, 101=FPCR. The FP
+    /// region doubles as the cooperative-yield FP slot (see `arch_fp_valid`).
     #[cfg(target_arch = "aarch64")]
-    pub arch_trapframe: [u64; 36],
+    pub arch_trapframe: [u64; 102],
     /// aarch64 only: true once `arch_trapframe` holds a valid timer-preempt
     /// snapshot to restore (vs. a fresh/syscall-entered thread).
     #[cfg(target_arch = "aarch64")]
     pub arch_frame_valid: bool,
+    /// aarch64 only: true once the FP region of `arch_trapframe` (words 36..102)
+    /// holds this thread's FP/SIMD file captured at SVC entry by the vector stub
+    /// (before kernel NEON ran), so a cooperative resume can restore it.
+    #[cfg(target_arch = "aarch64")]
+    pub arch_fp_valid: bool,
     /// aarch64 only: the user link register (x30) captured at the last SVC
     /// boundary. AArch64 keeps return addresses in LR, not on the stack, so a
     /// thread that yields mid-syscall must have x30 restored on resume — without
@@ -260,9 +267,11 @@ impl Process {
             user_stack_size: 0,
             current_cpu: None,
             #[cfg(target_arch = "aarch64")]
-            arch_trapframe: [0u64; 36],
+            arch_trapframe: [0u64; 102],
             #[cfg(target_arch = "aarch64")]
             arch_frame_valid: false,
+            #[cfg(target_arch = "aarch64")]
+            arch_fp_valid: false,
             #[cfg(target_arch = "aarch64")]
             user_lr: 0,
             #[cfg(target_arch = "aarch64")]
@@ -293,12 +302,15 @@ impl Process {
 /// blocking on a contended PTABLE_LOCK from inside an ISR would deadlock. Returns
 /// false if the lock was busy (the caller then skips the switch this tick).
 #[cfg(target_arch = "aarch64")]
-pub fn arch_store_trapframe(pid: u32, frame: &[u64; 36]) -> bool {
+pub fn arch_store_trapframe(pid: u32, frame: &[u64; 102]) -> bool {
     if let Some(_g) = PTABLE_LOCK.try_lock() {
         let p = unsafe { &mut PTABLE[idx_of(pid)] };
         if p.pid == pid {
             p.arch_trapframe = *frame;
             p.arch_frame_valid = true;
+            // The full frame includes FP; mark it valid too so a cooperative
+            // resume of this timer-preempted thread restores FP from it.
+            p.arch_fp_valid = true;
         }
         true
     } else {
@@ -311,15 +323,50 @@ pub fn arch_store_trapframe(pid: u32, frame: &[u64; 36]) -> bool {
 /// rebuilds the frame from `regs` instead of replaying a stale snapshot. Uses
 /// `try_lock` for the same ISR-safety reason as `arch_store_trapframe`.
 #[cfg(target_arch = "aarch64")]
-pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 36]> {
+pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 102]> {
     let _g = PTABLE_LOCK.try_lock()?;
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid && p.arch_frame_valid {
         p.arch_frame_valid = false;
+        // FP rides this frame; the resume path consumes both.
+        p.arch_fp_valid = false;
         Some(p.arch_trapframe)
     } else {
         None
     }
+}
+
+/// aarch64: stash the FP/SIMD file from a live trap frame (captured at SVC entry
+/// by the vector stub, BEFORE kernel NEON ran) into `pid`'s arch slot, so a
+/// cooperative resume can restore it. Writes ONLY the FP region (words 36..102),
+/// leaving the GPR words to the cooperative GPR snapshot.
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64_store_fp_from_frame(pid: u32, f: &crate::arch::aarch64::vectors::TrapFrame) {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid != pid { return; }
+    for i in 0..32 {
+        p.arch_trapframe[36 + i * 2] = f.v[i][0];
+        p.arch_trapframe[36 + i * 2 + 1] = f.v[i][1];
+    }
+    p.arch_trapframe[100] = f.fpsr;
+    p.arch_trapframe[101] = f.fpcr;
+    p.arch_fp_valid = true;
+}
+
+/// aarch64: take `pid`'s saved FP image (64 v-words + FPSR + FPCR) for a
+/// cooperative resume, or None if no FP was captured (fresh thread). Does NOT
+/// clear arch_frame_valid (the GPR snapshot path owns that).
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64_take_fp(pid: u32) -> Option<[u64; 66]> {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid != pid || !p.arch_fp_valid { return None; }
+    let mut out = [0u64; 66];
+    out[..64].copy_from_slice(&p.arch_trapframe[36..100]);
+    out[64] = p.arch_trapframe[100];
+    out[65] = p.arch_trapframe[101];
+    Some(out)
 }
 
 /// aarch64: read the callee-saved x24–x28 captured for `pid` (used to populate
@@ -732,6 +779,7 @@ pub fn spawn_with_bootstrap(
         #[cfg(target_arch = "aarch64")]
         {
             p.arch_frame_valid = false;
+            p.arch_fp_valid = false;
         }
     }
 
@@ -929,26 +977,41 @@ pub fn save_regs(pid: u32, regs: UserRegs) {
 /// call sites the CPU is always executing on behalf of `pid`, so saving
 /// the live XMM/YMM/MXCSR to that slot is always correct.
 pub fn save_xstate(pid: u32) {
-    let idx = idx_of(pid);
-    let _g = PTABLE_LOCK.lock();
-    let p = unsafe { &mut PTABLE[idx] };
-    if p.pid != pid {
-        return;
+    // aarch64: FP/SIMD is captured in the vector stub at trap entry (TrapFrame.v)
+    // and round-trips via arch_trapframe / the cooperative FP slot — NOT here.
+    // This runs AFTER the syscall handler's NEON memcpy/memset, so saving the live
+    // v-file now would store kernel garbage. No-op on aarch64.
+    #[cfg(target_arch = "aarch64")]
+    { let _ = pid; }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let idx = idx_of(pid);
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &mut PTABLE[idx] };
+        if p.pid != pid {
+            return;
+        }
+        let ptr = p.xstate.0.as_mut_ptr();
+        unsafe { crate::arch::cpu::save_xstate_to(ptr) };
     }
-    let ptr = p.xstate.0.as_mut_ptr();
-    unsafe { crate::arch::cpu::save_xstate_to(ptr) };
 }
 
 /// Restore CPU xstate image from process slot.
 pub fn restore_xstate(pid: u32) {
-    let idx = idx_of(pid);
-    let _g = PTABLE_LOCK.lock();
-    let p = unsafe { &PTABLE[idx] };
-    if p.pid != pid || p.state != ProcState::Running {
-        return;
+    // aarch64: FP rides the trap frame (see save_xstate). No-op here.
+    #[cfg(target_arch = "aarch64")]
+    { let _ = pid; }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let idx = idx_of(pid);
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx] };
+        if p.pid != pid || p.state != ProcState::Running {
+            return;
+        }
+        let ptr = p.xstate.0.as_ptr();
+        unsafe { crate::arch::cpu::restore_xstate_from(ptr) };
     }
-    let ptr = p.xstate.0.as_ptr();
-    unsafe { crate::arch::cpu::restore_xstate_from(ptr) };
 }
 
 /// Safely attempt to claim the given PID for execution on `my_cpu`.
@@ -1643,6 +1706,12 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         x28: cs.4,
     };
 
+    // aarch64: the FP/SIMD file captured at SVC entry by the vector stub (before
+    // kernel NEON). The full-frame path above already restores FP; this is for
+    // the build_image fall-through (no full frame). None for a fresh thread.
+    #[cfg(target_arch = "aarch64")]
+    let fp_img = aarch64_take_fp(pid);
+
     if preempted_by_timer {
         // ── IRET path ────────────────────────────────────────────────────────
         // This thread was timer-preempted at an arbitrary user instruction, so
@@ -1650,6 +1719,9 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         // RFLAGS) before returning.  SYSRETQ is wrong here because it would
         // set RIP=RCX and RFLAGS=R11, corrupting those registers and losing
         // the real FLAGS state (e.g. CF/ZF from a cmp instruction).
+        #[cfg(target_arch = "aarch64")]
+        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img.as_ref()) }
+        #[cfg(not(target_arch = "aarch64"))]
         unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
@@ -1662,6 +1734,9 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // SysV ABI mandates that callee-saved regs (rbx, rbp, r12–r15) survive
     // a function call, and the userspace SYSCALL trampoline is such a call.
     log::trace!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
+    #[cfg(target_arch = "aarch64")]
+    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img.as_ref()) }
+    #[cfg(not(target_arch = "aarch64"))]
     unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
@@ -1783,10 +1858,19 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         x28: cs.4,
     };
 
+    #[cfg(target_arch = "aarch64")]
+    let fp_img = aarch64_take_fp(pid);
+
     if preempted_by_timer {
+        #[cfg(target_arch = "aarch64")]
+        unsafe { crate::arch::enter_user_iret(&enter_regs, fp_img.as_ref()) }
+        #[cfg(not(target_arch = "aarch64"))]
         unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe { crate::arch::enter_user_sysret(&enter_regs, fp_img.as_ref()) }
+    #[cfg(not(target_arch = "aarch64"))]
     unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
@@ -1854,7 +1938,9 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
         p_cur.current_cpu = None; // Switch away from cur_pid
     }
 
-    // Save XSTATE for cur_pid
+    // Save XSTATE for cur_pid (x86 only; aarch64 FP is already in cur's TrapFrame,
+    // stored via arch_store_trapframe — the live v-file here is kernel garbage).
+    #[cfg(not(target_arch = "aarch64"))]
     if p_cur.pid == cur_pid {
         let ptr = p_cur.xstate.0.as_mut_ptr();
         unsafe { crate::arch::cpu::save_xstate_to(ptr) };
@@ -1870,9 +1956,13 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
     p_next.current_cpu = Some(my_cpu);
     let next_regs = p_next.regs;
 
-    // Restore XSTATE for next_pid
-    let ptr_next = p_next.xstate.0.as_ptr();
-    unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+    // Restore XSTATE for next_pid (x86 only; aarch64 restores FP via the trap
+    // frame on eret / enter_user_from_frame).
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let ptr_next = p_next.xstate.0.as_ptr();
+        unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+    }
 
     // Update the per-CPU scheduler state
     crate::process::set_current_pid(next_pid);
@@ -1912,7 +2002,9 @@ pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u3
             p_cur.current_cpu = None; // Switch away from cur_pid
         }
 
-        // Save XSTATE for cur_pid
+        // Save XSTATE for cur_pid (x86 only; aarch64 FP is already in cur's
+        // TrapFrame, stored via arch_store_trapframe).
+        #[cfg(not(target_arch = "aarch64"))]
         if p_cur.pid == cur_pid {
             let ptr = p_cur.xstate.0.as_mut_ptr();
             unsafe { crate::arch::cpu::save_xstate_to(ptr) };
@@ -1928,9 +2020,13 @@ pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u3
         p_next.current_cpu = Some(my_cpu);
         let next_regs = p_next.regs;
 
-        // Restore XSTATE for next_pid
-        let ptr_next = p_next.xstate.0.as_ptr();
-        unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+        // Restore XSTATE for next_pid (x86 only; aarch64 restores FP via the
+        // trap frame on eret / enter_user_from_frame).
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let ptr_next = p_next.xstate.0.as_ptr();
+            unsafe { crate::arch::cpu::restore_xstate_from(ptr_next) };
+        }
 
         // Update the per-CPU scheduler state
         crate::process::set_current_pid(next_pid);

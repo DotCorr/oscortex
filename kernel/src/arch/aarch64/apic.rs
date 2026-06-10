@@ -118,7 +118,12 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     // ever produced or presented. (aarch64 had only a no-op vsync_due() scaffold.)
     if vsync_due() {
         crate::wm::tick();
-        crate::compositor::tick();
+        // Deliver the vsync baton ONLY — do NOT call compositor::tick() here: its
+        // render_frame() does a full-screen blit/fill that, in the timer ISR under
+        // slow emulation, starves the engine's main thread (boot livelocked in
+        // fb::fill_rect at "[host] starting"). Flutter frames render via the
+        // present syscall path (present_surface → render_frame) in normal context.
+        crate::compositor::vsync_baton_tick();
         reset_vsync_last_tsc();
     }
 
@@ -169,7 +174,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     // Snapshot the FULL ARM frame for `cur` so its scratch registers survive.
     // If the PTABLE lock is busy, skip preemption this tick (resume cur) rather
     // than switch with a half-saved frame.
-    let full: [u64; 36] = frame_as_array(f);
+    let full: [u64; 102] = frame_as_array(f);
     if !crate::process::arch_store_trapframe(cur, &full) {
         return;
     }
@@ -293,26 +298,39 @@ fn userregs_to_trapframe(f: &mut super::vectors::TrapFrame, r: &crate::process::
     f.x[29] = r.rbp;
 }
 
-/// Serialise a trap frame to the 36-word array stored in `Process::arch_trapframe`.
+/// Serialise a trap frame to the 102-word array stored in `Process::arch_trapframe`.
 /// Layout matches `vectors::TrapFrame` / the SAVE_FRAME stack image:
-/// [0..31]=x0..x30, 31=SP_EL0, 32=ELR, 33=SPSR, 34=ESR, 35=pad.
-fn frame_as_array(f: &super::vectors::TrapFrame) -> [u64; 36] {
-    let mut a = [0u64; 36];
+/// [0..31]=x0..x30, 31=SP_EL0, 32=ELR, 33=SPSR, 34=ESR, 35=pad,
+/// [36..100)=v0..v31 (2 words each), 100=FPSR, 101=FPCR.
+fn frame_as_array(f: &super::vectors::TrapFrame) -> [u64; 102] {
+    let mut a = [0u64; 102];
     a[..31].copy_from_slice(&f.x);
     a[31] = f.sp_el0;
     a[32] = f.elr;
     a[33] = f.spsr;
     a[34] = f.esr;
+    for (i, lane) in f.v.iter().enumerate() {
+        a[36 + i * 2] = lane[0];
+        a[36 + i * 2 + 1] = lane[1];
+    }
+    a[100] = f.fpsr;
+    a[101] = f.fpcr;
     a
 }
 
-/// Restore a 36-word saved array into a live trap frame.
-fn apply_array_to_frame(f: &mut super::vectors::TrapFrame, a: &[u64; 36]) {
+/// Restore a 102-word saved array into a live trap frame (GPRs + FP/SIMD).
+fn apply_array_to_frame(f: &mut super::vectors::TrapFrame, a: &[u64; 102]) {
     f.x.copy_from_slice(&a[..31]);
     f.sp_el0 = a[31];
     f.elr = a[32];
     f.spsr = a[33];
     f.esr = a[34];
+    for i in 0..32 {
+        f.v[i][0] = a[36 + i * 2];
+        f.v[i][1] = a[36 + i * 2 + 1];
+    }
+    f.fpsr = a[100];
+    f.fpcr = a[101];
 }
 
 /// Finish any deferred MMIO mapping after `mm::init()`.

@@ -145,14 +145,77 @@ unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
     )
 }
 
+/// Restore the GPR image (`img`) AND the FP/SIMD file (`fp`: 64 v-words + FPSR +
+/// FPCR), then `eret`. FP is restored FIRST (x1/x2 scratch) before the GPR image
+/// overwrites the integer file. Never returns.
+///
+/// ld1/st1 (multiple structures) permit unaligned bases (SCTLR_EL1.A is 0 here),
+/// so an 8-aligned `[u64;66]` is fine.
+///
+/// # Safety
+/// As [`eret_to_el0`], plus `fp` must be a valid 66-word FP image.
+#[inline(never)]
+unsafe fn eret_to_el0_fp(img: &[u64; 34], fp: &[u64; 66]) -> ! {
+    core::arch::asm!(
+        // FP first: x1 = &fp[0]. Restore v0..v31 then FPSR/FPCR.
+        "mov x1, {fp}",
+        "ld1 {{v0.2d,  v1.2d,  v2.2d,  v3.2d}},  [x1], #64",
+        "ld1 {{v4.2d,  v5.2d,  v6.2d,  v7.2d}},  [x1], #64",
+        "ld1 {{v8.2d,  v9.2d,  v10.2d, v11.2d}}, [x1], #64",
+        "ld1 {{v12.2d, v13.2d, v14.2d, v15.2d}}, [x1], #64",
+        "ld1 {{v16.2d, v17.2d, v18.2d, v19.2d}}, [x1], #64",
+        "ld1 {{v20.2d, v21.2d, v22.2d, v23.2d}}, [x1], #64",
+        "ld1 {{v24.2d, v25.2d, v26.2d, v27.2d}}, [x1], #64",
+        "ld1 {{v28.2d, v29.2d, v30.2d, v31.2d}}, [x1], #64",
+        "ldr x2, [x1], #8",
+        "msr fpsr, x2",
+        "ldr x2, [x1]",
+        "msr fpcr, x2",
+        // GPRs (same as eret_to_el0; x18 = image base).
+        "mov x18, {base}",
+        "ldr x16, [x18, #(31 * 8)]",
+        "msr sp_el0, x16",
+        "ldr x16, [x18, #(32 * 8)]",
+        "msr elr_el1, x16",
+        "ldr x16, [x18, #(33 * 8)]",
+        "msr spsr_el1, x16",
+        "ldp x0,  x1,  [x18, #(0  * 8)]",
+        "ldp x2,  x3,  [x18, #(2  * 8)]",
+        "ldp x4,  x5,  [x18, #(4  * 8)]",
+        "ldp x6,  x7,  [x18, #(6  * 8)]",
+        "ldp x8,  x9,  [x18, #(8  * 8)]",
+        "ldp x10, x11, [x18, #(10 * 8)]",
+        "ldp x12, x13, [x18, #(12 * 8)]",
+        "ldp x14, x15, [x18, #(14 * 8)]",
+        "ldp x19, x20, [x18, #(19 * 8)]",
+        "ldp x21, x22, [x18, #(21 * 8)]",
+        "ldp x23, x24, [x18, #(23 * 8)]",
+        "ldp x25, x26, [x18, #(25 * 8)]",
+        "ldp x27, x28, [x18, #(27 * 8)]",
+        "ldr x29,      [x18, #(29 * 8)]",
+        "ldr x30,      [x18, #(30 * 8)]",
+        "ldr x17,      [x18, #(17 * 8)]",
+        "ldr x16,      [x18, #(16 * 8)]",
+        "ldr x18,      [x18, #(18 * 8)]",
+        "eret",
+        base = in(reg) img.as_ptr(),
+        fp   = in(reg) fp.as_ptr(),
+        options(noreturn),
+    )
+}
+
 /// ERET entry mirroring the x86_64 IRETQ path (timer-preempted re-entry).
+/// `fp` carries the thread's FP/SIMD file (None for a fresh thread → HW default).
 ///
 /// # Safety
 /// TTBR0_EL1 must already point at the target thread's address space.
 #[inline(never)]
-pub unsafe fn enter_user_iret(regs: &EnterUserRegs) -> ! {
+pub unsafe fn enter_user_iret(regs: &EnterUserRegs, fp: Option<&[u64; 66]>) -> ! {
     let img = build_image(regs);
-    eret_to_el0(&img)
+    match fp {
+        Some(fp) => eret_to_el0_fp(&img, fp),
+        None => eret_to_el0(&img),
+    }
 }
 
 /// ERET entry mirroring the x86_64 SYSRETQ path (syscall-yield re-entry).
@@ -160,9 +223,12 @@ pub unsafe fn enter_user_iret(regs: &EnterUserRegs) -> ! {
 /// # Safety
 /// TTBR0_EL1 must already point at the target thread's address space.
 #[inline(never)]
-pub unsafe fn enter_user_sysret(regs: &EnterUserRegs) -> ! {
+pub unsafe fn enter_user_sysret(regs: &EnterUserRegs, fp: Option<&[u64; 66]>) -> ! {
     let img = build_image(regs);
-    eret_to_el0(&img)
+    match fp {
+        Some(fp) => eret_to_el0_fp(&img, fp),
+        None => eret_to_el0(&img),
+    }
 }
 
 /// Resume a thread from its full saved trap-frame snapshot — the 36-word image
@@ -177,17 +243,22 @@ pub unsafe fn enter_user_sysret(regs: &EnterUserRegs) -> ! {
 /// that the `build_image` path would silently drop → near-null deref.
 ///
 /// Frame layout (matches `apic.rs::frame_as_array`):
-///   `[0..31]=x0..x30, 31=SP_EL0, 32=ELR(PC), 33=SPSR, 34=ESR, 35=pad`.
-/// The first 34 words are exactly the `img` layout [`eret_to_el0`] consumes.
+///   `[0..31]=x0..x30, 31=SP_EL0, 32=ELR(PC), 33=SPSR, 34=ESR, 35=pad,
+///    [36..100)=v0..v31, 100=FPSR, 101=FPCR`.
+/// The first 34 words are the `img` layout; the FP region restores v0..v31.
 ///
 /// # Safety
 /// TTBR0_EL1 must already point at the target thread's address space and the
 /// frame must describe a valid EL0 context.
 #[inline(never)]
-pub unsafe fn enter_user_from_frame(frame: &[u64; 36]) -> ! {
+pub unsafe fn enter_user_from_frame(frame: &[u64; 102]) -> ! {
     let mut img = [0u64; 34];
     img.copy_from_slice(&frame[..34]);
-    eret_to_el0(&img)
+    let mut fp = [0u64; 66];
+    fp[..64].copy_from_slice(&frame[36..100]);
+    fp[64] = frame[100];
+    fp[65] = frame[101];
+    eret_to_el0_fp(&img, &fp)
 }
 
 /// Directly enter EL0 at a given PC/SP with seeded x0..x2 (bring-up helper).
