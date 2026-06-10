@@ -20,19 +20,33 @@
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Full integer register context saved on every EL1 exception entry.
+/// Full integer + FP/SIMD register context saved on every EL1 exception entry.
 ///
-/// Layout is fixed and matched byte-for-byte by the asm save/restore in
-/// `vectors.S`-equivalent `global_asm!` below. Total size: 36 × 8 = 288 bytes
-/// (34 fields + ELR/SPSR), kept 16-byte aligned.
-#[repr(C)]
+/// Layout is fixed and matched byte-for-byte by the asm save/restore in the
+/// `global_asm!` below. The FP/SIMD area (v0..v31 + FPSR/FPCR) is saved in the
+/// stub BEFORE any Rust (and thus any compiler-emitted kernel NEON: memcpy/
+/// memset/ub-checks) runs — that is what keeps a preempted Dart worker's unboxed
+/// doubles / SIMD lanes intact. The old deep save (cpu::save_xstate_to, called
+/// from the timer ISR / syscall handlers AFTER kernel NEON had already clobbered
+/// v0..v31) captured kernel garbage → nondeterministic worker corruption.
+///
+/// Byte offsets (load-bearing — the asm depends on them):
+///   x[0..31]→0..248, sp_el0→248, elr→256, spsr→264, esr→272, _pad→280,
+///   v[0..32]→288..800 (16 bytes each), fpsr→800, fpcr→808.
+/// Total size 816 = 51 × 16, kept 16-byte aligned (so `sub sp,sp,#816` keeps SP
+/// 16-aligned and the v-area at 288 is 16-aligned for st1/ld1 .2d).
+#[repr(C, align(16))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct TrapFrame {
-    pub x: [u64; 31], // x0..x30 (x30 = LR)
-    pub sp_el0: u64,  // user stack pointer (SP_EL0)
-    pub elr: u64,     // ELR_EL1 (return address)
-    pub spsr: u64,    // SPSR_EL1 (saved PSTATE)
-    pub esr: u64,     // ESR_EL1 (syndrome — filled by the dispatcher path)
+    pub x: [u64; 31],      // x0..x30 (x30 = LR)   bytes 0..248
+    pub sp_el0: u64,       // user stack pointer    248
+    pub elr: u64,          // ELR_EL1               256
+    pub spsr: u64,         // SPSR_EL1              264
+    pub esr: u64,          // ESR_EL1               272
+    pub _pad: u64,         // word 35 pad → keeps v 16-aligned at 288
+    pub v: [[u64; 2]; 32], // v0..v31 (128-bit)     288..800
+    pub fpsr: u64,         // 800
+    pub fpcr: u64,         // 808  → total 816
 }
 
 /// Count of each exception kind seen, for bring-up visibility.
@@ -118,7 +132,7 @@ __vectors_el1:
 
 // ── Save macro: push a TrapFrame onto the current stack ─────────────────────
 .macro SAVE_FRAME
-    sub     sp, sp, #(36 * 8)               // room for x0..x30, sp_el0, elr, spsr, esr
+    sub     sp, sp, #(102 * 8)              // GPR(36) + v0..v31(64) + fpsr/fpcr(2)
     stp     x0,  x1,  [sp, #(0  * 8)]
     stp     x2,  x3,  [sp, #(2  * 8)]
     stp     x4,  x5,  [sp, #(4  * 8)]
@@ -141,11 +155,39 @@ __vectors_el1:
     mrs     x1, spsr_el1
     stp     x0,  x1,  [sp, #(32 * 8)]       // elr, spsr
     mrs     x0, esr_el1
-    str     x0,       [sp, #(34 * 8)]       // esr
+    str     x0,       [sp, #(34 * 8)]       // esr  (word 35 = pad, untouched)
+    // ── FP/SIMD: save v0..v31 + FPSR/FPCR. x0..x2 are already on the stack
+    // above, so they are free scratch here. Base (sp + 288) is 16-aligned
+    // (sp 16-aligned, 288 = 18×16); st1 .2d post-indexes 4 vectors (#64) each. ─
+    add     x0, sp, #(36 * 8)              // &v[0] = frame + 288
+    st1     {{v0.2d,  v1.2d,  v2.2d,  v3.2d}},  [x0], #64
+    st1     {{v4.2d,  v5.2d,  v6.2d,  v7.2d}},  [x0], #64
+    st1     {{v8.2d,  v9.2d,  v10.2d, v11.2d}}, [x0], #64
+    st1     {{v12.2d, v13.2d, v14.2d, v15.2d}}, [x0], #64
+    st1     {{v16.2d, v17.2d, v18.2d, v19.2d}}, [x0], #64
+    st1     {{v20.2d, v21.2d, v22.2d, v23.2d}}, [x0], #64
+    st1     {{v24.2d, v25.2d, v26.2d, v27.2d}}, [x0], #64
+    st1     {{v28.2d, v29.2d, v30.2d, v31.2d}}, [x0], #64    // x0 = &fpsr (frame+800)
+    mrs     x1, fpsr
+    mrs     x2, fpcr
+    stp     x1,  x2,  [x0]                 // fpsr @800, fpcr @808
 .endm
 
 // ── Restore macro: pop a TrapFrame and eret ─────────────────────────────────
 .macro RESTORE_FRAME
+    // ── FP/SIMD first, while x0..x2 are free scratch (reloaded from frame below). ─
+    add     x0, sp, #(36 * 8)              // &v[0]
+    ld1     {{v0.2d,  v1.2d,  v2.2d,  v3.2d}},  [x0], #64
+    ld1     {{v4.2d,  v5.2d,  v6.2d,  v7.2d}},  [x0], #64
+    ld1     {{v8.2d,  v9.2d,  v10.2d, v11.2d}}, [x0], #64
+    ld1     {{v12.2d, v13.2d, v14.2d, v15.2d}}, [x0], #64
+    ld1     {{v16.2d, v17.2d, v18.2d, v19.2d}}, [x0], #64
+    ld1     {{v20.2d, v21.2d, v22.2d, v23.2d}}, [x0], #64
+    ld1     {{v24.2d, v25.2d, v26.2d, v27.2d}}, [x0], #64
+    ld1     {{v28.2d, v29.2d, v30.2d, v31.2d}}, [x0], #64    // x0 = &fpsr
+    ldp     x1,  x2,  [x0]
+    msr     fpsr, x1
+    msr     fpcr, x2
     ldp     x0,  x1,  [sp, #(32 * 8)]       // elr, spsr
     msr     elr_el1, x0
     msr     spsr_el1, x1
@@ -167,7 +209,7 @@ __vectors_el1:
     ldp     x26, x27, [sp, #(26 * 8)]
     ldp     x28, x29, [sp, #(28 * 8)]
     ldr     x30,      [sp, #(30 * 8)]
-    add     sp, sp, #(36 * 8)
+    add     sp, sp, #(102 * 8)
 .endm
 
 // ── Per-kind entry stubs: save, call dispatcher (x0=frame, x1=kind), restore ─

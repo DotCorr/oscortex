@@ -1024,6 +1024,22 @@ pub fn render_frame() {
     crate::wm::push_vsync(c.frame_counter);
 }
 
+/// Lightweight vsync handler for the timer ISR: advance the frame counter and
+/// deliver the vsync baton (push_vsync) WITHOUT rendering. The Flutter present
+/// path (`present_surface_for` → `render_frame`) does the heavy compositing in a
+/// normal syscall context, so `render_frame` must NEVER run in the timer ISR —
+/// under slow emulation (TCG) a full-screen fill there starves the engine's main
+/// thread and the boot livelocks in `fb::fill_rect` before the engine even loads.
+/// (The boot-splash animation is sacrificed; the shell renders via present.)
+pub fn vsync_baton_tick() {
+    if let Some(mut c) = COMP.try_lock() {
+        c.frame_counter = c.frame_counter.wrapping_add(1);
+        let f = c.frame_counter;
+        drop(c);
+        crate::wm::push_vsync(f);
+    }
+}
+
 pub fn tick() {
     if !crate::drivers::fb::is_ready() {
         return;
