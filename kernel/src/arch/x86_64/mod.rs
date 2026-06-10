@@ -170,3 +170,11 @@ pub fn rdtsc() -> u64 {
     }
     ((hi as u64) << 32) | (lo as u64)
 }
+
+/// Monotonic nanoseconds from the TSC (assumes ~3 GHz — the existing convention).
+/// Arch-neutral callers (monotonic_ns / clock_gettime) use this so aarch64 can
+/// provide a correctly-scaled clock; x86 keeps the prior tsc/3 behavior.
+#[inline(always)]
+pub fn rdtsc_ns() -> u64 {
+    rdtsc() / 3
+}
