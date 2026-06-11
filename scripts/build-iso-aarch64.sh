@@ -18,7 +18,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-LIMINE_DIR="/opt/homebrew/share/limine"
+# Limine asset dir (limine-uefi-cd.bin, BOOTAA64.EFI). Defaults to the Homebrew
+# location for local macOS builds; override with LIMINE_DIR=... on CI (the GitHub
+# runner clones limine to $HOME/limine).
+LIMINE_DIR="${LIMINE_DIR:-/opt/homebrew/share/limine}"
 ISO_ROOT="$ROOT/iso_root_aarch64"
 OUTPUT="$ROOT/oscortex-aarch64.iso"
 TARGET="aarch64-unknown-none"
