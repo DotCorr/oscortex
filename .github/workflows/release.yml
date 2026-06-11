@@ -118,20 +118,29 @@ jobs:
             --no-default-features --features arch-aarch64 \
             -Z build-std=core,compiler_builtins,alloc \
             -Z build-std-features=compiler-builtins-mem
+          # Also build the UEFI/Limine bootable ISO (the same render runtime is
+          # already staged in initramfs/). This is what boots in UTM / VMs / bare
+          # metal — a real ISO, not just the raw -kernel ELF. build-iso-aarch64.sh
+          # builds a higher-half limine-boot kernel and packages it with
+          # BOOTAA64.EFI; LIMINE_DIR was exported by the limine install step.
+          LIMINE_DIR="$HOME/limine" bash scripts/build-iso-aarch64.sh
+          ls -lh oscortex-aarch64.iso
 
       - name: Stage release assets
         run: |
           set -euo pipefail
           mkdir -p dist
           tag="${{ steps.ver.outputs.tag }}"
-          # Arch-labelled names so the two artifacts are unambiguous:
-          #   x86_64 → bootable ISO (Limine);  aarch64 → raw kernel ELF (-kernel).
+          # Arch-labelled names. Each arch ships a bootable ISO (UEFI) AND, for
+          # aarch64, the raw -kernel ELF for QEMU `-M virt -kernel` users.
           cp oscortex.iso "dist/oscortex-x86_64-${tag}.iso"
+          cp oscortex-aarch64.iso "dist/oscortex-aarch64-${tag}.iso"
           cp target/aarch64-unknown-none/release/kernel "dist/oscortex-aarch64-${tag}.kernel"
           # Checksums computed from inside dist/ so each .sha256 lists a bare
           # filename and `sha256sum -c` works after downloading just the pair.
           ( cd dist
             sha256sum "oscortex-x86_64-${tag}.iso"     > "oscortex-x86_64-${tag}.iso.sha256"
+            sha256sum "oscortex-aarch64-${tag}.iso"    > "oscortex-aarch64-${tag}.iso.sha256"
             sha256sum "oscortex-aarch64-${tag}.kernel" > "oscortex-aarch64-${tag}.kernel.sha256" )
           ls -lh dist
 
@@ -146,19 +155,20 @@ jobs:
           body: |
             Automated production release built from `main`.
 
-            Two artifacts (one per architecture); they differ in type because the
-            arches boot differently — x86_64 via the Limine bootloader (a bootable
-            **ISO**), aarch64 via QEMU `-M virt -kernel` (a raw **kernel ELF**, no
-            bootloader/ISO).
+            Both architectures ship a **bootable UEFI ISO** — flash it or attach it
+            in UTM / a VM / bare metal. aarch64 additionally ships the raw `-kernel`
+            ELF for `qemu-system-aarch64 -M virt -kernel` users.
 
             **Artifacts:**
             - `oscortex-x86_64-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS +
-              UEFI), built via `cargo xtask iso`. **Platform-scope** (the full x86
-              Flutter shell is staged separately by `scripts/build-iso.sh`).
-            - `oscortex-aarch64-<tag>.kernel` — **render-capable** aarch64 kernel: it
-              embeds the full Flutter shell runtime (engine + AOT shell snapshot + ICU
-              + fonts/assets), fetched from the `oscortex-engine-1` release at build
-              time. Boot it directly:
+              UEFI), built via `cargo xtask iso`.
+            - `oscortex-aarch64-<tag>.iso` — **render-capable** aarch64 UEFI ISO
+              (Limine → higher-half kernel), embedding the full Flutter shell runtime
+              (engine + AOT shell snapshot + ICU + fonts/assets). This is the image to
+              boot in **UTM / VMs / bare metal**. In UTM use a single CPU core
+              (OSCortex runs a cooperative single-core scheduler).
+            - `oscortex-aarch64-<tag>.kernel` — the same render-capable kernel as a raw
+              ELF for direct QEMU boot:
               ```
               qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 2G \
                 -kernel oscortex-aarch64-<tag>.kernel -device ramfb \
@@ -171,5 +181,7 @@ jobs:
           files: |
             dist/oscortex-x86_64-${{ steps.ver.outputs.tag }}.iso
             dist/oscortex-x86_64-${{ steps.ver.outputs.tag }}.iso.sha256
+            dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.iso
+            dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.iso.sha256
             dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel
             dist/oscortex-aarch64-${{ steps.ver.outputs.tag }}.kernel.sha256
