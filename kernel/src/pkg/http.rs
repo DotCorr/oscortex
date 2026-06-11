@@ -39,21 +39,23 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
     let fd = crate::net::tcp::tcp_connect(host_ip, port).map_err(|_| HttpError::Connect)?;
 
     let mut connected = false;
-    // Busy-poll until connection is established (max ~2 seconds).
-    for _ in 0..120 {
+    // Busy-poll until the handshake completes. tcp_is_established (may_send)
+    // is the correct readiness signal — the old zero-byte tcp_read probe
+    // EAGAINed forever on an established-but-idle socket (can_recv is false
+    // until the peer sends, and an HTTP server says nothing until it gets the
+    // request), so every fetch failed with Connect since day one.
+    for _ in 0..240 {
         crate::net::tcp::poll();
-        // Try a zero-byte read to check if connected.
-        let mut probe = [0u8; 0];
-        match crate::net::tcp::tcp_read(fd, &mut probe) {
-            Ok(_) => {
+        match crate::net::tcp::tcp_is_established(fd) {
+            Ok(true) => {
                 connected = true;
                 break;
             }
-            Err(-11) => {
-                // EAGAIN — still connecting, wait a tick.
+            Ok(false) => {
+                // Still in SYN-SENT — wait a tick.
                 for _ in 0..50_000u64 { core::hint::spin_loop(); }
             }
-            Err(_) => break, // connected or error — proceed
+            Err(_) => break, // refused / reset
         }
     }
 

@@ -296,6 +296,27 @@ pub fn tcp_read(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     Ok(n)
 }
 
+/// True once the three-way handshake has completed (the socket may send).
+/// `Ok(false)` while still connecting; `Err(-111)` if the connection was
+/// refused / reset (socket left the open states).
+///
+/// NOTE this is the correct way to wait for an outbound connect. A zero-byte
+/// `tcp_read` probe does NOT work: `can_recv()` is false on an ESTABLISHED
+/// socket whose peer hasn't sent anything yet (an HTTP server says nothing
+/// until it gets the request), so the probe EAGAINs forever.
+pub fn tcp_is_established(fd: usize) -> Result<bool, i64> {
+    poll();
+    let _g = TCP_LOCK.lock();
+    let stack = unsafe { &mut *TCP_STACK.0.get() };
+    let s = stack.as_mut().ok_or(-1i64)?;
+    let handle = s.handles.get(fd).and_then(|h| *h).ok_or(-9i64)?;
+    let socket = s.sockets.get_mut::<TcpSocket>(handle);
+    if !socket.is_open() {
+        return Err(-111); // ECONNREFUSED — closed/reset during connect
+    }
+    Ok(socket.may_send())
+}
+
 /// Close a TCP socket.
 pub fn tcp_close(fd: usize) -> Result<(), i64> {
     poll();
