@@ -563,6 +563,11 @@ pub const SYS_APP_UNINSTALL: u64 = 0x372;
 pub const SYS_VFS_READ:      u64 = 0x37A;
 pub const SYS_VFS_STAT:      u64 = 0x37C;
 pub const SYS_VFS_LIST:      u64 = 0x379;
+// On-demand package delivery (matches kernel embedder/abi.rs). Moved off
+// 0x390-0x393 (collided with sched_yield/fork/signal) to a free block (b4dcdb5).
+pub const SYS_PKG_RESOLVE:    u64 = 0x4C0;
+pub const SYS_PKG_CATALOG:    u64 = 0x4C1;
+pub const SYS_PKG_SET_SERVER: u64 = 0x4C2;
 
 
 pub fn app_install(bundle: &[u8], id_out: &mut u32) -> i64 {
@@ -586,6 +591,25 @@ pub fn app_launch(app_id: u32) -> i64 {
 
 pub fn app_uninstall(app_id: u32) -> i64 {
     unsafe { syscall1(SYS_APP_UNINSTALL, app_id as u64) }
+}
+
+/// On-demand package: resolve a name → fetch + SHA-256 verify + cache + install.
+/// Returns app_id (>=0) or -ERRNO. The kernel runs the whole pipeline.
+pub fn pkg_resolve(name: &[u8]) -> i64 {
+    let len = path_len(name); // tolerate a trailing NUL
+    unsafe { syscall2(SYS_PKG_RESOLVE, name.as_ptr() as u64, len as u64) }
+}
+
+/// On-demand package: write the remote catalog (128-byte PkgManifest entries)
+/// into `buf`; returns the total available count.
+pub fn pkg_catalog(buf: &mut [u8]) -> i64 {
+    unsafe { syscall2(SYS_PKG_CATALOG, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// On-demand package: point the resolver at a server (IP big-endian u32 + port)
+/// and refresh the catalog. Returns 0.
+pub fn pkg_set_server(ip_be: u32, port: u16) -> i64 {
+    unsafe { syscall2(SYS_PKG_SET_SERVER, ip_be as u64, port as u64) }
 }
 
 fn path_len(path: &[u8]) -> usize {

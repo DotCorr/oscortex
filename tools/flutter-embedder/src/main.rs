@@ -1900,6 +1900,36 @@ fn dispatch_shell_command(payload: &[u8]) -> &'static [u8] {
         let path = trim_line(path);
         return install_osx_from_path(path);
     }
+    // ── On-demand package delivery. The kernel pipeline (HTTP → SHA-256 verify →
+    // LRU cache → install) is reachable via syscalls 0x4C0-0x4C2; route the shell's
+    // pkg_* messages to it. "Apps stream from your server on first tap." ─────────
+    if payload == b"pkg_catalog" || payload.starts_with(b"pkg_catalog") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\",\"packages\":[]}";
+        }
+        return format_pkg_catalog_json();
+    }
+    if payload.starts_with(b"pkg_resolve:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\",\"app_id\":-1}";
+        }
+        let name = trim_line(&payload[12..]); // "pkg_resolve:".len() == 12
+        return format_app_id_json(sys::pkg_resolve(name));
+    }
+    if payload.starts_with(b"pkg_set_server:") {
+        if !shell_capable {
+            return b"{\"ok\":false,\"err\":\"cap\"}";
+        }
+        // "pkg_set_server:<dotted-ip>:<port>"
+        let rest = trim_line(&payload[15..]); // "pkg_set_server:".len() == 15
+        match parse_ip_port(rest) {
+            Some((ip_be, port)) => {
+                let _ = sys::pkg_set_server(ip_be, port);
+                return b"{\"ok\":true}";
+            }
+            None => return b"{\"ok\":false}",
+        }
+    }
     // ── Settings. Driver/input preferences, settable from any host (the Settings
     // UI may run in the shell or its own app). "config:get" returns current state.
     if payload.starts_with(b"config:scroll_invert:") {
@@ -2068,6 +2098,129 @@ fn format_app_list_json() -> &'static [u8] {
     pos += 2;
     APP_LIST_JSON_LEN.store(pos as u32, Ordering::Release);
     unsafe { core::slice::from_raw_parts(APP_LIST_JSON.as_ptr(), pos) }
+}
+
+// ── On-demand package pipeline JSON helpers ──────────────────────────────────
+
+static mut PKG_APPID_JSON: [u8; 32] = [0; 32];
+/// `{"app_id":N}` for a pkg_resolve result (N>=0 ok, anything <0 → -1).
+fn format_app_id_json(id: i64) -> &'static [u8] {
+    let out = unsafe { &mut PKG_APPID_JSON };
+    const PREFIX: &[u8] = b"{\"app_id\":";
+    out[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut pos = PREFIX.len();
+    if id < 0 {
+        out[pos] = b'-';
+        pos += 1;
+        out[pos] = b'1';
+        pos += 1;
+    } else {
+        pos += write_json_u32(&mut out[pos..], id as u32);
+    }
+    out[pos] = b'}';
+    pos += 1;
+    unsafe { core::slice::from_raw_parts(PKG_APPID_JSON.as_ptr(), pos) }
+}
+
+static mut PKG_CATALOG_JSON: [u8; 4096] = [0; 4096];
+/// Serialise the kernel package catalog (128-byte PkgManifest entries) into the
+/// `{"packages":[{"name","version","size"}]}` shape the Dart shell expects.
+fn format_pkg_catalog_json() -> &'static [u8] {
+    let mut records = [0u8; 4096];
+    let cnt = sys::pkg_catalog(&mut records);
+    let count = if cnt < 0 { 0 } else { cnt as usize };
+    let out = unsafe { &mut PKG_CATALOG_JSON };
+    const HEAD: &[u8] = b"{\"packages\":[";
+    out[..HEAD.len()].copy_from_slice(HEAD);
+    let mut pos = HEAD.len();
+    let max = (records.len() / 128).min(count);
+    let mut i = 0usize;
+    while i < max {
+        let off = i * 128;
+        let name_end = records[off..off + 64].iter().position(|&b| b == 0).unwrap_or(64);
+        let name = &records[off..off + name_end];
+        let ver_end = records[off + 64..off + 80].iter().position(|&b| b == 0).unwrap_or(16);
+        let version = &records[off + 64..off + 64 + ver_end];
+        let size = u32::from_le_bytes(records[off + 112..off + 116].try_into().unwrap_or([0; 4]));
+        if pos + name.len() + version.len() + 80 > out.len() {
+            break;
+        }
+        if i > 0 {
+            out[pos] = b',';
+            pos += 1;
+        }
+        const NP: &[u8] = b"{\"name\":\"";
+        out[pos..pos + NP.len()].copy_from_slice(NP);
+        pos += NP.len();
+        out[pos..pos + name.len()].copy_from_slice(name);
+        pos += name.len();
+        const VP: &[u8] = b"\",\"version\":\"";
+        out[pos..pos + VP.len()].copy_from_slice(VP);
+        pos += VP.len();
+        out[pos..pos + version.len()].copy_from_slice(version);
+        pos += version.len();
+        const SP: &[u8] = b"\",\"size\":";
+        out[pos..pos + SP.len()].copy_from_slice(SP);
+        pos += SP.len();
+        pos += write_json_u32(&mut out[pos..], size);
+        out[pos] = b'}';
+        pos += 1;
+        i += 1;
+    }
+    out[pos..pos + 2].copy_from_slice(b"]}");
+    pos += 2;
+    unsafe { core::slice::from_raw_parts(PKG_CATALOG_JSON.as_ptr(), pos) }
+}
+
+/// Parse "a.b.c.d:port" → (ip as big-endian-packed u32, port). None on malformed.
+fn parse_ip_port(s: &[u8]) -> Option<(u32, u16)> {
+    let colon = s.iter().rposition(|&b| b == b':')?;
+    let (ip_str, port_str) = (&s[..colon], &s[colon + 1..]);
+    let mut octets = [0u32; 4];
+    let mut oi = 0usize;
+    let mut cur = 0u32;
+    let mut have = false;
+    for &b in ip_str {
+        if b == b'.' {
+            if oi >= 3 || !have {
+                return None;
+            }
+            octets[oi] = cur;
+            oi += 1;
+            cur = 0;
+            have = false;
+        } else if b.is_ascii_digit() {
+            cur = cur * 10 + (b - b'0') as u32;
+            if cur > 255 {
+                return None;
+            }
+            have = true;
+        } else {
+            return None;
+        }
+    }
+    if oi != 3 || !have {
+        return None;
+    }
+    octets[3] = cur;
+    let ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    let mut port = 0u32;
+    let mut phave = false;
+    for &b in port_str {
+        if b.is_ascii_digit() {
+            port = port * 10 + (b - b'0') as u32;
+            if port > 65535 {
+                return None;
+            }
+            phave = true;
+        } else {
+            return None;
+        }
+    }
+    if !phave {
+        return None;
+    }
+    Some((ip, port as u16))
 }
 
 static mut VFS_LIST_JSON: [u8; 8192] = [0; 8192];
