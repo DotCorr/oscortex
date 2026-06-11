@@ -762,7 +762,13 @@ pub fn spawn_with_bootstrap(
     let idx = idx_of(pid);
     let mut regs = UserRegs::default();
     regs.rip    = entry;
-    regs.rsp    = USER_STACK_TOP - 8; // leave one guard word
+    // AArch64 requires a 16-byte-aligned SP (enforced by SCTLR_EL1.SA on real
+    // hardware); x86 just wants a guard word. USER_STACK_TOP is page-aligned, so
+    // use it directly on aarch64 and keep the -8 guard word on x86.
+    #[cfg(target_arch = "aarch64")]
+    { regs.rsp = USER_STACK_TOP & !0xF; }
+    #[cfg(not(target_arch = "aarch64"))]
+    { regs.rsp = USER_STACK_TOP - 8; } // leave one guard word
     regs.rdi    = bootstrap.rdi;
     regs.rsi    = bootstrap.rsi;
     regs.rdx    = bootstrap.rdx;
@@ -1404,8 +1410,20 @@ pub fn spawn_thread(
     let mut regs = UserRegs::default();
     regs.rip    = entry_fn;
     regs.rdi    = arg;         // first argument via SysV ABI
-    regs.rsp    = stack_top - 8; // RSP%16==8 at entry, per SysV ABI; the word
-                                 // at [RSP] is the thread-return trampoline.
+    // Thread-entry stack pointer. The two arches have OPPOSITE alignment rules:
+    //   x86 SysV: at a function's first instruction RSP%16==8 (the CALL pushed an
+    //     8-byte return address), and the word at [RSP] is the return target — so
+    //     we seed `stack_top - 8` with the thread-return trampoline (above).
+    //   AArch64: SP must be 16-BYTE ALIGNED at all times (SCTLR_EL1.SA enforces it
+    //     on real hardware — HVF / bare metal / a Raspberry Pi), and the return
+    //     address lives in x30/LR, not on the stack (seeded via p.user_lr below).
+    //     `stack_top - 8` gave an 8-aligned SP that TCG tolerated but real silicon
+    //     faults on (EC=0x26 SP-alignment) the instant the new thread touches its
+    //     stack — which is why nothing rendered under HVF/UTM. Align down to 16.
+    #[cfg(target_arch = "aarch64")]
+    { regs.rsp = stack_top & !0xF; }
+    #[cfg(not(target_arch = "aarch64"))]
+    { regs.rsp = stack_top - 8; }
     regs.rflags = 0x0202;      // IF=1, reserved=1
 
     // ── Thread TLS block ──────────────────────────────────────────────────────
