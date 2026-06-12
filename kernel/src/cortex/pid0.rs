@@ -35,10 +35,11 @@ pub fn init() {
 }
 
 fn require_cortex_caller() -> bool {
-    let pid = crate::process::current_pid();
-    // Until capabilities are stored on each PCB, only init (pid 1) and the
-    // kernel idle task (pid 0) may invoke the Cortex API.
-    pid == 0 || pid == 1
+    // The kernel idle task (pid 0) is implicitly trusted; every other caller
+    // must hold CAP_CORTEX (the system shell does, launched apps do not). A
+    // real per-PCB capability check now, not a PID whitelist.
+    crate::process::current_pid() == 0
+        || crate::process::current_has_caps(crate::security::Capabilities::CORTEX)
 }
 
 fn node_kind_from_u64(kind: u64) -> Option<NodeKind> {

@@ -126,6 +126,10 @@ pub struct Process {
     pub state:   ProcState,
     /// Exit code set by `sys_exit`.
     pub exit_code: i32,
+    /// Capability set governing access to privileged syscalls. Stored per-PCB
+    /// (not derived from PID): the system shell (HOST_MODE_SHELL) gets the full
+    /// set, launched apps get none, and threads/forks inherit their creator's.
+    pub caps: crate::security::Capabilities,
     /// Base of this process syscall kernel stack.
     syscall_stack_base: *mut u8,
     /// Top of this process syscall kernel stack.
@@ -218,6 +222,7 @@ impl Process {
             },
             state:     ProcState::Dead,
             exit_code: 0,
+            caps:      crate::security::NO_CAPS,
             syscall_stack_base: core::ptr::null_mut(),
             syscall_stack_top: 0,
             xstate: XStateBuf([0; XSTATE_SIZE]),
@@ -631,6 +636,15 @@ pub fn spawn_with_bootstrap(
         p.regs       = regs;
         p.state      = ProcState::Running;
         p.exit_code  = 0;
+        // Capabilities: the trusted system shell (HOST_MODE_SHELL) holds the
+        // full set; everything else launched this way (HOST_MODE_APP) starts
+        // with none and must be granted caps explicitly. This is what makes
+        // privileged syscalls capability-gated rather than PID-gated.
+        p.caps = if bootstrap.rdi == crate::app_registry::HOST_MODE_SHELL {
+            crate::security::ALL_CAPS
+        } else {
+            crate::security::NO_CAPS
+        };
         p.syscall_stack_base = sys_stack_base;
         p.syscall_stack_top = sys_stack_top;
         p.xstate = XStateBuf::default();
@@ -656,8 +670,9 @@ pub fn spawn_with_bootstrap(
     }
 
     log::info!(
-        "[Process] Spawned '{}' pid={} entry={:#x} rdi={:#x} rsi={:#x} rdx={:#x} parent={}",
-        name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid
+        "[Process] Spawned '{}' pid={} entry={:#x} rdi={:#x} rsi={:#x} rdx={:#x} parent={} caps={:?}",
+        name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid,
+        caps_of(pid)
     );
     Ok(pid)
 }
@@ -822,6 +837,23 @@ pub fn set_current_pid(pid: u32) {
 /// Get currently active userspace PID.
 pub fn current_pid() -> u32 {
     crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
+}
+
+/// The capability set held by `pid` (NO_CAPS if the pid is unknown/dead).
+pub fn caps_of(pid: u32) -> crate::security::Capabilities {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state != ProcState::Dead {
+        p.caps
+    } else {
+        crate::security::NO_CAPS
+    }
+}
+
+/// Whether the CURRENTLY-RUNNING process holds all of `required`. The single
+/// gate every privileged syscall calls — capability-based, not PID-based.
+pub fn current_has_caps(required: crate::security::Capabilities) -> bool {
+    crate::security::check(caps_of(current_pid()), required)
 }
 
 /// Physical address of the current process's top-level page table (the L1 / TTBR0
@@ -1302,6 +1334,8 @@ pub fn spawn_thread(
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
+        // Threads inherit their owning process's capabilities.
+        p.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(owning_pid)].caps).read() };
         p.fs_base            = tls_va;
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base    = stack_va;
@@ -1368,6 +1402,8 @@ pub fn clone_thread(
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
+        // Threads inherit their owning process's capabilities.
+        p.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(owning_pid)].caps).read() };
         p.fs_base            = 0;
         p.current_cpu        = None;
         p.cpu_ticks          = 0;
@@ -2268,6 +2304,8 @@ pub fn fork_current() -> Result<u32, &'static str> {
     child.syscall_stack_top  = child_stack_top;
     child.is_thread          = false;
     child.parent_pid         = parent_pid;
+    // A forked child inherits the parent's capability set.
+    child.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(parent_pid)].caps).read() };
     child.cpu_ticks          = 0;
     child.slice_left         = 10;
     child.pending_sigs       = 0;
