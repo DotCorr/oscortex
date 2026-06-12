@@ -63,3 +63,7 @@ docs/goal-general-purpose.md
 # Fetched engine tool binaries (from fetch-engine.sh)
 /tools/flutter-engine/bin/
 initramfs/system/lib/liboscortex_libc.so
+
+# build artifacts / debug traces (untracked 2026-06-12)
+*.so.trace
+iso_root_aarch64/
