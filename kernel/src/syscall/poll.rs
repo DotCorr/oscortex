@@ -469,12 +469,26 @@ fn finish_cond_timedout_return(pid: u32, mutex: u64) {
         let rip = p.regs.rip;
         let rsp = p.regs.rsp;
         let fs = crate::arch::cpu::get_fs_base();
-        p.regs.rip    = rip.wrapping_add(2);
+        // `rip` points AT the syscall instruction (re-exec mode set by
+        // save_return_context_reexec when the waiter parked). To make it RETURN
+        // ETIMEDOUT instead of re-waiting, advance past the syscall instruction:
+        // 2 bytes on x86 (`syscall`), 4 bytes on aarch64 (`svc #0`). The old
+        // hardcoded `+2` was an x86-ism that, on aarch64, landed in the middle of
+        // the 4-byte `svc` → a misaligned resume PC (svc+2) → EC=0x22 PC-alignment
+        // fault (the deterministic ~280-frame crash on long aarch64 runs).
+        p.regs.rip    = rip.wrapping_add(crate::process::SYSCALL_INSN_LEN);
         p.regs.rsp    = rsp;
         p.regs.rflags = 0x202;
         p.preempted_by_timer = false;
         p.fs_base = fs;
         p.regs.rax = 110; // ETIMEDOUT
+        // aarch64: a syscall returns its result in x0, but build_image only maps
+        // rax→x0 when aarch64_ret_in_x0 is set. The re-exec park cleared it; set it
+        // so the waiter actually sees ETIMEDOUT (not a stale arg0) on resume.
+        #[cfg(target_arch = "aarch64")]
+        {
+            p.aarch64_ret_in_x0 = true;
+        }
     }
 
     drop(g_ptable);
