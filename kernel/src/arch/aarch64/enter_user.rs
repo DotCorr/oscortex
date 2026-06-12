@@ -118,6 +118,14 @@ fn build_image(regs: &EnterUserRegs) -> [u64; 34] {
 unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
     let reset_sp = crate::arch::aarch64::syscall::active_el1_sp();
     core::arch::asm!(
+        // Mask ALL interrupts at EL1 for the duration of the resume. The SP reset
+        // below abandons the frame that still holds `img`; if a wait loop yielded
+        // here with IRQs unmasked, a timer IRQ would push a TrapFrame onto the
+        // reset stack — overlapping `img` — and we would read a corrupted resume
+        // image (observed: x18/SPSR load faulting in eret_to_el0_fp, ~25% of long
+        // runs). `eret` restores SPSR_EL0T (I/F clear) so EL0 runs with interrupts
+        // enabled — this masking has no lasting effect.
+        "msr daifset, #0xf",
         // Reclaim the EL1 kernel stack. This is a cooperative-yield resume: we
         // eret straight to EL0 WITHOUT RESTORE_FRAME, so the SVC's EL1 exception
         // frame is abandoned. Reset SP_EL1 to the thread's syscall-stack top so it
@@ -180,6 +188,10 @@ unsafe fn eret_to_el0(img: &[u64; 34]) -> ! {
 unsafe fn eret_to_el0_fp(img: &[u64; 34], fp: &[u64; 66]) -> ! {
     let reset_sp = crate::arch::aarch64::syscall::active_el1_sp();
     core::arch::asm!(
+        // Mask ALL interrupts at EL1 (see eret_to_el0): the SP reset abandons the
+        // frame holding `img`/`fp`, so a timer IRQ here would corrupt the resume
+        // image. `eret` restores SPSR_EL0T (interrupts enabled) for EL0.
+        "msr daifset, #0xf",
         // Reclaim the abandoned EL1 frame (cooperative-yield resume) — see
         // eret_to_el0. img/fp live on the old stack; their memory stays valid
         // until the next EL1 entry pushes.

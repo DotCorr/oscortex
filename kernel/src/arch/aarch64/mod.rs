@@ -29,8 +29,15 @@ pub mod enter_user;
 pub mod uart;
 pub mod fdt;
 pub mod ramfb;
+// The bare `-kernel`/DTB entry path (its own `_start` trampoline + DTB-driven
+// boot) and the Limine entry path are mutually exclusive: only one provides the
+// ELF entry point + the boot prologue. `limine-boot` selects the Limine path.
+#[cfg(not(feature = "limine-boot"))]
 pub mod boot;
+#[cfg(not(feature = "limine-boot"))]
 pub mod boot_prod;
+#[cfg(feature = "limine-boot")]
+pub mod boot_limine;
 pub mod mmu;
 pub mod vectors;
 pub mod gic;
