@@ -168,6 +168,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
             apply_array_to_frame(f, &saved);
         } else {
             userregs_to_trapframe(f, &next_regs);
+            f.x[30] = crate::process::get_user_lr(next_pid);
         }
     }
 }

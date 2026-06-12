@@ -18,6 +18,20 @@ fi
 rm -f "$SERIAL_LOG"
 touch "$SERIAL_LOG"
 
+# Create a small virtio-blk disk image for ext2 testing (8 MiB).
+VBLK="$SCRIPT_DIR/vdisk.img"
+if [ ! -f "$VBLK" ]; then
+    echo "[QEMU] Creating 8 MiB virtio-blk image: $VBLK"
+    dd if=/dev/zero of="$VBLK" bs=1M count=8 2>/dev/null
+fi
+
+# Create a small NVMe disk image (16 MiB).
+NVME="$SCRIPT_DIR/nvme.img"
+if [ ! -f "$NVME" ]; then
+    echo "[QEMU] Creating 16 MiB NVMe image: $NVME"
+    dd if=/dev/zero of="$NVME" bs=1M count=16 2>/dev/null
+fi
+
 echo "=========================================="
 echo "OSCortex Boot — graphical window + serial"
 echo "=========================================="
@@ -40,6 +54,12 @@ qemu-system-x86_64 \
     -m 2G \
     -cdrom "$ISO" \
     -boot d \
+    -device virtio-net-pci,netdev=net0 \
+    -netdev user,id=net0 \
+    -device virtio-blk-pci,drive=vblk \
+    -drive "file=$VBLK,format=raw,id=vblk,if=none" \
+    -device nvme,drive=nvmedrive,serial=oscortex0 \
+    -drive "file=$NVME,format=raw,id=nvmedrive,if=none" \
     -serial file:"$SERIAL_LOG" \
     -display cocoa \
     -vga std \

@@ -184,15 +184,19 @@ else
     exit 1
 fi
 
-echo "[0.5/5] Compiling and staging userspace libc helper..."
-mkdir -p "$ROOT/initramfs/system/lib"
-docker run --rm --platform linux/amd64 \
-    -v "$ROOT:$ROOT" \
-    -w "$ROOT" \
-    gcc:12 \
-    gcc -shared -fPIC -ffreestanding -nostdlib -O2 \
-    -o "$ROOT/initramfs/system/lib/liboscortex_libc.so" \
-    "$ROOT/userspace/libc/libc.c"
+if [ -f "$ROOT/initramfs/system/lib/liboscortex_libc.so" ]; then
+    echo "[0.5/5] Skipping compilation of userspace libc helper (already exists)..."
+else
+    echo "[0.5/5] Compiling and staging userspace libc helper..."
+    mkdir -p "$ROOT/initramfs/system/lib"
+    docker run --rm --platform linux/amd64 \
+        -v "$ROOT:$ROOT" \
+        -w "$ROOT" \
+        gcc:12 \
+        gcc -shared -fPIC -ffreestanding -nostdlib -O2 \
+        -o "$ROOT/initramfs/system/lib/liboscortex_libc.so" \
+        "$ROOT/userspace/libc/libc.c"
+fi
 
 echo "[0.51/5] Staging Flutter engine runtime..."
 if [ ! -f "$FLUTTER_ENGINE_SO" ]; then

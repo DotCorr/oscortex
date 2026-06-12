@@ -1884,7 +1884,6 @@ fn gpr_cap_cpu_idx() -> usize {
 /// cannot yet be overwritten by a sibling (IRQs masked / pre-`sti`).
 pub fn capture_user_gprs_at_entry(pid: u32) {
     GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
-    save_full_user_gprs(pid);
 }
 
 /// Snapshot the full user GPR set (as captured at SYSCALL entry) into the
@@ -1893,7 +1892,6 @@ pub fn capture_user_gprs_at_entry(pid: u32) {
 /// `enter_user_by_pid_noreturn`, otherwise the yielding thread will resume
 /// with stale rbx/rbp/r12–r15/rdi/rsi/etc. and corrupt its C++ caller's
 /// `this` pointer and locals.
-/// Per-CPU "already captured the user GPRs for the current syscall" flag.
 ///
 /// The user GPR snapshot lives in a PER-CPU scratch area (`gs:[..]`), written by
 /// the syscall entry stub. It is shared by every thread on that core, so if a
@@ -1909,24 +1907,6 @@ pub fn capture_user_gprs_at_entry(pid: u32) {
 /// thread). This flag makes every subsequent yield-time `save_full_user_gprs`
 /// in the same syscall a no-op, so a clobbered per-CPU snapshot can never leak
 /// into our saved context.
-const GPR_CAP_MAX_CPUS: usize = 64;
-static GPRS_CAPTURED: [core::sync::atomic::AtomicBool; GPR_CAP_MAX_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; GPR_CAP_MAX_CPUS];
-
-#[inline]
-fn gpr_cap_cpu_idx() -> usize {
-    (crate::arch::smp::this_cpu().cpu_id as usize).min(GPR_CAP_MAX_CPUS - 1)
-}
-
-/// Capture the user GPRs into `pid`'s PTABLE slot at syscall ENTRY, while the
-/// per-CPU snapshot is guaranteed fresh for this thread. Marks them captured so
-/// later `save_full_user_gprs` calls this syscall don't re-read the (possibly
-/// since-clobbered) shared per-CPU snapshot.
-pub fn capture_user_gprs_at_entry(pid: u32) {
-    GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
-    save_full_user_gprs(pid);
-}
-
 pub fn save_full_user_gprs(pid: u32) {
     // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops so a
     // since-clobbered snapshot cannot leak into our saved context.
@@ -2012,6 +1992,14 @@ pub fn get_saved_rax(pid: u32) -> u64 {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &PTABLE[idx_of(pid)] };
     if p.pid == pid { p.regs.rax } else { 0 }
+}
+
+/// Read the saved user link register (x30) for a pid.
+#[cfg(target_arch = "aarch64")]
+pub fn get_user_lr(pid: u32) -> u64 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid { p.user_lr } else { 0 }
 }
 
 /// Saved user RIP/RSP for a blocked/yielded thread (from `save_return_context`).
