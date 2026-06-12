@@ -107,7 +107,13 @@ pub fn init_from_regions(map: &BootMemMap, hhdm_offset: u64) {
     // latent corruption that surfaces as a hang on the first large heap alloc.
     // Reserve [RAM base .. __kernel_end] before the heap is carved out.
     // (x86 gets this for free from the Limine memory-map types.)
-    #[cfg(target_arch = "aarch64")]
+    // Only the bare `-kernel`/DTB path needs this manual reserve: there the DTB
+    // reports the whole RAM span (incl. the loaded kernel image) as usable, so we
+    // must carve the image out by hand. On the Limine path the bootloader's memory
+    // map already marks the kernel + bootloader regions non-usable (they are never
+    // pushed into the BootMemMap), and `__kernel_end` is a higher-half VA — using
+    // it here would reserve the wrong physical range. So gate it out under Limine.
+    #[cfg(all(target_arch = "aarch64", not(feature = "limine-boot")))]
     {
         extern "C" {
             static __kernel_end: u8;

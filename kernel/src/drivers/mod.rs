@@ -14,5 +14,7 @@ pub mod usb;
 pub mod usb_hid;
 pub mod xhci_runtime;
 pub mod virtio_blk;
+#[cfg(target_arch = "aarch64")]
+pub mod virtio_input;
 pub mod virtio_net;
 pub mod wasm_sandbox;

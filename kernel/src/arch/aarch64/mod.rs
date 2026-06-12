@@ -29,8 +29,15 @@ pub mod enter_user;
 pub mod uart;
 pub mod fdt;
 pub mod ramfb;
+// The bare `-kernel`/DTB entry path (its own `_start` trampoline + DTB-driven
+// boot) and the Limine entry path are mutually exclusive: only one provides the
+// ELF entry point + the boot prologue. `limine-boot` selects the Limine path.
+#[cfg(not(feature = "limine-boot"))]
 pub mod boot;
+#[cfg(not(feature = "limine-boot"))]
 pub mod boot_prod;
+#[cfg(feature = "limine-boot")]
+pub mod boot_limine;
 pub mod mmu;
 pub mod vectors;
 pub mod gic;
@@ -43,7 +50,7 @@ pub mod bringup_irq;
 pub mod bringup_user;
 pub mod bringup_smp;
 
-pub use enter_user::{enter_user_iret, enter_user_sysret, EnterUserRegs};
+pub use enter_user::{enter_user_from_frame, enter_user_iret, enter_user_sysret, EnterUserRegs};
 
 use core::arch::asm;
 
@@ -144,6 +151,26 @@ pub fn rdtsc() -> u64 {
     let cnt: u64;
     unsafe { asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack)) };
     cnt
+}
+
+/// Monotonic nanoseconds from the virtual counter, scaled by the REAL counter
+/// frequency (CNTFRQ_EL0, 62.5 MHz on QEMU virt). The kernel clock (monotonic_ns
+/// / clock_gettime) MUST match liboscortex_libc, which reads CNTVCT_EL0 directly
+/// and scales by CNTFRQ — so the engine's timerfd deadlines line up with the
+/// kernel's "now". The previous `rdtsc()/3` (assuming a ~3 GHz x86 TSC) made the
+/// aarch64 clock ~48× too slow → timerfds never expired → epoll-parked engine
+/// workers were never woken → bootstrap stall + no frames. u128 avoids the
+/// cnt*1e9 overflow.
+#[inline(always)]
+pub fn rdtsc_ns() -> u64 {
+    let cnt: u64;
+    let frq: u64;
+    unsafe {
+        asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
+        asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
+    }
+    if frq == 0 { return 0; }
+    ((cnt as u128 * 1_000_000_000u128) / frq as u128) as u64
 }
 
 // ── Context switch ────────────────────────────────────────────────────────────

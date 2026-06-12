@@ -40,6 +40,10 @@ default = ["arch-x86_64"]
 arch-x86_64 = []
 arch-aarch64 = []
 arch-riscv64 = []
+# Boot the aarch64 kernel via the Limine UEFI protocol (higher-half, MMU/HHDM/
+# framebuffer set up by the bootloader) instead of the bare `-kernel`/DTB path.
+# Selects the higher-half linker script + the Limine entry trampoline.
+limine-boot = []
 ai-cortex = []
 driver-wasm = []
 self-healing = []

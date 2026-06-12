@@ -280,6 +280,22 @@ pub(crate) struct EpollEntry {
     pub data: u64,
 }
 
+// `struct epoll_event` ABI differs by arch. glibc marks it `__attribute__((packed))`
+// (`__EPOLL_PACKED`) ONLY on x86_64 → 12 bytes with `data` at offset 4. On aarch64
+// (and most other arches) the attribute is empty → the struct is naturally aligned:
+// 16 bytes with the 8-byte `data` union at offset 8. The engine's
+// EventHandlerImplementation::Poll reads events with a 16-byte stride + data@8 on
+// aarch64; if the kernel writes the 12-byte/offset-4 layout the engine reads a
+// garbage `data` pointer (e.g. 0x100000000) and faults dereferencing it.
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 16;
+#[cfg(target_arch = "aarch64")]
+pub(crate) const EPOLL_DATA_OFF: u64 = 8;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_EVENT_SIZE: u64 = 12;
+#[cfg(not(target_arch = "aarch64"))]
+pub(crate) const EPOLL_DATA_OFF: u64 = 4;
+
 pub(crate) static TIMERFD_TABLE: spin::Mutex<BTreeMap<u32, TimerState>> = spin::Mutex::new(BTreeMap::new());
 /// eventfd counters: synth fd → counter (u64). A write adds to the counter;
 /// a read drains it atomically. epoll fires EPOLLIN when counter > 0.
@@ -453,12 +469,26 @@ fn finish_cond_timedout_return(pid: u32, mutex: u64) {
         let rip = p.regs.rip;
         let rsp = p.regs.rsp;
         let fs = crate::arch::cpu::get_fs_base();
-        p.regs.rip    = rip.wrapping_add(2);
+        // `rip` points AT the syscall instruction (re-exec mode set by
+        // save_return_context_reexec when the waiter parked). To make it RETURN
+        // ETIMEDOUT instead of re-waiting, advance past the syscall instruction:
+        // 2 bytes on x86 (`syscall`), 4 bytes on aarch64 (`svc #0`). The old
+        // hardcoded `+2` was an x86-ism that, on aarch64, landed in the middle of
+        // the 4-byte `svc` → a misaligned resume PC (svc+2) → EC=0x22 PC-alignment
+        // fault (the deterministic ~280-frame crash on long aarch64 runs).
+        p.regs.rip    = rip.wrapping_add(crate::process::SYSCALL_INSN_LEN);
         p.regs.rsp    = rsp;
         p.regs.rflags = 0x202;
         p.preempted_by_timer = false;
         p.fs_base = fs;
         p.regs.rax = 110; // ETIMEDOUT
+        // aarch64: a syscall returns its result in x0, but build_image only maps
+        // rax→x0 when aarch64_ret_in_x0 is set. The re-exec park cleared it; set it
+        // so the waiter actually sees ETIMEDOUT (not a stale arg0) on resume.
+        #[cfg(target_arch = "aarch64")]
+        {
+            p.aarch64_ret_in_x0 = true;
+        }
     }
 
     drop(g_ptable);
@@ -617,7 +647,7 @@ pub fn monotonic_ns() -> u64 {
     //   1_700_000_000 * 10^9 + tsc_ns
     // timerfd_settime with TFD_TIMER_ABSTIME passes this value, so our
     // "now" must use the same epoch or timers will never fire.
-    let tsc_ns = crate::arch::rdtsc() / 3;
+    let tsc_ns = crate::arch::rdtsc_ns();
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
 }
 
@@ -817,7 +847,7 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
         1 | 3 => { // ADD or MOD
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + EPOLL_DATA_OFF) as *const u64) };
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -909,10 +939,10 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     );
                 }
                 // Report EPOLLIN; leave pending for the read() call to drain.
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -933,20 +963,20 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                         eventfd_count
                     );
                 }
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
                 continue;
             }
             // Check pipe readability for non-timerfd fds.
             if pipe_readable_for_fd(entry.fd) {
-                let slot = events_out + (count as u64) * 12;
+                let slot = events_out + (count as u64) * EPOLL_EVENT_SIZE;
                 unsafe {
                     core::ptr::write_unaligned(slot as *mut u32, 0x1 /* EPOLLIN */);
-                    core::ptr::write_unaligned((slot + 4) as *mut u64, entry.data);
+                    core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
             }
@@ -1329,7 +1359,72 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
             }
         }
 
-        #[cfg(target_arch = "x86_64")]
+        if cur != 0 {
+            let coop_target = cooperative_sched_target(cur);
+            if let Some(next) = coop_target.filter(|&n| n != cur) {
+                if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
+                    static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 48 {
+                        log::warn!(
+                            "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
+                            n,
+                            cur,
+                            epfd,
+                            next,
+                            crate::arch::syscall::user_rip()
+                        );
+                    }
+                }
+                // Re-execute the epoll_wait syscall on resume (do NOT return
+                // -1/EINTR to userspace). Returning EINTR here makes the
+                // Flutter engine retry epoll_wait immediately; if it is woken
+                // before any fd is actually ready it gets EINTR again and
+                // busy-spins, monopolizing the single core and starving the
+                // embedder host (pid 1) input loop. Saving the context at the
+                // syscall instruction (urip - 2) with rax = the epoll_wait
+                // syscall number makes the thread re-enter the kernel on wake
+                // and re-check readiness — returning real events when ready or
+                // blocking again — exactly like sys_wm_event_wait does.
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context_reexec(cur, urip, ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(next);
+            } else if cur >= 2
+                && crate::process::get_group_leader(cur) == 1
+                && !crate::wm::flutter_init_ready()
+                && crate::process::current_pid() != 1
+            {
+                static EPOLL_INIT_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = EPOLL_INIT_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x} target={:?}",
+                        n,
+                        cur,
+                        epfd,
+                        crate::arch::syscall::user_rip(),
+                        coop_target
+                    );
+                }
+                crate::process::set_state(1, crate::process::ProcState::Running);
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context_reexec(cur, urip, ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B);
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(1);
+            }
+        }
+
+        // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) its
+        // kernel-mode wake-assist can run. Was x86-only → aarch64 busy-spun in EL1.
         unsafe {
             { crate::arch::enable_and_halt(); }
         }

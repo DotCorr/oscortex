@@ -546,20 +546,34 @@ pub(crate) fn sys_fstat(fd: u64, stat_ptr: u64) -> i64 {
         (tbl[idx].data.len() as u64, tbl[idx].is_dir)
     };
     if stat_ptr != 0 {
-        // Write a minimal stat64 struct — st_size is at offset 48 in Linux stat64.
+        let mode: u32 = if is_dir { 0o040755 } else { 0o100644 };
         unsafe {
             let p = stat_ptr as *mut u8;
-            // Zero out 144 bytes (sizeof(struct stat64))
-            core::ptr::write_bytes(p, 0, 144);
-            // st_size at offset 48
-            (p.add(48) as *mut u64).write_unaligned(size);
-            // st_blksize at offset 56 = 4096
-            (p.add(56) as *mut u64).write_unaligned(4096);
-            // st_blocks at offset 64 = (size+511)/512
-            (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);
-            // st_mode at offset 24: S_IFDIR|0755 for dirs, S_IFREG|0644 for files
-            let mode: u32 = if is_dir { 0o040755 } else { 0o100644 };
-            (p.add(24) as *mut u32).write_unaligned(mode);
+            // CRITICAL: `struct stat` has DIFFERENT size + field offsets per arch.
+            // Writing the x86-64 layout (144 bytes, st_mode@24) into an aarch64
+            // caller's 128-byte buffer overruns it by 16 bytes and corrupts
+            // whatever the compiler placed right after — observed clobbering a
+            // caller's saved x29/x30 frame record so its next `ret` branched to 0
+            // (crashed fml::icu::ICUContext on ARM). Use the arch-correct layout.
+            #[cfg(target_arch = "aarch64")]
+            {
+                // aarch64 glibc `struct stat`: 128 bytes; st_mode@16, st_size@48,
+                // st_blksize@56, st_blocks@64.
+                core::ptr::write_bytes(p, 0, 128);
+                (p.add(16) as *mut u32).write_unaligned(mode);
+                (p.add(48) as *mut u64).write_unaligned(size);
+                (p.add(56) as *mut u32).write_unaligned(4096);
+                (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                // x86-64 glibc `struct stat`: 144 bytes; st_mode@24, st_size@48.
+                core::ptr::write_bytes(p, 0, 144);
+                (p.add(48) as *mut u64).write_unaligned(size);
+                (p.add(56) as *mut u64).write_unaligned(4096);
+                (p.add(64) as *mut u64).write_unaligned((size + 511) / 512);
+                (p.add(24) as *mut u32).write_unaligned(mode);
+            }
         }
     }
     0
@@ -663,8 +677,20 @@ pub(crate) fn sys_exit(code: u64) -> i64 {
             crate::process::enter_user_by_pid_noreturn(next_pid);
         }
     }
-    // No runnable user process left.
+    // No runnable user process RIGHT NOW. Do NOT halt forever: a sibling that is
+    // transiently Blocked (cooperative cond/epoll wait) can become Running on a
+    // later timer tick (timerfd expiry / pending-wake / the periodic task-runner
+    // kick). On aarch64 a tick taken from EL1 returns early without switching, so
+    // a bare `loop { wfi }` here would never re-enter the now-runnable thread —
+    // the exiting worker (e.g. a transient Dart init thread) would freeze the whole
+    // engine. Re-check every wake and enter the next runnable thread when one
+    // appears, instead of parking permanently.
     loop {
+        crate::process::handle_pending_wakes_try();
+        crate::syscall::check_timerfds_and_wake_try();
+        if let Some(next_pid) = crate::process::next_runnable_pid(0) {
+            crate::process::enter_user_by_pid_noreturn(next_pid);
+        }
         crate::arch::enable_and_halt();
     }
 }

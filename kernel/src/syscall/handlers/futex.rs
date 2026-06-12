@@ -484,7 +484,8 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
                     { crate::arch::enable_and_halt(); }
                 }
@@ -583,7 +584,8 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             while unsafe { core::ptr::read_volatile(uaddr as *const u32) } == val
                 && futex_waiter_present(uaddr, pid)
             {
-                #[cfg(target_arch = "x86_64")]
+                // Sleep with IRQs unmasked so the timer ISR fires + (aarch64) the
+                // kernel-mode wake-assist runs. Was x86-only → aarch64 busy-spun.
                 unsafe {
                     { crate::arch::enable_and_halt(); }
                 }
@@ -695,16 +697,23 @@ pub(crate) fn sys_thread_create(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i
         if let Some(child_pid) = child_pid_opt {
             log::warn!("[thread-create] spawned child={} entry={:#x}", child_pid, arg2);
 
-            // x86 gave the newborn an immediate slice by entering the child
-            // from inside the creator's pthread_create syscall (never returning;
-            // delivering r=0 on the creator's later cooperative resume). On
-            // aarch64 that nested enter-while-in-a-syscall corrupts the creator's
-            // resume so the *next* fml::Thread's pthread_create returns non-zero
-            // (thread.cc:80 FML_CHECK abort) — reproducible even with the x30/LR
-            // and 4-byte-svc-rewind fixes in place. Keep it OFF on aarch64: the
-            // child becomes runnable here and is picked up by normal cooperative
-            // scheduling / timer preemption the next time the creator yields.
-            #[cfg(not(target_arch = "aarch64"))]
+            // Give the newborn an IMMEDIATE slice by entering the child from inside
+            // the creator's pthread_create syscall (never returning here; the
+            // creator gets r=0 on its later cooperative resume). The Flutter engine
+            // bootstrap depends on this ordering: FlutterEngineRunInitialized posts
+            // the root-isolate-launch task to the freshly-created UI thread, and the
+            // platform thread (pid 1) then blocks waiting for it. If the UI thread
+            // is only marked Running and left for "later" pickup, main()/runApp may
+            // never run promptly → no frame is ever scheduled → nothing presents.
+            //
+            // This was OFF on aarch64 because the nested enter-while-in-a-syscall
+            // corrupted the creator's resume (next pthread_create FML_CHECK abort).
+            // That corruption was the cooperative-resume register/stack loss since
+            // FIXED: callee-saved x24-x28 + x30/LR, FP/SIMD (vector-stub save), the
+            // RETURN-mode x0=rax delivery, and the SP_EL1 syscall-stack reset. The
+            // creator resumes via build_image, which is now lossless for a syscall
+            // boundary (caller-saved x6/x7/x9-x18 are dead across the svc per the
+            // ABI; everything live is preserved), so re-enabling is safe.
             {
                 let parent = crate::process::current_pid();
                 if parent != 0 && child_pid != parent {
@@ -782,6 +791,28 @@ pub(crate) fn sys_thread_join(thread_handle: u64, retval: u64) -> i64 {
                     // Safety cap so a deadlocked join can't hang forever; treat as joined.
                     if retval != 0 { unsafe { *(retval as *mut u64) = 0; } }
                     return 0;
+                }
+                // Cooperatively yield so the join TARGET (or another runnable
+                // thread) can run and exit. A bare spin_pause never makes progress
+                // on aarch64: a thread spinning here at EL1 can't be timer-preempted
+                // (the tick returns early when taken from EL1), so the join target
+                // would never be scheduled and this would spin to the 2e9 cap. Hand
+                // the core to a runnable thread and RE-EXEC this join syscall on
+                // resume to re-check waitpid. (x86 relied on kernel-mode preemption
+                // running the target; aarch64 must yield explicitly.)
+                let me = crate::process::current_pid();
+                if me != 0 {
+                    if let Some(next) = crate::syscall::cooperative_sched_target(me) {
+                        if next != me {
+                            let urip = crate::arch::syscall::user_rip();
+                            let ursp = crate::arch::syscall::user_rsp();
+                            crate::process::save_return_context_reexec(me, urip, ursp);
+                            crate::process::save_full_user_gprs(me);
+                            crate::process::set_rax(me, crate::embedder::abi::SYS_THREAD_JOIN);
+                            crate::process::save_xstate(me);
+                            crate::process::enter_user_by_pid_noreturn(next);
+                        }
+                    }
                 }
                 crate::arch::spin_pause();
             }

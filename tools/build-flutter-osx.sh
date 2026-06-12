@@ -48,40 +48,17 @@ if [ ! -f "$AOT_DILL" ]; then
 fi
 
 mkdir -p "$(dirname "$LIBAPP_SO")"
-# Locate native gen_snapshot if possible to avoid Docker overhead/deadlocks.
-HOST_GEN_SNAP=""
-for path in \
-    "$FLUTTER_HOME/bin/cache/artifacts/engine/android-x64-release/darwin-x64/gen_snapshot" \
-    "/Users/ghostportal/sdks/flutter344/bin/cache/artifacts/engine/android-x64-release/darwin-x64/gen_snapshot" \
-    "/opt/homebrew/Caskroom/flutter/3.38.9/flutter/bin/cache/artifacts/engine/android-x64-release/darwin-x64/gen_snapshot"; do
-    if [ -f "$path" ]; then
-        HOST_GEN_SNAP="$path"
-        break
-    fi
-done
-
-if [ -n "$HOST_GEN_SNAP" ]; then
-    echo "[osx] Using native host gen_snapshot: $HOST_GEN_SNAP"
-    "$HOST_GEN_SNAP" \
-        --deterministic \
-        --snapshot_kind=app-aot-elf \
-        --elf="$LIBAPP_SO" \
-        --strip \
-        "$AOT_DILL" 2>&1
-else
-    echo "[osx] Falling back to Docker-based gen_snapshot..."
-    docker run --rm --platform linux/amd64 \
-        -v "$ROOT:$ROOT" \
-        -w "$ROOT" \
-        ubuntu:22.04 \
-        "$GEN_SNAP" \
-        --deterministic \
-        --snapshot_kind=app-aot-elf \
-        --elf="$LIBAPP_SO" \
-        --dedup_instructions \
-        --strip \
-        "$AOT_DILL" 2>&1
-fi
+docker run --rm --platform linux/amd64 \
+    -v "$ROOT:$ROOT" \
+    -w "$ROOT" \
+    ubuntu:22.04 \
+    "$GEN_SNAP" \
+    --deterministic \
+    --snapshot_kind=app-aot-elf \
+    --elf="$LIBAPP_SO" \
+    --dedup_instructions \
+    --strip \
+    "$AOT_DILL" 2>&1
 
 python3 "$ROOT/tools/flutter-engine/patch_libapp.py" "$LIBAPP_SO"
 

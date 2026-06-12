@@ -1,13 +1,22 @@
-//! ARM generic timer — periodic EL1 physical-timer tick (CNTP_*).
+//! ARM generic timer — periodic EL1 VIRTUAL-timer tick (CNTV_*).
 //!
 //! Drives the same scheduler tick the x86 APIC timer drives. We use the EL1
-//! physical timer (CNTP_CTL_EL0 / CNTP_TVAL_EL0); on QEMU `-M virt` its
-//! interrupt is PPI 30. CNTFRQ_EL0 gives the tick frequency (62.5 MHz on virt).
+//! VIRTUAL timer (CNTV_CTL_EL0 / CNTV_TVAL_EL0 / CNTVCT_EL0), PPI 27.
+//!
+//! Why virtual, not physical: OSCortex runs the kernel at EL1. Under a
+//! hypervisor (Apple's HVF — what UTM uses — KVM, Xen, …) EL2 owns the PHYSICAL
+//! timer (CNTP, PPI 30): EL1 accesses are trapped and its interrupt is NOT
+//! delivered to the guest, so a CNTP-based tick simply never fires under HVF →
+//! no vsync baton → frames schedule but never present (the engine reaches the
+//! event loop and stalls). The VIRTUAL timer is the architected EL1-guest timer
+//! and is delivered on HVF, on bare metal (CNTVOFF=0 → virtual time == physical
+//! time), AND on QEMU `-M virt` TCG — so it is strictly more portable. CNTFRQ_EL0
+//! gives the tick frequency (62.5 MHz on TCG virt, ~24 MHz on Apple Silicon).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// EL1 physical-timer PPI on QEMU `-M virt`.
-pub const TIMER_PPI: u32 = 30;
+/// EL1 VIRTUAL-timer PPI (architected; delivered under HVF and on bare metal).
+pub const TIMER_PPI: u32 = 27;
 
 /// Timer frequency in Hz (read from CNTFRQ_EL0 at init).
 static FREQ_HZ: AtomicU64 = AtomicU64::new(0);
@@ -23,11 +32,12 @@ fn cntfrq() -> u64 {
     v
 }
 
-/// Current physical count.
+/// Current virtual count (CNTVCT_EL0 — matches the virtual timer we tick on,
+/// and the same counter vsync cadence is measured against).
 #[inline]
 pub fn count() -> u64 {
     let v: u64;
-    unsafe { core::arch::asm!("mrs {}, cntpct_el0", out(reg) v, options(nomem, nostack)) };
+    unsafe { core::arch::asm!("mrs {}, cntvct_el0", out(reg) v, options(nomem, nostack)) };
     v
 }
 
@@ -46,8 +56,8 @@ pub fn init_periodic(hz: u64) {
     arm_next(interval);
 
     unsafe {
-        // CNTP_CTL_EL0: ENABLE=1, IMASK=0 (bit0=enable, bit1=imask).
-        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
+        // CNTV_CTL_EL0: ENABLE=1, IMASK=0 (bit0=enable, bit1=imask).
+        core::arch::asm!("msr cntv_ctl_el0, {}", in(reg) 1u64, options(nomem, nostack));
         core::arch::asm!("isb", options(nomem, nostack));
     }
 }
@@ -56,7 +66,7 @@ pub fn init_periodic(hz: u64) {
 fn arm_next(interval: u64) {
     unsafe {
         // TVAL counts down from `interval`; the interrupt fires at zero.
-        core::arch::asm!("msr cntp_tval_el0, {}", in(reg) interval, options(nomem, nostack));
+        core::arch::asm!("msr cntv_tval_el0, {}", in(reg) interval, options(nomem, nostack));
     }
 }
 

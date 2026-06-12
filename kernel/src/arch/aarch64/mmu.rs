@@ -172,6 +172,63 @@ pub fn is_on() -> bool {
     MMU_ON.load(Ordering::Acquire)
 }
 
+// ── Limine boot path: install our own low-half (TTBR0) identity map ──────────
+//
+// Under Limine the MMU is ALREADY on: the bootloader maps the kernel higher-half
+// (TTBR1), an HHDM direct map, and a framebuffer. We do NOT touch TTBR1 (it holds
+// the running kernel's code/data at its higher-half link address). Instead we
+// install our OWN low-half identity map into TTBR0 — device MMIO @ 0-1 GiB +
+// `ram_gibs` GiB of RAM from 0x4000_0000 — and set TCR_EL1.T0SZ = 25 so the
+// TTBR0 walk starts at L1 (39-bit VA).
+//
+// This makes the ENTIRE rest of the aarch64 port (uart/gic raw-PA MMIO, the
+// per-process L1-start TTBR0 paging in mm::paging, the `alloc_user_pml4` kernel-
+// clone, enter_user) behave EXACTLY as on the bare `-kernel` path — VA == PA in
+// the low half, HHDM offset 0 — with zero changes to that code. The only
+// difference from `-kernel` is that the kernel's own code lives in TTBR1 (mapped
+// by Limine) rather than in this TTBR0 identity map.
+//
+// `table_phys` translates a kernel static's higher-half VA to the physical
+// address we must program into TTBR0 (the MMU walks tables by physical address).
+#[cfg(feature = "limine-boot")]
+pub unsafe fn limine_setup_ttbr0(ram_gibs: u64, virt_to_phys: impl Fn(u64) -> u64) {
+    let l1_low = &mut *core::ptr::addr_of_mut!(L1_LOW);
+    fill_identity(l1_low, ram_gibs);
+
+    // The L1 table lives in the kernel image (BSS, higher-half). The MMU needs its
+    // PHYSICAL address. Likewise every descriptor's output address is already
+    // physical (fill_identity uses raw PAs). Flush the table out of the dcache so
+    // the page-table walker (which may bypass the cache) sees it.
+    let l1_va = core::ptr::addr_of!(L1_LOW) as u64;
+    let l1_pa = virt_to_phys(l1_va);
+
+    // Adjust ONLY TTBR0's T0SZ to 25 (39-bit VA, L1 start) — TTBR1 (T1SZ, the
+    // kernel high half) is left as Limine programmed it. Read-modify-write so we
+    // preserve Limine's granule/cacheability/IPS bits for both halves.
+    let mut tcr: u64;
+    core::arch::asm!("mrs {}, tcr_el1", out(reg) tcr, options(nomem, nostack));
+    tcr &= !0x3F; // clear T0SZ[5:0]
+    tcr |= TCR_T0SZ; // 25
+    // Force a 4 KiB TTBR0 granule (TG0 = 0b00) so the L1-start math matches.
+    tcr &= !(0b11 << 14);
+    tcr |= TCR_TG0_4K;
+
+    core::arch::asm!(
+        "dsb ish",
+        "msr tcr_el1, {tcr}",
+        "msr ttbr0_el1, {ttbr0}",
+        "isb",
+        "tlbi vmalle1is",
+        "dsb ish",
+        "isb",
+        tcr = in(reg) tcr,
+        ttbr0 = in(reg) l1_pa,
+        options(nostack, preserves_flags),
+    );
+
+    MMU_ON.store(true, Ordering::Release);
+}
+
 // ── EL0 user mapping (bring-up) ──────────────────────────────────────────────
 
 /// Table descriptor: valid + table type (points at the next-level table).

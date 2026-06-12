@@ -276,6 +276,46 @@ pub fn kernel_main_arch(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
     shared_init_and_run()
 }
 
+/// aarch64 Limine kernel entry (UEFI / UTM boot).
+///
+/// Called from `arch::aarch64::boot_limine::limine_kernel_entry` after the Limine
+/// path has installed our low-half TTBR0 identity map, brought up serial, the EL1
+/// vectors, and the GIC. Mirrors `kernel_main_arch` but takes its memory map from
+/// the Limine memory map (already translated into the neutral `BootMemMap` by the
+/// caller) and its framebuffer + engine module from Limine instead of ramfb.
+#[cfg(all(target_arch = "aarch64", feature = "limine-boot"))]
+pub fn kernel_main_arch_limine(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
+    logger::early_print("[OSCORTEX] kernel_main_arch_limine reached (aarch64/limine)\r\n");
+
+    mm::frame_allocator::set_hhdm_offset(hhdm_offset);
+
+    // ── 1. Architecture early init (FPU/SIMD, SVC readiness) ─────────────────
+    // Vectors + GIC are already live (set up in boot_limine).
+    arch::early_init();
+    logger::early_print("[OSCORTEX] arch::early_init done (aarch64/limine)\r\n");
+
+    // ── 2. Memory management from the Limine memory map ──────────────────────
+    mm::init_from_regions(&map, hhdm_offset);
+
+    // ── 3. Logger (serial only here; the Limine framebuffer comes up next) ──
+    logger::init(None);
+
+    log::warn!(
+        "[MM::FrameAlloc] capacity at boot: total_usable_frames={} ({} MiB), used_at_boot={} ({} MiB)",
+        mm::frame_allocator::frames_total(),
+        (mm::frame_allocator::frames_total() * 4096) / (1024 * 1024),
+        mm::frame_allocator::frames_used(),
+        (mm::frame_allocator::frames_used() * 4096) / (1024 * 1024)
+    );
+    log::info!("OSCortex kernel {} booting (aarch64/limine)...", env!("CARGO_PKG_VERSION"));
+
+    // ── 3b. Framebuffer + engine module via Limine ───────────────────────────
+    arch::aarch64::boot_limine::init_framebuffer();
+    arch::aarch64::boot_limine::scan_modules();
+
+    shared_init_and_run()
+}
+
 /// Architecture-neutral subsystem init, init-process spawn, and idle loop.
 ///
 /// Runs after each arch's boot prologue has brought up serial, the memory
@@ -300,6 +340,11 @@ fn shared_init_and_run() -> ! {
 
     // ── 7a. Window-manager event bridge ──────────────────────────────────
     wm::init();
+
+    // aarch64: bring up virtio-input (pointer) now that the WM queue + GIC are
+    // live. On `-M virt` there is no PS/2; pointer input arrives via virtio-mmio.
+    #[cfg(target_arch = "aarch64")]
+    crate::drivers::virtio_input::init();
 
     // ── 7b. Virtual filesystem (initramfs) ───────────────────────────────
     fs::init();
@@ -391,6 +436,13 @@ fn shared_init_and_run() -> ! {
                         // immediate-child-enter disabled on arm those workers only
                         // get the CPU when a timer tick preempts pid 1.
                         let _ = engine_present;
+                        // Clear the pending-init guard: aarch64 launches the init
+                        // process directly (below) instead of via the x86
+                        // user_launch_task, which is the only other site that clears
+                        // it. Left set, next_runnable_pid (the wrapper) returns None
+                        // forever → sys_exit halts the whole engine when any thread
+                        // exits. See process::mark_init_launched.
+                        process::mark_init_launched();
                         arch::aarch64::apic::start_scheduler_tick();
                         process::enter_user_by_pid_noreturn(pid);
                     }

@@ -5,9 +5,52 @@
 //! map at init time. The Cortex can expand the heap at runtime.
 
 use linked_list_allocator::LockedHeap;
+use core::alloc::{GlobalAlloc, Layout};
+
+/// The raw linked-list heap. Its lock is a plain spinlock — NOT interrupt-safe.
+static HEAP: LockedHeap = LockedHeap::empty();
+
+/// Interrupt-safe global allocator wrapper.
+///
+/// The kernel allocates from interrupt context: the generic-timer ISR
+/// (`check_timerfds_and_wake_try`, `handle_pending_wakes_try`) builds `Vec`s and
+/// touches `BTreeMap`s, all of which hit this global allocator. `LockedHeap`'s
+/// inner lock is a bare spinlock, so if a timer tick lands while the interrupted
+/// thread holds the heap lock, the ISR's allocation either deadlocks on the lock
+/// or (worse) races the hole-list bookkeeping — observed as nondeterministic
+/// `linked_list_allocator` panics ("Hole list out of order", "subtract with
+/// overflow", `assertion left == right failed`) once the engine starts doing
+/// real heap-heavy work. Masking IRQs around every heap operation makes alloc/
+/// dealloc atomic w.r.t. the timer ISR, so the ISR can never observe or mutate a
+/// half-updated hole list. (x86 is implicitly safe because its allocation-heavy
+/// ISR paths run with interrupts masked; aarch64 runs the syscall/ISR with IRQs
+/// unmasked, exposing the race.)
+struct IrqSafeHeap;
+
+unsafe fn with_irqs_off<R>(f: impl FnOnce() -> R) -> R {
+    let flags = crate::arch::interrupts_save_and_disable();
+    let r = f();
+    crate::arch::interrupts_restore(flags);
+    r
+}
+
+unsafe impl GlobalAlloc for IrqSafeHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        with_irqs_off(|| HEAP.alloc(layout))
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        with_irqs_off(|| HEAP.dealloc(ptr, layout))
+    }
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        with_irqs_off(|| HEAP.alloc_zeroed(layout))
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        with_irqs_off(|| HEAP.realloc(ptr, layout, new_size))
+    }
+}
 
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static ALLOCATOR: IrqSafeHeap = IrqSafeHeap;
 
 const INITIAL_HEAP_SIZE: usize = 64 * 1024 * 1024; // 64 MiB — needed for Flutter double-buffers
 const HEAP_ALIGN: usize = 4096;
