@@ -44,7 +44,14 @@ pub const MAX_PROCS: usize = 256;
 pub const USER_ELF_BASE: u64 = 0x0000_0000_0040_0000; // 4 MiB
 
 /// User stack top (grows downward; bottom = TOP − STACK_SIZE).
+///
+/// x86_64 uses a 47-bit canonical-low address. aarch64's bring-up MMU configures
+/// a 39-bit TTBR0 VA window (T0SZ=25 → max user VA 512 GiB), so the ARM stack top
+/// is placed just under that boundary instead.
+#[cfg(not(target_arch = "aarch64"))]
 pub const USER_STACK_TOP:  u64  = 0x0000_7FFF_FFFF_0000;
+#[cfg(target_arch = "aarch64")]
+pub const USER_STACK_TOP:  u64  = 0x0000_007F_FFF0_0000; // ~512 GiB − 1 MiB (39-bit VA)
 pub const USER_STACK_SIZE: usize = 4 * 1024 * 1024; // 4 MiB
 const SYSCALL_STACK_SIZE: usize = 64 * 1024;
 const XSTATE_SIZE: usize = 4096;
@@ -164,6 +171,37 @@ pub struct Process {
     pub user_stack_size: u64,
     /// CPU core index that currently executes this process context (None if idle/blocked).
     pub current_cpu: Option<u32>,
+    /// aarch64 only: full EL0 trap-frame snapshot (x0..x30, SP_EL0, ELR, SPSR,
+    /// ESR) captured when this thread is timer-preempted at an arbitrary user
+    /// instruction. The shared `UserRegs` carries only the x86-named subset, so
+    /// ARM scratch registers (x6/x7, x11–x18, x24–x28, x30) would otherwise be
+    /// lost across a preemptive switch. The ARM timer ISR saves the live
+    /// `vectors::TrapFrame` here and restores it on resume, giving full-fidelity
+    /// preemption while the shared scheduler still owns the switch *decision*.
+    /// Layout matches `arch::aarch64::vectors::TrapFrame` (36 × u64).
+    #[cfg(target_arch = "aarch64")]
+    pub arch_trapframe: [u64; 36],
+    /// aarch64 only: true once `arch_trapframe` holds a valid timer-preempt
+    /// snapshot to restore (vs. a fresh/syscall-entered thread).
+    #[cfg(target_arch = "aarch64")]
+    pub arch_frame_valid: bool,
+    /// aarch64 only: the user link register (x30) captured at the last SVC
+    /// boundary. AArch64 keeps return addresses in LR, not on the stack, so a
+    /// thread that yields mid-syscall must have x30 restored on resume — without
+    /// it the cooperative `build_image` re-entry leaves x30=0 and the thread's
+    /// next `ret` branches to address 0.
+    #[cfg(target_arch = "aarch64")]
+    pub user_lr: u64,
+    /// aarch64 only: the user PC (ELR) and SP (SP_EL0) captured at SVC ENTRY,
+    /// while the per-CPU snapshot is fresh (the eager entry capture). A blocking
+    /// syscall's `save_return_context` rewinds/uses THESE rather than the live
+    /// per-CPU scratch, which a timer-preempted sibling's SVC can clobber before
+    /// the yield decision — otherwise the thread resumes on the wrong SP and its
+    /// `ldp x29,x30,[sp,#..]; ret` reads a stale/zero frame record → `ret` to 0.
+    #[cfg(target_arch = "aarch64")]
+    pub entry_user_rip: u64,
+    #[cfg(target_arch = "aarch64")]
+    pub entry_user_rsp: u64,
 }
 
 impl Process {
@@ -196,7 +234,54 @@ impl Process {
             user_stack_base: 0,
             user_stack_size: 0,
             current_cpu: None,
+            #[cfg(target_arch = "aarch64")]
+            arch_trapframe: [0u64; 36],
+            #[cfg(target_arch = "aarch64")]
+            arch_frame_valid: false,
+            #[cfg(target_arch = "aarch64")]
+            user_lr: 0,
+            #[cfg(target_arch = "aarch64")]
+            entry_user_rip: 0,
+            #[cfg(target_arch = "aarch64")]
+            entry_user_rsp: 0,
         }
+    }
+}
+
+/// aarch64: save a full EL0 trap-frame snapshot into `pid`'s arch slot, taken
+/// when the generic-timer ISR preempts the thread. Restored verbatim by
+/// `arch_take_trapframe` so ARM scratch registers survive the switch.
+///
+/// Called from the timer IRQ handler, so it uses `try_lock` and never blocks —
+/// blocking on a contended PTABLE_LOCK from inside an ISR would deadlock. Returns
+/// false if the lock was busy (the caller then skips the switch this tick).
+#[cfg(target_arch = "aarch64")]
+pub fn arch_store_trapframe(pid: u32, frame: &[u64; 36]) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.arch_trapframe = *frame;
+            p.arch_frame_valid = true;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// aarch64: fetch `pid`'s saved trap-frame snapshot (and whether it is valid).
+/// The valid flag is consumed (cleared) so a subsequent syscall-entry re-entry
+/// rebuilds the frame from `regs` instead of replaying a stale snapshot. Uses
+/// `try_lock` for the same ISR-safety reason as `arch_store_trapframe`.
+#[cfg(target_arch = "aarch64")]
+pub fn arch_take_trapframe(pid: u32) -> Option<[u64; 36]> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.arch_frame_valid {
+        p.arch_frame_valid = false;
+        Some(p.arch_trapframe)
+    } else {
+        None
     }
 }
 
@@ -271,6 +356,18 @@ pub struct PTableLock {
     holder: AtomicU32,
 }
 
+/// CPU index used to key PTABLE_LOCK_RECURSION / the holder atomic. Always a
+/// valid in-range index. We use the computed `current_cpu_id()` (which on
+/// aarch64 short-circuits to 0 for single-core) rather than reading the
+/// `PerCpuData.cpu_id` *field*, and hard-clamp to the recursion-array bound so
+/// the timer ISR can never index out of bounds and panic the kernel even if a
+/// per-CPU struct read is momentarily inconsistent.
+#[inline(always)]
+fn ptable_cpu_idx() -> u32 {
+    let id = crate::arch::smp::current_cpu_id();
+    if (id as usize) < crate::arch::smp::MAX_CPUS { id } else { 0 }
+}
+
 impl PTableLock {
     pub const fn new() -> Self {
         Self {
@@ -280,7 +377,7 @@ impl PTableLock {
     }
 
     pub fn lock(&self) -> PTableGuard {
-        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        let my_cpu = ptable_cpu_idx();
         if self.holder.load(Ordering::Acquire) == my_cpu {
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
@@ -298,7 +395,7 @@ impl PTableLock {
     }
 
     pub fn try_lock(&self) -> Option<PTableGuard> {
-        let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+        let my_cpu = ptable_cpu_idx();
         if self.holder.load(Ordering::Acquire) == my_cpu {
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
@@ -322,14 +419,14 @@ impl PTableLock {
 impl Drop for PTableGuard {
     fn drop(&mut self) {
         if self.is_outer {
-            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            let my_cpu = ptable_cpu_idx();
             unsafe {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] = 0;
                 PTABLE_LOCK.holder.store(0xFFFF_FFFF, Ordering::Release);
                 PTABLE_LOCK_GUARD = None;
             }
         } else {
-            let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+            let my_cpu = ptable_cpu_idx();
             unsafe {
                 if PTABLE_LOCK_RECURSION[my_cpu as usize] > 0 {
                     PTABLE_LOCK_RECURSION[my_cpu as usize] -= 1;
@@ -509,7 +606,11 @@ pub fn spawn_with_bootstrap(
         }
     }
 
-    // Map POSIX trampoline + sysdata pages so glibc symbols resolve correctly.
+    // Map POSIX trampoline + sysdata pages so libc/glibc symbols the Flutter
+    // engine imports resolve to in-process syscall stubs. encode_stub() emits
+    // native machine code per arch (x86 on x86_64, AArch64 on aarch64), so this
+    // is required on BOTH arches once a dynamically-linked host (the Flutter
+    // embedder) runs — the engine's DT_INIT_ARRAY jumps into these stubs.
     posix_trampolines::map_system_pages(pml4_phys)?;
 
     let idx = idx_of(pid);
@@ -547,6 +648,11 @@ pub fn spawn_with_bootstrap(
         p.sig_handlers       = [0u64; 32];
         p.errno_to_deliver   = 0;
         p.preempted_by_timer = false;
+        // aarch64: start with no stale timer-preempt frame snapshot.
+        #[cfg(target_arch = "aarch64")]
+        {
+            p.arch_frame_valid = false;
+        }
     }
 
     log::info!(
@@ -716,6 +822,18 @@ pub fn set_current_pid(pid: u32) {
 /// Get currently active userspace PID.
 pub fn current_pid() -> u32 {
     crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
+}
+
+/// Physical address of the current process's top-level page table (the L1 / TTBR0
+/// root on aarch64, the PML4 on x86). Used by diagnostics / kernel-side user-VA
+/// translation. Returns 0 if there is no current process.
+pub fn current_user_root() -> u64 {
+    let pid = current_pid();
+    if pid == 0 { return 0; }
+    let idx = idx_of(pid);
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx] };
+    if p.pid == pid { p.pml4_phys } else { 0 }
 }
 
 /// Wait for `pid` to become zombie, then reap it and return exit code.
@@ -895,6 +1013,35 @@ pub fn sibling_pids(current: u32) -> alloc::vec::Vec<u32> {
         }
     }
     out
+}
+
+/// Compact debug string of pid/state/current_cpu for the first few PIDs, for
+/// diagnosing why the timer-preempt scheduler can't find a runnable thread.
+pub fn debug_runnable_states() -> alloc::string::String {
+    use core::fmt::Write;
+    let mut s = alloc::string::String::new();
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        // Print the RAW slot contents for indices 1..=12 (the slot's own .pid
+        // field, not the loop var) so a slot whose .pid != index reveals a
+        // reused/cleared entry — the mechanism behind a worker thread that runs
+        // yet never appears under its expected index.
+        for idx in 1usize..=12 {
+            let p = unsafe { &PTABLE[idx] };
+            if p.pid == 0 { continue; }
+            let st = match p.state {
+                ProcState::Running => 'R',
+                ProcState::Blocked => 'B',
+                ProcState::Zombie(_) => 'Z',
+                ProcState::Dead => 'D',
+            };
+            let cpu = match p.current_cpu { Some(c) => c as i32, None => -1 };
+            // slot[idx]=pid:state c cpu
+            let _ = write!(s, "s{}={}{}{} ", idx, p.pid, st, cpu);
+        }
+    } else {
+        s.push_str("(locked)");
+    }
+    s
 }
 
 pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
@@ -1301,13 +1448,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     crate::arch::cpu::set_fs_base(fs_base);
 
     // Switch to the user address space.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {cr3}",
-            cr3 = in(reg) pml4_phys,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
+    crate::arch::memory::write_cr3(pml4_phys);
 
     // Deliver pending errno (e.g. EINTR=4 from sys_epoll_wait_real) NOW,
     // after the CR3 switch so we write into the resuming thread's own SYSDATA
@@ -1322,6 +1463,26 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         }
     }
 
+    // aarch64: carry the user link register (x30) in the otherwise-unused
+    // `rflags` slot (build_image maps rflags→x30 on aarch64; SPSR is constant
+    // there). Without this the cooperative SYSRET resume leaves x30=0 and the
+    // resuming thread's next `ret` branches to address 0.
+    #[cfg(target_arch = "aarch64")]
+    let rflags = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid { p.user_lr } else { rflags }
+    };
+
+    // Assemble the full user register state for the arch entry hook. The
+    // arch backend owns the actual ring-3 transition asm (IRETQ vs SYSRETQ on
+    // x86_64); the shared code above owns all the PTABLE/CR3/errno logic.
+    let enter_regs = crate::arch::EnterUserRegs {
+        rip, rsp, rflags,
+        rax, rbx, rcx, rdx, rsi, rdi, rbp,
+        r8, r9, r10, r11, r12, r13, r14, r15,
+    };
+
     if preempted_by_timer {
         // ── IRET path ────────────────────────────────────────────────────────
         // This thread was timer-preempted at an arbitrary user instruction, so
@@ -1329,67 +1490,7 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
         // RFLAGS) before returning.  SYSRETQ is wrong here because it would
         // set RIP=RCX and RFLAGS=R11, corrupting those registers and losing
         // the real FLAGS state (e.g. CF/ZF from a cmp instruction).
-        //
-        // Layout of iret_frame (accessed via r11 as base register):
-        //   [r11 + 0x00]  RIP   ─┐
-        //   [r11 + 0x08]  CS      │ hardware IRET frame pushed onto
-        //   [r11 + 0x10]  RFLAGS  │ the kernel stack by the `push` sequence
-        //   [r11 + 0x18]  RSP    ─┘ (ring-3 switch includes RSP+SS)
-        //   [r11 + 0x20]  SS
-        //   [r11 + 0x28]  RAX .. R15  (all user GPRs, r11 loaded last)
-        let iret_frame: [u64; 20] = [
-            /* 0x00 */ rip,
-            /* 0x08 */ crate::arch::gdt::USER_CS as u64,   // 0x2B
-            /* 0x10 */ rflags | 0x200,  // ensure IF=1
-            /* 0x18 */ rsp,
-            /* 0x20 */ crate::arch::gdt::USER_DS as u64,   // 0x23
-            /* 0x28 */ rax,
-            /* 0x30 */ rbx,
-            /* 0x38 */ rcx,   // real RCX (not SYSCALL convention)
-            /* 0x40 */ rdx,
-            /* 0x48 */ rdi,
-            /* 0x50 */ rsi,
-            /* 0x58 */ rbp,
-            /* 0x60 */ r8,
-            /* 0x68 */ r9,
-            /* 0x70 */ r10,
-            /* 0x78 */ r11,   // real R11 (not RFLAGS convention)
-            /* 0x80 */ r12,
-            /* 0x88 */ r13,
-            /* 0x90 */ r14,
-            /* 0x98 */ r15,
-        ];
-        unsafe {
-            core::arch::asm!(
-                // Push the 5-word IRET frame: SS, RSP, RFLAGS, CS, RIP.
-                // These land on the current kernel stack; IRETQ will consume
-                // them and switch to the user stack (RSP) automatically.
-                "push qword ptr [r11 + 0x20]",  // SS
-                "push qword ptr [r11 + 0x18]",  // RSP
-                "push qword ptr [r11 + 0x10]",  // RFLAGS
-                "push qword ptr [r11 + 0x08]",  // CS
-                "push qword ptr [r11 + 0x00]",  // RIP
-                // Restore all user GPRs (r11 last because it is our base ptr).
-                "mov rax, [r11 + 0x28]",
-                "mov rbx, [r11 + 0x30]",
-                "mov rcx, [r11 + 0x38]",
-                "mov rdx, [r11 + 0x40]",
-                "mov rdi, [r11 + 0x48]",
-                "mov rsi, [r11 + 0x50]",
-                "mov rbp, [r11 + 0x58]",
-                "mov r8,  [r11 + 0x60]",
-                "mov r9,  [r11 + 0x68]",
-                "mov r10, [r11 + 0x70]",
-                "mov r12, [r11 + 0x80]",
-                "mov r13, [r11 + 0x88]",
-                "mov r14, [r11 + 0x90]",
-                "mov r15, [r11 + 0x98]",
-                "mov r11, [r11 + 0x78]",   // real R11 — must be last
-                "iretq",
-                in("r11") iret_frame.as_ptr(),
-                options(noreturn),
-            )
-        }
+        unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
     // ── SYSRET path (syscall-yield context) ──────────────────────────────────
@@ -1400,58 +1501,8 @@ pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
     // RAX changed to the syscall return value. This is required because the
     // SysV ABI mandates that callee-saved regs (rbx, rbp, r12–r15) survive
     // a function call, and the userspace SYSCALL trampoline is such a call.
-    //
-    // Stage values in a fixed-layout stack array and load them inside the asm
-    // block via a single pointer. RSP and the syscall-consumed regs (RCX,
-    // R11) are loaded last so all intermediate reads complete first.
-    let frame: [u64; 16] = [
-        /* 0x00 */ rip,
-        /* 0x08 */ rflags,
-        /* 0x10 */ rsp,
-        /* 0x18 */ rdi,
-        /* 0x20 */ rsi,
-        /* 0x28 */ rdx,
-        /* 0x30 */ rax,
-        /* 0x38 */ rbx,
-        /* 0x40 */ rbp,
-        /* 0x48 */ r8,
-        /* 0x50 */ r9,
-        /* 0x58 */ r10,
-        /* 0x60 */ r12,
-        /* 0x68 */ r13,
-        /* 0x70 */ r14,
-        /* 0x78 */ r15,
-    ];
     log::trace!("[enter_user] about to SYSRET. rip={:#x} rsp={:#x} rflags={:#x} pml4_phys={:#x}", rip, rsp, rflags, pml4_phys);
-    unsafe {
-        core::arch::asm!(
-            // Pin the frame base in r11. r11 is consumed by SYSRET (as user
-            // RFLAGS) and is the LAST register we load — every other load
-            // can therefore use [r11 + disp] safely. If we let the compiler
-            // pick the base register, it can alias the base with the first
-            // destination (e.g. rax) and have the very first `mov` clobber
-            // the pointer before any further reads happen.
-            "mov rax, [r11 + 0x30]",
-            "mov rdi, [r11 + 0x18]",
-            "mov rsi, [r11 + 0x20]",
-            "mov rdx, [r11 + 0x28]",
-            "mov rbx, [r11 + 0x38]",
-            "mov rbp, [r11 + 0x40]",
-            "mov r8,  [r11 + 0x48]",
-            "mov r9,  [r11 + 0x50]",
-            "mov r10, [r11 + 0x58]",
-            "mov r12, [r11 + 0x60]",
-            "mov r13, [r11 + 0x68]",
-            "mov r14, [r11 + 0x70]",
-            "mov r15, [r11 + 0x78]",
-            "mov rcx, [r11 + 0x00]",   // user RIP   → RCX (consumed by sysretq)
-            "mov rsp, [r11 + 0x10]",   // switch to user stack (mapped in user PML4)
-            "mov r11, [r11 + 0x08]",   // user RFL  → R11 (consumed by sysretq) — load LAST
-            "sysretq",
-            in("r11") frame.as_ptr(),
-            options(noreturn),
-        )
-    }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
 pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
@@ -1483,6 +1534,12 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
          syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = context;
 
     crate::process::set_current_pid(pid);
+    if rip == 0 || rip < 0x1000 {
+        log::error!(
+            "[enter-user-ZEROPC] pid={} rip={:#x} rsp={:#x} rax={:#x} fs={:#x} preempted={}",
+            pid, rip, rsp, rax, fs_base, preempted_by_timer
+        );
+    }
     if pid == 8 || pid == 9 {
         static ENTER_USER_89_LOG: AtomicU32 = AtomicU32::new(0);
         let n = ENTER_USER_89_LOG.fetch_add(1, Ordering::Relaxed);
@@ -1504,13 +1561,7 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
     crate::arch::cpu::set_fs_base(fs_base);
 
     // Switch to the user address space.
-    unsafe {
-        core::arch::asm!(
-            "mov cr3, {cr3}",
-            cr3 = in(reg) pml4_phys,
-            options(nostack, nomem, preserves_flags),
-        );
-    }
+    crate::arch::memory::write_cr3(pml4_phys);
 
     if errno_to_deliver != 0 {
         unsafe {
@@ -1521,99 +1572,29 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         }
     }
 
+    // aarch64: carry the user link register (x30) in the otherwise-unused
+    // `rflags` slot. build_image maps rflags→x30 on aarch64; SPSR is a constant
+    // there, so rflags is free. (The timer-preempt/IRET path restores x30 from
+    // arch_trapframe instead, so this only matters for the SYSRET/cooperative
+    // resume below.)
+    #[cfg(target_arch = "aarch64")]
+    let rflags = {
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid { p.user_lr } else { rflags }
+    };
+
+    let enter_regs = crate::arch::EnterUserRegs {
+        rip, rsp, rflags,
+        rax, rbx, rcx, rdx, rsi, rdi, rbp,
+        r8, r9, r10, r11, r12, r13, r14, r15,
+    };
+
     if preempted_by_timer {
-        let iret_frame: [u64; 20] = [
-            /* 0x00 */ rip,
-            /* 0x08 */ crate::arch::gdt::USER_CS as u64,
-            /* 0x10 */ rflags | 0x200,
-            /* 0x18 */ rsp,
-            /* 0x20 */ crate::arch::gdt::USER_DS as u64,
-            /* 0x28 */ rax,
-            /* 0x30 */ rbx,
-            /* 0x38 */ rcx,
-            /* 0x40 */ rdx,
-            /* 0x48 */ rdi,
-            /* 0x50 */ rsi,
-            /* 0x58 */ rbp,
-            /* 0x60 */ r8,
-            /* 0x68 */ r9,
-            /* 0x70 */ r10,
-            /* 0x78 */ r11,
-            /* 0x80 */ r12,
-            /* 0x88 */ r13,
-            /* 0x90 */ r14,
-            /* 0x98 */ r15,
-        ];
-        unsafe {
-            core::arch::asm!(
-                "push qword ptr [r11 + 0x20]",
-                "push qword ptr [r11 + 0x18]",
-                "push qword ptr [r11 + 0x10]",
-                "push qword ptr [r11 + 0x08]",
-                "push qword ptr [r11 + 0x00]",
-                "mov rax, [r11 + 0x28]",
-                "mov rbx, [r11 + 0x30]",
-                "mov rcx, [r11 + 0x38]",
-                "mov rdx, [r11 + 0x40]",
-                "mov rdi, [r11 + 0x48]",
-                "mov rsi, [r11 + 0x50]",
-                "mov rbp, [r11 + 0x58]",
-                "mov r8,  [r11 + 0x60]",
-                "mov r9,  [r11 + 0x68]",
-                "mov r10, [r11 + 0x70]",
-                "mov r12, [r11 + 0x80]",
-                "mov r13, [r11 + 0x88]",
-                "mov r14, [r11 + 0x90]",
-                "mov r15, [r11 + 0x98]",
-                "mov r11, [r11 + 0x78]",
-                "iretq",
-                in("r11") iret_frame.as_ptr(),
-                options(noreturn),
-            )
-        }
+        unsafe { crate::arch::enter_user_iret(&enter_regs) }
     }
 
-    let frame: [u64; 16] = [
-        /* 0x00 */ rip,
-        /* 0x08 */ rflags,
-        /* 0x10 */ rsp,
-        /* 0x18 */ rdi,
-        /* 0x20 */ rsi,
-        /* 0x28 */ rdx,
-        /* 0x30 */ rax,
-        /* 0x38 */ rbx,
-        /* 0x40 */ rbp,
-        /* 0x48 */ r8,
-        /* 0x50 */ r9,
-        /* 0x58 */ r10,
-        /* 0x60 */ r12,
-        /* 0x68 */ r13,
-        /* 0x70 */ r14,
-        /* 0x78 */ r15,
-    ];
-    unsafe {
-        core::arch::asm!(
-            "mov rax, [r11 + 0x30]",
-            "mov rdi, [r11 + 0x18]",
-            "mov rsi, [r11 + 0x20]",
-            "mov rdx, [r11 + 0x28]",
-            "mov rbx, [r11 + 0x38]",
-            "mov rbp, [r11 + 0x40]",
-            "mov r8,  [r11 + 0x48]",
-            "mov r9,  [r11 + 0x50]",
-            "mov r10, [r11 + 0x58]",
-            "mov r12, [r11 + 0x60]",
-            "mov r13, [r11 + 0x68]",
-            "mov r14, [r11 + 0x70]",
-            "mov r15, [r11 + 0x78]",
-            "mov rcx, [r11 + 0x00]",
-            "mov rsp, [r11 + 0x10]",
-            "mov r11, [r11 + 0x08]",
-            "sysretq",
-            in("r11") frame.as_ptr(),
-            options(noreturn),
-        )
-    }
+    unsafe { crate::arch::enter_user_sysret(&enter_regs) }
 }
 
 /// Kernel-task entry point: loads the user PML4 and SYSRETs to ring-3.
@@ -1629,7 +1610,7 @@ fn user_launch_task() {
     // Disable interrupts so the APIC timer cannot preempt between
     // mark_current_zombie() and sysretq.  SYSRET restores RFLAGS from R11
     // (0x0202 = IF=1), so the user process runs with interrupts enabled.
-    unsafe { core::arch::asm!("cli", options(nomem, nostack, preserves_flags)); }
+    crate::arch::interrupts_disable();
     // Mark this kernel task as Zombie before we SYSRET.  The SYSRET transfers
     // execution to ring-3 permanently; this task slot must never be resumed as
     // a kernel task again.  Marking it Zombie prevents the scheduler from
@@ -1659,7 +1640,7 @@ fn user_launch_task() {
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
 pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
-    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
     let _g = PTABLE_LOCK.lock();
@@ -1718,7 +1699,7 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
 
 /// Try-lock variant of `timer_preempt_switch` to avoid ISR deadlocks.
 pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
-    let my_cpu = crate::arch::smp::this_cpu().cpu_id;
+    let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
     if let Some(_g) = PTABLE_LOCK.try_lock() {
@@ -1798,18 +1779,112 @@ pub fn save_cooperative_yield_context(pid: u32, rip: u64, rsp: u64) {
 
 /// Save the user-space return context (RIP + RSP after syscall) into the
 /// process's register file so `enter_user_by_pid_noreturn` resumes correctly.
+/// Length in bytes of the user syscall-entry instruction. On x86_64 `syscall`
+/// is 2 bytes; on aarch64 `svc #0` is 4 bytes. After a syscall the user PC
+/// (ELR_EL1 / the saved RIP) points at the *next* instruction, so to make a
+/// blocked thread RE-EXECUTE its syscall on resume the kernel rewinds the saved
+/// PC by exactly one syscall instruction.
+#[cfg(target_arch = "x86_64")]
+pub const SYSCALL_INSN_LEN: u64 = 2;
+#[cfg(target_arch = "aarch64")]
+pub const SYSCALL_INSN_LEN: u64 = 4;
+
+/// Save a thread's resume context rewound to RE-EXECUTE the syscall it is
+/// currently in (used by the blocking syscalls — epoll_wait/poll/wm_event_wait/
+/// futex — which resume by re-entering the kernel and re-checking readiness).
+/// Rewinds the saved PC by one syscall instruction (arch-correct length).
+/// Using a hardcoded `-2` here mis-rewinds aarch64's 4-byte `svc` into the
+/// middle of the instruction → a PC-alignment fault (EC=0x22) on resume.
+pub fn save_return_context_reexec(pid: u32, urip: u64, ursp: u64) {
+    save_return_context_inner(pid, urip.wrapping_sub(SYSCALL_INSN_LEN), ursp, SYSCALL_INSN_LEN);
+}
+
 pub fn save_return_context(pid: u32, rip: u64, rsp: u64) {
+    save_return_context_inner(pid, rip, rsp, 0);
+}
+
+/// `aarch64_rewind` is how far the resume PC is rewound from the syscall return
+/// point (0 for a plain return, SYSCALL_INSN_LEN to re-execute the `svc`). On
+/// aarch64 the resume PC/SP/LR come from the TARGET thread's eagerly-captured
+/// entry snapshot (`entry_user_rip`/`entry_user_rsp`/`user_lr`, taken in the
+/// IRQ-masked SVC window), NOT from the caller's `rip`/`rsp` — those were read
+/// from the live per-CPU scratch, which on the wake path belongs to the WAKER
+/// (not `pid`) and on a self-yield can be clobbered by a timer-preempted
+/// sibling's SVC. Trusting the scratch there resumed the thread on the wrong SP,
+/// so its `ldp x29,x30,[sp,#..]; ret` read a stale/zero frame record → `ret` 0.
+fn save_return_context_inner(pid: u32, rip: u64, rsp: u64, aarch64_rewind: u64) {
     let fs = crate::arch::cpu::get_fs_base();
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid == pid {
-        p.regs.rip    = rip;
-        p.regs.rsp    = rsp;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Prefer this thread's own entry-captured PC/SP; fall back to the
+            // passed values only if no entry capture exists yet (e.g. a fresh
+            // thread that has not run a syscall). x30 was already persisted by
+            // the eager capture — do NOT overwrite it with the live scratch.
+            if p.entry_user_rip != 0 {
+                p.regs.rip = p.entry_user_rip.wrapping_sub(aarch64_rewind);
+                p.regs.rsp = p.entry_user_rsp;
+            } else {
+                p.regs.rip = rip;
+                p.regs.rsp = rsp;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = aarch64_rewind;
+            p.regs.rip = rip;
+            p.regs.rsp = rsp;
+        }
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
         p.preempted_by_timer = false;
         p.fs_base = fs;
     }
+}
+
+/// Guards against a since-clobbered per-CPU user-GPR snapshot leaking into a
+/// thread's saved context.
+///
+/// The user GPR snapshot lives in a PER-CPU scratch area, written at syscall
+/// entry from the trapping thread's frame. It is shared by every thread on that
+/// core, so once a syscall hands off the CPU (a cooperative `epoll`/`futex`/
+/// `cond` yield, or — on aarch64 — a generic-timer preempt that lands a
+/// sibling's SVC mid-handler), another thread's syscall entry OVERWRITES it. A
+/// later `save_full_user_gprs` would then read the *other* thread's callee-saved
+/// regs / link register and store them into our context → on resume rbx/rbp/
+/// r12–15 (x19–x23/x29) or x30 are garbage, and the next `ret` branches to a
+/// stale address (observed on aarch64: x30=0 → `ret` to 0 → EL0 UDF after
+/// `FlutterEngineRunInitialized`; the x86 analogue corrupted `MessageLoop::Run`'s
+/// `this`).
+///
+/// Fix: capture ONCE, eagerly, at syscall entry (`capture_user_gprs_at_entry`),
+/// while the snapshot is still fresh for THIS thread (x86: interrupts masked
+/// until the handler `sti`s; aarch64: from inside the IRQ-masked SVC window in
+/// the vector dispatch). This flag makes every subsequent yield-time
+/// `save_full_user_gprs` in the same syscall a no-op, so a clobbered per-CPU
+/// snapshot can never leak into our saved context.
+const GPR_CAP_MAX_CPUS: usize = 64;
+static GPRS_CAPTURED: [core::sync::atomic::AtomicBool; GPR_CAP_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; GPR_CAP_MAX_CPUS];
+
+#[inline]
+fn gpr_cap_cpu_idx() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    { (crate::arch::aarch64::smp::current_cpu_id() as usize).min(GPR_CAP_MAX_CPUS - 1) }
+    #[cfg(not(target_arch = "aarch64"))]
+    { (crate::arch::smp::this_cpu().cpu_id as usize).min(GPR_CAP_MAX_CPUS - 1) }
+}
+
+/// Capture the user GPRs into `pid`'s PTABLE slot at syscall ENTRY, while the
+/// per-CPU snapshot is guaranteed fresh for this thread. Marks them captured so
+/// later `save_full_user_gprs` calls this syscall don't re-read the (possibly
+/// since-clobbered) shared per-CPU snapshot. MUST be invoked while the snapshot
+/// cannot yet be overwritten by a sibling (IRQs masked / pre-`sti`).
+pub fn capture_user_gprs_at_entry(pid: u32) {
+    GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
+    save_full_user_gprs(pid);
 }
 
 /// Snapshot the full user GPR set (as captured at SYSCALL entry) into the
@@ -1853,8 +1928,8 @@ pub fn capture_user_gprs_at_entry(pid: u32) {
 }
 
 pub fn save_full_user_gprs(pid: u32) {
-    // Only the first call per syscall (the eager entry capture) reads the
-    // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops.
+    // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops so a
+    // since-clobbered snapshot cannot leak into our saved context.
     if GPRS_CAPTURED[gpr_cap_cpu_idx()].swap(true, core::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -1887,6 +1962,16 @@ pub fn save_full_user_gprs(pid: u32) {
     p.regs.r13 = snap.r13;
     p.regs.r14 = snap.r14;
     p.regs.r15 = snap.r15;
+    // aarch64: persist the user link register (x30) so the thread can `ret`
+    // correctly after resuming from this syscall yield, plus the entry PC/SP so a
+    // blocking syscall's save_return_context can rewind from the FRESH entry
+    // values rather than the live (clobberable) per-CPU scratch.
+    #[cfg(target_arch = "aarch64")]
+    {
+        p.user_lr = snap.lr;
+        p.entry_user_rip = crate::arch::syscall::user_rip();
+        p.entry_user_rsp = crate::arch::syscall::user_rsp();
+    }
 }
 
 /// Set the `rax` return value that will be delivered when this process is

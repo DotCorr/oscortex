@@ -27,6 +27,7 @@ use sys::*;
 
 /// Bare-metal userspace entry. The kernel sets up RBP=0 and RSP pointing to
 /// a fresh user stack before jumping here.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn _start() -> ! {
@@ -66,6 +67,52 @@ unsafe extern "C" fn _start() -> ! {
             "mov rax, 60",  // SYS_EXIT
             "xor rdi, rdi",
             "syscall",
+            "2:",
+            ".ascii \"!\"",
+            main = sym main_embedder,
+        );
+    }
+}
+
+/// aarch64 userspace entry. The kernel enters EL0 with x0=host_mode, x1=app_id,
+/// x2=aot_va (the SpawnBootstrap rdi/rsi/rdx mapped to x0/x1/x2 by
+/// `enter_user.rs::build_image`) and SP pointing at a fresh 16-byte-aligned user
+/// stack. We preserve x0..x2 across the breadcrumb write (callee-saved x19..x21
+/// survive the `svc`), then call `main_embedder(x0, x1, x2)`.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+unsafe extern "C" fn _start() -> ! {
+    unsafe {
+        core::arch::naked_asm!(
+            // Zero the frame pointer (x29) — terminates backtraces cleanly.
+            "mov x29, #0",
+            "mov x30, #0",
+            // AAPCS64 requires SP to be 16-byte aligned. SP cannot be a direct
+            // operand of AND, so round it down via a scratch GPR (x9).
+            "mov x9, sp",
+            "and x9, x9, #-16",
+            "mov sp, x9",
+            // Preserve the bootstrap args (x0=host_mode, x1=app_id, x2=aot_va)
+            // across the breadcrumb write syscall, which clobbers x0..x2.
+            "mov x19, x0",
+            "mov x20, x1",
+            "mov x21, x2",
+            // Earliest userspace breadcrumb: write one '!' byte to fd 1.
+            "mov x8, #1",            // SYS_WRITE
+            "mov x0, #1",            // fd = 1
+            "adr x1, 2f",            // buf = label 2
+            "mov x2, #1",            // len = 1
+            "svc #0",
+            // Restore the bootstrap args for main_embedder(x0, x1, x2).
+            "mov x0, x19",
+            "mov x1, x20",
+            "mov x2, x21",
+            "bl {main}",
+            // If main returns, exit(0).
+            "mov x8, #60",           // SYS_EXIT
+            "mov x0, #0",
+            "svc #0",
             "2:",
             ".ascii \"!\"",
             main = sym main_embedder,
@@ -2380,27 +2427,16 @@ const ENGINE_LIB_PATH: &[u8] = b"/system/lib/libflutter_engine.so";
 const HOST_MODE_SHELL: u64 = 1;
 const HOST_MODE_APP: u64 = 2;
 
-fn read_host_bootstrap() -> (u64, u64, u64) {
-    let rdi: u64;
-    let rsi: u64;
-    let rdx: u64;
-    unsafe {
-        asm!(
-            "mov {0}, rdi",
-            "mov {1}, rsi",
-            "mov {2}, rdx",
-            out(reg) rdi,
-            out(reg) rsi,
-            out(reg) rdx,
-        );
-    }
-    (rdi, rsi, rdx)
-}
-
 // ── Main embedder logic ───────────────────────────────────────────────────────
 
-extern "C" fn main_embedder() {
-    let (host_mode, app_id, aot_va) = read_host_bootstrap();
+/// Entry called from `_start` with the kernel's bootstrap registers passed as
+/// the first three C arguments (x86: rdi/rsi/rdx, aarch64: x0/x1/x2):
+///   `host_mode` (1 = shell, 2 = launched app), `app_id`, `aot_va`.
+extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
+    // DIAGNOSTIC (aarch64 bring-up): emit a raw breadcrumb via the syscall
+    // wrapper so we can confirm main_embedder is entered and `write()` works
+    // against a .rodata buffer before the heavier init runs.
+    write(b"[host] main_embedder entered\n");
     CURRENT_HOST_MODE.store(host_mode, Ordering::Release);
     CURRENT_APP_ID.store(app_id, Ordering::Release);
     write(b"[host] starting\n");
@@ -2627,10 +2663,16 @@ extern "C" fn main_embedder() {
     // layer (livelock). Strategy: make the heap large enough that NO GC fires during
     // the first frame — no safepoint, no livelock. (Do NOT use --marker_tasks=0 /
     // --scavenger_tasks=0: the debug VM asserts num_tasks>0 and SIGABRTs.)
-    static ARG8: &[u8] =
-        b"--dart-flags=--old_gen_heap_size=512,--new_gen_semi_max_size=64,--no_background_compilation\0";
+    // NOTE: we deliberately do NOT pass a `--dart-flags=...` switch. The engine's
+    // SettingsFromCommandLine (shell/common/switches.cc) runs every comma-split
+    // entry through IsAllowedDartVMFlag against a tiny allowlist and FML_LOG(FATAL)s
+    // on anything else — `--old_gen_heap_size` / `--new_gen_semi_max_size` /
+    // `--no_background_compilation` are NOT on that list, so passing them via
+    // --dart-flags aborts the engine (switches.cc:478). The original GC-heap sizing
+    // was a workaround for an x86-TCG/JIT livelock that the later diagnosis traced
+    // to font fallback + slow JIT; under AOT on ARM we let the VM use its defaults.
     #[repr(transparent)]
-    struct ArgvPtrs([*const u8; 9]);
+    struct ArgvPtrs([*const u8; 8]);
     unsafe impl Sync for ArgvPtrs {}
     static ENGINE_ARGV: ArgvPtrs =
         ArgvPtrs([
@@ -2642,7 +2684,6 @@ extern "C" fn main_embedder() {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
-            ARG8.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
@@ -2764,10 +2805,16 @@ extern "C" fn main_embedder() {
         }
     }
 
-    // Save main thread RSP so our task runner callback can detect if we are on the platform thread.
-    let mut rsp: u64;
+    // Save the platform-thread stack pointer so the task-runner callback can
+    // detect whether it is running on the platform thread.
+    let rsp: u64;
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         asm!("mov {}, rsp", out(reg) rsp);
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        asm!("mov {}, sp", out(reg) rsp);
     }
     PLATFORM_THREAD_RSP.store(rsp, Ordering::SeqCst);
 
@@ -3501,10 +3548,14 @@ fn write_hex_u64(label: &[u8], val: u64) {
     write(&buf);
 }
 
-/// Read the x86 TSC and return an approximate nanosecond timestamp.
-/// Uses a nominal 3 GHz frequency (Phase 33-A keeps the kernel calibrated).
-/// Must match sys_clock_gettime(CLOCK_MONOTONIC) exactly by adding the Unix epoch
-/// offset used by the kernel (1,700,000,000 seconds).
+/// Read a monotonic nanosecond timestamp from the CPU cycle/tick counter.
+///
+/// x86: the TSC at a nominal 3 GHz. aarch64: the architected generic timer
+/// virtual count (`CNTVCT_EL0`) scaled by its frequency (`CNTFRQ_EL0`, typically
+/// 62.5 MHz under QEMU). Both add the same Unix-epoch offset the kernel's
+/// `sys_clock_gettime(CLOCK_MONOTONIC)` uses (1,700,000,000 s) so the engine's
+/// timeline matches the kernel's.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc_ns() -> u64 {
     let lo: u32;
@@ -3520,6 +3571,22 @@ fn rdtsc_ns() -> u64 {
     let tsc = ((hi as u64) << 32) | (lo as u64);
     let tsc_ns = tsc / 3;
     tsc_ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn rdtsc_ns() -> u64 {
+    let cnt: u64;
+    let frq: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cnt, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frq, options(nomem, nostack));
+    }
+    // ns = count * 1e9 / freq. Guard against a zero frequency (shouldn't happen
+    // on QEMU virt, where CNTFRQ_EL0 is programmed). Use u128 to avoid overflow.
+    let freq = if frq == 0 { 62_500_000u64 } else { frq };
+    let ns = (cnt as u128 * 1_000_000_000u128 / freq as u128) as u64;
+    ns.saturating_add(1_700_000_000u64 * 1_000_000_000u64)
 }
 
 fn write_hex(mut v: u64) {

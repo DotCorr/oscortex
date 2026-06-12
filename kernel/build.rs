@@ -47,6 +47,22 @@ fn main() {
         generate_liboscortex_embedder_shim(),
     ));
 
+    // aarch64 port: provide a native EL0 `/init` so the production kernel_main can
+    // spawn a userspace process + service its first syscalls on ARM.
+    //
+    // When `scripts/build-aarch64-shell.sh` has staged the real Flutter host as
+    // `initramfs/init` (it is then already in `entries`), we KEEP it — that path
+    // boots the actual shell. Only when no `init` was collected do we inject the
+    // self-contained preemption self-test (a couple of `write` syscalls, a
+    // `getpid`, then `exit`) so a bare `cargo build` + `run-aarch64.sh` still has
+    // something to spawn and exercises the spawn → SVC dispatch → exit path.
+    if arch == "aarch64" {
+        let has_real_init = entries.iter().any(|(n, _)| n == "init");
+        if !has_real_init {
+            entries.push(("init".to_string(), generate_aarch64_init_elf()));
+        }
+    }
+
     // Write the USTAR tar to OUT_DIR.
     let tar_bytes = build_ustar_tar(&entries);
     std::fs::write(&out_tar, &tar_bytes).unwrap();
@@ -87,7 +103,15 @@ fn collect_dir(
                 && name != "system/flutter/flutter_assets/kernel_blob.bin"
                 && !(name.starts_with("Applications/") && name.ends_with(".app/flutter_assets/kernel_blob.bin"))
             { continue; }
-            if fname == "libflutter_engine.so" || fname.ends_with(".bak") { continue; }
+            // The Flutter engine .so is delivered as a Limine MODULE on x86
+            // (iso_root/boot/libflutter_engine.so), so it is excluded from the
+            // initramfs there. On aarch64 there is NO Limine — the kernel boots
+            // via `-kernel` and the engine MUST travel in the initramfs, so we
+            // KEEP it. (collect_dir runs in build.rs; CARGO_CFG_TARGET_ARCH is
+            // the kernel's build target.)
+            let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+            if fname == "libflutter_engine.so" && target_arch != "aarch64" { continue; }
+            if fname.ends_with(".bak") { continue; }
             println!("cargo:rerun-if-changed={}", path.display());
             let data = match std::fs::read(&path) {
                 Ok(b) => b,
@@ -438,6 +462,184 @@ fn generate_liboscortex_embedder_shim() -> Vec<u8> {
         "oscortex_embedder_version",
     ];
     generate_ret_stub_elf(SYMS)
+}
+
+// ── aarch64 native `/init` EL0 program ───────────────────────────────────────
+
+/// Build a minimal statically-linked AArch64 ELF64 (ET_EXEC, EM_AARCH64) that
+/// runs at EL0 and issues syscalls through the OSCortex shared dispatcher.
+///
+/// Syscall ABI (OSCortex / x86-numbered, as understood by `dispatch_fast`):
+///   nr in x8, args in x0..x2, return in x0, trap via `svc #0`.
+///     1  = write(fd, buf, len)   → fd 1/2 print to the kernel serial console
+///     39 = getpid()              → returns the process id
+///     60 = exit(code)            → terminate the process
+///
+/// Layout: a single RWX PT_LOAD at vaddr 0x400000 (USER_ELF_BASE). Code starts
+/// at the entry; two NUL-free messages live at fixed offsets in the same page.
+fn generate_aarch64_init_elf() -> Vec<u8> {
+    // Link the init program at 64 GiB (L1 index 64), well clear of the kernel's
+    // low identity map. The bring-up kernel runs from the TTBR0 low half, so each
+    // per-process root is seeded with the kernel's 1 GiB block descriptors for
+    // the device region (index 0) and RAM (indices 1..2). A user page at a low VA
+    // would collide with those blocks; placing the program at a high, otherwise-
+    // empty L1 index lets the page-table walker create fresh L2/L3 tables there.
+    const VBASE: u64 = 0x10_0000_0000; // 64 GiB
+
+    // Two messages selected by the bootstrap value the kernel seeds in x0 at
+    // entry: process A (x0==0) prints msg_a, any other value prints msg_b. This
+    // lets two instances of the SAME program emit distinguishable output so an
+    // observer can see the timer round-robining between them.
+    let msg_a: &[u8] = b"[arm-A] tick (EL0 compute loop A)\n";
+    let msg_b: &[u8] = b"[arm-B] tick (EL0 compute loop B)\n";
+    let hello: &[u8] = b"[arm-init] EL0 up; entering compute loop (timer preemption test)\n";
+    let msg_a_off: u64 = 0x200;
+    let msg_b_off: u64 = 0x280;
+    let hello_off: u64 = 0x300;
+    let msg_a_va = VBASE + msg_a_off;
+    let msg_b_va = VBASE + msg_b_off;
+    let hello_va = VBASE + hello_off;
+
+    // ── Assemble the code (offset 0) ────────────────────────────────────────
+    //
+    // Pseudocode:
+    //   x19 = (x0 == 0) ? msg_a_va : msg_b_va         // pick this instance's msg
+    //   x20 = (x0 == 0) ? len_a    : len_b
+    //   write(1, hello, hello.len())                   // announce once
+    //   loop:
+    //       x21 = SPIN_ITERS                            // pure-compute busy spin —
+    //       spin: subs x21,x21,#1; b.ne spin            //   NO syscall, so only the
+    //                                                   //   timer can switch us out
+    //       write(1, x19, x20)                          // print this instance's tick
+    //       b loop
+    //
+    // Because the spin does no syscalls, the kernel cannot cooperatively yield
+    // here; if both A and B make progress (interleaved ticks on serial) the
+    // generic-timer ISR MUST be preempting and switching between them.
+    const SPIN_ITERS: u64 = 4_000_000;
+    // Each thread prints this many ticks, then exits — enough to demonstrate the
+    // timer round-robining the two compute-bound threads, after which the system
+    // settles into the kernel idle/cortex loop (rather than spamming forever).
+    const TICK_BUDGET: u64 = 12;
+    let mut code: Vec<u32> = Vec::new();
+
+    // Select message VA (x19) and length (x20) from x0.
+    a64_load_imm(&mut code, 19, msg_a_va);
+    a64_load_imm(&mut code, 20, msg_a.len() as u64);
+    a64_load_imm(&mut code, 9, msg_b_va);
+    a64_load_imm(&mut code, 10, msg_b.len() as u64);
+    // cmp x0, #0 ; csel x19, x19, x9, eq ; csel x20, x20, x10, eq
+    code.push(0xF100_001F); // subs xzr, x0, #0   (cmp x0,#0)
+    code.push(0x9A89_0273); // csel x19, x19, x9, eq
+    code.push(0x9A8A_0294); // csel x20, x20, x10, eq
+
+    // x22 = TICK_BUDGET (remaining ticks before this thread exits)
+    a64_load_imm(&mut code, 22, TICK_BUDGET);
+
+    // write(1, hello, hello.len())
+    a64_load_imm(&mut code, 0, 1);
+    a64_load_imm(&mut code, 1, hello_va);
+    a64_load_imm(&mut code, 2, hello.len() as u64);
+    a64_load_imm(&mut code, 8, 1);
+    code.push(0xD400_0001); // svc #0
+
+    // loop:
+    let loop_idx = code.len();
+    // x21 = SPIN_ITERS
+    a64_load_imm(&mut code, 21, SPIN_ITERS);
+    // spin: subs x21, x21, #1 ; b.ne spin   (pure compute — no syscall)
+    let spin_idx = code.len();
+    code.push(0xF100_06B5); // subs x21, x21, #1
+    {
+        let off = (spin_idx as i64 - code.len() as i64) as i32; // negative
+        let imm19 = (off as u32) & 0x7FFFF;
+        code.push(0x5400_0001 | (imm19 << 5)); // b.ne spin
+    }
+    // write(1, x19, x20)
+    a64_load_imm(&mut code, 0, 1);
+    code.push(0xAA13_03E1); // mov x1, x19
+    code.push(0xAA14_03E2); // mov x2, x20
+    a64_load_imm(&mut code, 8, 1);
+    code.push(0xD400_0001); // svc #0
+    // subs x22, x22, #1 ; b.ne loop   (loop until the tick budget is spent)
+    code.push(0xF100_06D6); // subs x22, x22, #1
+    {
+        let off = (loop_idx as i64 - code.len() as i64) as i32; // negative
+        let imm19 = (off as u32) & 0x7FFFF;
+        code.push(0x5400_0001 | (imm19 << 5)); // b.ne loop
+    }
+    // exit(0) — lets the system settle into the kernel idle/cortex loop after
+    // the preemption demonstration rather than spinning forever.
+    a64_load_imm(&mut code, 0, 0);
+    a64_load_imm(&mut code, 8, 60);
+    code.push(0xD400_0001); // svc #0
+    // safety net: spin if exit ever returns to EL0.
+    code.push(0x1400_0000); // b .
+
+    // ── Compose the single loadable page image ──────────────────────────────
+    let page_sz = 0x1000usize;
+    let mut img = vec![0u8; page_sz];
+    for (i, w) in code.iter().enumerate() {
+        let o = i * 4;
+        img[o..o + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    img[msg_a_off as usize..msg_a_off as usize + msg_a.len()].copy_from_slice(msg_a);
+    img[msg_b_off as usize..msg_b_off as usize + msg_b.len()].copy_from_slice(msg_b);
+    img[hello_off as usize..hello_off as usize + hello.len()].copy_from_slice(hello);
+
+    // ── ELF header + one program header ─────────────────────────────────────
+    let ehsize = 64usize;
+    let phentsize = 56usize;
+    let phoff = ehsize;
+    let data_off = phoff + phentsize; // file offset of the loadable image
+
+    let file_sz = data_off + img.len();
+    let mut elf = vec![0u8; file_sz];
+
+    // e_ident
+    elf[0..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
+    elf[4] = 2; // ELFCLASS64
+    elf[5] = 1; // ELFDATA2LSB
+    elf[6] = 1; // EV_CURRENT
+    write_u16(&mut elf, 16, 2);   // e_type = ET_EXEC
+    write_u16(&mut elf, 18, 183); // e_machine = EM_AARCH64
+    write_u32(&mut elf, 20, 1);   // e_version
+    write_u64(&mut elf, 24, VBASE); // e_entry
+    write_u64(&mut elf, 32, phoff as u64); // e_phoff
+    write_u16(&mut elf, 52, ehsize as u16);    // e_ehsize
+    write_u16(&mut elf, 54, phentsize as u16); // e_phentsize
+    write_u16(&mut elf, 56, 1);                // e_phnum
+
+    // PT_LOAD program header (RWX).
+    let p = phoff;
+    write_u32(&mut elf, p,      1); // p_type = PT_LOAD
+    write_u32(&mut elf, p + 4,  7); // p_flags = R|W|X
+    write_u64(&mut elf, p + 8,  data_off as u64); // p_offset
+    write_u64(&mut elf, p + 16, VBASE);           // p_vaddr
+    write_u64(&mut elf, p + 24, VBASE);           // p_paddr
+    write_u64(&mut elf, p + 32, img.len() as u64); // p_filesz
+    write_u64(&mut elf, p + 40, img.len() as u64); // p_memsz
+    write_u64(&mut elf, p + 48, 0x1000);           // p_align
+
+    elf[data_off..data_off + img.len()].copy_from_slice(&img);
+    elf
+}
+
+/// Emit a MOVZ/MOVK sequence loading the 64-bit immediate `imm` into x`reg`.
+fn a64_load_imm(code: &mut Vec<u32>, reg: u32, imm: u64) {
+    let mut first = true;
+    for hw in 0..4u32 {
+        let imm16 = ((imm >> (hw * 16)) & 0xFFFF) as u32;
+        if imm16 == 0 && !first {
+            continue; // skip zero halfwords once at least one MOVZ emitted
+        }
+        let base = if first { 0xD280_0000 } else { 0xF280_0000 };
+        code.push(base | (hw << 21) | (imm16 << 5) | reg);
+        first = false;
+    }
+    if first {
+        code.push(0xD280_0000 | reg); // imm == 0 → MOVZ Xreg, #0
+    }
 }
 
 /// Generate a minimal ELF64 ET_DYN where every exported symbol is a

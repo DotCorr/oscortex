@@ -208,6 +208,29 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
     FB_READY.store(true, Ordering::Release);
 }
 
+/// Initialise the framebuffer console from raw parameters (arch-neutral).
+///
+/// The x86 path feeds the framebuffer from the Limine response (`init` above);
+/// architectures without a bootloader framebuffer (e.g. aarch64 QEMU ramfb, set
+/// up by `arch::aarch64::ramfb`) call this with the buffer they configured. The
+/// `addr` must be a directly-writable virtual address (identity-mapped on ARM,
+/// so VA == PA) and `pitch_bytes` is the number of bytes per row. Only 32 bpp
+/// (XRGB) is supported, matching the rest of this console.
+pub fn init_raw(addr: u64, width: u32, height: u32, pitch_bytes: u32) {
+    if addr == 0 || width == 0 || height == 0 || pitch_bytes < width * 4 {
+        return;
+    }
+    FB_ADDR    .store(addr,            Ordering::Release);
+    FB_PITCH_PX.store(pitch_bytes / 4, Ordering::Release);
+    FB_WIDTH   .store(width,           Ordering::Release);
+    FB_HEIGHT  .store(height,          Ordering::Release);
+    FB_COLS    .store(width / CHAR_W,  Ordering::Release);
+    FB_ROWS    .store(height / CHAR_H, Ordering::Release);
+
+    clear();
+    FB_READY.store(true, Ordering::Release);
+}
+
 /// Write a string to the framebuffer console.
 ///
 /// Handles `\n` (advance to next row, scroll if needed) and
@@ -530,6 +553,12 @@ pub fn swap_buffers() {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn write_byte(b: u8) {
+    // The text console is a best-effort serial mirror. If the FB geometry is
+    // unpublished or degenerate (e.g. a corrupted FB_ROWS/FB_COLS static), do
+    // nothing rather than risk an arithmetic-overflow panic in the kernel.
+    if FB_ROWS.load(Ordering::Relaxed) == 0 || FB_COLS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     match b {
         b'\r' => {
             CURSOR.lock().0 = 0;
@@ -539,7 +568,7 @@ fn write_byte(b: u8) {
             cur.0 = 0;
             cur.1 += 1;
             let rows = FB_ROWS.load(Ordering::Relaxed);
-            if cur.1 >= rows {
+            if rows > 0 && cur.1 >= rows {
                 drop(cur);
                 scroll_up();
                 CURSOR.lock().1 = rows - 1;
@@ -578,10 +607,19 @@ fn blit_char(ch: u8, col: u32, row: u32) {
     let height   = FB_HEIGHT  .load(Ordering::Relaxed);
 
     let glyph_idx = ch.wrapping_sub(0x20) as usize;
+    if glyph_idx >= FONT.len() { return; }
     let glyph = &FONT[glyph_idx];
 
-    let px0 = col * CHAR_W;
-    let py0 = row * CHAR_H;
+    // Bound the cell to the framebuffer. A corrupted/overlarge col or row (e.g.
+    // before the FB geometry is published, or if the CURSOR static is clobbered)
+    // must NOT panic the kernel via an arithmetic overflow in `col * CHAR_W` —
+    // the text console is only a serial mirror and is never worth a panic.
+    let cols = if width  != 0 { width  / CHAR_W } else { 0 };
+    let rows = if height != 0 { height / CHAR_H } else { 0 };
+    if col >= cols || row >= rows { return; }
+
+    let px0 = col.saturating_mul(CHAR_W);
+    let py0 = row.saturating_mul(CHAR_H);
 
     let mut gy = 0;
     while gy < CHAR_H {
@@ -612,6 +650,13 @@ fn scroll_up() {
     let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed);
     let height   = FB_HEIGHT  .load(Ordering::Relaxed);
     let rows     = FB_ROWS    .load(Ordering::Relaxed);
+
+    // Guard against an unpublished/degenerate FB geometry: the serial-mirror
+    // console must never panic the kernel (subtract-with-overflow on height or
+    // rows). Bail out cleanly if there is nothing safe to scroll.
+    if addr == 0 || height < CHAR_H || rows == 0 || pitch_px == 0 {
+        return;
+    }
 
     // Number of pixel rows to copy.
     let copy_rows = height - CHAR_H;

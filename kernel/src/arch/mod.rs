@@ -8,7 +8,7 @@ cfg_if::cfg_if! {
         mod x86_64;
         pub use x86_64::*;
     } else if #[cfg(target_arch = "aarch64")] {
-        mod aarch64;
+        pub mod aarch64;
         pub use aarch64::*;
     } else if #[cfg(target_arch = "riscv64")] {
         mod riscv64;
@@ -27,7 +27,22 @@ pub mod mmio;
 
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
-        pub use x86_64::cpu::{interrupts_restore, interrupts_save_and_disable, memory_fence, spin_pause};
+        pub use x86_64::cpu::{interrupts_disable, interrupts_restore, interrupts_save_and_disable, memory_fence, spin_pause};
+    } else if #[cfg(target_arch = "aarch64")] {
+        pub fn memory_fence() {
+            core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        pub fn spin_pause() {
+            core::hint::spin_loop();
+        }
+        /// Mask IRQ/FIQ at the current EL (DAIF.I/F).
+        pub fn interrupts_disable() {
+            unsafe { core::arch::asm!("msr daifset, #3", options(nomem, nostack, preserves_flags)); }
+        }
+        pub fn interrupts_save_and_disable() -> u64 {
+            0
+        }
+        pub fn interrupts_restore(_rflags: u64) {}
     } else {
         pub fn memory_fence() {
             core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -35,10 +50,35 @@ cfg_if::cfg_if! {
         pub fn spin_pause() {
             core::hint::spin_loop();
         }
+        pub fn interrupts_disable() {}
         pub fn interrupts_save_and_disable() -> u64 {
             0
         }
         pub fn interrupts_restore(_rflags: u64) {}
+    }
+}
+
+/// Read the current frame-pointer register (for best-effort backtraces).
+///
+/// On x86_64 this is RBP; on aarch64 it is X29.  Returns 0 on architectures
+/// where no fixed frame pointer is available.
+#[inline(always)]
+pub fn read_frame_pointer() -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let fp: u64;
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp, options(nomem, nostack)); }
+        fp
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let fp: u64;
+        unsafe { core::arch::asm!("mov {}, x29", out(reg) fp, options(nomem, nostack)); }
+        fp
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
     }
 }
 

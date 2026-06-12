@@ -6,6 +6,16 @@
 //!   rax = syscall number
 //!   rdi = arg0, rsi = arg1, rdx = arg2, r10 = arg3
 //!   Return value in rax (negative = error).
+//!
+//! ABI (aarch64 Linux-compatible):
+//!   x8 = syscall number
+//!   x0 = arg0, x1 = arg1, x2 = arg2, x3 = arg3
+//!   `svc #0`; return value in x0 (negative = error).
+//!
+//! Both backends expose the same `syscallN(nr, …)` surface so the typed wrappers
+//! below are architecture-neutral. The kernel's aarch64 SVC handler
+//! (`arch::aarch64::syscall::production_svc_handler`) reads x8 as the number and
+//! x0..x4 as the dispatcher args, mirroring the x86 SYSCALL fast path.
 
 use core::arch::asm;
 
@@ -128,6 +138,9 @@ pub const WM_EVENT_SIZE: usize = core::mem::size_of::<WmEvent>();
 
 // ── Raw syscall helpers ───────────────────────────────────────────────────────
 
+// ── x86_64 backend (SYSCALL: nr=rax, args rdi/rsi/rdx/r10) ────────────────────
+
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn syscall0(nr: u64) -> i64 {
     let ret: i64;
@@ -143,6 +156,7 @@ pub unsafe fn syscall0(nr: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
     let ret: i64;
@@ -159,6 +173,7 @@ pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
     let ret: i64;
@@ -176,6 +191,7 @@ pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     let ret: i64;
@@ -194,6 +210,7 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
     ret
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let ret: i64;
@@ -207,6 +224,92 @@ pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
             out("rcx") _,
             out("r11") _,
             lateout("rax") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+// ── aarch64 backend (SVC #0: nr=x8, args x0..x5) ──────────────────────────────
+//
+// The kernel SVC handler reads x8 as the syscall number and x0..x4 as the five
+// dispatcher arguments, then writes the return value back into x0. We mark x8 as
+// `in` (the kernel does not clobber it) and x0 as `inlateout` since it carries
+// arg0 in and the return out. We do NOT use `options(nostack)` blanket here
+// because the SVC trap saves/restores the full frame; `nomem` is unsafe to
+// assume (the syscall may read/write user buffers passed by pointer), so we omit
+// it to keep the compiler from reordering memory ops across the trap.
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn syscall0(nr: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #0",
+            in("x8") nr,
+            lateout("x0") ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("svc #0",
+            in("x8") nr,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+            in("x2") a2,
+            in("x3") a3,
             options(nostack),
         );
     }

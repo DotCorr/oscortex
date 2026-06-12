@@ -44,8 +44,7 @@ fn panic(info: &PanicInfo) -> ! {
     // Best-effort backtrace: walk the saved RBP chain a few frames and print
     // each return address. Stops on a bogus pointer.
     unsafe {
-        let mut rbp: u64;
-        core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack));
+        let mut rbp: u64 = crate::arch::read_frame_pointer();
         crate::logger::early_print("backtrace:\r\n");
         for _ in 0..16 {
             if rbp < 0xffff_8000_0000_0000 || (rbp & 7) != 0 { break; }
