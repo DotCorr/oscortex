@@ -47,11 +47,7 @@ pub fn init() {
 
     // Attempt initial catalog refresh (best-effort).
     match resolver::refresh_catalog() {
-        Ok(n) => log::error!("[pkg-test] catalog loaded (SIGNED+verified): {} packages", n),
-        Err(e) => log::error!("[pkg-test] catalog refresh failed: {:?}", e),
-    }
-    match resolver::resolve(b"Demo") {
-        Ok(id) => log::error!("[pkg-test] signed resolve OK: Demo -> app_id={}", id),
-        Err(e) => log::error!("[pkg-test] signed resolve FAILED: {:?}", e),
+        Ok(n) => log::info!("[pkg] catalog loaded: {} packages available", n),
+        Err(_) => log::info!("[pkg] server unreachable — running in offline mode"),
     }
 }
