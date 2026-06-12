@@ -19,6 +19,28 @@ use super::http;
 use super::manifest::PkgManifest;
 use super::sha256;
 
+/// Ed25519 public key that authenticates the package catalog. The server signs
+/// `catalog.bin`; a valid signature vouches for every SHA-256 hash the catalog
+/// lists, and the per-bundle SHA-256 check then vouches for the bundle bytes —
+/// a complete chain from a single trusted key to installed code.
+///
+/// DEV key (matches tools/pkg-server's fixed dev seed). Production would ship a
+/// per-vendor key here; the verification mechanism is identical.
+const CATALOG_PUBKEY: [u8; 32] = [
+    0x9e, 0x48, 0x65, 0x7d, 0x5f, 0x21, 0x44, 0x66, 0x79, 0x85, 0xe3, 0xb2, 0xbd, 0x8d, 0x34, 0xc3,
+    0xc4, 0x03, 0x9b, 0xac, 0x6a, 0x44, 0x57, 0xff, 0x62, 0x5e, 0x8c, 0xe6, 0xf4, 0xdb, 0xa1, 0xb1,
+];
+
+/// Verify a detached Ed25519 signature over `msg` with `CATALOG_PUBKEY`.
+fn verify_catalog_sig(msg: &[u8], sig: &[u8]) -> bool {
+    use ed25519_compact::{PublicKey, Signature};
+    let Ok(sig_arr) = <[u8; 64]>::try_from(sig) else {
+        return false;
+    };
+    let pk = PublicKey::new(CATALOG_PUBKEY);
+    pk.verify(msg, &Signature::new(sig_arr)).is_ok()
+}
+
 /// Resolver errors.
 #[derive(Debug)]
 pub enum ResolveError {
@@ -30,6 +52,8 @@ pub enum ResolveError {
     FetchFailed,
     /// SHA-256 hash mismatch after download.
     HashMismatch,
+    /// The catalog's Ed25519 signature did not verify against CATALOG_PUBKEY.
+    BadSignature,
     /// Failed to install into app_registry.
     InstallFailed,
     /// Cache is full and all slots are pinned.
@@ -78,6 +102,20 @@ pub fn refresh_catalog() -> Result<usize, ResolveError> {
         log::warn!("[pkg] catalog fetch failed: {:?}", e);
         ResolveError::FetchFailed
     })?;
+
+    // Authenticate the catalog BEFORE trusting any entry: fetch its detached
+    // Ed25519 signature and verify it against the baked-in public key. An
+    // unsigned / tampered / wrong-key catalog is rejected outright — we will
+    // not install code vouched for only by an unauthenticated index.
+    let sig = http::get(ip, port, "/catalog.sig").map_err(|e| {
+        log::warn!("[pkg] catalog signature fetch failed: {:?}", e);
+        ResolveError::BadSignature
+    })?;
+    if !verify_catalog_sig(&body, &sig) {
+        log::error!("[pkg] catalog signature INVALID — rejecting catalog");
+        return Err(ResolveError::BadSignature);
+    }
+    log::info!("[pkg] catalog signature verified (Ed25519)");
 
     let entries = super::manifest::parse_catalog(&body).ok_or_else(|| {
         log::warn!("[pkg] catalog parse failed");

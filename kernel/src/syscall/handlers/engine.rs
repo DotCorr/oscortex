@@ -860,6 +860,7 @@ pub(crate) fn sys_pkg_resolve(name_ptr: u64, name_len: u64) -> i64 {
         Err(crate::pkg::resolver::ResolveError::NoCatalog) => -2,   // ENOENT
         Err(crate::pkg::resolver::ResolveError::FetchFailed) => -5, // EIO
         Err(crate::pkg::resolver::ResolveError::HashMismatch) => -22, // EINVAL
+        Err(crate::pkg::resolver::ResolveError::BadSignature) => -13, // EACCES
         Err(crate::pkg::resolver::ResolveError::InstallFailed) => -12, // ENOMEM
         Err(crate::pkg::resolver::ResolveError::CacheFull) => -28,  // ENOSPC
     }
