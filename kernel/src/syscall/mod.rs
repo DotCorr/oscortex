@@ -88,7 +88,7 @@
 
 mod dispatch;
 mod handlers;
-mod poll;
+pub(crate) mod poll;
 mod posix;
 mod state;
 mod tables;
