@@ -1125,21 +1125,6 @@ pub fn try_claim_cpu_for(pid: u32, my_cpu: u32) -> bool {
     false
 }
 
-/// Safely attempt to claim the given PID for execution on `my_cpu`.
-/// Returns `true` if the process is Running and either unclaimed or already assigned to `my_cpu`.
-pub fn try_claim_cpu_for(pid: u32, my_cpu: u32) -> bool {
-    let idx = idx_of(pid);
-    let _g = PTABLE_LOCK.lock();
-    let p = unsafe { &mut PTABLE[idx] };
-    if p.pid == pid && p.state == ProcState::Running {
-        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
-            p.current_cpu = Some(my_cpu);
-            return true;
-        }
-    }
-    false
-}
-
 /// Try-lock variant of `try_claim_cpu_for` to avoid ISR deadlocks.
 pub fn try_claim_cpu_for_try(pid: u32, my_cpu: u32) -> bool {
     if let Some(_g) = PTABLE_LOCK.try_lock() {
