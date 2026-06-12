@@ -653,6 +653,45 @@ pub fn exit(pid: u32, code: i32) {
     p.exit_code = code;
     p.current_cpu = None;
     log::info!("[Process] pid={} exited with code {}", pid, code);
+
+    // Crash auto-recovery: tell the app registry which thread GROUP this exit
+    // belongs to. Resolved while the lock is held; the (try-lock, ISR-safe)
+    // notification itself runs after we release it.
+    let leader = get_group_leader_locked(pid);
+    drop(_g);
+    crate::app_registry::note_thread_exit(leader, pid, code);
+}
+
+/// Forcefully terminate every still-live member of `leader`'s thread group
+/// (including the leader itself). Used by crash recovery: when one thread of a
+/// launched app faults, the survivors must be torn down before a fresh
+/// instance is launched — two engine instances of the same app corrupt each
+/// other under the cooperative scheduler. Returns the number killed.
+///
+/// Must be called from a normal (syscall) context, NOT an ISR: it takes the
+/// PTABLE lock to collect victims, then calls `exit()` per victim.
+pub fn kill_group(leader: u32) -> u32 {
+    let mut victims = [0u32; MAX_PROCS];
+    let mut n = 0usize;
+    {
+        let _g = PTABLE_LOCK.lock();
+        for slot in unsafe { PTABLE.iter() } {
+            if slot.pid == 0 {
+                continue;
+            }
+            if matches!(slot.state, ProcState::Zombie(_) | ProcState::Dead) {
+                continue;
+            }
+            if get_group_leader_locked(slot.pid) == leader && n < victims.len() {
+                victims[n] = slot.pid;
+                n += 1;
+            }
+        }
+    }
+    for &v in &victims[..n] {
+        exit(v, -9);
+    }
+    n as u32
 }
 
 /// Send SIGKILL to a process (forceful immediate exit).
@@ -871,7 +910,20 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     // two-VM concurrency that crashes the launched app.
     let fg = crate::wm::focus_pid();
     let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
-    let exclusive = fg_group > 1;
+    let mut exclusive = fg_group > 1;
+    // If the foreground group's LEADER is dead (the app crashed), exclusivity
+    // must lapse — otherwise the filter below skips every other process
+    // (including the shell) and the whole system wedges on a dead group.
+    // The shell then gets scheduled again and crash recovery (app_registry
+    // drain in sys_wm_next_event) can refocus + relaunch.
+    if exclusive {
+        let leader = unsafe { &PTABLE[idx_of(fg_group)] };
+        let leader_alive = leader.pid == fg_group
+            && !matches!(leader.state, ProcState::Zombie(_) | ProcState::Dead);
+        if !leader_alive {
+            exclusive = false;
+        }
+    }
 
     let focus = fg;
     let input_target = if focus != 0 { focus } else { 1 };
