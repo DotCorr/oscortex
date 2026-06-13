@@ -242,11 +242,11 @@ for req in "${REQUIRED_FILES[@]}"; do
     fi
 done
 
-# This is the x86_64 builder and the shell runs JIT off kernel_blob.bin. If an
-# AOT snapshot (libapp.so / app.aot) is left in system/flutter — e.g. an arm64
-# one staged by a prior aarch64 build — the embedder picks AOT and a cross-arch
-# snapshot aborts the Dart VM ("snapshot requires arm64 but the VM has x64").
-# Strip them so the embedder uses the arch-independent JIT kernel_blob.
+# x86_64 runs the shell via the JIT engine off kernel_blob.bin (the staged engine
+# MUST be the JIT/debug engine that contains the Dart kernel compiler, NOT the AOT
+# 'product' engine — the AOT path needs a matching 'product' gen_snapshot that is
+# not available, so it leaves the shell unable to load Dart → blank screen). Remove
+# any AOT snapshot so the embedder uses the arch-independent JIT kernel_blob.
 rm -f "$ROOT/initramfs/system/flutter/libapp.so" \
       "$ROOT/initramfs/system/flutter/app.aot"
 
