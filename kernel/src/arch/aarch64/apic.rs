@@ -134,6 +134,10 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         // present syscall path (present_surface → render_frame) in normal context.
         crate::compositor::vsync_baton_tick();
         reset_vsync_last_tsc();
+        // Poll the USB xHCI runtime for HID input (mouse/keyboard) on the vsync
+        // boundary — mirrors the x86 APIC ISR (idt.rs). Drains transfer events
+        // (→ wm::push_pointer/push_key) and re-arms the interrupt transfer.
+        crate::drivers::usb::poll();
     }
 
     // Only the EL0-preempt switch below requires an interrupted EL0 frame. SPSR_EL1

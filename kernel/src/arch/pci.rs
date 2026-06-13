@@ -3,8 +3,11 @@
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
         pub use crate::arch::x86_64::pci::*;
+    } else if #[cfg(target_arch = "aarch64")] {
+        pub use crate::arch::aarch64::pci::*;
     } else {
         pub const LEGACY_IO_AVAILABLE: bool = false;
+        pub const PCI_AVAILABLE: bool = false;
 
         pub fn config_read32(_bus: u8, _dev: u8, _func: u8, _offset: u8) -> u32 {
             0xFFFF_FFFF

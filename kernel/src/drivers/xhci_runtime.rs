@@ -1,4 +1,5 @@
-//! xHCI runtime — command/event rings, keyboard enumeration, HID interrupt IN.
+//! xHCI runtime — command/event rings, HID enumeration (keyboard + mouse boot
+//! protocol), control transfers, and the HID interrupt-IN report path.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,6 +13,12 @@ const TRB_IOC: u32 = 1 << 5;
 const TRB_DIR_IN: u32 = 1 << 16;
 
 const TRB_TYPE_NORMAL: u32 = 1 << 10;
+const TRB_TYPE_SETUP: u32 = 2 << 10;
+const TRB_TYPE_DATA: u32 = 3 << 10;
+const TRB_TYPE_STATUS: u32 = 4 << 10;
+const TRB_TYPE_LINK: u32 = 6 << 10;
+const TRB_IDT: u32 = 1 << 6; // Immediate Data (Setup stage carries the 8 setup bytes)
+const TRB_TC: u32 = 1 << 1; // Toggle Cycle (on Link TRB)
 const TRB_TYPE_CMD_ENABLE_SLOT: u32 = 9 << 10;
 const TRB_TYPE_CMD_ADDR_DEV: u32 = 11 << 10;
 const TRB_TYPE_CMD_CONF_EP: u32 = 12 << 10;
@@ -115,21 +122,31 @@ pub struct XhciRuntime {
     in_phys: u64,
     dev_phys: u64,
     ep_ring_phys: u64,
+    ep0_ring_phys: u64,
     hid_phys: u64,
+    ctrl_buf_phys: u64,
     cmd: *mut Trb,
     evt: *mut Trb,
     ep_ring: *mut Trb,
+    ep0_ring: *mut Trb,
     cmd_idx: u32,
     cmd_cycle: u32,
     evt_idx: u32,
     evt_cycle: u32,
     ep_idx: u32,
     ep_cycle: u32,
+    ep0_idx: u32,
+    ep0_cycle: u32,
     slot: u8,
+    hid_protocol: u8,
+    cmd_done: bool,
+    ctrl_done: bool,
     hid_armed: bool,
     enumerated: bool,
     enum_gave_up: bool,
     last_hid: [u8; HID_LEN],
+    cur_x: i32,
+    cur_y: i32,
 }
 
 static RUNTIME_OK: AtomicBool = AtomicBool::new(false);
@@ -169,8 +186,12 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
     unsafe {
         let cap = mmio::read32(ctrl.bar_virt, 0);
         let cap_len = (cap & 0xFF) as u8;
-        let rts_off = mmio::read32(ctrl.bar_virt, cap_len as usize + 0x18) & 0xFFFF_FFE0;
-        let db_off = mmio::read32(ctrl.bar_virt, cap_len as usize + 0x14) & 0xFFFF_FFE0;
+        // DBOFF (0x14) and RTSOFF (0x18) are CAPABILITY registers at fixed offsets
+        // from bar_virt — NOT relative to CAPLENGTH (that's the operational-reg
+        // base). Reading them cap_len-relative pointed the doorbell + interrupter
+        // at garbage, so commands never rang and no events were ever posted.
+        let db_off = mmio::read32(ctrl.bar_virt, 0x14) & 0xFFFF_FFE0;
+        let rts_off = mmio::read32(ctrl.bar_virt, 0x18) & 0xFFFF_FFE0;
 
         let cmd_phys = crate::mm::frame_allocator::alloc_frame().ok_or("cmd")?;
         let evt_phys = crate::mm::frame_allocator::alloc_frame().ok_or("evt")?;
@@ -179,7 +200,9 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
         let in_phys = crate::mm::frame_allocator::alloc_frame().ok_or("in")?;
         let dev_phys = crate::mm::frame_allocator::alloc_frame().ok_or("dev")?;
         let ep_ring_phys = crate::mm::frame_allocator::alloc_frame().ok_or("ep")?;
+        let ep0_ring_phys = crate::mm::frame_allocator::alloc_frame().ok_or("ep0")?;
         let hid_phys = crate::mm::frame_allocator::alloc_frame().ok_or("hid")?;
+        let ctrl_buf_phys = crate::mm::frame_allocator::alloc_frame().ok_or("cbuf")?;
 
         for p in [
             cmd_phys,
@@ -189,7 +212,9 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             in_phys,
             dev_phys,
             ep_ring_phys,
+            ep0_ring_phys,
             hid_phys,
+            ctrl_buf_phys,
         ] {
             zpage(p);
         }
@@ -205,6 +230,20 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             .unwrap()
             .trbs
             .as_mut_ptr();
+        let ep0_ring = (p2v(ep0_ring_phys) as *mut EpRingPage)
+            .as_mut()
+            .unwrap()
+            .trbs
+            .as_mut_ptr();
+        // Link TRB at the end of each transfer ring → wrap to start + toggle cycle,
+        // so the rings keep running past EP_TRBS entries (the interrupt EP re-arms
+        // forever; without this the controller halts after the first wrap).
+        put_trb(ep_ring, (EP_TRBS - 1) as u32, EP_TRBS,
+            Trb { dw0: ep_ring_phys as u32, dw1: (ep_ring_phys >> 32) as u32, dw2: 0,
+                  dw3: TRB_TYPE_LINK | TRB_TC }, TRB_CYCLE);
+        put_trb(ep0_ring, (EP_TRBS - 1) as u32, EP_TRBS,
+            Trb { dw0: ep0_ring_phys as u32, dw1: (ep0_ring_phys >> 32) as u32, dw2: 0,
+                  dw3: TRB_TYPE_LINK | TRB_TC }, TRB_CYCLE);
 
         let dcbaa = p2v(dcbaa_phys) as *mut DcbaaPage;
         core::ptr::write_bytes(dcbaa as *mut u8, 0, 4096);
@@ -269,21 +308,31 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             in_phys,
             dev_phys,
             ep_ring_phys,
+            ep0_ring_phys,
             hid_phys,
+            ctrl_buf_phys,
             cmd,
             evt,
             ep_ring,
+            ep0_ring,
             cmd_idx: 0,
             cmd_cycle: TRB_CYCLE,
             evt_idx: 0,
             evt_cycle: TRB_CYCLE,
             ep_idx: 0,
             ep_cycle: TRB_CYCLE,
+            ep0_idx: 0,
+            ep0_cycle: TRB_CYCLE,
             slot: 0,
+            hid_protocol: 0,
+            cmd_done: false,
+            ctrl_done: false,
             hid_armed: false,
             enumerated: false,
             enum_gave_up: false,
             last_hid: [0; HID_LEN],
+            cur_x: 64,
+            cur_y: 64,
         });
         RUNTIME_OK.store(true, Ordering::Release);
         log::info!("[USB] XHCI runtime started");
@@ -293,7 +342,7 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             drain_events(rt);
             if try_enumerate(rt) {
                 rt.enumerated = true;
-                log::info!("[USB-HID] keyboard enumerated slot={}", rt.slot);
+                log::info!("[USB-HID] device enumerated slot={} protocol={}", rt.slot, rt.hid_protocol);
                 arm_hid_transfer(rt);
                 break;
             }
@@ -303,7 +352,7 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             crate::arch::spin_pause();
         }
         if !RUNTIME.as_ref().unwrap().enumerated {
-            log::warn!("[USB-HID] keyboard enumeration pending (poll on vsync)");
+            log::warn!("[USB-HID] device enumeration pending (poll on vsync)");
         }
 
         Ok(())
@@ -324,7 +373,7 @@ pub fn poll() {
         if !rt.enumerated {
             if try_enumerate(rt) {
                 rt.enumerated = true;
-                log::info!("[USB-HID] keyboard enumerated slot={}", rt.slot);
+                log::info!("[USB-HID] device enumerated slot={} protocol={}", rt.slot, rt.hid_protocol);
             }
         } else if !rt.hid_armed {
             arm_hid_transfer(rt);
@@ -351,21 +400,91 @@ unsafe fn post_cmd(rt: &mut XhciRuntime, trb: Trb) {
         rt.cmd_idx = 0;
         rt.cmd_cycle ^= TRB_CYCLE;
     }
-    let ptr = rt.cmd_phys + (rt.cmd_idx as u64) * 16;
-    mmio::write64(op(rt), 0x18, ptr | rt.cmd_cycle as u64);
+    // CRCR (op 0x18) is programmed ONCE at init; the controller advances its own
+    // command-ring dequeue pointer. Rewriting it here clobbered the ring and the
+    // command was never consumed. Just publish the TRB and ring the doorbell.
     crate::arch::memory_fence();
     let db = rt.bar_virt + rt.db_off as u64;
     mmio::write32(db, 0, 0);
 }
 
 unsafe fn wait_cmd(rt: &mut XhciRuntime) -> bool {
-    for _ in 0..500_000 {
-        if drain_events(rt) {
+    rt.cmd_done = false;
+    for _ in 0..2_000_000 {
+        drain_events(rt);
+        if rt.cmd_done {
+            rt.cmd_done = false;
             return true;
         }
         crate::arch::spin_pause();
     }
     false
+}
+
+/// Post the three (or two) control-transfer stages on the EP0 ring and ring the
+/// slot's EP0 doorbell (DCI 1), then wait for the Status-stage transfer event.
+unsafe fn control_xfer(
+    rt: &mut XhciRuntime,
+    bm: u8,
+    req: u8,
+    value: u16,
+    index: u16,
+    length: u16,
+    data_phys: u64,
+) -> bool {
+    let setup_lo = (bm as u32) | ((req as u32) << 8) | ((value as u32) << 16);
+    let setup_hi = (index as u32) | ((length as u32) << 16);
+    let dir_in = bm & 0x80 != 0;
+    let trt = if length == 0 { 0 } else if dir_in { 3u32 } else { 2u32 };
+
+    put_ep0(rt, Trb {
+        dw0: setup_lo,
+        dw1: setup_hi,
+        dw2: 8,
+        dw3: TRB_TYPE_SETUP | TRB_IDT | (trt << 16),
+    });
+    if length > 0 {
+        let dir = if dir_in { TRB_DIR_IN } else { 0 };
+        put_ep0(rt, Trb {
+            dw0: data_phys as u32,
+            dw1: (data_phys >> 32) as u32,
+            dw2: length as u32,
+            dw3: TRB_TYPE_DATA | dir,
+        });
+    }
+    // Status stage: direction opposite the data stage; IN for no-data / OUT data.
+    let status_dir = if length > 0 && dir_in { 0 } else { TRB_DIR_IN };
+    put_ep0(rt, Trb {
+        dw0: 0,
+        dw1: 0,
+        dw2: 0,
+        dw3: TRB_TYPE_STATUS | status_dir | TRB_IOC,
+    });
+
+    crate::arch::memory_fence();
+    let db = rt.bar_virt + rt.db_off as u64 + (rt.slot as u64) * 4;
+    mmio::write32(db, 0, 1); // EP0 = DCI 1
+
+    rt.ctrl_done = false;
+    for _ in 0..2_000_000 {
+        drain_events(rt);
+        if rt.ctrl_done {
+            rt.ctrl_done = false;
+            return true;
+        }
+        crate::arch::spin_pause();
+    }
+    false
+}
+
+/// Append a TRB to the EP0 control ring, wrapping at the trailing Link TRB.
+unsafe fn put_ep0(rt: &mut XhciRuntime, trb: Trb) {
+    put_trb(rt.ep0_ring, rt.ep0_idx, EP_TRBS, trb, rt.ep0_cycle);
+    rt.ep0_idx += 1;
+    if rt.ep0_idx as usize >= EP_TRBS - 1 {
+        rt.ep0_idx = 0;
+        rt.ep0_cycle ^= TRB_CYCLE;
+    }
 }
 
 unsafe fn drain_events(rt: &mut XhciRuntime) -> bool {
@@ -376,9 +495,14 @@ unsafe fn drain_events(rt: &mut XhciRuntime) -> bool {
         if (dw3 & 1) != rt.evt_cycle {
             break;
         }
-        let kind = dw3 & (0x3FF << 10);
+        // TRB Type is a 6-bit field (bits 15:10). A 0x3FF mask would spill into
+        // the Endpoint ID field (bits 20:16) of Transfer Events, so EP0 (id 1) and
+        // HID (id 3) events would be misclassified and dropped — only command/port
+        // events (endpoint-id bits = 0) would match. Mask exactly 6 bits.
+        let kind = dw3 & (0x3F << 10);
         if kind == TRB_TYPE_EVT_CMD_COMP {
             cmd_done = true;
+            rt.cmd_done = true;
             let slot = (dw3 >> 24) & 0xFF;
             if rt.slot == 0 && slot != 0 {
                 rt.slot = slot as u8;
@@ -386,9 +510,15 @@ unsafe fn drain_events(rt: &mut XhciRuntime) -> bool {
                 (*dcbaa).ptrs[rt.slot as usize] = rt.dev_phys;
             }
         } else if kind == TRB_TYPE_EVT_TRANSFER {
-            let report = core::slice::from_raw_parts(p2v(rt.hid_phys) as *const u8, HID_LEN);
-            route_report(report, rt);
-            rt.hid_armed = false;
+            // Endpoint ID 1 = EP0 (control); higher = HID interrupt IN (EP1=DCI 3).
+            let ep_id = (dw3 >> 16) & 0x1F;
+            if ep_id <= 1 {
+                rt.ctrl_done = true;
+            } else {
+                let report = core::slice::from_raw_parts(p2v(rt.hid_phys) as *const u8, HID_LEN);
+                route_report(report, rt);
+                rt.hid_armed = false;
+            }
         }
         rt.evt_idx += 1;
         if rt.evt_idx as usize >= EVT_TRBS {
@@ -403,49 +533,93 @@ unsafe fn drain_events(rt: &mut XhciRuntime) -> bool {
 }
 
 fn route_report(report: &[u8], rt: &mut XhciRuntime) {
+    // Protocol 2 = boot mouse. Mouse deltas are RELATIVE — two identical reports
+    // are two real movements, so never dedup them (unlike keyboards, where an
+    // unchanged report means no key state change).
+    if rt.hid_protocol == 2 {
+        route_mouse(report, rt);
+        return;
+    }
     if report == &rt.last_hid {
         return;
     }
     let old = rt.last_hid;
     rt.last_hid.copy_from_slice(report);
 
-    if let Some((sc, pressed)) = usb_hid::handle_boot_keyboard_report(report) {
-        crate::wm::push_key(sc, pressed);
-        LIVE_KEY.store(true, Ordering::Release);
-        log::info!("[USB-HID] live key scancode={:#x}", sc);
-    }
-    for i in 2..8 {
-        let prev = old.get(i).copied().unwrap_or(0);
-        let cur = report.get(i).copied().unwrap_or(0);
-        if prev != 0 && prev != cur {
-            if let Some(sc) = usb_hid::usb_keycode_to_scancode(prev) {
-                crate::wm::push_key(sc, false);
+    if rt.hid_protocol == 1 || rt.hid_protocol == 0 {
+        if let Some((sc, pressed)) = usb_hid::handle_boot_keyboard_report(report) {
+            crate::wm::push_key(sc, pressed);
+            LIVE_KEY.store(true, Ordering::Release);
+            log::info!("[USB-HID] live key scancode={:#x}", sc);
+        }
+        for i in 2..8 {
+            let prev = old.get(i).copied().unwrap_or(0);
+            let cur = report.get(i).copied().unwrap_or(0);
+            if prev != 0 && prev != cur {
+                if let Some(sc) = usb_hid::usb_keycode_to_scancode(prev) {
+                    crate::wm::push_key(sc, false);
+                }
             }
         }
     }
 }
 
-unsafe fn write_input_address_ctx(in_phys: u64, port: u8) {
-    let p = p2v(in_phys) as *mut u8;
-    core::ptr::write_bytes(p, 0, 512);
-    // Input control: add slot + EP0.
-    core::ptr::write(p.add(4), 0x03);
-    // Slot context @ 0x20 — 1 context entry, full-speed.
-    core::ptr::write_unaligned(p.add(0x20) as *mut u32, (1 << 27) | (1 << 20));
-    core::ptr::write_unaligned(p.add(0x24) as *mut u32, (port as u32) << 16);
-    // EP0 context @ 0x40 — control (type 4), max packet 64.
-    core::ptr::write_unaligned(p.add(0x44) as *mut u32, (4 << 3) | 64);
+/// Boot-protocol mouse report: byte0 = buttons (b0 L, b1 R, b2 M),
+/// byte1 = dx (i8), byte2 = dy (i8), byte3 = wheel (i8). Maintain an absolute
+/// cursor clamped to the framebuffer and feed the WM's unified pointer state.
+fn route_mouse(report: &[u8], rt: &mut XhciRuntime) {
+    let buttons = (report[0] as u32) & 0x7;
+    let dx = report[1] as i8 as i32;
+    let dy = report[2] as i8 as i32;
+    let wheel = report.get(3).map(|b| *b as i8 as i32).unwrap_or(0);
+    let (w, h) = crate::drivers::fb::size_px().unwrap_or((1024, 768));
+    rt.cur_x = (rt.cur_x + dx).clamp(0, w as i32 - 1);
+    rt.cur_y = (rt.cur_y + dy).clamp(0, h as i32 - 1);
+    crate::wm::push_pointer(rt.cur_x, rt.cur_y, buttons);
+    if wheel != 0 {
+        crate::wm::push_scroll(rt.cur_x, rt.cur_y, wheel);
+    }
 }
 
-unsafe fn write_input_config_ep1(in_phys: u64, ep_ring_phys: u64) {
-    let p = p2v(in_phys) as *mut u8;
+unsafe fn write_input_address_ctx(rt: &XhciRuntime, port: u8, speed: u32) {
+    let p = p2v(rt.in_phys) as *mut u8;
     core::ptr::write_bytes(p, 0, 512);
-    // Add EP1.
-    core::ptr::write(p.add(4), 0x04);
-    // EP1 context @ 0x60 — interrupt IN, max packet 8, interval 8.
-    core::ptr::write_unaligned(p.add(0x64) as *mut u32, (7 << 3) | 8);
-    core::ptr::write(p.add(0x62), 8);
-    core::ptr::write_unaligned(p.add(0x68) as *mut u64, ep_ring_phys | 1);
+    // Input Control Context @ 0x00: add Slot (bit0) + EP0 (bit1).
+    core::ptr::write_unaligned(p.add(0x04) as *mut u32, 0x03);
+    // Slot Context @ 0x20: Context Entries=1 (bits31:27), Speed (bits23:20).
+    core::ptr::write_unaligned(p.add(0x20) as *mut u32, (1u32 << 27) | (speed << 20));
+    // Root Hub Port Number @ dword1 bits31:16.
+    core::ptr::write_unaligned(p.add(0x24) as *mut u32, (port as u32) << 16);
+    // EP0 Max Packet Size depends on bus speed (xHCI speed IDs: 1=Full, 2=Low,
+    // 3=High, 4=Super). High-speed control endpoints REQUIRE 64; a mismatch halts
+    // EP0 after the first transfer. Low=8, Super=512, Full/High=64.
+    let mps0: u32 = match speed {
+        2 => 8,
+        4 => 512,
+        _ => 64,
+    };
+    // EP0 Context @ 0x40, dword1: CErr=3 (bits2:1), type 4=control (bits5:3),
+    // Max Packet Size (bits31:16).
+    core::ptr::write_unaligned(p.add(0x44) as *mut u32, (3u32 << 1) | (4u32 << 3) | (mps0 << 16));
+    // EP0 TR Dequeue Pointer @ 0x48, DCS=1.
+    core::ptr::write_unaligned(p.add(0x48) as *mut u64, rt.ep0_ring_phys | 1);
+}
+
+unsafe fn write_input_config_ep1(rt: &XhciRuntime) {
+    let p = p2v(rt.in_phys) as *mut u8;
+    core::ptr::write_bytes(p, 0, 512);
+    // Add Slot (bit0, required by Configure Endpoint) + EP1-IN (DCI 3, bit3).
+    core::ptr::write_unaligned(p.add(0x04) as *mut u32, (1u32 << 0) | (1u32 << 3));
+    // Slot Context @ 0x20: Context Entries must reach the highest DCI = 3.
+    core::ptr::write_unaligned(p.add(0x20) as *mut u32, 3u32 << 27);
+    // EP1-IN Context @ DCI3 = 0x20 + 3*0x20 = 0x80.
+    // dword0 @ 0x80: Interval (bits23:16).
+    core::ptr::write_unaligned(p.add(0x80) as *mut u32, 8u32 << 16);
+    // dword1 @ 0x84: CErr=3 (bits2:1), type 7=interrupt-IN (bits5:3),
+    // Max Packet Size=8 (bits31:16).
+    core::ptr::write_unaligned(p.add(0x84) as *mut u32, (3u32 << 1) | (7u32 << 3) | (8u32 << 16));
+    // EP1 TR Dequeue Pointer @ 0x88, DCS=1.
+    core::ptr::write_unaligned(p.add(0x88) as *mut u64, rt.ep_ring_phys | 1);
 }
 
 unsafe fn try_enumerate(rt: &mut XhciRuntime) -> bool {
@@ -487,16 +661,14 @@ unsafe fn try_enumerate(rt: &mut XhciRuntime) -> bool {
         },
     );
     if !wait_cmd(rt) || rt.slot == 0 {
-        static ENABLE_FAIL: core::sync::atomic::AtomicBool =
-            core::sync::atomic::AtomicBool::new(false);
-        if !ENABLE_FAIL.swap(true, Ordering::Relaxed) {
-            log::warn!("[USB-HID] enable slot failed slot={}", rt.slot);
-        }
         rt.enum_gave_up = true;
         return false;
     }
+    // Port speed lives in PORTSC bits[13:10]; the slot context wants it verbatim.
+    let speed = (portsc(rt, port) >> 10) & 0xF;
 
-    write_input_address_ctx(rt.in_phys, port);
+    // Address Device (BSR=0 → controller issues SET_ADDRESS on EP0).
+    write_input_address_ctx(rt, port, speed);
     post_cmd(
         rt,
         Trb {
@@ -510,7 +682,45 @@ unsafe fn try_enumerate(rt: &mut XhciRuntime) -> bool {
         log::warn!("[USB-HID] address device failed");
         return false;
     }
-    write_input_config_ep1(rt.in_phys, rt.ep_ring_phys);
+
+    // GET_DESCRIPTOR(Configuration) → read bInterfaceProtocol (1=kbd, 2=mouse)
+    // and bConfigurationValue so SET_CONFIGURATION uses the right value.
+    let mut cfg_val = 1u8;
+    if control_xfer(rt, 0x80, 0x06, 0x0200, 0, 64, rt.ctrl_buf_phys) {
+        let buf = core::slice::from_raw_parts(p2v(rt.ctrl_buf_phys) as *const u8, 64);
+        if buf[1] == 0x02 {
+            cfg_val = buf[5];
+        }
+        // Walk descriptors for the (first) HID interface's bInterfaceProtocol.
+        let total = buf[0] as usize;
+        let mut off = total; // skip the 9-byte config descriptor
+        while off + 2 <= 64 {
+            let dlen = buf[off] as usize;
+            let dtype = buf[off + 1];
+            if dlen == 0 {
+                break;
+            }
+            if dtype == 0x04 && off + 8 <= 64 {
+                // Interface descriptor: bInterfaceProtocol @ +7.
+                rt.hid_protocol = buf[off + 7];
+                break;
+            }
+            off += dlen;
+        }
+    }
+    if cfg_val == 0 {
+        cfg_val = 1;
+    }
+
+    // SET_CONFIGURATION → move the device to the Configured state so its endpoints
+    // become active (without this it never sends interrupt reports).
+    if !control_xfer(rt, 0x00, 0x09, cfg_val as u16, 0, 0, 0) {
+        log::warn!("[USB-HID] set configuration failed");
+        return false;
+    }
+
+    // xHCI Configure Endpoint for the interrupt-IN endpoint (DCI 3).
+    write_input_config_ep1(rt);
     post_cmd(
         rt,
         Trb {
@@ -524,6 +734,11 @@ unsafe fn try_enumerate(rt: &mut XhciRuntime) -> bool {
         log::warn!("[USB-HID] configure EP failed");
         return false;
     }
+
+    // HID class requests: SET_PROTOCOL(boot=0) so reports are boot-format, and
+    // SET_IDLE(0) so the device only reports on change. Best-effort.
+    let _ = control_xfer(rt, 0x21, 0x0B, 0, 0, 0, 0); // SET_PROTOCOL boot
+    let _ = control_xfer(rt, 0x21, 0x0A, 0, 0, 0, 0); // SET_IDLE infinite
     true
 }
 
@@ -541,11 +756,14 @@ unsafe fn arm_hid_transfer(rt: &mut XhciRuntime) {
         rt.ep_cycle,
     );
     rt.ep_idx += 1;
-    if rt.ep_idx as usize >= EP_TRBS {
+    if rt.ep_idx as usize >= EP_TRBS - 1 {
+        // Wrap before the trailing Link TRB (it toggles the cycle for us).
         rt.ep_idx = 0;
         rt.ep_cycle ^= TRB_CYCLE;
     }
     rt.hid_armed = true;
+    crate::arch::memory_fence();
+    // EP1 IN = DCI 3.
     let db = rt.bar_virt + rt.db_off as u64 + (rt.slot as u64) * 4;
-    mmio::write32(db, 0, 2);
+    mmio::write32(db, 0, 3);
 }

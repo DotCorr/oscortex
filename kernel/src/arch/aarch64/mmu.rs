@@ -113,6 +113,50 @@ unsafe fn fill_identity(table: &mut Table, ram_gibs: u64) {
     }
 }
 
+/// Identity-map the 1 GiB Device block containing the physical address `pa`
+/// into both translation halves, if it is not already mapped.
+///
+/// The boot identity map only covers the low 1 GiB of device MMIO (entry 0) plus
+/// a few GiB of RAM. Windows above that — notably the QEMU `virt` PCIe ECAM at
+/// 0x40_1000_0000 (= 257 GiB) — fall outside it and must be mapped on demand
+/// before the kernel touches them. This installs a single Device-nGnRE 1 GiB L1
+/// block at the aligned index and flushes the TLB so the new mapping takes
+/// effect. Idempotent.
+///
+/// # Safety
+/// Must run at EL1 with the MMU on. `pa` must lie within the 39-bit VA range.
+pub unsafe fn map_device_1gib(pa: u64) {
+    if !MMU_ON.load(Ordering::Acquire) {
+        return;
+    }
+    let idx = (pa >> 30) as usize;
+    if idx >= 512 {
+        return;
+    }
+    let base = (pa >> 30) << 30; // 1 GiB-aligned
+    let desc = block_desc(base, ATTR_IDX_DEVICE, DESC_AP_RW_EL1);
+    let l1_low = &mut *core::ptr::addr_of_mut!(L1_LOW);
+    let l1_high = &mut *core::ptr::addr_of_mut!(L1_HIGH);
+    let mut changed = false;
+    if l1_low.0[idx] != desc {
+        l1_low.0[idx] = desc;
+        changed = true;
+    }
+    if l1_high.0[idx] != desc {
+        l1_high.0[idx] = desc;
+        changed = true;
+    }
+    if changed {
+        core::arch::asm!(
+            "dsb ish",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Returns the physical address of the active TTBR0 L1 table (for the shared
 /// `arch::memory::read_cr3` view). Until per-process tables exist, all address
 /// spaces share this identity map.

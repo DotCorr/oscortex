@@ -19,7 +19,7 @@ pub fn init_early(qemu_like: bool) {
         log::warn!("[Input] PS/2 skipped (bare-metal safe mode)");
     }
 
-    if pci::LEGACY_IO_AVAILABLE {
+    if pci::PCI_AVAILABLE {
         super::usb::probe_and_init();
     }
 

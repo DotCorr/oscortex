@@ -23,6 +23,7 @@ pub mod cpu;
 pub mod syscall;
 pub mod acpi;
 pub mod smp;
+pub mod pci;
 pub mod enter_user;
 
 // ── Bare-metal bring-up (direct `-kernel` boot) ─────────────────────────────

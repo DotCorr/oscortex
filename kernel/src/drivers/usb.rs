@@ -64,7 +64,7 @@ pub fn probe_and_init() {
     if USB_XHCI_COUNT.load(Ordering::Relaxed) != 0 {
         return;
     }
-    if !pci::LEGACY_IO_AVAILABLE {
+    if !pci::PCI_AVAILABLE {
         log::info!("[USB] XHCI skipped — PCI unavailable on this arch");
         return;
     }
@@ -72,7 +72,11 @@ pub fn probe_and_init() {
     let hhdm = crate::mm::frame_allocator::hhdm_offset();
     let mut found = 0u32;
 
-    for bus in 0u8..=255u8 {
+    // QEMU `virt` (aarch64) exposes a single PCIe bus; scanning all 256 buses
+    // over ECAM MMIO is slow and pointless. x86 keeps the full legacy scan.
+    let bus_limit: u8 = if cfg!(target_arch = "aarch64") { 1 } else { 255 };
+
+    for bus in 0u8..=bus_limit {
         for dev in 0u8..32u8 {
             for func in 0u8..8u8 {
                 let id = pci::config_read32(bus, dev, func, 0x00);
@@ -97,14 +101,32 @@ pub fn probe_and_init() {
 
                 let vendor = (id & 0xFFFF) as u16;
                 let device = (id >> 16) as u16;
+
+                // On aarch64 the QEMU virt 32-bit MMIO window (where the assigned
+                // BAR lands) is already covered by the boot identity map's Device
+                // entry 0, so the BAR is reachable at bar_phys directly (hhdm = 0).
+                // Do NOT re-map it — double-mapping the 1GiB block faults. On x86
+                // the BAR is reached via the HHDM after an explicit map_mmio.
+                #[cfg(target_arch = "aarch64")]
+                let bar_virt = bar_phys;
+                #[cfg(not(target_arch = "aarch64"))]
+                let bar_virt = {
+                    let v = bar_phys + hhdm;
+                    unsafe { crate::mm::paging::map_mmio(bar_phys, v, XHCI_MMIO_SIZE); }
+                    v
+                };
+
+                // Enabling memory-space decode makes QEMU rebuild the guest memory
+                // map for the BAR; under HVF a timer-ISR MMIO access racing that
+                // rebuild hangs the vCPU. Mask interrupts across the enable AND the
+                // first controller MMIO (init_controller) so nothing else touches
+                // device memory mid-remap.
+                let irq = crate::arch::interrupts_save_and_disable();
                 pci::enable_io_and_busmaster(bus, dev, func);
+                let init = init_controller(bus, dev, func, bar_phys, bar_virt, vendor, device);
+                crate::arch::interrupts_restore(irq);
 
-                let bar_virt = bar_phys + hhdm;
-                unsafe {
-                    crate::mm::paging::map_mmio(bar_phys, bar_virt, XHCI_MMIO_SIZE);
-                }
-
-                match init_controller(bus, dev, func, bar_phys, bar_virt, vendor, device) {
+                match init {
                     Ok(ctrl) => {
                         if (found as usize) < MAX_CONTROLLERS {
                             if let Err(e) = super::xhci_runtime::start(&ctrl) {
@@ -158,7 +180,9 @@ fn init_controller(
 ) -> Result<XhciController, &'static str> {
     unsafe {
         let cap = mmio::read32(bar_virt, 0);
-        let hcsparams1 = mmio::read32(bar_virt, (cap & 0xFF) as usize);
+        // HCSPARAMS1 is at the fixed capability-register offset 0x04, NOT at
+        // CAPLENGTH (that's where the operational registers begin).
+        let hcsparams1 = mmio::read32(bar_virt, 0x04);
         let caps = parse_capability(cap, hcsparams1)?;
 
         let usbcmd_off = caps.usbcmd_off;
