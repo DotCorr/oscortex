@@ -401,47 +401,44 @@ fn draw_text_centered(s: &[u8], py: i32, scale: u32, color: u32) {
     }
 }
 
-/// Minimal animated loading spinner, drawn by the compositor while no app
-/// surface has presented yet (the Flutter engine's JIT warm-up). Just a ring of
-/// dots with a rotating bright head — enough to show the machine is alive, no
-/// text. A Flutter spinner can't appear until the engine is ready, so this has
-/// to be drawn by the kernel.
-pub fn draw_boot_splash(frame: u64) {
-    let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
-    let height = FB_HEIGHT.load(Ordering::Relaxed) as i32;
-    if width == 0 || height == 0 {
+/// 256×256 8-bit alpha mask of the white OSCortex/Dotcorr logo mark, rasterised
+/// from landing/public/dotcorr-logo-mark-white.svg at build-prep time.
+static LOGO_MASK: &[u8; 256 * 256] = include_bytes!("../../assets/logo_mask.bin");
+const LOGO_SRC: u32 = 256;
+
+/// Boot splash, drawn by the compositor while no app surface has presented yet
+/// (the Flutter engine's JIT warm-up). The white OSCortex logo, centered, scaled
+/// to ~1/4 of the screen's shorter dimension — a consistent, Apple-boot-mark size
+/// on any display. The caller paints the (black) background first; this blits the
+/// mark over it. Static (white on black: black is power-friendly, the mark is
+/// already white). A Flutter splash can't appear until the engine is ready, so
+/// this has to be drawn by the kernel.
+pub fn draw_boot_splash(_frame: u64) {
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    if w == 0 || h == 0 {
         return;
     }
-    let cx = width / 2;
-    let cy = height / 2;
-
-    // 8 dot positions evenly around a circle (radius ~28px), clockwise from right.
-    const OFFS: [(i32, i32); 8] = [
-        (28, 0),
-        (20, 20),
-        (0, 28),
-        (-20, 20),
-        (-28, 0),
-        (-20, -20),
-        (0, -28),
-        (20, -20),
-    ];
-    let head = ((frame / 4) % 8) as i32;
-    let mut i = 0i32;
-    while i < 8 {
-        // Trailing distance behind the rotating head (0 = brightest).
-        let d = ((head - i) & 7) as u32;
-        // Fade teal (0x2D,0xD4,0xBF) by (8-d)/8 down the tail.
-        let f = (8 - d) as u32;
-        let r = (0x2D * f) / 8;
-        let g = (0xD4 * f) / 8;
-        let b = (0xBF * f) / 8;
-        let color = (r << 16) | (g << 8) | b;
-        let size: u32 = if d == 0 { 9 } else { 7 };
-        let off = (size as i32) / 2;
-        let (dx, dy) = OFFS[i as usize];
-        fill_rect(cx + dx - off, cy + dy - off, size, size, color);
-        i += 1;
+    // Target box = 1/5 of the shorter screen side (clamped), centered — the same
+    // proportion as the Apple boot mark. Nearest-neighbour scale of the 256² alpha
+    // mask (which is cropped tight to the logo), so it's crisp and fully
+    // resolution-independent.
+    let target = (w.min(h) / 5).max(64);
+    let ox = w.saturating_sub(target) / 2;
+    let oy = h.saturating_sub(target) / 2;
+    let mut ty = 0u32;
+    while ty < target {
+        let sy = (ty * LOGO_SRC) / target;
+        let mut tx = 0u32;
+        while tx < target {
+            let sx = (tx * LOGO_SRC) / target;
+            // The mark is white-on-transparent: alpha doubles as coverage.
+            if LOGO_MASK[(sy * LOGO_SRC + sx) as usize] >= 110 {
+                set_pixel(ox + tx, oy + ty, 0x00FF_FFFF); // white (XRGB8888)
+            }
+            tx += 1;
+        }
+        ty += 1;
     }
 }
 

@@ -948,9 +948,9 @@ pub fn render_frame() {
         c.frame_counter = frame;
         drop(c);
         if let Some((w, h)) = crate::drivers::fb::size_px() {
-            crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
+            crate::drivers::fb::fill_rect(0, 0, w, h, 0x0000_0000); // black (power-friendly)
             // No app has presented a frame yet → we're in the engine warm-up.
-            // Draw the animated loading splash so the screen isn't a dead blank.
+            // Draw the centered white OSCortex boot logo so the screen isn't blank.
             crate::drivers::fb::draw_boot_splash(frame);
         }
         draw_software_cursor();
