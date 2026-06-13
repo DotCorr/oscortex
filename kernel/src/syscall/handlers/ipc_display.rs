@@ -575,8 +575,8 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
                 deadline_ns,
                 crate::wm::pending_count_for(cur),
                 crate::wm::input_pending_for(cur),
-                crate::wm::embedder_baton_due(),
-                crate::wm::baton_vsync_queued_for(1)
+                crate::wm::embedder_baton_due(cur),
+                crate::wm::baton_vsync_queued_for(cur)
             );
         }
 

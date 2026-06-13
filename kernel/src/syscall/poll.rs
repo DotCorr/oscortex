@@ -134,7 +134,7 @@ pub fn coop_target_ready_locked(pid: u32, my_cpu: u32) -> bool {
         let input_is_waiting = input_priority_active
             && input_target != 0
             && crate::wm::input_pending_for(input_target) > 0;
-        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due();
+        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due(pid);
         if (wm == pid && has_pending) || (input_is_waiting && pid == input_target) {
             p.state = crate::process::ProcState::Running;
             crate::arch::smp::broadcast_resched_ipi();
@@ -151,15 +151,26 @@ pub fn coop_target_ready(pid: u32) -> bool {
     coop_target_ready_locked(pid, my_cpu)
 }
 
-/// When a vsync baton is waiting, always prefer the embedder over engine spins.
+/// When a vsync baton is waiting, prefer the engine whose baton is due over
+/// engine spins. Per-engine: try the foreground app first (so a launched app
+/// gets its own frames), then the shell (pid 1). Previously hardcoded pid 1,
+/// which ran the shell for the app's baton and froze the app.
 pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     let _g = crate::process::PTABLE_LOCK.lock();
-    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready_locked(1, my_cpu) {
-        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(1)] };
-        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
-            p.current_cpu = Some(my_cpu);
-            return Some(1);
+    let focus = crate::wm::focus_pid();
+    let candidates = [focus, 1];
+    for &cand in candidates.iter() {
+        if cand != 0
+            && cand != cur
+            && crate::wm::embedder_baton_due(cand)
+            && coop_target_ready_locked(cand, my_cpu)
+        {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(cand)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(cand);
+            }
         }
     }
     None
@@ -186,8 +197,9 @@ pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
     }
 
     let wm = WM_WAITER_PID.load(Ordering::Acquire);
-    // Embedder must drain WM events (especially vsync batons) promptly.
-    if wm != 0 && wm != cur && crate::wm::embedder_baton_due() {
+    // Embedder must drain WM events (especially vsync batons) promptly — run the
+    // waiting engine if ITS baton is due (per-engine, was a global pid-1 check).
+    if wm != 0 && wm != cur && crate::wm::embedder_baton_due(wm) {
         if coop_target_ready_locked(wm, my_cpu) {
             let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {

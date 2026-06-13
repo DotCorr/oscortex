@@ -159,7 +159,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         if target != 0
             && (cur == 0 || crate::process::is_blocked_try(cur))
             && (crate::wm::input_pending_for(target) > 0
-                || (target == 1 && crate::wm::embedder_baton_due()))
+                || crate::wm::embedder_baton_due(target))
             && cur != target
         {
             // BISECT: just wake the target; let normal cooperative scheduling enter
@@ -193,7 +193,7 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
                 && target != 0
                 && cur != target
                 && (crate::wm::input_pending_for(target) > 0
-                    || (target == 1 && crate::wm::embedder_baton_due()))));
+                    || crate::wm::embedder_baton_due(target))));
     {
         static PREEMPT_TICK_LOG: AtomicU32 = AtomicU32::new(0);
         let n = PREEMPT_TICK_LOG.fetch_add(1, Ordering::Relaxed);

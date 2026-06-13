@@ -488,9 +488,12 @@ pub fn baton_vsync_queued_for(pid: u32) -> bool {
     with_queue(|q| q.has_baton_vsync_for(pid))
 }
 
-/// True when the embedder must run FlutterEngineOnVsync (baton queued or posted).
-pub fn embedder_baton_due() -> bool {
-    vsync_baton_pending() || baton_vsync_queued_for(1)
+/// True when engine `pid` must run FlutterEngineOnVsync (a baton-carrying
+/// EV_VSYNC is queued for it). Per-engine: each Flutter engine (shell pid 1,
+/// each launched app) gets its OWN vsync, so a second engine no longer starves
+/// when the shell's baton slot is busy (the cause of the open-an-app freeze).
+pub fn embedder_baton_due(pid: u32) -> bool {
+    baton_vsync_queued_for(pid)
 }
 
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
@@ -581,29 +584,34 @@ pub fn push_vsync(frame: u64) {
 
 }
 
-/// Deliver a vsync baton to the embedder (pid=1) immediately.
+/// Deliver a vsync baton to the engine that posted it, immediately.
 ///
-/// Called via `sys_engine_vsync_baton_post` when the engine invokes the
-/// embedder's `vsync_callback`. The baton is a "call `FlutterEngineOnVsync`
-/// now" signal: it must NOT be parked in `VSYNC_BATON` waiting for the next
-/// `compositor::tick()` -> `push_vsync`, because that path is gated on
-/// `COMP.try_lock()` and stalls permanently if any thread holds the compositor
-/// lock. We push the EV_VSYNC event straight to the front of pid=1's queue and
-/// wake it, independent of compositor state.
-pub fn set_vsync_baton(baton: u64) {
+/// Called via `sys_engine_vsync_baton_post` when an engine invokes its
+/// `vsync_callback`. The baton is a "call `FlutterEngineOnVsync` now" signal: it
+/// must NOT be parked in `VSYNC_BATON` waiting for the next `compositor::tick()`
+/// -> `push_vsync` (that path is gated on `COMP.try_lock()` and stalls if any
+/// thread holds the compositor lock). We push the EV_VSYNC event to the front of
+/// the POSTING engine's queue and wake it, independent of compositor state.
+///
+/// `pid` is the engine that posted (the syscall caller). Previously this was
+/// hardcoded to pid 1, so a launched app's baton was delivered to the shell and
+/// the app's engine never advanced — the second-engine freeze. Now each engine
+/// gets its own vsync.
+pub fn set_vsync_baton(pid: u32, baton: u64) {
     if baton == 0 {
         VSYNC_BATON.store(0, Ordering::Release);
         return;
     }
-    // Don't strand the baton; deliver it now.
+    // Don't strand the baton; deliver it now to the posting engine.
     VSYNC_BATON.store(0, Ordering::Release);
+    let owner = canonical_pid(pid);
     let mut ev = WmEvent::empty();
     ev.kind = EV_VSYNC;
     ev.a = 0;
     ev.b = baton;
-    with_queue(|q| q.push_front(ev, 0));
+    with_queue(|q| q.push_front(ev, owner));
     BATON_VSYNC_QUEUED.store(true, Ordering::Release);
-    crate::process::wake_process(1);
+    crate::process::wake_process(owner);
     let waiter = WM_WAITER.load(Ordering::Acquire);
     if waiter != 0 {
         WM_WAITER.store(0, Ordering::Release);

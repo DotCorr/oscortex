@@ -1290,8 +1290,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     }
 
     // Shell (pid 1) baton shortcut — SUPPRESSED while an app is foreground, so the
-    // shell engine cannot run concurrently with the launched app.
-    if !exclusive && current != 1 && crate::wm::embedder_baton_due() {
+    // shell engine cannot run concurrently with the launched app. Per-engine: only
+    // the SHELL's own baton triggers this (the app's baton runs the app instead).
+    if !exclusive && current != 1 && crate::wm::embedder_baton_due(1) {
         let embedder = unsafe { &mut PTABLE[idx_of(1)] };
         if embedder.pid == 1 && embedder.state == ProcState::Running {
             if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {

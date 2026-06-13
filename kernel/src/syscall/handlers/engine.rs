@@ -302,11 +302,13 @@ pub(crate) fn sys_engine_vsync_baton_post(baton: u64) -> i64 {
             baton
         );
     }
-    crate::wm::set_vsync_baton(baton);
-    // Embedder must run FlutterEngineOnVsync before the next push_vsync consumes
-    // this baton — keep pid=1 runnable even when engine threads are spinning.
+    let caller = crate::process::current_pid();
+    crate::wm::set_vsync_baton(caller, baton);
+    // The POSTING engine must run FlutterEngineOnVsync before the next push_vsync
+    // consumes this baton — keep IT runnable even when engine threads spin. Was
+    // hardcoded pid=1, which starved a launched app's engine (second-engine freeze).
     if baton != 0 {
-        crate::process::set_state(1, crate::process::ProcState::Running);
+        crate::process::set_state(caller, crate::process::ProcState::Running);
     }
     0
 }
