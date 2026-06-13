@@ -131,6 +131,32 @@ static FONT: [[u8; 8]; 96] = [
 static FB_ADDR:     AtomicU64 = AtomicU64::new(0);
 /// Pitch in 32-bit words (= pitch_bytes / 4 for 32bpp).
 static FB_PITCH_PX: AtomicU32 = AtomicU32::new(0);
+
+// ── Pixel format (firmware channel order) ─────────────────────────────────────
+// Colors flow through this module as 0x00RRGGBB. Real UEFI GOP framebuffers are
+// not always XRGB (e.g. many Intel Macs report RGB / red_shift=0), so we read the
+// firmware's channel shifts and repack at the final framebuffer write. The
+// XRGB fast-path keeps the common case (ARM ramfb, x86 std-vga) byte-identical.
+static FB_R_SHIFT:   AtomicU32 = AtomicU32::new(16);
+static FB_G_SHIFT:   AtomicU32 = AtomicU32::new(8);
+static FB_B_SHIFT:   AtomicU32 = AtomicU32::new(0);
+/// True when channel order is exactly XRGB (16/8/0) → write u32 colors verbatim.
+static FB_XRGB_FAST: AtomicBool = AtomicBool::new(true);
+
+/// Repack a 0x00RRGGBB color into the firmware's channel order. Identity on the
+/// XRGB fast-path (no cost on the common path).
+#[inline(always)]
+fn fb_pack(color: u32) -> u32 {
+    if FB_XRGB_FAST.load(Ordering::Relaxed) {
+        return color;
+    }
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    (r << FB_R_SHIFT.load(Ordering::Relaxed))
+        | (g << FB_G_SHIFT.load(Ordering::Relaxed))
+        | (b << FB_B_SHIFT.load(Ordering::Relaxed))
+}
 /// Display width in pixels.
 static FB_WIDTH:    AtomicU32 = AtomicU32::new(0);
 /// Display height in pixels.
@@ -186,8 +212,22 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
     let addr = fb.address() as u64;
     if addr == 0 { return; }
 
-    // Only 32 bpp is supported by this console.
-    if fb.bpp != 32 { return; }
+    // Read the firmware's channel order. Log it unconditionally so a real
+    // machine's GOP format is visible on the serial console for diagnosis.
+    let (rs, gs, bs) = (fb.red_mask_shift as u32, fb.green_mask_shift as u32, fb.blue_mask_shift as u32);
+    log::info!(
+        "[fb] GOP {}x{} bpp={} pitch={} model={} shifts r={} g={} b={}",
+        fb.width, fb.height, fb.bpp, fb.pitch, fb.memory_model, rs, gs, bs
+    );
+
+    // Only 32 bpp is supported by this console (24bpp byte-packing is a TODO).
+    if fb.bpp != 32 { log::warn!("[fb] unsupported bpp {} — no UI", fb.bpp); return; }
+
+    FB_R_SHIFT.store(rs, Ordering::Release);
+    FB_G_SHIFT.store(gs, Ordering::Release);
+    FB_B_SHIFT.store(bs, Ordering::Release);
+    // Fast-path only when the firmware is exactly XRGB. Otherwise repack at write.
+    FB_XRGB_FAST.store(rs == 16 && gs == 8 && bs == 0, Ordering::Release);
 
     let pitch_px = (fb.pitch / 4) as u32;
     let width    = fb.width as u32;
@@ -297,7 +337,7 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
         }
     }
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
-    unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(color); }
+    unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(fb_pack(color)); }
 }
 
 /// Read a single pixel at `(x, y)` from the framebuffer or double buffer.
@@ -350,11 +390,12 @@ pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
     }
 
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
+    let packed = fb_pack(color);
     unsafe {
         for py in y0 as usize..y1 as usize {
             let row = addr.add(py * pitch_px);
             for px in x0 as usize..x1 as usize {
-                row.add(px).write_volatile(color);
+                row.add(px).write_volatile(packed);
             }
         }
     }
@@ -510,7 +551,7 @@ pub fn blit_rgba32(x: i32, y: i32, src_w: u32, src_h: u32, src: &[u32]) {
                 let g = (px & 0x0000_FF00) >> 8;
                 let b = (px & 0x00FF_0000) >> 16;
                 let xrgb = (r << 16) | (g << 8) | b;
-                dst_base.add(dst_row + col).write_volatile(xrgb);
+                dst_base.add(dst_row + col).write_volatile(fb_pack(xrgb));
             }
         }
     }
@@ -542,7 +583,14 @@ pub fn swap_buffers() {
         let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
         let total = height * pitch_px;
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), addr, total);
+            if FB_XRGB_FAST.load(Ordering::Relaxed) {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), addr, total);
+            } else {
+                // Non-XRGB firmware: repack each pixel into the panel's channel order.
+                for i in 0..total {
+                    addr.add(i).write_volatile(fb_pack(buf[i]));
+                }
+            }
         }
     }
 }
@@ -632,7 +680,7 @@ fn blit_char(ch: u8, col: u32, row: u32) {
                 // offset is guaranteed within bounds by px < width && py < height.
                 unsafe {
                     let ptr = addr as *mut u32;
-                    ptr.add(offset).write_volatile(color);
+                    ptr.add(offset).write_volatile(fb_pack(color));
                 }
             }
             gx += 1;
@@ -671,7 +719,7 @@ fn scroll_up() {
         // Clear the last character row.
         let clear_start = base.add((rows - 1) as usize * CHAR_H as usize * words_per_row);
         for i in 0..(CHAR_H as usize * words_per_row) {
-            clear_start.add(i).write_volatile(BG);
+            clear_start.add(i).write_volatile(fb_pack(BG));
         }
     }
 }
@@ -686,7 +734,7 @@ fn clear() {
     unsafe {
         let base = addr as *mut u32;
         for i in 0..total {
-            base.add(i).write_volatile(BG);
+            base.add(i).write_volatile(fb_pack(BG));
         }
     }
 }
