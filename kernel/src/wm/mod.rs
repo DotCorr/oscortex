@@ -716,6 +716,12 @@ pub fn push_scroll(x: i32, y: i32, dz: i32) {
 }
 
 pub fn push_key(scancode: u32, pressed: bool) {
+    // F2 (PS/2 set-1 make 0x3C) toggles the kernel boot screen's verbose log
+    // overlay. Handled here so it works during the engine warm-up before any app
+    // is focused; the keypress is still forwarded for normal handling.
+    if pressed && scancode == 0x3C {
+        crate::drivers::bootscreen::toggle_verbose();
+    }
     let focus = focus_pid();
     let flags = if pressed { 1 } else { 0 };
     if focus == 0 {

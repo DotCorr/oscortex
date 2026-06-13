@@ -949,17 +949,17 @@ pub fn render_frame() {
         let frame = c.frame_counter.wrapping_add(1);
         c.frame_counter = frame;
         drop(c);
-        if let Some((w, h)) = crate::drivers::fb::size_px() {
-            crate::drivers::fb::fill_rect(0, 0, w, h, 0x0000_0000); // black (power-friendly)
-            // No app has presented a frame yet → we're in the engine warm-up.
-            // Draw the centered white OSCortex boot logo so the screen isn't blank.
-            crate::drivers::fb::draw_boot_splash(frame);
-        }
+        // No app has presented a frame yet → we're in the engine warm-up. Draw the
+        // kernel boot screen (dot-matrix OSCORTEX + progress + status, or the F2
+        // verbose log overlay) instead of raw logs. It fills its own black bg.
+        crate::drivers::bootscreen::render();
         draw_software_cursor();
         crate::drivers::fb::swap_buffers();
         crate::wm::push_vsync(frame);
         return;
     }
+    // First real surface presented → boot is done; snap the progress to 100%.
+    crate::drivers::bootscreen::mark_done();
 
     let bypass = is_fb_bypass();
     drop(c);

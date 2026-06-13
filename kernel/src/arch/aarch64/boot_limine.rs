@@ -240,9 +240,8 @@ pub fn init_framebuffer() {
     // (device + RAM, 0..2 GiB) on QEMU/UTM virt, so the raw address is directly
     // writable. Publish it to the shared fb console.
     crate::drivers::fb::init_raw(addr, w, h, pitch);
-    crate::drivers::fb::fill_rect(0, 0, w, 48, 0x0014_B8A6);
-    crate::drivers::fb::fill_rect(0, 48, w, h.saturating_sub(48), 0x001A_1A2E);
-    crate::drivers::fb::write_str("\n  OSCortex aarch64 — Limine framebuffer up\n");
-    crate::drivers::fb::disable_fb_logging();
+    // Clean boot screen from the first frame (silences on-screen log spam).
+    crate::drivers::bootscreen::init();
+    crate::drivers::bootscreen::render();
     log::info!("[limine-boot] framebuffer online: {}x{} via Limine", w, h);
 }

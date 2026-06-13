@@ -30,6 +30,9 @@ impl Write for PanicBuf {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     crate::arch::disable_interrupts();
+    // The boot screen silences on-screen logs; a panic must always be visible, so
+    // re-enable framebuffer logging before the final log::error! below.
+    crate::drivers::fb::enable_fb_logging();
     let mut buf = PanicBuf::new();
     let _ = write!(buf, "{}", info.message());
     crate::logger::early_print("\r\n[PANIC] ");

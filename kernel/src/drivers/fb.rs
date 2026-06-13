@@ -289,6 +289,12 @@ pub fn disable_fb_logging() {
     FB_SILENT.store(true, Ordering::Release);
 }
 
+/// Re-enable framebuffer console text logging (used by the verbose-log toggle
+/// and the panic handler so failures are always visible on screen).
+pub fn enable_fb_logging() {
+    FB_SILENT.store(false, Ordering::Release);
+}
+
 /// Return whether the framebuffer console is initialised.
 pub fn is_ready() -> bool {
     FB_READY.load(Ordering::Acquire)
@@ -439,6 +445,60 @@ fn draw_text_centered(s: &[u8], py: i32, scale: u32, color: u32) {
     for &ch in s {
         draw_glyph_px(ch, x, py, scale, color);
         x += cw;
+    }
+}
+
+/// Pixel width of `len` glyphs at `scale` (8 px per glyph cell).
+pub fn text_width(len: usize, scale: u32) -> i32 {
+    (len as u32 * CHAR_W * scale) as i32
+}
+
+/// Draw an ASCII string left-aligned at `(x, py)`, magnified by `scale`.
+pub fn draw_text(s: &[u8], x: i32, py: i32, scale: u32, color: u32) {
+    let cw = (CHAR_W * scale) as i32;
+    let mut cx = x;
+    for &ch in s {
+        draw_glyph_px(ch, cx, py, scale, color);
+        cx += cw;
+    }
+}
+
+/// Pixel width of `len` glyphs rendered dot-matrix style with grid `cell`.
+pub fn dotted_text_width(len: usize, cell: u32) -> i32 {
+    (len as u32 * CHAR_W * cell) as i32
+}
+
+/// Render ASCII as a dot matrix (the "Doto" look): each lit pixel of the 8×8
+/// glyph becomes a `dot`-sized square centered in a `cell`-sized grid cell.
+/// `cell > dot` leaves the gaps between dots. Left-aligned at `(x, py)`.
+pub fn draw_dotted_text(s: &[u8], x: i32, py: i32, cell: u32, dot: u32, color: u32) {
+    let off = (cell.saturating_sub(dot) / 2) as i32;
+    let cell_i = cell as i32;
+    let char_adv = (CHAR_W * cell) as i32;
+    let mut cx = x;
+    for &ch in s {
+        if (0x20..0x80).contains(&ch) {
+            let glyph = &FONT[(ch - 0x20) as usize];
+            let mut gy = 0u32;
+            while gy < CHAR_H {
+                let bits = glyph[gy as usize];
+                let mut gx = 0u32;
+                while gx < CHAR_W {
+                    if (bits >> (7 - gx)) & 1 != 0 {
+                        fill_rect(
+                            cx + (gx as i32) * cell_i + off,
+                            py + (gy as i32) * cell_i + off,
+                            dot,
+                            dot,
+                            color,
+                        );
+                    }
+                    gx += 1;
+                }
+                gy += 1;
+            }
+        }
+        cx += char_adv;
     }
 }
 

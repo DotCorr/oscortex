@@ -2,6 +2,7 @@
 
 #[cfg(target_arch = "x86_64")]
 pub mod beep;
+pub mod bootscreen;
 pub mod common;
 pub mod fb;
 pub mod nvme;
