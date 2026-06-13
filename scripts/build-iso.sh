@@ -242,6 +242,14 @@ for req in "${REQUIRED_FILES[@]}"; do
     fi
 done
 
+# This is the x86_64 builder and the shell runs JIT off kernel_blob.bin. If an
+# AOT snapshot (libapp.so / app.aot) is left in system/flutter — e.g. an arm64
+# one staged by a prior aarch64 build — the embedder picks AOT and a cross-arch
+# snapshot aborts the Dart VM ("snapshot requires arm64 but the VM has x64").
+# Strip them so the embedder uses the arch-independent JIT kernel_blob.
+rm -f "$ROOT/initramfs/system/flutter/libapp.so" \
+      "$ROOT/initramfs/system/flutter/app.aot"
+
 echo "[1/5] Building kernel ELF..."
 touch "$ROOT/kernel/src/fs/initramfs.rs"
 cd "$ROOT"
