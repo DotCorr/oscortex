@@ -73,23 +73,38 @@ fi
 # libapp.so. Native AOT is being done properly via the engine port — see
 # docs/native-engine-port.md. (Removed with the scratch/ debugging tree.)
 
-echo "[0.35/5] Building core system apps into /Applications..."
 mkdir -p "$ROOT/initramfs/Applications"
-"$ROOT/tools/build-flutter-osx.sh" \
-    "$ROOT/apps/oscortex_canvas" \
-    "Canvas" \
-    "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx" \
-    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets"
-"$ROOT/tools/build-flutter-osx.sh" \
-    "$ROOT/apps/oscortex_files" \
-    "Files" \
-    "$ROOT/initramfs/Applications/Files.app/Files.osx" \
-    "$ROOT/initramfs/Applications/Files.app/flutter_assets"
-"$ROOT/tools/build-flutter-osx.sh" \
-    "$ROOT/apps/oscortex_web_link" \
-    "Web Link" \
-    "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx" \
-    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets"
+if [ -n "${SKIP_CORE_APPS:-}" ]; then
+    # The core-app rebuild drives tools/build-flutter-osx.sh, whose AOT step needs
+    # the oscx-engine Docker image. When that image is unavailable, skip the rebuild
+    # and reuse the app assets already staged in initramfs/Applications (the apps run
+    # JIT off kernel_blob.bin — arch-independent — so the staged bundles still render
+    # their launcher tiles). Set SKIP_CORE_APPS=1 to take this path.
+    echo "[0.35/5] SKIP_CORE_APPS set — reusing staged app assets (Docker/oscx-engine not required)"
+    for a in "Canvas.app/flutter_assets/kernel_blob.bin" "Files.app/flutter_assets/kernel_blob.bin" "Web Link.app/flutter_assets/kernel_blob.bin"; do
+        if [ ! -f "$ROOT/initramfs/Applications/$a" ]; then
+            echo "ERROR: SKIP_CORE_APPS set but staged app asset missing: initramfs/Applications/$a" >&2
+            exit 1
+        fi
+    done
+else
+    echo "[0.35/5] Building core system apps into /Applications..."
+    "$ROOT/tools/build-flutter-osx.sh" \
+        "$ROOT/apps/oscortex_canvas" \
+        "Canvas" \
+        "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx" \
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets"
+    "$ROOT/tools/build-flutter-osx.sh" \
+        "$ROOT/apps/oscortex_files" \
+        "Files" \
+        "$ROOT/initramfs/Applications/Files.app/Files.osx" \
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets"
+    "$ROOT/tools/build-flutter-osx.sh" \
+        "$ROOT/apps/oscortex_web_link" \
+        "Web Link" \
+        "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx" \
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets"
+fi
 
 if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
