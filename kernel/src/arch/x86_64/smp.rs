@@ -25,6 +25,21 @@ use limine::request::MpResponse;
 /// Maximum CPUs supported.
 pub const MAX_CPUS: usize = 64;
 
+/// Gate: true once CPU 0 has entered the scheduler and claimed the init thread.
+/// APs must not run the scheduler before this (else they'd race the BSP to claim
+/// the init thread). Set inside `enter_user_by_pid_noreturn` on CPU 0. Mirrors
+/// the aarch64 SMP gate so the arch-neutral scheduler code links on both arches.
+pub static SMP_SCHED_READY: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn sched_ready() -> bool {
+    SMP_SCHED_READY.load(Ordering::Acquire)
+}
+#[inline]
+pub fn set_sched_ready() {
+    SMP_SCHED_READY.store(true, Ordering::Release);
+}
+
 // ── Per-CPU data ──────────────────────────────────────────────────────────────
 
 /// Per-CPU mutable state — one entry per logical processor.
