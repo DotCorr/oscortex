@@ -102,8 +102,14 @@ pub fn bar0_io_base(_bus: u8, _dev: u8, _func: u8) -> u16 {
 /// program PCIe BARs, so BAR0 reads back with its address field zeroed (only the
 /// type bits are set, e.g. `0x4` = 64-bit memory). When that happens we size the
 /// BAR (write all-ones, read the mask back) and assign it an aligned address out
-/// of the 32-bit MMIO window before returning it. Already-assigned BARs (real HW
-/// / UEFI boot) are returned unchanged.
+/// of the 32-bit MMIO window before returning it.
+///
+/// UEFI/edk2 boot is different: the firmware DOES assign BARs, and for a 64-bit
+/// BAR it places them in the high PCIe MMIO window at 512 GiB
+/// (e.g. 0x80_0000_8000). That address is outside our 39-bit TTBR0 identity map
+/// (and `map_device_1gib` can't reach it), so touching it faults. We only accept
+/// a firmware assignment that lands in the low 32-bit window we can identity-map;
+/// anything higher (or unassigned) is (re)assigned into that window.
 pub fn bar0_mmio_phys(bus: u8, dev: u8, func: u8) -> Option<u64> {
     let bar0_lo = config_read32(bus, dev, func, 0x10);
     if bar0_lo & 1 != 0 {
@@ -112,11 +118,14 @@ pub fn bar0_mmio_phys(bus: u8, dev: u8, func: u8) -> Option<u64> {
     let is64 = (bar0_lo >> 1) & 0x3 == 0x2;
     let bar0_hi = if is64 { config_read32(bus, dev, func, 0x14) } else { 0 };
     let current = ((bar0_hi as u64) << 32) | ((bar0_lo & !0xF) as u64);
-    if current != 0 {
-        return Some(current); // firmware already assigned it
+    // Accept an existing assignment only if it's inside the identity-mapped low
+    // 32-bit MMIO window; otherwise fall through and re-assign it there.
+    if current != 0 && current < MMIO_WINDOW_END {
+        return Some(current);
     }
 
-    // Unassigned — size the BAR (write all-ones, read the mask back).
+    // Unassigned (or assigned too high) — size the BAR (write all-ones, read the
+    // mask back) and re-assign it into the low 32-bit window below.
     config_write32(bus, dev, func, 0x10, 0xFFFF_FFFF);
     let size_lo = config_read32(bus, dev, func, 0x10);
     let size_hi = if is64 {
