@@ -50,16 +50,6 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
 
-    // Trace the first 32 syscalls made by pid=7 so we can see exactly which
-    // call triggers "Poll failed:" and from where.
-    {
-        static PID7_TRACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if crate::process::current_pid() == 7 {
-            let n = PID7_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let _ = n;
-        }
-    }
-
     // Post-pid2-exit trace window: log every syscall (any pid) for the first
     // POSTEXIT_TRACE_LIMIT calls after PID-2's exit, so we can see exactly
     // what pid=1 does once it resumes from pthread_cond_wait.
