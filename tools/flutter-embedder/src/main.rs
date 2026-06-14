@@ -915,16 +915,28 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             respond_platform_message(msg, &[0x00u8]);
         }
 
-        b"flutter/navigation"
-        | b"flutter/system"
+        // StandardMethodCodec channels: the framework decodes the reply with
+        // StandardMethodCodec, so a success-null reply MUST be the binary
+        // envelope [0x00, 0x00] — NOT JSON `[null]`. Replying JSON here makes the
+        // framework throw `FormatException: Message corrupted` in
+        // StandardMethodCodec.decodeEnvelope. flutter/restoration is the loud one:
+        // RestorationManager probes it with StandardMethodCodec at startup on
+        // EVERY engine, so a JSON reply throws once per engine (shell + each app).
+        b"flutter/restoration"
+        | b"flutter/platform_views"
         | b"flutter/spellcheck"
         | b"flutter/processtext"
         | b"flutter/menu"
+        | b"flutter/scribe" => {
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+
+        // JSONMethodCodec / BasicMessageChannel (JSON/String) channels: a JSON
+        // `[null]` envelope is the correct graceful ack.
+        b"flutter/navigation"
+        | b"flutter/system"
         | b"flutter/contextmenu"
-        | b"flutter/scribe"
-        | b"flutter/restoration"
         | b"flutter/keyevent"
-        | b"flutter/platform_views"
         | b"flutter/isolate"
         | b"flutter/lifecycle" => {
             respond_platform_message(msg, JSON_SUCCESS_NULL);
@@ -1639,48 +1651,126 @@ fn textinput_feed_key(scancode: u32, pressed: bool) {
 
 // ── Mouse cursor channel ─────────────────────────────────────────────────────
 
+// ── Minimal StandardMessageCodec reader (binary) ─────────────────────────────
+// flutter/mousecursor uses StandardMethodCodec (a method call is
+// writeValue(methodName:String) + writeValue(arguments:Map)), NOT JSON. Type
+// bytes: 0=null 1=true 2=false 3=int32 4=int64 6=float64 7=string 8=uint8list
+// 9=int32list 10=int64list 11=float64list 12=list 13=map. Strings/sizes use the
+// readSize varint: <254 → 1 byte; 254 → u16; 255 → u32.
+
+/// Read a StandardMessageCodec size varint at `i`. Returns (size, next_index).
+fn std_read_size(buf: &[u8], i: usize) -> Option<(usize, usize)> {
+    let b = *buf.get(i)? as usize;
+    if b < 254 {
+        Some((b, i + 1))
+    } else if b == 254 {
+        Some(((*buf.get(i + 1)? as usize) | ((*buf.get(i + 2)? as usize) << 8), i + 3))
+    } else {
+        let v = (*buf.get(i + 1)? as usize)
+            | ((*buf.get(i + 2)? as usize) << 8)
+            | ((*buf.get(i + 3)? as usize) << 16)
+            | ((*buf.get(i + 4)? as usize) << 24);
+        Some((v, i + 5))
+    }
+}
+
+/// Advance past one StandardMessageCodec value starting at `i`. Handles the
+/// types that appear in framework method-call arguments (scalars, strings,
+/// nested list/map). Returns the index after the value.
+fn std_skip_value(buf: &[u8], i: usize) -> Option<usize> {
+    let t = *buf.get(i)?;
+    let i = i + 1;
+    match t {
+        0 | 1 | 2 => Some(i),     // null / true / false
+        3 => Some(i + 4),         // int32
+        4 => Some(i + 8),         // int64
+        6 => Some(((i + 7) & !7) + 8), // float64, 8-byte aligned to buffer start
+        7 | 8 => {                // string / uint8list
+            let (n, j) = std_read_size(buf, i)?;
+            Some(j + n)
+        }
+        12 | 13 => {              // list / map
+            let (n, mut j) = std_read_size(buf, i)?;
+            let count = if t == 13 { n * 2 } else { n };
+            for _ in 0..count {
+                j = std_skip_value(buf, j)?;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// Decode a StandardMethodCodec method call and return the string value of the
+/// `kind` key in the arguments map, if present.
+fn std_find_kind(buf: &[u8]) -> Option<&[u8]> {
+    // [0] = method name (string). Skip it.
+    if *buf.first()? != 7 {
+        return None;
+    }
+    let i = std_skip_value(buf, 0)?;
+    // arguments must be a Map (type 13).
+    if *buf.get(i)? != 13 {
+        return None;
+    }
+    let (n, mut j) = std_read_size(buf, i + 1)?;
+    for _ in 0..n {
+        // key
+        if *buf.get(j)? == 7 {
+            let (klen, kstart) = std_read_size(buf, j + 1)?;
+            let key = buf.get(kstart..kstart + klen)?;
+            let after_key = kstart + klen;
+            if key == b"kind" {
+                if *buf.get(after_key)? == 7 {
+                    let (vlen, vstart) = std_read_size(buf, after_key + 1)?;
+                    return buf.get(vstart..vstart + vlen);
+                }
+                return None;
+            }
+            j = std_skip_value(buf, after_key)?;
+        } else {
+            j = std_skip_value(buf, j)?; // skip non-string key
+            j = std_skip_value(buf, j)?; // skip its value
+        }
+    }
+    None
+}
+
 fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
     let payload = if msg.message != 0 && msg.message_size != 0 {
         unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
     } else {
-        respond_platform_message(msg, JSON_SUCCESS_NULL);
+        // flutter/mousecursor is StandardMethodCodec: a success-null reply is the
+        // binary envelope [0x00, 0x00], NOT JSON `[null]` (which the framework's
+        // StandardMethodCodec.decodeEnvelope rejects as "Message corrupted").
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
         return;
     };
-    let mut method = [0u8; 64];
-    if let Some((mlen, _)) = json_method_name(payload, &mut method) {
-        if &method[..mlen] == b"MouseCursor.activateSystemCursor" {
-            // args = { device, kind }. Map the Flutter cursor `kind` to a kernel
-            // cursor shape and apply it via SYS_CURSOR_SHAPE_SET so the compositor
-            // actually draws the matching pointer (hand on links, I-beam on text…).
-            if let Some(vi) = json_find_value(payload, b"kind") {
-                if payload.get(vi) == Some(&b'"') {
-                    let mut kind = [0u8; 32];
-                    if let Some((klen, _)) = json_parse_string(payload, vi, &mut kind) {
-                        let shape = cursor_kind_to_shape(&kind[..klen]);
-                        // De-dupe: Flutter spams activateSystemCursor on every
-                        // hover move. The kernel syscall redraws the cursor
-                        // (invalidate → composite), so calling it per-event is a
-                        // redraw STORM that freezes the cooperative core. Only hit
-                        // the kernel when the shape actually CHANGES.
-                        static LAST_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(u32::MAX);
-                        let changed = LAST_CURSOR_SHAPE.swap(shape, Ordering::Relaxed) != shape;
-                        if changed {
-                            sys::cursor_shape_set(shape);
-                        }
-                        static CUR_LOG: AtomicU32 = AtomicU32::new(0);
-                        if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
-                            write(b"[embedder/cursor] kind=");
-                            write(&kind[..klen]);
-                            write(b" -> shape=");
-                            write_dec(shape as u64);
-                            write(b"\n");
-                        }
-                    }
-                }
-            }
+    // args = { device, kind }. Map the Flutter cursor `kind` to a kernel cursor
+    // shape and apply it via SYS_CURSOR_SHAPE_SET so the compositor draws the
+    // matching pointer (hand on links, I-beam on text…). The request is binary
+    // StandardMethodCodec, so decode it as such (the old JSON parse silently
+    // failed → cursor shapes never changed).
+    if let Some(kind) = std_find_kind(payload) {
+        let shape = cursor_kind_to_shape(kind);
+        // De-dupe: Flutter spams activateSystemCursor on every hover move. The
+        // kernel syscall redraws the cursor (invalidate → composite), so calling
+        // it per-event is a redraw STORM. Only hit the kernel on a real change.
+        static LAST_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(u32::MAX);
+        let changed = LAST_CURSOR_SHAPE.swap(shape, Ordering::Relaxed) != shape;
+        if changed {
+            sys::cursor_shape_set(shape);
+        }
+        static CUR_LOG: AtomicU32 = AtomicU32::new(0);
+        if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+            write(b"[embedder/cursor] kind=");
+            write(kind);
+            write(b" -> shape=");
+            write_dec(shape as u64);
+            write(b"\n");
         }
     }
-    respond_platform_message(msg, JSON_SUCCESS_NULL);
+    respond_platform_message(msg, METHOD_SUCCESS_NULL);
 }
 
 /// Map a Flutter `SystemMouseCursors` kind string to a kernel `CURSOR_SHAPE_*`.
