@@ -2745,7 +2745,6 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     // --dart-flags= switch (bare --flag argv items are NOT forwarded to the VM).
     // AOT-only: the JIT/debug VM (x86) asserts num_tasks>0 and SIGABRTs on
     // tasks=0, so the JIT path keeps the bare heap args below instead (ARG5-ARG7).
-    #[cfg(target_arch = "aarch64")]
     static ARG_DARTFLAGS_AOT: &[u8] =
         b"--dart-flags=--scavenger_tasks=0,--marker_tasks=0,--no_concurrent_mark,--no_concurrent_sweep\0";
     static ARG5: &[u8] = b"--old_gen_heap_size=64\0";
@@ -2793,15 +2792,12 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
             ARG6.as_ptr(),
             ARG7.as_ptr(),
         ]);
-    // AOT/release argv (aarch64 only): the 5 AOT-safe switches + the serial-GC
-    // --dart-flags. The patched arm64 release engine forwards the GC flags to the
-    // Dart VM (see above). x86 does not use this — see the argc selection below.
-    #[cfg(target_arch = "aarch64")]
+    // AOT/release argv: the 5 AOT-safe switches + the serial-GC --dart-flags. The
+    // patched release engine (both arches now) forwards the GC flags to the Dart
+    // VM — the post-app-launch freeze fix.
     #[repr(transparent)]
     struct ArgvPtrs6([*const u8; 6]);
-    #[cfg(target_arch = "aarch64")]
     unsafe impl Sync for ArgvPtrs6 {}
-    #[cfg(target_arch = "aarch64")]
     static ENGINE_ARGV_AOT: ArgvPtrs6 =
         ArgvPtrs6([
             ARG0.as_ptr(),
@@ -2836,22 +2832,12 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     // patched arm64 release engine forwards it to the Dart VM, which is the
     // post-app-launch freeze fix (verified on aarch64).
     //
-    // The serial-GC flags are scoped to aarch64 ON PURPOSE: that is the only arch
-    // whose patched engine is built + verified to accept them. x86 currently runs
-    // a stock (unpatched) engine that FATALs on disallowed --dart-flags, and its
-    // engine-mode/asset story (release engine reports is_aot=true but the build is
-    // set up for JIT/kernel_blob) is a separate, unresolved issue. So on x86 we
-    // pass only the 5 AOT-safe args — no serial-GC flags — leaving x86 exactly as
-    // it was before the freeze work. JIT path keeps the full 8-arg ENGINE_ARGV.
+    // Both arches now run the patched release engine in AOT mode with prebuilt
+    // product-mode libapp.so snapshots, so both deliver the serial-GC --dart-flags
+    // (ENGINE_ARGV_AOT, argc=6). JIT path (no AOT snapshot) keeps the full 8-arg
+    // ENGINE_ARGV with bare heap flags — its debug VM asserts on tasks=0.
     let (argv_ptr, engine_argc): (u64, i32) = if is_aot {
-        #[cfg(target_arch = "aarch64")]
-        {
-            (ENGINE_ARGV_AOT.0.as_ptr() as u64, 6)
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            (ENGINE_ARGV.0.as_ptr() as u64, 5)
-        }
+        (ENGINE_ARGV_AOT.0.as_ptr() as u64, 6)
     } else {
         (ENGINE_ARGV.0.as_ptr() as u64, ENGINE_ARGV.0.len() as i32)
     };
