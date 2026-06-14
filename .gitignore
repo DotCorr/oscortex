@@ -67,3 +67,5 @@ initramfs/system/lib/liboscortex_libc.so
 # build artifacts / debug traces (untracked 2026-06-12)
 *.so.trace
 iso_root_aarch64/
+oscortex-aarch64.iso
+tools/flutter-engine/linux-arm64/

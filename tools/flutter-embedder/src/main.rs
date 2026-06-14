@@ -2684,6 +2684,7 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
+            ARG8.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
