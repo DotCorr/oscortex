@@ -45,8 +45,15 @@ pub(crate) fn futex_waiter_present(addr: u64, pid: u32) -> bool {
 }
 
 pub(crate) fn futex_waiter_for(addr: u64, exclude: u32) -> Option<u32> {
+    // Only return a waiter in the SAME address space as the caller (`exclude` is
+    // the calling pid). The waiter table is keyed by VA alone, which collides
+    // across processes that load the same .so at the same address — see
+    // futex_wake_waiters for the full rationale.
+    let grp = if exclude == 0 { 0 } else { crate::process::get_group_leader(exclude) };
     let table = FUTEX_WAITERS.lock();
     table.get(&addr).and_then(|waiters| {
-        waiters.iter().copied().find(|&pid| pid != exclude)
+        waiters.iter().copied().find(|&pid| {
+            pid != exclude && (grp == 0 || crate::process::get_group_leader(pid) == grp)
+        })
     })
 }

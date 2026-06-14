@@ -2640,6 +2640,23 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
     static ARG4: &[u8] = b"--precompiled-mode\0";
+    // SERIAL-GC FIX (post-app-launch freeze). The default Dart VM runs parallel
+    // GC worker threads (scavenger + marker) plus concurrent mark/sweep threads;
+    // a collection is a stop-the-world safepoint that needs ALL of them to park
+    // simultaneously. On our cooperative single-core scheduler that safepoint can
+    // never converge for a 2nd app engine → its render thread freezes (the live
+    // repro: launch Files, sweep, present_callback stops advancing). Making GC
+    // fully SERIAL — run entirely on the mutator that triggered it, no background
+    // GC threads to coordinate — removes the safepoint convergence problem at its
+    // root. These flags ARE forwarded now: the AOT engine is rebuilt with
+    // engine-port/patches/0004 adding them to switches.cc kAllowedDartFlags
+    // (prefix-matched, so the "=value" forms pass), and --dart-flags is parsed
+    // unconditionally (not gated on !FLUTTER_RELEASE). DELIVERED via the single
+    // --dart-flags= switch (bare --flag argv items are NOT forwarded to the VM).
+    // AOT-only: the JIT/debug VM (x86) asserts num_tasks>0 and SIGABRTs on
+    // tasks=0, so the JIT path keeps the bare heap args below instead (ARG5-ARG7).
+    static ARG_DARTFLAGS_AOT: &[u8] =
+        b"--dart-flags=--scavenger_tasks=0,--marker_tasks=0,--no_concurrent_mark,--no_concurrent_sweep\0";
     static ARG5: &[u8] = b"--old_gen_heap_size=64\0";
     static ARG6: &[u8] = b"--new_gen_heap_size=8\0";
     static ARG7: &[u8] = b"--max_old_gen_heap_size=64\0";
@@ -2684,7 +2701,20 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
-            ARG8.as_ptr(),
+        ]);
+    // AOT/release argv: the 5 AOT-safe switches + the serial-GC --dart-flags. The
+    // patched release engine forwards the GC flags to the Dart VM (see above).
+    #[repr(transparent)]
+    struct ArgvPtrs6([*const u8; 6]);
+    unsafe impl Sync for ArgvPtrs6 {}
+    static ENGINE_ARGV_AOT: ArgvPtrs6 =
+        ArgvPtrs6([
+            ARG0.as_ptr(),
+            ARG1.as_ptr(),
+            ARG2.as_ptr(),
+            ARG3.as_ptr(),
+            ARG4.as_ptr(),
+            ARG_DARTFLAGS_AOT.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
@@ -2706,10 +2736,16 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
         icu_path.as_ptr() as u64,
     );
     // ARG0-ARG4 are AOT-safe (name, impeller=false, software-rendering,
-    // disable-vm-service, precompiled-mode). ARG5-ARG8 are JIT-era GC/heap
-    // workarounds that the RELEASE/AOT engine rejects as disallowed Dart VM flags
-    // (switches.cc:478 FATAL). So pass only the first 5 args under AOT.
-    let engine_argc: i32 = if is_aot { 5 } else { ENGINE_ARGV.0.len() as i32 };
+    // disable-vm-service, precompiled-mode). Under AOT we additionally pass the
+    // serial-GC --dart-flags switch (ENGINE_ARGV_AOT, argc=6) — the patched
+    // release engine forwards it to the Dart VM, which is the post-app-launch
+    // freeze fix. Under JIT (x86 debug VM, which asserts on tasks=0) we keep the
+    // full 8-arg ENGINE_ARGV with bare heap flags instead.
+    let (argv_ptr, engine_argc): (u64, i32) = if is_aot {
+        (ENGINE_ARGV_AOT.0.as_ptr() as u64, 6)
+    } else {
+        (ENGINE_ARGV.0.as_ptr() as u64, ENGINE_ARGV.0.len() as i32)
+    };
     write_i32_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_COMMAND_LINE_ARGC,
@@ -2718,7 +2754,7 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_COMMAND_LINE_ARGV,
-        ENGINE_ARGV.0.as_ptr() as u64,
+        argv_ptr,
     );
     write_u64_at(
         &mut project_args.bytes,

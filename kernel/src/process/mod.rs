@@ -175,6 +175,13 @@ pub struct Process {
     pub user_stack_size: u64,
     /// CPU core index that currently executes this process context (None if idle/blocked).
     pub current_cpu: Option<u32>,
+    /// SMP/preemption safety (Redox pattern): false while this thread is inside a
+    /// critical region that must not be preempted or migrated to another core
+    /// (e.g. holding a userspace mutex/futex). The timer-preempt path and the
+    /// cross-core scheduler skip a non-preemptable thread instead of switching it
+    /// away — preventing the mid-critical-section corruption that broke preempted
+    /// Dart engine threads. Defaults true. See [[redox-blueprint]].
+    pub is_preemptable: bool,
     /// aarch64 only: full EL0 trap-frame snapshot (x0..x30, SP_EL0, ELR, SPSR,
     /// ESR) captured when this thread is timer-preempted at an arbitrary user
     /// instruction. The shared `UserRegs` carries only the x86-named subset, so
@@ -271,6 +278,7 @@ impl Process {
             user_stack_base: 0,
             user_stack_size: 0,
             current_cpu: None,
+            is_preemptable: true,
             #[cfg(target_arch = "aarch64")]
             arch_trapframe: [0u64; 102],
             #[cfg(target_arch = "aarch64")]
@@ -980,6 +988,30 @@ pub fn kill(pid: u32) -> Result<(), &'static str> {
     }
     exit(pid, -9); // SIGKILL = -9
     Ok(())
+}
+
+/// Mark a thread (non-)preemptable (Redox pattern). Set false while it holds a
+/// userspace lock so the timer-preempt path + cross-core scheduler won't switch
+/// it away / migrate it mid-critical-section. ISR/lock-free-safe via try_lock.
+pub fn set_preemptable(pid: u32, value: bool) {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.is_preemptable = value;
+        }
+    }
+}
+
+/// Is `pid` currently preemptable? Defaults true for unknown/dead pids so callers
+/// never wedge on a stale id.
+pub fn is_preemptable(pid: u32) -> bool {
+    if let Some(_g) = PTABLE_LOCK.try_lock() {
+        let p = unsafe { &PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            return p.is_preemptable;
+        }
+    }
+    true
 }
 
 /// Set currently active userspace PID (called by exec/scheduler glue).
@@ -1707,30 +1739,64 @@ pub fn mark_init_launched() {
     PENDING_INIT_PID.store(0, Ordering::Release);
 }
 
-pub fn enter_user_by_pid_noreturn(pid: u32) -> ! {
+pub fn enter_user_by_pid_noreturn(req_pid: u32) -> ! {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     let old_pid = current_pid();
+
+    // ── SMP claim resolution ────────────────────────────────────────────────
+    // Release our previous claim, then claim a pid THIS core may run. If the
+    // requested pid is owned by ANOTHER core (a cooperative hand-off targeted a
+    // thread the other core is already running), re-pick a runnable thread for
+    // this core instead of panicking — this is the SMP-correct back-off that
+    // makes every hand-off call site safe without per-site auditing. On a single
+    // core this always resolves to `req_pid` (claim is free), so behaviour there
+    // is unchanged.
+    {
+        let _g = PTABLE_LOCK.lock();
+        // STICKY CPU AFFINITY: do NOT release `old_pid`'s claim here. Releasing it on
+        // every hand-off makes every yielded thread instantly pickable by the other
+        // core, so both cores chase the same hot threads and livelock (rendering
+        // stalls at ~1 frame under smp=2). Keeping the claim sticky pins each thread
+        // to the core that first ran it; unclaimed threads distribute across cores as
+        // they become runnable, and a blocked thread is reclaimed by its own core.
+        // (current_cpu is reset to None when the PCB is freed/reused on exit.)
+        if my_cpu == 0 {
+            crate::arch::smp::set_sched_ready();
+        }
+    }
+    let pid = loop {
+        let got = {
+            let _g = PTABLE_LOCK.lock();
+            let p = unsafe { &mut PTABLE[idx_of(req_pid)] };
+            if p.pid == req_pid
+                && (p.current_cpu.is_none() || p.current_cpu == Some(my_cpu))
+            {
+                p.current_cpu = Some(my_cpu);
+                true
+            } else {
+                false
+            }
+        };
+        if got {
+            break req_pid;
+        }
+        // req_pid is owned by another core — pick a different runnable thread for
+        // this core (next_runnable_pid claims it for my_cpu). If none, idle + retry.
+        if let Some(other) = next_runnable_pid(current_pid()) {
+            if other != req_pid {
+                break other;
+            }
+        }
+        unsafe { crate::arch::enable_and_halt() };
+    };
 
     let (pml4_phys, rip, rsp, rflags, rax, rdi, rsi, rdx,
          rbx, rbp, r8, r9, r10, r11, r12, r13, r14, r15, rcx,
          syscall_stack_top, fs_base, errno_to_deliver, preempted_by_timer) = {
         let _g = PTABLE_LOCK.lock();
-        if old_pid != 0 && old_pid != pid {
-            let old_p = unsafe { &mut PTABLE[idx_of(old_pid)] };
-            if old_p.pid == old_pid && old_p.current_cpu == Some(my_cpu) {
-                old_p.current_cpu = None;
-            }
-        }
         let p = unsafe { &mut PTABLE[idx_of(pid)] };
         assert_eq!(p.pid, pid, "[Process] enter_user_by_pid_noreturn: stale PID");
-        if let Some(other_cpu) = p.current_cpu {
-            if other_cpu != my_cpu {
-                panic!(
-                    "[Process] enter_user_by_pid_noreturn: PID {} is already running on CPU {}, but CPU {} is trying to enter it!",
-                    pid, other_cpu, my_cpu
-                );
-            }
-        }
+        // Claim already established above; ensure it's ours (re-pick set it too).
         p.current_cpu = Some(my_cpu);
         let e = p.errno_to_deliver;
         p.errno_to_deliver = 0; // consume it

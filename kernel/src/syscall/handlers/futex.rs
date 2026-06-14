@@ -325,6 +325,19 @@ fn futex_pending_take(addr: u64) -> bool {
 }
 
 pub(crate) fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
+    // CRITICAL: FUTEX_WAITERS is keyed by the userspace futex/mutex ADDRESS only,
+    // but that address is process-local. The shell (pid 1) and any launched app
+    // (e.g. pid 10) are distinct address spaces that load the same libc / Flutter
+    // engine .so at IDENTICAL virtual addresses, so their internal pthread
+    // mutex/cond addresses COLLIDE in this table. Waking the first `count` waiters
+    // blindly can wake — and remove — the WRONG process's waiter, leaving the
+    // intended one parked forever (the post-app-launch render freeze: a render
+    // thread stuck in pthread_mutex_lock while the unlock woke a sibling-process
+    // waiter instead). Only wake waiters that share the caller's address space.
+    // (Kernel/ISR context, pid 0, has no group and wakes everyone — preserves the
+    // force-wake bring-up path.)
+    let caller = crate::process::current_pid();
+    let caller_grp = if caller == 0 { 0 } else { crate::process::get_group_leader(caller) };
     let wake_list = {
         let mut table = FUTEX_WAITERS.lock();
         let Some(waiters) = table.get_mut(&addr) else {
@@ -337,10 +350,17 @@ pub(crate) fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
             }
             return 0;
         };
-        let wake_count = waiters.len().min(count as usize);
-        let mut woke = Vec::with_capacity(wake_count);
-        for _ in 0..wake_count {
-            woke.push(waiters.remove(0));
+        let mut woke = Vec::with_capacity((count as usize).min(waiters.len()));
+        let mut i = 0;
+        while i < waiters.len() && woke.len() < count as usize {
+            let w = waiters[i];
+            let same_space = caller_grp == 0 || crate::process::get_group_leader(w) == caller_grp;
+            if same_space {
+                woke.push(w);
+                waiters.remove(i);
+            } else {
+                i += 1;
+            }
         }
         if waiters.is_empty() {
             table.remove(&addr);
