@@ -485,6 +485,9 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
     // aot_va=0: the embedder ignores it in APP mode when is_aot=false.
     crate::process::set_bootstrap_regs(child_pid, HOST_MODE_APP, app_id as u64, 0);
 
+    // Track the running instance for crash auto-recovery (see note_thread_exit).
+    note_running(child_pid, app_id);
+
     crate::wm::push_app_event(child_pid, crate::embedder::abi::APP_LAUNCH, 0);
 
     // Switch focus to the freshly launched app. This does double duty:
@@ -525,4 +528,129 @@ pub fn get_info(app_id: u32, buf: &mut [u8; 88]) -> bool {
     buf[68..84].copy_from_slice(&record.version);
     buf[84..88].copy_from_slice(&(record.aot_data.len() as u32).to_le_bytes());
     true
+}
+
+// ── Crash auto-recovery ───────────────────────────────────────────────────────
+//
+// "One crashes, the kernel recovers it in milliseconds." A launched app whose
+// thread group dies abnormally is torn down and relaunched automatically, with
+// a retry cap so a crash-looping app degrades to the shell instead of flapping.
+//
+// Flow: process::exit() → note_thread_exit (try-lock only — runs in whatever
+// context the death happened in, possibly an ISR) records the dead app. The
+// shell's event pump (sys_wm_next_event, pid 1, called continuously) drains via
+// drain_relaunches() in a normal syscall context: tear down group survivors,
+// refocus the shell, and relaunch the app.
+
+const RECOVERY_SLOTS: usize = 8;
+/// Max automatic relaunches of one app within the window before giving up.
+const MAX_RELAUNCHES: u32 = 3;
+/// Backoff window (30 s).
+const RELAUNCH_WINDOW_NS: u64 = 30_000_000_000;
+
+/// (root_pid, app_id) of currently-running launched apps.
+static RUNNING: Mutex<[(u32, u32); RECOVERY_SLOTS]> = Mutex::new([(0, 0); RECOVERY_SLOTS]);
+/// Abnormally-dead apps awaiting relaunch: (app_id, dead_leader_pid).
+static PENDING: Mutex<[(u32, u32); RECOVERY_SLOTS]> = Mutex::new([(0, 0); RECOVERY_SLOTS]);
+/// Relaunch backoff: (app_id, attempts, window_start_ns).
+static HISTORY: Mutex<[(u32, u32, u64); RECOVERY_SLOTS]> = Mutex::new([(0, 0, 0); RECOVERY_SLOTS]);
+
+/// Record a freshly-launched app (called from `launch`).
+fn note_running(root_pid: u32, app_id: u32) {
+    let mut t = RUNNING.lock();
+    if let Some(slot) = t.iter_mut().find(|s| s.0 == 0) {
+        *slot = (root_pid, app_id);
+    }
+}
+
+/// Process-exit notification from `process::exit()`. May run in ISR context —
+/// try-lock only; a missed notification under contention just means no
+/// auto-relaunch for that particular death (the scheduler liveness fallback
+/// still returns control to the shell).
+pub fn note_thread_exit(leader: u32, pid: u32, code: i32) {
+    // Only thread-group LEADER deaths matter for bookkeeping of graceful exits;
+    // for crashes, any member's abnormal death condemns the group.
+    let Some(mut running) = RUNNING.try_lock() else { return };
+    let Some(slot) = running.iter_mut().find(|s| s.0 == leader && s.0 != 0) else {
+        return;
+    };
+    let app_id = slot.1;
+    if code == 0 {
+        // Graceful exit of the leader: just forget it. (A worker thread
+        // exiting cleanly is normal and doesn't end the app.)
+        if pid == leader {
+            *slot = (0, 0);
+        }
+        return;
+    }
+    // Abnormal death (fault / kill): condemn the group, queue a relaunch.
+    *slot = (0, 0);
+    drop(running);
+    if let Some(mut pending) = PENDING.try_lock() {
+        if let Some(p) = pending.iter_mut().find(|s| s.0 == 0) {
+            *p = (app_id, leader);
+            log::error!(
+                "[recover] app_id={} (group {}) died abnormally (pid={} code={}) — relaunch queued",
+                app_id, leader, pid, code
+            );
+        }
+    }
+}
+
+/// Drain pending relaunches. Called from the shell's event pump
+/// (sys_wm_next_event, pid 1) — a normal syscall context where spawning is
+/// safe. Cheap when idle: one try-lock + a scan of 8 slots.
+pub fn drain_relaunches() {
+    let (app_id, dead_leader) = {
+        let Some(mut pending) = PENDING.try_lock() else { return };
+        let Some(p) = pending.iter_mut().find(|s| s.0 != 0) else { return };
+        let v = *p;
+        *p = (0, 0);
+        v
+    };
+
+    // 1. Tear down any surviving threads of the dead instance — a relaunch
+    //    while old engine threads still run is the two-VM corruption case.
+    let killed = crate::process::kill_group(dead_leader);
+
+    // 2. Make sure the shell is the foreground again (the crash may have left
+    //    focus pointing at the dead group).
+    if crate::wm::focus_pid() != 1 {
+        crate::wm::set_focus_pid(1);
+    }
+
+    // 3. Backoff: give up after MAX_RELAUNCHES within the window.
+    let now = crate::syscall::poll::monotonic_ns();
+    let mut history = HISTORY.lock();
+    let slot = match history.iter_mut().find(|s| s.0 == app_id) {
+        Some(s) => s,
+        None => match history.iter_mut().find(|s| s.0 == 0) {
+            Some(s) => {
+                *s = (app_id, 0, now);
+                s
+            }
+            None => return, // table full — drop silently (8 distinct crashing apps)
+        },
+    };
+    if now.saturating_sub(slot.2) > RELAUNCH_WINDOW_NS {
+        // Window expired — reset the counter.
+        *slot = (app_id, 0, now);
+    }
+    if slot.1 >= MAX_RELAUNCHES {
+        log::error!(
+            "[recover] app_id={} crashed {} times in 30s — giving up (staying at shell)",
+            app_id, slot.1
+        );
+        return;
+    }
+    slot.1 += 1;
+    let attempt = slot.1;
+    drop(history);
+
+    // 4. Relaunch.
+    let pid = launch(app_id, 0);
+    log::error!(
+        "[recover] relaunched app_id={} -> pid={} (attempt {}/{}, reaped {} survivors)",
+        app_id, pid, attempt, MAX_RELAUNCHES, killed
+    );
 }

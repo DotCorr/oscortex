@@ -214,10 +214,15 @@ pub const CURSOR_SHAPE_MAX:       u32 = 8;
 pub const CLIPBOARD_MAX: usize = 64 * 1024;
 
 // On-demand package delivery — Fuchsia-inspired ephemeral fetch.
-pub const SYS_PKG_RESOLVE:    u64 = 0x390; // pkg_resolve(name_ptr, name_len) → app_id / -ERRNO
-pub const SYS_PKG_CATALOG:    u64 = 0x391; // pkg_catalog(buf_ptr, buf_len) → count (writes manifest entries)
-pub const SYS_PKG_SET_SERVER: u64 = 0x392; // pkg_set_server(ip_packed_be, port) → 0
-pub const SYS_PKG_EVICT:      u64 = 0x393; // pkg_evict(app_id) → 0 / -ERRNO
+// NOTE: these were originally 0x390-0x393, which COLLIDED with the Phase 53-55
+// scheduler/fork/signal syscalls (sched_yield/get_cpu_time/fork/kill_signal).
+// Because the pkg match arms precede those in dispatch.rs, 0x390 silently
+// dispatched to pkg_resolve and sched_yield was dead — every embedder yield
+// hit pkg_resolve(garbage). Moved to a free block (0x4C0+) so both work.
+pub const SYS_PKG_RESOLVE:    u64 = 0x4C0; // pkg_resolve(name_ptr, name_len) → app_id / -ERRNO
+pub const SYS_PKG_CATALOG:    u64 = 0x4C1; // pkg_catalog(buf_ptr, buf_len) → count (writes manifest entries)
+pub const SYS_PKG_SET_SERVER: u64 = 0x4C2; // pkg_set_server(ip_packed_be, port) → 0
+pub const SYS_PKG_EVICT:      u64 = 0x4C3; // pkg_evict(app_id) → 0 / -ERRNO
 
 // WM event kind for incoming platform-channel messages.
 pub const EV_PLATFORM_MSG: u32 = 6;

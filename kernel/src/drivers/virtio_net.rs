@@ -12,7 +12,12 @@ use crate::drivers::common::virtio_net_frame::{
 };
 use crate::drivers::common::vring::{VirtqDesc, VringLayout, VIRTQ_DESC_F_WRITE};
 
-const RX_SLOTS: usize = 8;
+// Posted RX descriptors. 8 slots (~12 KB of frames in flight) overflowed the
+// moment a TCP sender bursts more than 8 frames between guest polls — slirp
+// then drops and falls into retransmit-timeout pacing (~28 KB/s observed on a
+// 5.4 MB package fetch, regardless of the TCP window). 64 slots absorbs the
+// bursts; the virtqueue is 256 entries and each slot is one 4 KiB frame.
+const RX_SLOTS: usize = 64;
 
 const VIRTIO_DEVICE_FEATURES: u16 = 0x00;
 const VIRTIO_GUEST_FEATURES: u16 = 0x04;

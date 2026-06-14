@@ -477,6 +477,12 @@ pub(crate) fn sys_wm_focus_mirror_set(enabled: u64) -> i64 {
 }
 
 pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i64 {
+    // Crash auto-recovery drain: the shell's event pump is a continuously-
+    // polled, normal syscall context — the safe place to tear down a crashed
+    // app's group and relaunch it. Cheap no-op when nothing is pending.
+    if crate::process::current_pid() == 1 {
+        crate::app_registry::drain_relaunches();
+    }
     let cur = crate::process::current_pid();
     if cur == 0 {
         return -1;
@@ -569,8 +575,8 @@ pub(crate) fn sys_wm_event_wait(ev_ptr: u64, ev_len: u64, timeout_ms: u64) -> i6
                 deadline_ns,
                 crate::wm::pending_count_for(cur),
                 crate::wm::input_pending_for(cur),
-                crate::wm::embedder_baton_due(),
-                crate::wm::baton_vsync_queued_for(1)
+                crate::wm::embedder_baton_due(cur),
+                crate::wm::baton_vsync_queued_for(cur)
             );
         }
 

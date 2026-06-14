@@ -488,9 +488,12 @@ pub fn baton_vsync_queued_for(pid: u32) -> bool {
     with_queue(|q| q.has_baton_vsync_for(pid))
 }
 
-/// True when the embedder must run FlutterEngineOnVsync (baton queued or posted).
-pub fn embedder_baton_due() -> bool {
-    vsync_baton_pending() || baton_vsync_queued_for(1)
+/// True when engine `pid` must run FlutterEngineOnVsync (a baton-carrying
+/// EV_VSYNC is queued for it). Per-engine: each Flutter engine (shell pid 1,
+/// each launched app) gets its OWN vsync, so a second engine no longer starves
+/// when the shell's baton slot is busy (the cause of the open-an-app freeze).
+pub fn embedder_baton_due(pid: u32) -> bool {
+    baton_vsync_queued_for(pid)
 }
 
 pub fn pop_event_for(pid: u32) -> Option<WmEvent> {
@@ -581,29 +584,34 @@ pub fn push_vsync(frame: u64) {
 
 }
 
-/// Deliver a vsync baton to the embedder (pid=1) immediately.
+/// Deliver a vsync baton to the engine that posted it, immediately.
 ///
-/// Called via `sys_engine_vsync_baton_post` when the engine invokes the
-/// embedder's `vsync_callback`. The baton is a "call `FlutterEngineOnVsync`
-/// now" signal: it must NOT be parked in `VSYNC_BATON` waiting for the next
-/// `compositor::tick()` -> `push_vsync`, because that path is gated on
-/// `COMP.try_lock()` and stalls permanently if any thread holds the compositor
-/// lock. We push the EV_VSYNC event straight to the front of pid=1's queue and
-/// wake it, independent of compositor state.
-pub fn set_vsync_baton(baton: u64) {
+/// Called via `sys_engine_vsync_baton_post` when an engine invokes its
+/// `vsync_callback`. The baton is a "call `FlutterEngineOnVsync` now" signal: it
+/// must NOT be parked in `VSYNC_BATON` waiting for the next `compositor::tick()`
+/// -> `push_vsync` (that path is gated on `COMP.try_lock()` and stalls if any
+/// thread holds the compositor lock). We push the EV_VSYNC event to the front of
+/// the POSTING engine's queue and wake it, independent of compositor state.
+///
+/// `pid` is the engine that posted (the syscall caller). Previously this was
+/// hardcoded to pid 1, so a launched app's baton was delivered to the shell and
+/// the app's engine never advanced — the second-engine freeze. Now each engine
+/// gets its own vsync.
+pub fn set_vsync_baton(pid: u32, baton: u64) {
     if baton == 0 {
         VSYNC_BATON.store(0, Ordering::Release);
         return;
     }
-    // Don't strand the baton; deliver it now.
+    // Don't strand the baton; deliver it now to the posting engine.
     VSYNC_BATON.store(0, Ordering::Release);
+    let owner = canonical_pid(pid);
     let mut ev = WmEvent::empty();
     ev.kind = EV_VSYNC;
     ev.a = 0;
     ev.b = baton;
-    with_queue(|q| q.push_front(ev, 0));
+    with_queue(|q| q.push_front(ev, owner));
     BATON_VSYNC_QUEUED.store(true, Ordering::Release);
-    crate::process::wake_process(1);
+    crate::process::wake_process(owner);
     let waiter = WM_WAITER.load(Ordering::Acquire);
     if waiter != 0 {
         WM_WAITER.store(0, Ordering::Release);
@@ -618,7 +626,41 @@ pub fn set_vsync_baton(baton: u64) {
 
 static LAST_BUTTONS: AtomicU32 = AtomicU32::new(0);
 
+// Unified software-cursor state. Fed by EVERY pointer source — the x86 PS/2
+// driver and the aarch64 virtio-input driver both funnel through push_pointer —
+// so the compositor can draw the cursor on any arch (previously it read x86-only
+// ps2:: state and never drew on ARM).
+static CURSOR_X: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(32);
+static CURSOR_Y: core::sync::atomic::AtomicI32 = core::sync::atomic::AtomicI32::new(32);
+static CURSOR_BUTTONS: AtomicU32 = AtomicU32::new(0);
+static CURSOR_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CURSOR_LAST_ACT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Current pointer position (absolute, framebuffer pixels).
+pub fn cursor_pos() -> (i32, i32) {
+    (CURSOR_X.load(Ordering::Relaxed), CURSOR_Y.load(Ordering::Relaxed))
+}
+/// Current pressed-button bitmask.
+pub fn cursor_buttons() -> u32 {
+    CURSOR_BUTTONS.load(Ordering::Relaxed)
+}
+/// True once any pointer event has arrived (a pointing device is live).
+pub fn cursor_seen() -> bool {
+    CURSOR_SEEN.load(Ordering::Relaxed)
+}
+/// Monotonic-ns timestamp of the last pointer activity (for idle auto-hide).
+pub fn cursor_last_act_ns() -> u64 {
+    CURSOR_LAST_ACT_NS.load(Ordering::Relaxed)
+}
+
 pub fn push_pointer(x: i32, y: i32, buttons: u32) {
+    // Record cursor state for the compositor's software cursor (arch-neutral).
+    CURSOR_X.store(x, Ordering::Relaxed);
+    CURSOR_Y.store(y, Ordering::Relaxed);
+    CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
+    CURSOR_SEEN.store(true, Ordering::Relaxed);
+    CURSOR_LAST_ACT_NS.store(crate::arch::rdtsc_ns(), Ordering::Relaxed);
+
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
 
     // Detect button transition (press or release) to flag it as high-priority.
@@ -674,6 +716,12 @@ pub fn push_scroll(x: i32, y: i32, dz: i32) {
 }
 
 pub fn push_key(scancode: u32, pressed: bool) {
+    // F2 (PS/2 set-1 make 0x3C) toggles the kernel boot screen's verbose log
+    // overlay. Handled here so it works during the engine warm-up before any app
+    // is focused; the keypress is still forwarded for normal handling.
+    if pressed && scancode == 0x3C {
+        crate::drivers::bootscreen::toggle_verbose();
+    }
     let focus = focus_pid();
     let flags = if pressed { 1 } else { 0 };
     if focus == 0 {

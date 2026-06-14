@@ -11,6 +11,11 @@ const CONFIG_DATA: u16 = 0xCFC;
 /// True when this architecture exposes legacy PCI config I/O ports.
 pub const LEGACY_IO_AVAILABLE: bool = true;
 
+/// True when PCI config space is reachable on this arch. On x86 the legacy
+/// CF8/CFC ports are always present, so this mirrors `LEGACY_IO_AVAILABLE` and
+/// the x86 path is unchanged.
+pub const PCI_AVAILABLE: bool = LEGACY_IO_AVAILABLE;
+
 /// Read a 32-bit PCI config DWORD. `offset` is the byte offset (0, 4, 8, …).
 pub fn config_read32(bus: u8, dev: u8, func: u8, offset: u8) -> u32 {
     let addr: u32 = (1u32 << 31)

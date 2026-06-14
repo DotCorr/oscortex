@@ -131,6 +131,32 @@ static FONT: [[u8; 8]; 96] = [
 static FB_ADDR:     AtomicU64 = AtomicU64::new(0);
 /// Pitch in 32-bit words (= pitch_bytes / 4 for 32bpp).
 static FB_PITCH_PX: AtomicU32 = AtomicU32::new(0);
+
+// ── Pixel format (firmware channel order) ─────────────────────────────────────
+// Colors flow through this module as 0x00RRGGBB. Real UEFI GOP framebuffers are
+// not always XRGB (e.g. many Intel Macs report RGB / red_shift=0), so we read the
+// firmware's channel shifts and repack at the final framebuffer write. The
+// XRGB fast-path keeps the common case (ARM ramfb, x86 std-vga) byte-identical.
+static FB_R_SHIFT:   AtomicU32 = AtomicU32::new(16);
+static FB_G_SHIFT:   AtomicU32 = AtomicU32::new(8);
+static FB_B_SHIFT:   AtomicU32 = AtomicU32::new(0);
+/// True when channel order is exactly XRGB (16/8/0) → write u32 colors verbatim.
+static FB_XRGB_FAST: AtomicBool = AtomicBool::new(true);
+
+/// Repack a 0x00RRGGBB color into the firmware's channel order. Identity on the
+/// XRGB fast-path (no cost on the common path).
+#[inline(always)]
+fn fb_pack(color: u32) -> u32 {
+    if FB_XRGB_FAST.load(Ordering::Relaxed) {
+        return color;
+    }
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    (r << FB_R_SHIFT.load(Ordering::Relaxed))
+        | (g << FB_G_SHIFT.load(Ordering::Relaxed))
+        | (b << FB_B_SHIFT.load(Ordering::Relaxed))
+}
 /// Display width in pixels.
 static FB_WIDTH:    AtomicU32 = AtomicU32::new(0);
 /// Display height in pixels.
@@ -186,8 +212,22 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
     let addr = fb.address() as u64;
     if addr == 0 { return; }
 
-    // Only 32 bpp is supported by this console.
-    if fb.bpp != 32 { return; }
+    // Read the firmware's channel order. Log it unconditionally so a real
+    // machine's GOP format is visible on the serial console for diagnosis.
+    let (rs, gs, bs) = (fb.red_mask_shift as u32, fb.green_mask_shift as u32, fb.blue_mask_shift as u32);
+    log::info!(
+        "[fb] GOP {}x{} bpp={} pitch={} model={} shifts r={} g={} b={}",
+        fb.width, fb.height, fb.bpp, fb.pitch, fb.memory_model, rs, gs, bs
+    );
+
+    // Only 32 bpp is supported by this console (24bpp byte-packing is a TODO).
+    if fb.bpp != 32 { log::warn!("[fb] unsupported bpp {} — no UI", fb.bpp); return; }
+
+    FB_R_SHIFT.store(rs, Ordering::Release);
+    FB_G_SHIFT.store(gs, Ordering::Release);
+    FB_B_SHIFT.store(bs, Ordering::Release);
+    // Fast-path only when the firmware is exactly XRGB. Otherwise repack at write.
+    FB_XRGB_FAST.store(rs == 16 && gs == 8 && bs == 0, Ordering::Release);
 
     let pitch_px = (fb.pitch / 4) as u32;
     let width    = fb.width as u32;
@@ -249,6 +289,12 @@ pub fn disable_fb_logging() {
     FB_SILENT.store(true, Ordering::Release);
 }
 
+/// Re-enable framebuffer console text logging (used by the verbose-log toggle
+/// and the panic handler so failures are always visible on screen).
+pub fn enable_fb_logging() {
+    FB_SILENT.store(false, Ordering::Release);
+}
+
 /// Return whether the framebuffer console is initialised.
 pub fn is_ready() -> bool {
     FB_READY.load(Ordering::Acquire)
@@ -297,7 +343,7 @@ pub fn set_pixel(x: u32, y: u32, color: u32) {
         }
     }
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
-    unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(color); }
+    unsafe { addr.add(y as usize * pitch_px + x as usize).write_volatile(fb_pack(color)); }
 }
 
 /// Read a single pixel at `(x, y)` from the framebuffer or double buffer.
@@ -350,11 +396,12 @@ pub fn fill_rect(x: i32, y: i32, w: u32, h: u32, color: u32) {
     }
 
     let addr = FB_ADDR.load(Ordering::Relaxed) as *mut u32;
+    let packed = fb_pack(color);
     unsafe {
         for py in y0 as usize..y1 as usize {
             let row = addr.add(py * pitch_px);
             for px in x0 as usize..x1 as usize {
-                row.add(px).write_volatile(color);
+                row.add(px).write_volatile(packed);
             }
         }
     }
@@ -401,47 +448,98 @@ fn draw_text_centered(s: &[u8], py: i32, scale: u32, color: u32) {
     }
 }
 
-/// Minimal animated loading spinner, drawn by the compositor while no app
-/// surface has presented yet (the Flutter engine's JIT warm-up). Just a ring of
-/// dots with a rotating bright head — enough to show the machine is alive, no
-/// text. A Flutter spinner can't appear until the engine is ready, so this has
-/// to be drawn by the kernel.
-pub fn draw_boot_splash(frame: u64) {
-    let width = FB_WIDTH.load(Ordering::Relaxed) as i32;
-    let height = FB_HEIGHT.load(Ordering::Relaxed) as i32;
-    if width == 0 || height == 0 {
+/// Pixel width of `len` glyphs at `scale` (8 px per glyph cell).
+pub fn text_width(len: usize, scale: u32) -> i32 {
+    (len as u32 * CHAR_W * scale) as i32
+}
+
+/// Draw an ASCII string left-aligned at `(x, py)`, magnified by `scale`.
+pub fn draw_text(s: &[u8], x: i32, py: i32, scale: u32, color: u32) {
+    let cw = (CHAR_W * scale) as i32;
+    let mut cx = x;
+    for &ch in s {
+        draw_glyph_px(ch, cx, py, scale, color);
+        cx += cw;
+    }
+}
+
+/// Pixel width of `len` glyphs rendered dot-matrix style with grid `cell`.
+pub fn dotted_text_width(len: usize, cell: u32) -> i32 {
+    (len as u32 * CHAR_W * cell) as i32
+}
+
+/// Render ASCII as a dot matrix (the "Doto" look): each lit pixel of the 8×8
+/// glyph becomes a `dot`-sized square centered in a `cell`-sized grid cell.
+/// `cell > dot` leaves the gaps between dots. Left-aligned at `(x, py)`.
+pub fn draw_dotted_text(s: &[u8], x: i32, py: i32, cell: u32, dot: u32, color: u32) {
+    let off = (cell.saturating_sub(dot) / 2) as i32;
+    let cell_i = cell as i32;
+    let char_adv = (CHAR_W * cell) as i32;
+    let mut cx = x;
+    for &ch in s {
+        if (0x20..0x80).contains(&ch) {
+            let glyph = &FONT[(ch - 0x20) as usize];
+            let mut gy = 0u32;
+            while gy < CHAR_H {
+                let bits = glyph[gy as usize];
+                let mut gx = 0u32;
+                while gx < CHAR_W {
+                    if (bits >> (7 - gx)) & 1 != 0 {
+                        fill_rect(
+                            cx + (gx as i32) * cell_i + off,
+                            py + (gy as i32) * cell_i + off,
+                            dot,
+                            dot,
+                            color,
+                        );
+                    }
+                    gx += 1;
+                }
+                gy += 1;
+            }
+        }
+        cx += char_adv;
+    }
+}
+
+/// 256×256 8-bit alpha mask of the white OSCortex/Dotcorr logo mark, rasterised
+/// from landing/public/dotcorr-logo-mark-white.svg at build-prep time.
+static LOGO_MASK: &[u8; 256 * 256] = include_bytes!("../../assets/logo_mask.bin");
+const LOGO_SRC: u32 = 256;
+
+/// Boot splash, drawn by the compositor while no app surface has presented yet
+/// (the Flutter engine's JIT warm-up). The white OSCortex logo, centered, scaled
+/// to ~1/4 of the screen's shorter dimension — a consistent, Apple-boot-mark size
+/// on any display. The caller paints the (black) background first; this blits the
+/// mark over it. Static (white on black: black is power-friendly, the mark is
+/// already white). A Flutter splash can't appear until the engine is ready, so
+/// this has to be drawn by the kernel.
+pub fn draw_boot_splash(_frame: u64) {
+    let w = FB_WIDTH.load(Ordering::Relaxed);
+    let h = FB_HEIGHT.load(Ordering::Relaxed);
+    if w == 0 || h == 0 {
         return;
     }
-    let cx = width / 2;
-    let cy = height / 2;
-
-    // 8 dot positions evenly around a circle (radius ~28px), clockwise from right.
-    const OFFS: [(i32, i32); 8] = [
-        (28, 0),
-        (20, 20),
-        (0, 28),
-        (-20, 20),
-        (-28, 0),
-        (-20, -20),
-        (0, -28),
-        (20, -20),
-    ];
-    let head = ((frame / 4) % 8) as i32;
-    let mut i = 0i32;
-    while i < 8 {
-        // Trailing distance behind the rotating head (0 = brightest).
-        let d = ((head - i) & 7) as u32;
-        // Fade teal (0x2D,0xD4,0xBF) by (8-d)/8 down the tail.
-        let f = (8 - d) as u32;
-        let r = (0x2D * f) / 8;
-        let g = (0xD4 * f) / 8;
-        let b = (0xBF * f) / 8;
-        let color = (r << 16) | (g << 8) | b;
-        let size: u32 = if d == 0 { 9 } else { 7 };
-        let off = (size as i32) / 2;
-        let (dx, dy) = OFFS[i as usize];
-        fill_rect(cx + dx - off, cy + dy - off, size, size, color);
-        i += 1;
+    // Target box = 1/5 of the shorter screen side (clamped), centered — the same
+    // proportion as the Apple boot mark. Nearest-neighbour scale of the 256² alpha
+    // mask (which is cropped tight to the logo), so it's crisp and fully
+    // resolution-independent.
+    let target = (w.min(h) / 5).max(64);
+    let ox = w.saturating_sub(target) / 2;
+    let oy = h.saturating_sub(target) / 2;
+    let mut ty = 0u32;
+    while ty < target {
+        let sy = (ty * LOGO_SRC) / target;
+        let mut tx = 0u32;
+        while tx < target {
+            let sx = (tx * LOGO_SRC) / target;
+            // The mark is white-on-transparent: alpha doubles as coverage.
+            if LOGO_MASK[(sy * LOGO_SRC + sx) as usize] >= 110 {
+                set_pixel(ox + tx, oy + ty, 0x00FF_FFFF); // white (XRGB8888)
+            }
+            tx += 1;
+        }
+        ty += 1;
     }
 }
 
@@ -513,7 +611,7 @@ pub fn blit_rgba32(x: i32, y: i32, src_w: u32, src_h: u32, src: &[u32]) {
                 let g = (px & 0x0000_FF00) >> 8;
                 let b = (px & 0x00FF_0000) >> 16;
                 let xrgb = (r << 16) | (g << 8) | b;
-                dst_base.add(dst_row + col).write_volatile(xrgb);
+                dst_base.add(dst_row + col).write_volatile(fb_pack(xrgb));
             }
         }
     }
@@ -545,7 +643,14 @@ pub fn swap_buffers() {
         let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed) as usize;
         let total = height * pitch_px;
         unsafe {
-            core::ptr::copy_nonoverlapping(buf.as_ptr(), addr, total);
+            if FB_XRGB_FAST.load(Ordering::Relaxed) {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), addr, total);
+            } else {
+                // Non-XRGB firmware: repack each pixel into the panel's channel order.
+                for i in 0..total {
+                    addr.add(i).write_volatile(fb_pack(buf[i]));
+                }
+            }
         }
     }
 }
@@ -635,7 +740,7 @@ fn blit_char(ch: u8, col: u32, row: u32) {
                 // offset is guaranteed within bounds by px < width && py < height.
                 unsafe {
                     let ptr = addr as *mut u32;
-                    ptr.add(offset).write_volatile(color);
+                    ptr.add(offset).write_volatile(fb_pack(color));
                 }
             }
             gx += 1;
@@ -674,7 +779,7 @@ fn scroll_up() {
         // Clear the last character row.
         let clear_start = base.add((rows - 1) as usize * CHAR_H as usize * words_per_row);
         for i in 0..(CHAR_H as usize * words_per_row) {
-            clear_start.add(i).write_volatile(BG);
+            clear_start.add(i).write_volatile(fb_pack(BG));
         }
     }
 }
@@ -689,7 +794,7 @@ fn clear() {
     unsafe {
         let base = addr as *mut u32;
         for i in 0..total {
-            base.add(i).write_volatile(BG);
+            base.add(i).write_volatile(fb_pack(BG));
         }
     }
 }

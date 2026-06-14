@@ -197,6 +197,23 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         }
     }
 
+    // ── Capability enforcement ────────────────────────────────────────────
+    // Privileged syscalls require the matching capability on the caller's PCB.
+    // Unprivileged calls (render/wm/vfs-read/posix) return None and run freely,
+    // so this never affects the shell or normal apps. The kernel idle task
+    // (pid 0) is exempt (kernel-internal callers).
+    if let Some(required) = required_cap(number) {
+        if crate::process::current_pid() != 0
+            && !crate::process::current_has_caps(required)
+        {
+            log::warn!(
+                "[security] pid={} denied syscall {:#x} — missing capability {:?}",
+                crate::process::current_pid(), number, required
+            );
+            return -1; // EPERM
+        }
+    }
+
     let __ret: i64 = match number {
         // POSIX-compatible
         0   => sys_read(arg0, arg1, arg2),
@@ -786,6 +803,29 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
 }
 
 /// Legacy INT 0x80 syscall path (handled by `arch::x86_64::syscall::legacy_syscall_entry`).
+/// The capability a syscall requires, or `None` if it is unprivileged.
+///
+/// Deliberately conservative: only the genuinely privileged operations are
+/// gated (raw network access here; CAP_CORTEX is enforced inside the PID-0
+/// dispatch). Rendering, window-manager, VFS-read and POSIX calls — everything
+/// a normal app makes — are unprivileged and never gated, so enforcement is
+/// safe to switch on without breaking the shell or apps.
+fn required_cap(number: u64) -> Option<crate::security::Capabilities> {
+    use crate::embedder::abi as eabi;
+    use crate::security::Capabilities;
+    match number {
+        // Raw network: userspace TCP/UDP + DHCP. The kernel's own package
+        // fetch does NOT go through these (it calls net::tcp directly), so
+        // gating them only constrains userspace — which only the trusted shell
+        // uses today.
+        n if n == eabi::SYS_NET_INFO
+            || n == eabi::SYS_NET_SEND
+            || n == eabi::SYS_NET_RECV => Some(Capabilities::NET),
+        0x388 | 0x389 | 0x38A | 0x38B | 0x38C => Some(Capabilities::NET),
+        _ => None,
+    }
+}
+
 pub fn dispatch_legacy() {
     log::warn!("[syscall] dispatch_legacy called without saved register frame");
 }

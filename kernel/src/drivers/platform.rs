@@ -19,8 +19,17 @@ pub fn init_early(qemu_like: bool) {
         log::warn!("[Input] PS/2 skipped (bare-metal safe mode)");
     }
 
-    if pci::LEGACY_IO_AVAILABLE {
-        super::usb::probe_and_init();
+    // USB xHCI HID probe. Skipped on the aarch64 UEFI/Limine ISO build: probing
+    // the firmware-configured xHCI's PCIe config space under QEMU+HVF trips a
+    // QEMU host-side `assert(isv)` (hvf.c) that kills the VM — a QEMU+HVF host bug
+    // on the edk2 boot path, not present on real hardware, under TCG, or on the
+    // bare `-kernel` boot (which self-assigns BARs and works fully). The `-kernel`
+    // artifact is the supported UTM arm64 path and keeps USB HID; x86 keeps it too.
+    #[cfg(not(all(target_arch = "aarch64", feature = "limine-boot")))]
+    {
+        if pci::PCI_AVAILABLE {
+            super::usb::probe_and_init();
+        }
     }
 
     register_input_natives(qemu_like);

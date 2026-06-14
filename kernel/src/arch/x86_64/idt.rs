@@ -626,7 +626,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
             && target != 0
             && cur != target
             && !crate::wm::flutter_bootstrap_spin_active()
-            && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
+            && (crate::wm::input_pending_for(target) > 0 || crate::wm::embedder_baton_due(target))
         );
 
         if should_preempt {
@@ -701,7 +701,7 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         && crate::wm::flutter_init_ready()
         && !crate::wm::flutter_bootstrap_spin_active()
         && (cur == 0 || crate::process::is_blocked_try(cur))
-        && (crate::wm::input_pending_for(target) > 0 || (target == 1 && crate::wm::embedder_baton_due()))
+        && (crate::wm::input_pending_for(target) > 0 || crate::wm::embedder_baton_due(target))
     {
         if crate::process::set_state_try(target, crate::process::ProcState::Running) {
 

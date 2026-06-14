@@ -20,9 +20,73 @@ impl Log for KernelLogger {
         let rflags = crate::arch::interrupts_save_and_disable();
         SERIAL.lock().write_str(s).ok();
         crate::drivers::fb::write_str(s);
+        LOG_RING.lock().push(s);
         crate::arch::interrupts_restore(rflags);
     }
     fn flush(&self) {}
+}
+
+// ── In-memory log ring (for the boot screen's F2 verbose overlay) ────────────
+//
+// The framebuffer is owned (double-buffered) by the compositor during the boot
+// warm-up, so verbose logs can't be shown via the live text console — they have
+// to be re-rendered into the compositor's frame. Every log line is also kept
+// here so the boot screen can snapshot + draw the recent history on demand.
+
+/// Max log lines retained for the F2 verbose overlay.
+pub const RING_LINES: usize = 32;
+/// Max bytes retained per log line.
+pub const RING_COLS: usize = 96;
+
+struct LogRing {
+    lines: [[u8; RING_COLS]; RING_LINES],
+    lens: [u8; RING_LINES],
+    head: usize,
+    count: usize,
+}
+
+impl LogRing {
+    const fn new() -> Self {
+        Self { lines: [[0u8; RING_COLS]; RING_LINES], lens: [0u8; RING_LINES], head: 0, count: 0 }
+    }
+    fn push(&mut self, s: &str) {
+        for line in s.split('\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let b = line.as_bytes();
+            let n = b.len().min(RING_COLS);
+            self.lines[self.head][..n].copy_from_slice(&b[..n]);
+            self.lens[self.head] = n as u8;
+            self.head = (self.head + 1) % RING_LINES;
+            if self.count < RING_LINES {
+                self.count += 1;
+            }
+        }
+    }
+}
+
+static LOG_RING: Mutex<LogRing> = Mutex::new(LogRing::new());
+
+/// Copy retained log lines (oldest → newest) into the caller's buffers under a
+/// short interrupt-off critical section; returns the line count. Drawing happens
+/// after the lock is released so the framebuffer pass runs with interrupts on.
+pub fn snapshot_logs(
+    out_lines: &mut [[u8; RING_COLS]; RING_LINES],
+    out_lens: &mut [u8; RING_LINES],
+) -> usize {
+    let rflags = crate::arch::interrupts_save_and_disable();
+    let ring = LOG_RING.lock();
+    let start = if ring.count < RING_LINES { 0 } else { ring.head };
+    for i in 0..ring.count {
+        let idx = (start + i) % RING_LINES;
+        out_lines[i] = ring.lines[idx];
+        out_lens[i] = ring.lens[idx];
+    }
+    let n = ring.count;
+    drop(ring);
+    crate::arch::interrupts_restore(rflags);
+    n
 }
 
 /// Tiny stack-allocated write buffer for log formatting (no heap needed).

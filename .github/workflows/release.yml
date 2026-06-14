@@ -155,27 +155,36 @@ jobs:
           body: |
             Automated production release built from `main`.
 
-            Both architectures ship a **bootable UEFI ISO** — flash it or attach it
-            in UTM / a VM / bare metal. aarch64 additionally ships the raw `-kernel`
-            ELF for `qemu-system-aarch64 -M virt -kernel` users.
+            Both architectures render the full Flutter shell. For **UTM on Apple
+            Silicon**, boot the aarch64 **`.kernel`** via *Linux → Boot from kernel
+            image* (see below) — UTM's bundled UEFI firmware does not boot the Limine
+            ISO, so the ISO is for QEMU/other UEFI VMs and bare metal.
 
             **Artifacts:**
-            - `oscortex-x86_64-<tag>.iso` — x86_64 bootable kernel ISO (Limine BIOS +
-              UEFI), built via `cargo xtask iso`.
-            - `oscortex-aarch64-<tag>.iso` — **render-capable** aarch64 UEFI ISO
-              (Limine → higher-half kernel), embedding the full Flutter shell runtime
-              (engine + AOT shell snapshot + ICU + fonts/assets). This is the image to
-              boot in **UTM / VMs / bare metal**. In UTM use a single CPU core
-              (OSCortex runs a cooperative single-core scheduler).
-            - `oscortex-aarch64-<tag>.kernel` — the same render-capable kernel as a raw
-              ELF for direct QEMU boot:
+            - `oscortex-x86_64-<tag>.iso` — x86_64 render-capable kernel ISO (Limine
+              BIOS + UEFI) embedding the Flutter shell.
+            - `oscortex-aarch64-<tag>.iso` — render-capable aarch64 UEFI ISO (Limine →
+              higher-half kernel) embedding the full Flutter shell runtime (engine +
+              shell snapshot + ICU + fonts/assets). Boots under QEMU with the edk2
+              AArch64 firmware and on UEFI ARM bare metal. **Not for UTM** (see below).
+            - `oscortex-aarch64-<tag>.kernel` — the render-capable kernel as a raw ELF.
+              **This is the UTM-bootable artifact** and also boots directly under QEMU:
               ```
-              qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 1 -m 2G \
+              qemu-system-aarch64 -M virt,accel=hvf -cpu host -smp 1 -m 4G \
                 -kernel oscortex-aarch64-<tag>.kernel -device ramfb \
                 -device virtio-tablet-device -device virtio-keyboard-device
               ```
-              Wait ~60–90s (TCG warm-up) for the shell to paint; the virtio-tablet
-              gives mouse hover/click.
+
+            **Booting the `.kernel` in UTM (Apple Silicon):**
+            1. New VM → **Virtualize** → **Linux**; leave *Use Apple Virtualization*
+               unchecked (we need the QEMU backend for ramfb).
+            2. *Boot from kernel image* → select `oscortex-aarch64-<tag>.kernel`
+               (no initrd / root FS).
+            3. Finish, then **Edit** the VM: **System → CPU Cores = 1** (OSCortex is a
+               cooperative single-core scheduler); **Display → Emulated Display Card =
+               ram framebuffer standalone device (ramfb)**.
+            4. Run. Under HVF the shell paints in a few seconds (under TCG, allow
+               ~60–90s warm-up).
 
             Verify with the attached `.sha256` files.
           files: |

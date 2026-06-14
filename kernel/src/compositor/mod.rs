@@ -716,15 +716,17 @@ fn cursor_line(x: i32, y: i32, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color
 /// field hover → I-beam), so hovering interactive widgets actually changes the
 /// cursor — a real platform capability, not a stub.
 fn draw_software_cursor() {
-    use core::sync::atomic::Ordering;
-    if !crate::drivers::ps2::PS2_READY.load(Ordering::Relaxed) {
+    // Cursor state is unified in `wm` and fed by every pointer source (x86 PS/2
+    // AND aarch64 virtio-input), so this works on both arches. Previously it was
+    // gated on the x86-only PS2_READY flag and never drew on ARM.
+    if !crate::wm::cursor_seen() {
         return;
     }
 
-    // Auto-disappear cursor after 3 seconds of inactivity (6,000,000,000 TSC cycles @ 2GHz)
-    let last_act = crate::drivers::ps2::last_activity_tsc();
-    let now = crate::arch::rdtsc();
-    if now.wrapping_sub(last_act) > 6_000_000_000 {
+    // Auto-disappear cursor after 3 seconds of inactivity (arch-neutral ns clock).
+    let last_act = crate::wm::cursor_last_act_ns();
+    let now = crate::arch::rdtsc_ns();
+    if now.wrapping_sub(last_act) > 3_000_000_000 {
         return;
     }
 
@@ -734,8 +736,8 @@ fn draw_software_cursor() {
         return;
     }
 
-    let (mut x, mut y) = crate::drivers::ps2::cursor_pos();
-    let buttons = crate::drivers::ps2::cursor_buttons();
+    let (mut x, mut y) = crate::wm::cursor_pos();
+    let buttons = crate::wm::cursor_buttons();
 
     // Keep the sprite fully on-screen (max sprite extent is ~10px from hotspot).
     if let Some((w, h)) = crate::drivers::fb::size_px() {
@@ -947,17 +949,17 @@ pub fn render_frame() {
         let frame = c.frame_counter.wrapping_add(1);
         c.frame_counter = frame;
         drop(c);
-        if let Some((w, h)) = crate::drivers::fb::size_px() {
-            crate::drivers::fb::fill_rect(0, 0, w, h, 0x000c1c26);
-            // No app has presented a frame yet → we're in the engine warm-up.
-            // Draw the animated loading splash so the screen isn't a dead blank.
-            crate::drivers::fb::draw_boot_splash(frame);
-        }
+        // No app has presented a frame yet → we're in the engine warm-up. Draw the
+        // kernel boot screen (dot-matrix OSCORTEX + progress + status, or the F2
+        // verbose log overlay) instead of raw logs. It fills its own black bg.
+        crate::drivers::bootscreen::render();
         draw_software_cursor();
         crate::drivers::fb::swap_buffers();
         crate::wm::push_vsync(frame);
         return;
     }
+    // First real surface presented → boot is done; snap the progress to 100%.
+    crate::drivers::bootscreen::mark_done();
 
     let bypass = is_fb_bypass();
     drop(c);

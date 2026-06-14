@@ -166,6 +166,13 @@ pub extern "C" fn kernel_main() -> ! {
     let fb_response = FB_REQUEST.response();
     logger::init(fb_response);
 
+    // Clean boot screen from the first frame (silences on-screen log spam; serial
+    // keeps everything; F2 toggles the verbose overlay).
+    if drivers::fb::is_ready() {
+        drivers::bootscreen::init();
+        drivers::bootscreen::render();
+    }
+
     log::warn!(
         "[MM::FrameAlloc] capacity stats at boot: total_usable_frames={} ({} MiB), used_at_boot={} ({} MiB)",
         mm::frame_allocator::frames_total(),
@@ -255,17 +262,14 @@ pub fn kernel_main_arch(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
             // Identity-mapped RAM → the physical framebuffer base is directly
             // writable as a virtual address (VA == PA on aarch64).
             drivers::fb::init_raw(addr, w, h, pitch);
-            // Paint a visible boot fill so the display is provably driven even
-            // before any userspace renders (top band teal, body dark navy).
-            drivers::fb::fill_rect(0, 0, w, 48, 0x0014_B8A6);
-            drivers::fb::fill_rect(0, 48, w, h - 48, 0x001A_1A2E);
-            drivers::fb::write_str("\n  OSCortex aarch64 — ramfb framebuffer up\n");
-            // Stop mirroring kernel logs into the framebuffer console: under TCG,
-            // glyph rendering into the 1280x800 buffer (64 volatile writes/glyph)
-            // is so slow per log line it dwarfs the rest of boot. The serial log
-            // is the lifeline; the fb stays driven (the boot fill is visible) and
-            // userspace/compositor renders into it normally.
-            drivers::fb::disable_fb_logging();
+            // Silence on-screen log spam and paint the kernel boot screen (the
+            // dot-matrix OSCORTEX wordmark + progress + status) so the display is
+            // provably driven and clean from the first frame. The serial log stays
+            // the developer lifeline; F2 toggles an on-screen verbose log overlay.
+            // (Mirroring logs into the 1280x800 fb console is also brutally slow
+            // under TCG — ~64 volatile writes/glyph — so this is prettier + faster.)
+            drivers::bootscreen::init();
+            drivers::bootscreen::render();
             log::info!("[BOOT] aarch64 framebuffer online: {}x{} via ramfb", w, h);
         }
         None => {

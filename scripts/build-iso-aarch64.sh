@@ -8,8 +8,13 @@
 #   * BOOTAA64.EFI as the EFI bootloader,
 #   * limine.conf with the OSCortex entry.
 #
-# The aarch64 `/init` is the embedded EL0 preemption-test program (kernel build.rs);
-# no extra initramfs staging is required to reach userspace.
+# The kernel embeds the `initramfs/` tree (via kernel/build.rs), including `/init`
+# (the aarch64 Flutter shell host) and the aarch64 engine + libapp. That tree is
+# SHARED with the x86 build (scripts/build-iso.sh), which overwrites it with x86
+# binaries — so running the x86 build before this one leaves an x86 `/init` the
+# aarch64 kernel can't spawn ("Failed to spawn /init: wrong ELF machine"), hanging
+# the boot before the shell. The guard below fails loudly in that case so we never
+# package a contaminated ISO; re-stage the aarch64 runtime first.
 #
 # Usage:
 #   scripts/build-iso-aarch64.sh           # build the ISO
@@ -28,6 +33,17 @@ TARGET="aarch64-unknown-none"
 # edk2 AArch64 UEFI firmware shipped with Homebrew QEMU.
 QEMU_SHARE="$(dirname "$(command -v qemu-system-aarch64)")/../share/qemu"
 AAVMF_CODE="$QEMU_SHARE/edk2-aarch64-code.fd"
+
+# Guard: refuse to build if the shared initramfs/ holds a wrong-arch /init
+# (cross-arch contamination from an x86 build). Packaging it would hang the boot.
+INIT_BIN="$ROOT/initramfs/init"
+if [ -f "$INIT_BIN" ] && ! file -b "$INIT_BIN" | grep -qi "aarch64"; then
+    echo "ERROR: $INIT_BIN is not an aarch64 binary — initramfs/ is contaminated:" >&2
+    echo "       $(file -b "$INIT_BIN")" >&2
+    echo "       Re-stage the aarch64 runtime (scripts/build-aarch64-shell.sh, or" >&2
+    echo "       restore the arm64 shell-runtime tarball) before building the ISO." >&2
+    exit 1
+fi
 
 echo "[1/4] Building aarch64 kernel ELF (Limine higher-half)..."
 cd "$ROOT"

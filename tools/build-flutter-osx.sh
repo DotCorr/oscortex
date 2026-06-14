@@ -19,7 +19,17 @@ FLUTTER_HOME="${FLUTTER_HOME:-/opt/homebrew/share/flutter}"
 DARTAOT="$FLUTTER_HOME/bin/cache/dart-sdk/bin/dartaotruntime"
 FRONTEND_SERVER="$FLUTTER_HOME/bin/cache/artifacts/engine/darwin-x64/frontend_server_aot.dart.snapshot"
 SDK_ROOT_PRODUCT="$FLUTTER_HOME/bin/cache/artifacts/engine/common/flutter_patched_sdk/"
-GEN_SNAP="$ROOT/tools/flutter-engine/linux-x64/gen_snapshot"
+# Use the gen_snapshot that MATCHES the shipped x86_64 engine
+# (tools/flutter-engine/libflutter_engine.so). The two x64 gen_snapshots are
+# different Dart build flavors: tools/flutter-engine/linux-x64/gen_snapshot emits
+# a 'release' snapshot, but the shipped engine is 'product' — that mismatch
+# ("snapshot requires release but the VM has product") left the x86 shell unable
+# to load its Dart code → blank screen. The matched (product) gen_snapshot ships
+# in the oscortex-x64-release engine bundle.
+GEN_SNAP="$ROOT/.engine-cache/oscortex-engine-1/oscortex-x64-release/gen_snapshot"
+if [ ! -x "$GEN_SNAP" ]; then
+    GEN_SNAP="$ROOT/tools/flutter-engine/linux-x64/gen_snapshot"
+fi
 
 PKG_CONFIG="$APP_DIR/.dart_tool/package_config.json"
 APP_MAIN="$APP_DIR/lib/main.dart"

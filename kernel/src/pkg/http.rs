@@ -39,21 +39,23 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
     let fd = crate::net::tcp::tcp_connect(host_ip, port).map_err(|_| HttpError::Connect)?;
 
     let mut connected = false;
-    // Busy-poll until connection is established (max ~2 seconds).
-    for _ in 0..120 {
+    // Busy-poll until the handshake completes. tcp_is_established (may_send)
+    // is the correct readiness signal — the old zero-byte tcp_read probe
+    // EAGAINed forever on an established-but-idle socket (can_recv is false
+    // until the peer sends, and an HTTP server says nothing until it gets the
+    // request), so every fetch failed with Connect since day one.
+    for _ in 0..240 {
         crate::net::tcp::poll();
-        // Try a zero-byte read to check if connected.
-        let mut probe = [0u8; 0];
-        match crate::net::tcp::tcp_read(fd, &mut probe) {
-            Ok(_) => {
+        match crate::net::tcp::tcp_is_established(fd) {
+            Ok(true) => {
                 connected = true;
                 break;
             }
-            Err(-11) => {
-                // EAGAIN — still connecting, wait a tick.
+            Ok(false) => {
+                // Still in SYN-SENT — wait a tick.
                 for _ in 0..50_000u64 { core::hint::spin_loop(); }
             }
-            Err(_) => break, // connected or error — proceed
+            Err(_) => break, // refused / reset
         }
     }
 
@@ -92,9 +94,15 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
         }
     }
 
-    // 3. Read response (headers + body)
+    // 3. Read response (headers + body). Once Content-Length is known, read
+    // until the FULL body has arrived — the old "300 EAGAINs ≈ no more data"
+    // heuristic clipped large transfers (a 5 MB bundle takes ~80s under TCG
+    // with stalls well past 5s), silently truncating the body and failing the
+    // SHA-256 check downstream.
     let mut response = Vec::with_capacity(4096);
     let mut consecutive_eagain = 0u32;
+    // (header_end+4 .. +content_length) once headers are parsed.
+    let mut expected_total: Option<usize> = None;
 
     loop {
         crate::net::tcp::poll();
@@ -108,15 +116,37 @@ pub fn get(host_ip: u32, port: u16, path: &str) -> Result<Vec<u8>, HttpError> {
                     let _ = crate::net::tcp::tcp_close(fd);
                     return Err(HttpError::TooLarge);
                 }
+                if expected_total.is_none() {
+                    if let Some(header_end) = find_header_end(&response) {
+                        if let Ok(headers) = core::str::from_utf8(&response[..header_end]) {
+                            if let Some(cl) = parse_content_length(headers) {
+                                if cl > MAX_BODY_SIZE {
+                                    let _ = crate::net::tcp::tcp_close(fd);
+                                    return Err(HttpError::TooLarge);
+                                }
+                                expected_total = Some(header_end + 4 + cl);
+                            }
+                        }
+                    }
+                }
+                if let Some(total) = expected_total {
+                    if response.len() >= total {
+                        break; // full body received
+                    }
+                }
             }
             Err(-11) => {
-                // EAGAIN
+                // EAGAIN. With a known remaining length we KNOW more data is
+                // coming — tolerate long stalls (TCG is slow). Without
+                // Content-Length keep the short no-more-data heuristic.
+                // Short spin: every iteration re-polls the stack, and draining
+                // the RX ring promptly is what keeps the sender streaming.
                 consecutive_eagain += 1;
-                if consecutive_eagain > 300 {
-                    // ~5 seconds of no data — assume done
+                let cap = if expected_total.is_some() { 20_000 } else { 1_500 };
+                if consecutive_eagain > cap {
                     break;
                 }
-                for _ in 0..10_000u64 { core::hint::spin_loop(); }
+                for _ in 0..2_000u64 { core::hint::spin_loop(); }
             }
             Err(_) => break, // Connection closed or error
         }
@@ -168,8 +198,13 @@ fn parse_response(data: &[u8]) -> Result<Vec<u8>, HttpError> {
         if content_length > MAX_BODY_SIZE {
             return Err(HttpError::TooLarge);
         }
-        let actual = body.len().min(content_length);
-        return Ok(body[..actual].to_vec());
+        // A SHORT body is a truncated transfer — fail loudly rather than
+        // returning clipped bytes (the silent min() here previously turned
+        // stream truncation into a confusing downstream HashMismatch).
+        if body.len() < content_length {
+            return Err(HttpError::Malformed);
+        }
+        return Ok(body[..content_length].to_vec());
     }
 
     // No Content-Length — return whatever body we got

@@ -39,7 +39,12 @@ use spin::Mutex;
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const MAX_TCP_SOCKETS: usize = 8;
-const TCP_BUF_SIZE: usize = 4096;
+// Per-socket rx/tx buffer = the advertised TCP window. 4 KiB forced a window-
+// update round trip every 4 KiB — a 5.4 MB package fetch crawled at ~28 KB/s
+// under TCG (~1300 stop-and-wait turns) and starved the reader into timeouts.
+// 64 KiB (max un-scaled window) makes bulk fetches stream properly; worst-case
+// memory is 2 × 64 KiB × MAX_TCP_SOCKETS(8) = 1 MiB.
+const TCP_BUF_SIZE: usize = 65535;
 const UDP_BUF_SIZE: usize = 2048;
 
 // Default static IP (overridden by SYS_DHCP_DISCOVER or SYS_NET_SET_IP).
@@ -114,10 +119,14 @@ impl Device for VirtioNetDev {
 // ── Monotonic timestamp ───────────────────────────────────────────────────────
 
 fn now() -> Instant {
-    // Use the compositor frame counter (60 Hz) as a coarse millisecond clock.
-    // Each frame ≈ 16.7 ms; multiply by 17 to get ms approximation.
-    let frames = crate::compositor::frame_counter();
-    Instant::from_millis(frames as i64 * 17)
+    // Real monotonic clock (rdtsc-based, same source as timerfds). smoltcp
+    // uses this for ACK-delay/retransmit/window timers — it must track REAL
+    // time. The previous source (compositor frame counter ×17ms) crawls
+    // whenever the compositor isn't presenting (early boot, headless, busy
+    // CPU): smoltcp then thought ~10ms passed per ~150ms of reality, so every
+    // TCP timer ran ~15× slow and bulk transfers paced at ~28 KB/s no matter
+    // how large the buffers were (a 5.4 MB fetch took a constant ~193 s).
+    Instant::from_millis((crate::syscall::poll::monotonic_ns() / 1_000_000) as i64)
 }
 
 // ── Global state ──────────────────────────────────────────────────────────────
@@ -251,7 +260,15 @@ pub fn tcp_connect(dst_ip: u32, dst_port: u16) -> Result<usize, i64> {
 
     let bytes = dst_ip.to_be_bytes();
     let dst_addr = Ipv4Address::new(bytes[0], bytes[1], bytes[2], bytes[3]);
-    let local_port = 49152 + slot as u16;
+    // Ephemeral local port from a monotonic counter — NOT the slot index. A
+    // slot-derived port meant two back-to-back connections through slot 0 to
+    // the same server reused the IDENTICAL 4-tuple; the peer's TIME_WAIT state
+    // then swallowed the new SYN and the second connect always timed out
+    // (observed: pkg catalog fetch OK, immediately-following bundle fetch dead).
+    static NEXT_EPHEMERAL: core::sync::atomic::AtomicU16 =
+        core::sync::atomic::AtomicU16::new(0);
+    let n = NEXT_EPHEMERAL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let local_port = 49152 + (n % 16384);
     socket
         .connect(
             s.iface.context(),
@@ -294,6 +311,27 @@ pub fn tcp_read(fd: usize, buf: &mut [u8]) -> Result<usize, i64> {
     if !socket.can_recv() { return Err(-11); } // EAGAIN
     let n = socket.recv_slice(buf).map_err(|_| -5i64)?;
     Ok(n)
+}
+
+/// True once the three-way handshake has completed (the socket may send).
+/// `Ok(false)` while still connecting; `Err(-111)` if the connection was
+/// refused / reset (socket left the open states).
+///
+/// NOTE this is the correct way to wait for an outbound connect. A zero-byte
+/// `tcp_read` probe does NOT work: `can_recv()` is false on an ESTABLISHED
+/// socket whose peer hasn't sent anything yet (an HTTP server says nothing
+/// until it gets the request), so the probe EAGAINs forever.
+pub fn tcp_is_established(fd: usize) -> Result<bool, i64> {
+    poll();
+    let _g = TCP_LOCK.lock();
+    let stack = unsafe { &mut *TCP_STACK.0.get() };
+    let s = stack.as_mut().ok_or(-1i64)?;
+    let handle = s.handles.get(fd).and_then(|h| *h).ok_or(-9i64)?;
+    let socket = s.sockets.get_mut::<TcpSocket>(handle);
+    if !socket.is_open() {
+        return Err(-111); // ECONNREFUSED — closed/reset during connect
+    }
+    Ok(socket.may_send())
 }
 
 /// Close a TCP socket.

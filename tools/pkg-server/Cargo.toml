@@ -6,3 +6,4 @@ description = "Serves .osx application bundles over HTTP for on-demand package d
 
 [dependencies]
 sha2 = "0.10"
+ed25519-compact = "2"

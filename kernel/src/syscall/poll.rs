@@ -134,7 +134,7 @@ pub fn coop_target_ready_locked(pid: u32, my_cpu: u32) -> bool {
         let input_is_waiting = input_priority_active
             && input_target != 0
             && crate::wm::input_pending_for(input_target) > 0;
-        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due();
+        let has_pending = crate::wm::pending_count_for(pid) > 0 || crate::wm::embedder_baton_due(pid);
         if (wm == pid && has_pending) || (input_is_waiting && pid == input_target) {
             p.state = crate::process::ProcState::Running;
             crate::arch::smp::broadcast_resched_ipi();
@@ -151,15 +151,26 @@ pub fn coop_target_ready(pid: u32) -> bool {
     coop_target_ready_locked(pid, my_cpu)
 }
 
-/// When a vsync baton is waiting, always prefer the embedder over engine spins.
+/// When a vsync baton is waiting, prefer the engine whose baton is due over
+/// engine spins. Per-engine: try the foreground app first (so a launched app
+/// gets its own frames), then the shell (pid 1). Previously hardcoded pid 1,
+/// which ran the shell for the app's baton and froze the app.
 pub fn prefer_embedder_if_baton_due(cur: u32) -> Option<u32> {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     let _g = crate::process::PTABLE_LOCK.lock();
-    if cur != 1 && crate::wm::embedder_baton_due() && coop_target_ready_locked(1, my_cpu) {
-        let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(1)] };
-        if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
-            p.current_cpu = Some(my_cpu);
-            return Some(1);
+    let focus = crate::wm::focus_pid();
+    let candidates = [focus, 1];
+    for &cand in candidates.iter() {
+        if cand != 0
+            && cand != cur
+            && crate::wm::embedder_baton_due(cand)
+            && coop_target_ready_locked(cand, my_cpu)
+        {
+            let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(cand)] };
+            if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
+                p.current_cpu = Some(my_cpu);
+                return Some(cand);
+            }
         }
     }
     None
@@ -186,8 +197,9 @@ pub fn cooperative_sched_target_locked(cur: u32, my_cpu: u32) -> Option<u32> {
     }
 
     let wm = WM_WAITER_PID.load(Ordering::Acquire);
-    // Embedder must drain WM events (especially vsync batons) promptly.
-    if wm != 0 && wm != cur && crate::wm::embedder_baton_due() {
+    // Embedder must drain WM events (especially vsync batons) promptly — run the
+    // waiting engine if ITS baton is due (per-engine, was a global pid-1 check).
+    if wm != 0 && wm != cur && crate::wm::embedder_baton_due(wm) {
         if coop_target_ready_locked(wm, my_cpu) {
             let p = unsafe { &mut crate::process::PTABLE[crate::process::idx_of(wm)] };
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
@@ -1292,6 +1304,70 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
                     break;
                 }
                 core::hint::spin_loop();
+            }
+        }
+
+        if cur != 0 {
+            let coop_target = cooperative_sched_target(cur);
+            if let Some(next) = coop_target.filter(|&n| n != cur) {
+                if epfd == 70 || epfd == 72 || cur == 2 || cur == 3 || cur == 4 || cur == 7 {
+                    static EPOLL_BLOCK_LOG: core::sync::atomic::AtomicU32 =
+                        core::sync::atomic::AtomicU32::new(0);
+                    let n = EPOLL_BLOCK_LOG.fetch_add(1, Ordering::Relaxed);
+                    if n < 48 {
+                        log::warn!(
+                            "[epoll-block] #{} pid={} epfd={} next={} rip={:#x}",
+                            n,
+                            cur,
+                            epfd,
+                            next,
+                            crate::arch::syscall::user_rip()
+                        );
+                    }
+                }
+                // Re-execute the epoll_wait syscall on resume (do NOT return
+                // -1/EINTR to userspace). Returning EINTR here makes the
+                // Flutter engine retry epoll_wait immediately; if it is woken
+                // before any fd is actually ready it gets EINTR again and
+                // busy-spins, monopolizing the single core and starving the
+                // embedder host (pid 1) input loop. Saving the context at the
+                // syscall instruction (urip - 2) with rax = the epoll_wait
+                // syscall number makes the thread re-enter the kernel on wake
+                // and re-check readiness — returning real events when ready or
+                // blocking again — exactly like sys_wm_event_wait does.
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context_reexec(cur, urip, ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B); // SYS epoll_wait (re-enter)
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(next);
+            } else if cur >= 2
+                && crate::process::get_group_leader(cur) == 1
+                && !crate::wm::flutter_init_ready()
+                && crate::process::current_pid() != 1
+            {
+                static EPOLL_INIT_HANDOFF_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let n = EPOLL_INIT_HANDOFF_LOG.fetch_add(1, Ordering::Relaxed);
+                if n < 32 {
+                    log::warn!(
+                        "[epoll-init-handoff] #{} pid={} epfd={} -> pid1 rip={:#x} target={:?}",
+                        n,
+                        cur,
+                        epfd,
+                        crate::arch::syscall::user_rip(),
+                        coop_target
+                    );
+                }
+                crate::process::set_state(1, crate::process::ProcState::Running);
+                let urip = crate::arch::syscall::user_rip();
+                let ursp = crate::arch::syscall::user_rsp();
+                crate::process::save_return_context_reexec(cur, urip, ursp);
+                crate::process::save_full_user_gprs(cur);
+                crate::process::set_rax(cur, 0x47B);
+                crate::process::save_xstate(cur);
+                crate::process::enter_user_by_pid_noreturn(1);
             }
         }
 

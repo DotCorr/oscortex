@@ -126,6 +126,10 @@ pub struct Process {
     pub state:   ProcState,
     /// Exit code set by `sys_exit`.
     pub exit_code: i32,
+    /// Capability set governing access to privileged syscalls. Stored per-PCB
+    /// (not derived from PID): the system shell (HOST_MODE_SHELL) gets the full
+    /// set, launched apps get none, and threads/forks inherit their creator's.
+    pub caps: crate::security::Capabilities,
     /// Base of this process syscall kernel stack.
     syscall_stack_base: *mut u8,
     /// Top of this process syscall kernel stack.
@@ -250,6 +254,7 @@ impl Process {
             },
             state:     ProcState::Dead,
             exit_code: 0,
+            caps:      crate::security::NO_CAPS,
             syscall_stack_base: core::ptr::null_mut(),
             syscall_stack_top: 0,
             xstate: XStateBuf([0; XSTATE_SIZE]),
@@ -783,6 +788,15 @@ pub fn spawn_with_bootstrap(
         p.regs       = regs;
         p.state      = ProcState::Running;
         p.exit_code  = 0;
+        // Capabilities: the trusted system shell (HOST_MODE_SHELL) holds the
+        // full set; everything else launched this way (HOST_MODE_APP) starts
+        // with none and must be granted caps explicitly. This is what makes
+        // privileged syscalls capability-gated rather than PID-gated.
+        p.caps = if bootstrap.rdi == crate::app_registry::HOST_MODE_SHELL {
+            crate::security::ALL_CAPS
+        } else {
+            crate::security::NO_CAPS
+        };
         p.syscall_stack_base = sys_stack_base;
         p.syscall_stack_top = sys_stack_top;
         p.xstate = XStateBuf::default();
@@ -809,8 +823,9 @@ pub fn spawn_with_bootstrap(
     }
 
     log::info!(
-        "[Process] Spawned '{}' pid={} entry={:#x} rdi={:#x} rsi={:#x} rdx={:#x} parent={}",
-        name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid
+        "[Process] Spawned '{}' pid={} entry={:#x} rdi={:#x} rsi={:#x} rdx={:#x} parent={} caps={:?}",
+        name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid,
+        caps_of(pid)
     );
     Ok(pid)
 }
@@ -912,6 +927,45 @@ pub fn exit(pid: u32, code: i32) {
     p.exit_code = code;
     p.current_cpu = None;
     log::info!("[Process] pid={} exited with code {}", pid, code);
+
+    // Crash auto-recovery: tell the app registry which thread GROUP this exit
+    // belongs to. Resolved while the lock is held; the (try-lock, ISR-safe)
+    // notification itself runs after we release it.
+    let leader = get_group_leader_locked(pid);
+    drop(_g);
+    crate::app_registry::note_thread_exit(leader, pid, code);
+}
+
+/// Forcefully terminate every still-live member of `leader`'s thread group
+/// (including the leader itself). Used by crash recovery: when one thread of a
+/// launched app faults, the survivors must be torn down before a fresh
+/// instance is launched — two engine instances of the same app corrupt each
+/// other under the cooperative scheduler. Returns the number killed.
+///
+/// Must be called from a normal (syscall) context, NOT an ISR: it takes the
+/// PTABLE lock to collect victims, then calls `exit()` per victim.
+pub fn kill_group(leader: u32) -> u32 {
+    let mut victims = [0u32; MAX_PROCS];
+    let mut n = 0usize;
+    {
+        let _g = PTABLE_LOCK.lock();
+        for slot in unsafe { PTABLE.iter() } {
+            if slot.pid == 0 {
+                continue;
+            }
+            if matches!(slot.state, ProcState::Zombie(_) | ProcState::Dead) {
+                continue;
+            }
+            if get_group_leader_locked(slot.pid) == leader && n < victims.len() {
+                victims[n] = slot.pid;
+                n += 1;
+            }
+        }
+    }
+    for &v in &victims[..n] {
+        exit(v, -9);
+    }
+    n as u32
 }
 
 /// Send SIGKILL to a process (forceful immediate exit).
@@ -936,6 +990,23 @@ pub fn set_current_pid(pid: u32) {
 /// Get currently active userspace PID.
 pub fn current_pid() -> u32 {
     crate::arch::smp::this_cpu().current_pid.load(Ordering::Acquire)
+}
+
+/// The capability set held by `pid` (NO_CAPS if the pid is unknown/dead).
+pub fn caps_of(pid: u32) -> crate::security::Capabilities {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state != ProcState::Dead {
+        p.caps
+    } else {
+        crate::security::NO_CAPS
+    }
+}
+
+/// Whether the CURRENTLY-RUNNING process holds all of `required`. The single
+/// gate every privileged syscall calls — capability-based, not PID-based.
+pub fn current_has_caps(required: crate::security::Capabilities) -> bool {
+    crate::security::check(caps_of(current_pid()), required)
 }
 
 /// Physical address of the current process's top-level page table (the L1 / TTBR0
@@ -1186,7 +1257,20 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     // two-VM concurrency that crashes the launched app.
     let fg = crate::wm::focus_pid();
     let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
-    let exclusive = fg_group > 1;
+    let mut exclusive = fg_group > 1;
+    // If the foreground group's LEADER is dead (the app crashed), exclusivity
+    // must lapse — otherwise the filter below skips every other process
+    // (including the shell) and the whole system wedges on a dead group.
+    // The shell then gets scheduled again and crash recovery (app_registry
+    // drain in sys_wm_next_event) can refocus + relaunch.
+    if exclusive {
+        let leader = unsafe { &PTABLE[idx_of(fg_group)] };
+        let leader_alive = leader.pid == fg_group
+            && !matches!(leader.state, ProcState::Zombie(_) | ProcState::Dead);
+        if !leader_alive {
+            exclusive = false;
+        }
+    }
 
     let focus = fg;
     let input_target = if focus != 0 { focus } else { 1 };
@@ -1206,8 +1290,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     }
 
     // Shell (pid 1) baton shortcut — SUPPRESSED while an app is foreground, so the
-    // shell engine cannot run concurrently with the launched app.
-    if !exclusive && current != 1 && crate::wm::embedder_baton_due() {
+    // shell engine cannot run concurrently with the launched app. Per-engine: only
+    // the SHELL's own baton triggers this (the app's baton runs the app instead).
+    if !exclusive && current != 1 && crate::wm::embedder_baton_due(1) {
         let embedder = unsafe { &mut PTABLE[idx_of(1)] };
         if embedder.pid == 1 && embedder.state == ProcState::Running {
             if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
@@ -1499,6 +1584,8 @@ pub fn spawn_thread(
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
+        // Threads inherit their owning process's capabilities.
+        p.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(owning_pid)].caps).read() };
         p.fs_base            = tls_va;
         // Record user stack bounds so pthread_attr_getstack can return them.
         p.user_stack_base    = stack_va;
@@ -1573,6 +1660,8 @@ pub fn clone_thread(
         p.xstate             = XStateBuf::default();
         p.is_thread          = true;
         p.parent_pid         = owning_pid;
+        // Threads inherit their owning process's capabilities.
+        p.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(owning_pid)].caps).read() };
         p.fs_base            = 0;
         p.current_cpu        = None;
         p.cpu_ticks          = 0;
@@ -2238,6 +2327,21 @@ pub fn capture_user_gprs_at_entry(pid: u32) {
 /// `enter_user_by_pid_noreturn`, otherwise the yielding thread will resume
 /// with stale rbx/rbp/r12–r15/rdi/rsi/etc. and corrupt its C++ caller's
 /// `this` pointer and locals.
+///
+/// The user GPR snapshot lives in a PER-CPU scratch area (`gs:[..]`), written by
+/// the syscall entry stub. It is shared by every thread on that core, so if a
+/// thread switch lands mid-handler (the wait loops `sti; hlt` and the timer ISR
+/// can switch threads), another thread's syscall entry OVERWRITES it. A later
+/// `save_full_user_gprs` would then read the *other* thread's callee-saved regs
+/// and store them into our context → on resume `rbx`/`rbp`/`r12-15` are garbage
+/// (observed: `MessageLoopOscortex::Run` resuming from `epoll_wait` with
+/// `rbx`=a Skia stride → SIGSEGV; the root of the "sporadic" render crashes).
+///
+/// Fix: capture ONCE, eagerly, at syscall entry (`capture_user_gprs_at_entry`,
+/// called from `dispatch_fast` while the snapshot is still fresh for THIS
+/// thread). This flag makes every subsequent yield-time `save_full_user_gprs`
+/// in the same syscall a no-op, so a clobbered per-CPU snapshot can never leak
+/// into our saved context.
 pub fn save_full_user_gprs(pid: u32) {
     // Only the first call per syscall (the eager entry capture) reads the
     // per-CPU snapshot; it is fresh then. Later yield-time calls are no-ops so a
@@ -2246,6 +2350,19 @@ pub fn save_full_user_gprs(pid: u32) {
         return;
     }
     let snap = crate::arch::syscall::user_gprs();
+    if pid == 2 {
+        log::warn!(
+            "[save_full_user_gprs] pid=2 rdi={:#x} rsi={:#x} rbx={:#x} rbp={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            snap.rdi,
+            snap.rsi,
+            snap.rbx,
+            snap.rbp,
+            snap.r12,
+            snap.r13,
+            snap.r14,
+            snap.r15
+        );
+    }
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &mut PTABLE[idx_of(pid)] };
     if p.pid != pid { return; }
@@ -2316,6 +2433,14 @@ pub fn get_saved_rax(pid: u32) -> u64 {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &PTABLE[idx_of(pid)] };
     if p.pid == pid { p.regs.rax } else { 0 }
+}
+
+/// Read the saved user link register (x30) for a pid.
+#[cfg(target_arch = "aarch64")]
+pub fn get_user_lr(pid: u32) -> u64 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid { p.user_lr } else { 0 }
 }
 
 /// Saved user RIP/RSP for a blocked/yielded thread (from `save_return_context`).
@@ -2584,6 +2709,8 @@ pub fn fork_current() -> Result<u32, &'static str> {
     child.syscall_stack_top  = child_stack_top;
     child.is_thread          = false;
     child.parent_pid         = parent_pid;
+    // A forked child inherits the parent's capability set.
+    child.caps               = unsafe { core::ptr::addr_of!(PTABLE[idx_of(parent_pid)].caps).read() };
     child.cpu_ticks          = 0;
     child.slice_left         = 10;
     child.pending_sigs       = 0;
