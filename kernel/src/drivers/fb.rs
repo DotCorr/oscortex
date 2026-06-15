@@ -626,7 +626,25 @@ pub fn set_double_buffer(active: bool) {
             let height = FB_HEIGHT.load(Ordering::Relaxed);
             let pitch_px = FB_PITCH_PX.load(Ordering::Relaxed);
             let size = pitch_px as usize * height as usize;
-            *db = Some(vec![0u32; size]);
+            // A full-fb back buffer is large on high-res panels — a 2880x1800
+            // Retina framebuffer (e.g. a 2016 MacBook Pro) is ~20 MiB. Allocate
+            // it FALLIBLY (and reject an implausible geometry) so a big fb or a
+            // tight heap degrades to single-buffer / direct-to-fb rendering
+            // instead of `vec!` aborting and hanging the boot at
+            // cortex::compositor. Single-buffer is fully supported (every write
+            // path checks DOUBLE_BUFFER_ACTIVE); it just tears.
+            const MAX_DB_PIXELS: usize = 24 * 1024 * 1024; // ~96 MiB sanity ceiling
+            let mut buf: Vec<u32> = Vec::new();
+            if size == 0 || size > MAX_DB_PIXELS || buf.try_reserve_exact(size).is_err() {
+                DOUBLE_BUFFER_ACTIVE.store(false, Ordering::SeqCst);
+                log::error!(
+                    "[fb] double-buffer unavailable (size={} px) — single-buffer mode",
+                    size
+                );
+            } else {
+                buf.resize(size, 0u32);
+                *db = Some(buf);
+            }
         }
     }
 }

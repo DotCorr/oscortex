@@ -334,6 +334,12 @@ fn shared_init_and_run() -> ! {
             if drivers::fb::is_ready() {
                 drivers::bootscreen::set_phase($n);
                 drivers::bootscreen::render();
+                // Present immediately: once the compositor enables double-
+                // buffering, render() draws to the back buffer and nothing
+                // swaps until the engine warm-up loop — which would freeze the
+                // splash at "compositor" and mask a hang in any LATER phase.
+                // Swapping here keeps every milestone actually on screen.
+                drivers::fb::swap_buffers();
             }
         };
     }
