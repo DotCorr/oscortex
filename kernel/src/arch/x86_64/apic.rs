@@ -60,7 +60,55 @@ fn print_u64_early(val: u64) {
     }
 }
 
+/// Upper bound (in TSC cycles) on any legacy-PIT gate spin. The PIT wait is a
+/// fixed ~1–10 ms; this bound is many seconds at any real clock, so it never
+/// trips on working hardware but guarantees we cannot spin forever on firmware
+/// that does not wire the legacy PIT / speaker gate (e.g. Apple Macs), which
+/// otherwise hangs boot at "cortex::starting" with the clock frozen at 0.0s.
+const PIT_SPIN_TIMEOUT_TSC: u64 = 2_000_000_000;
+
+/// TSC frequency (Hz) straight from CPUID — no legacy PIT required. Tries leaf
+/// 0x15 (TSC / core-crystal ratio) then leaf 0x16 (processor base MHz). Returns
+/// 0 when neither is usable (caller falls back to the bounded PIT calibration).
+fn tsc_hz_from_cpuid() -> u64 {
+    let (max_leaf, _, _, _) = crate::arch::x86_64::cpu::cpuid(0, 0);
+    // Leaf 0x15: EAX=denominator, EBX=numerator, ECX=core-crystal Hz.
+    if max_leaf >= 0x15 {
+        let (denom, numer, crystal, _) = crate::arch::x86_64::cpu::cpuid(0x15, 0);
+        if denom != 0 && numer != 0 {
+            if crystal != 0 {
+                return (crystal as u64) * (numer as u64) / (denom as u64);
+            }
+            // Crystal often reads 0 on Skylake/Kaby Lake; the nominal TSC equals
+            // the processor base frequency reported by leaf 0x16.
+            if max_leaf >= 0x16 {
+                let (base_mhz, _, _, _) = crate::arch::x86_64::cpu::cpuid(0x16, 0);
+                if base_mhz != 0 {
+                    return base_mhz as u64 * 1_000_000;
+                }
+            }
+        }
+    }
+    // Leaf 0x16: EAX = processor base frequency in MHz.
+    if max_leaf >= 0x16 {
+        let (base_mhz, _, _, _) = crate::arch::x86_64::cpu::cpuid(0x16, 0);
+        if base_mhz != 0 {
+            return base_mhz as u64 * 1_000_000;
+        }
+    }
+    0
+}
+
 fn calibrate_tsc() -> u64 {
+    // Prefer CPUID — it needs no legacy PIT, so it works on firmware (Macs, some
+    // UEFI) that does not provide the i8254 the PIT path below relies on. Guard
+    // against bogus values: QEMU/TCG reports nonsensical CPUID 0x15/0x16 (e.g.
+    // a few MHz), so accept only a plausible CPU clock (0.2–20 GHz) and otherwise
+    // fall through to the (bounded) PIT measurement.
+    let cpuid_hz = tsc_hz_from_cpuid();
+    if (200_000_000..=20_000_000_000).contains(&cpuid_hz) {
+        return cpuid_hz;
+    }
     unsafe {
         let val = super::port_io::inb(0x61);
         super::port_io::outb(0x61, (val & 0xFD) | 1);
@@ -76,16 +124,26 @@ fn calibrate_tsc() -> u64 {
         super::port_io::outb(0x61, val2 | 1);
 
         let start = crate::arch::rdtsc();
+        // BOUNDED spin: bail if the PIT gate never fires (missing/idle PIT).
         while (super::port_io::inb(0x61) & 0x20) == 0 {
+            if crate::arch::rdtsc().wrapping_sub(start) > PIT_SPIN_TIMEOUT_TSC {
+                break;
+            }
             core::hint::spin_loop();
         }
         let end = crate::arch::rdtsc();
+        let fired = (super::port_io::inb(0x61) & 0x20) != 0;
 
         let elapsed = end.wrapping_sub(start);
-        
+
         let val3 = super::port_io::inb(0x61);
         super::port_io::outb(0x61, val3 & 0xFC);
 
+        // PIT never fired within the bound → no usable measurement. Return 0 so
+        // the caller uses the conservative default instead of a bogus value.
+        if !fired {
+            return 0;
+        }
         elapsed * 100
     }
 }
@@ -117,7 +175,14 @@ fn calibrate_apic_ticks_per_ms() -> u32 {
             }
         }
 
+        // BOUNDED spin (see PIT_SPIN_TIMEOUT_TSC): a missing/idle PIT must not
+        // hang boot. If it never fires, `current` stays the full count → ticks=0
+        // → the caller's 62500 default is used.
+        let spin_start = crate::arch::rdtsc();
         while (super::port_io::inb(0x61) & 0x20) == 0 {
+            if crate::arch::rdtsc().wrapping_sub(spin_start) > PIT_SPIN_TIMEOUT_TSC {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -331,7 +396,12 @@ pub fn finish_xapic_init() {
     }
 
     // Calibrate TSC.
-    let tsc_hz = calibrate_tsc();
+    // 0 means neither CPUID nor a working PIT gave a value — keep the safe 2 GHz
+    // default rather than setting a 0 frequency (which would zero the timer period).
+    let tsc_hz = match calibrate_tsc() {
+        0 => 2_000_000_000,
+        hz => hz,
+    };
     set_tsc_hz(tsc_hz);
     crate::logger::early_print("[APIC] Calibrated TSC frequency: ");
     print_u64_early(tsc_hz);

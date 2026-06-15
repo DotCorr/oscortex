@@ -11,7 +11,7 @@
 //! serial console for developers). Press **F2** to toggle a verbose overlay that
 //! renders the recent kernel log ring on demand.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::drivers::fb;
 use crate::logger;
@@ -29,6 +29,16 @@ const LOG_ERR: u32 = 0x00E0_5A4A; // verbose log error/warn text
 static START_NS: AtomicU64 = AtomicU64::new(0);
 static VERBOSE: AtomicBool = AtomicBool::new(false);
 static DONE: AtomicBool = AtomicBool::new(false);
+/// Explicit boot milestone (0 = none → fall back to the time-derived stage).
+/// Set by `set_phase` at each major init step so the on-screen status names the
+/// LAST step reached — when boot wedges (e.g. on real hardware QEMU can't
+/// reproduce), the frozen splash shows exactly where it stopped.
+static PHASE: AtomicU32 = AtomicU32::new(0);
+
+/// Record the current boot milestone (see PHASE). Phases are listed in `stage()`.
+pub fn set_phase(p: u32) {
+    PHASE.store(p, Ordering::Release);
+}
 
 fn now_ns() -> u64 {
     crate::syscall::poll::monotonic_ns()
@@ -87,9 +97,25 @@ fn stage() -> &'static [u8] {
     if DONE.load(Ordering::Acquire) {
         return b"boot_completed";
     }
-    match percent() {
-        0..=24 => b"starting",
-        25..=54 => b"init_runtime",
+    // Explicit milestone wins (set by set_phase at each init step). The frozen
+    // splash then names the last step reached if boot wedges on real hardware.
+    match PHASE.load(Ordering::Acquire) {
+        0 => match percent() {
+            0..=24 => b"starting",
+            25..=54 => b"init_runtime",
+            _ => b"warming_engine",
+        },
+        1 => b"drivers",
+        2 => b"compositor",
+        3 => b"scheduler",
+        4 => b"ipc_wm",
+        5 => b"filesystem",
+        6 => b"block_net",
+        7 => b"packages",
+        8 => b"cortex",
+        9 => b"smp",
+        10 => b"spawn_shell",
+        11 => b"enter_user",
         _ => b"warming_engine",
     }
 }
