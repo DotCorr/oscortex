@@ -131,4 +131,50 @@ void main() {
     expect(f[0], 0x05);
     expect(<int>[f[1], f[2], f[3], f[4]], <int>[3, 0, 0, 0]);
   });
+
+  test('httpGet sends a GET request and returns the body with headers stripped',
+      () async {
+    const String response = 'HTTP/1.0 200 OK\r\n'
+        'Content-Type: text/plain\r\n'
+        'Content-Length: 5\r\n'
+        '\r\n'
+        'HELLO';
+    int reads = 0;
+    messenger().setMockMessageHandler(channelName, (ByteData? message) async {
+      final Uint8List f = bytesOf(message);
+      sent.add(f);
+      switch (f[0]) {
+        case 0x01:
+          return i32(7); // connect → fd 7
+        case 0x02:
+          return i32(1); // established
+        case 0x03:
+          return i32(f.length - 5); // wrote the whole request
+        case 0x04:
+          if (reads++ == 0) {
+            final List<int> b = response.codeUnits;
+            final ByteData r = ByteData(4 + b.length);
+            r.setInt32(0, b.length, Endian.little);
+            for (int i = 0; i < b.length; i++) {
+              r.setUint8(4 + i, b[i]);
+            }
+            return r;
+          }
+          return i32(0); // no more data → httpGet's read loop ends on timeout
+        case 0x05:
+          return i32(0);
+        default:
+          return i32(-22);
+      }
+    });
+
+    final String body = await httpGet('93.184.216.34', 'example.com', '/');
+    expect(body, 'HELLO');
+
+    final Uint8List writeFrame = sent.firstWhere((Uint8List f) => f[0] == 0x03);
+    final String reqText = String.fromCharCodes(writeFrame.sublist(5));
+    expect(reqText, startsWith('GET / HTTP/1.0\r\n'));
+    expect(reqText, contains('Host: example.com\r\n'));
+    expect(reqText, contains('Connection: close'));
+  }, timeout: const Timeout(Duration(seconds: 15)));
 }
