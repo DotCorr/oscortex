@@ -78,3 +78,4 @@ iso_root/
 packages/*/.dart_tool/
 packages/*/pubspec.lock
 packages/*/.flutter-plugins*
+packages/*/build/
