@@ -118,6 +118,7 @@ static mut AP_VBAR: u64 = 0;
 
 /// Snapshot the BSP's live MMU + vector registers so an AP can install identical
 /// translation before touching kernel memory. Call AFTER mmu::enable + vectors.
+#[cfg(feature = "smp")]
 pub fn capture_boot_state() {
     unsafe {
         let (mair, tcr, ttbr0, ttbr1, sctlr, vbar): (u64, u64, u64, u64, u64, u64);
@@ -219,6 +220,7 @@ _ap_trampoline:
     stack_size = const AP_STACK_SIZE,
 );
 
+#[cfg(feature = "smp")]
 extern "C" {
     fn _ap_trampoline();
 }
@@ -272,9 +274,11 @@ pub fn cpu_engaged(cpu_id: u32) -> bool {
 }
 
 /// PSCI conduit, latched once from the DTB at wake time.
+#[cfg(feature = "smp")]
 static PSCI_USE_SMC: AtomicBool = AtomicBool::new(false);
 
 /// Raw PSCI/SMCCC call via the selected conduit. Returns x0.
+#[cfg(feature = "smp")]
 unsafe fn psci_raw(use_smc: bool, fn_id: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let ret: u64;
     if use_smc {
@@ -300,11 +304,13 @@ unsafe fn psci_raw(use_smc: bool, fn_id: u64, a1: u64, a2: u64, a3: u64) -> i64 
 /// Probe PSCI_VERSION (0x84000000, side-effect-free) on a conduit. A real PSCI
 /// implementation returns a small positive version word (e.g. 0x10001 for v1.1);
 /// a conduit that isn't wired returns -1 (NOT_SUPPORTED) or garbage.
+#[cfg(feature = "smp")]
 unsafe fn psci_version(use_smc: bool) -> i64 {
     psci_raw(use_smc, 0x8400_0000, 0, 0, 0)
 }
 
 /// Issue PSCI CPU_ON (SMC64 fn 0xC400_0003) on the selected conduit.
+#[cfg(feature = "smp")]
 unsafe fn psci_cpu_on(target_mpidr: u64, entry_pa: u64, context_id: u64) -> i64 {
     psci_raw(
         PSCI_USE_SMC.load(Ordering::Relaxed),
@@ -318,6 +324,7 @@ unsafe fn psci_cpu_on(target_mpidr: u64, entry_pa: u64, context_id: u64) -> i64 
 /// Wake secondary cores into `ap_main` (Milestone 1: → idle). Must run after the
 /// BSP's MMU + vectors + GIC are up. Reads the PSCI conduit from the DTB; tries
 /// CPU_ON for cores 1..=MAX_APS and stops at the first absent core.
+#[cfg(feature = "smp")]
 pub fn wake_aps() {
     let dtb = crate::arch::aarch64::fdt::dtb_ptr();
     // Determine the PSCI conduit. Prefer the DTB; else probe both with the
@@ -376,8 +383,13 @@ pub fn wake_aps() {
     log::error!("[SMP] online CPU count = {}", CPU_COUNT.load(Ordering::Acquire));
 }
 
-/// Wake all APs. Sets up the BSP's per-CPU entry, then brings secondary cores
-/// online (Milestone 1: into an idle loop).
+/// Wake all APs. Sets up the BSP's per-CPU entry, then (under `--features smp`)
+/// brings secondary cores online (Milestone 1: into an idle loop).
+///
+/// Single-core by default — matching x86. Waking cores only idles them today
+/// (`ap_main` parks in `wfi`; co-scheduling doesn't converge the Dart GC
+/// safepoint — see [[smp-bringup]]) and risks a boot hang on real hardware if an
+/// AP faults in the trampoline and the BSP spins waiting for it to come online.
 pub fn init(_smp_resp: Option<&'static MpResponse>) {
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
@@ -386,7 +398,11 @@ pub fn init(_smp_resp: Option<&'static MpResponse>) {
         table[0].online.store(true, Ordering::Release);
     }
     CPU_COUNT.store(1, Ordering::Release);
+
+    #[cfg(feature = "smp")]
     wake_aps();
+    #[cfg(not(feature = "smp"))]
+    log::info!("[SMP] single-core boot (AP bring-up gated behind the `smp` feature)");
 }
 
 /// Broadcast a reschedule IPI to all other online CPUs.

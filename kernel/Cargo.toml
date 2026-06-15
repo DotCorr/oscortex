@@ -52,6 +52,10 @@ limine-boot = []
 ai-cortex = []
 driver-wasm = []
 self-healing = []
+# Multi-core (SMP) AP bring-up. OFF by default: the scheduler isn't fully SMP-safe
+# yet and AP bring-up hung real hardware (a 2016 Skylake Mac) at cortex::smp. The
+# proven-stable config is single-core (serial-GC engine). Enable for SMP dev.
+smp = []
 # Draw an on-screen input debug HUD (bound device + live pointer/key/scroll event
 # counts) over every frame. For diagnosing input on a VM/board with no serial.
 # Off in release ISOs (zero cost). See compositor::input_hud + dev-tools/README.md.

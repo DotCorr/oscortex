@@ -117,56 +117,76 @@ pub fn init(smp_resp: Option<&'static MpResponse>) {
         PER_CPU_DATA[0].online.store(true, Ordering::Release);
     }
 
-    let resp = match smp_resp {
-        Some(r) => r,
-        None => {
-            log::warn!("[SMP] Limine SMP response missing — single-core only");
+    // SMP scheduling isn't verified safe on real hardware yet: the scheduler is
+    // not fully SMP-safe, ap_init faulted on a real 2016 Skylake Mac, and the BSP
+    // then ground through a spin-count AP timeout (PAUSE is ~140 cycles on
+    // Skylake, so the old 200x5M budget was ~minutes per AP) — hanging the boot at
+    // cortex::smp. Single-core is the proven-stable config (the freeze is fixed by
+    // the serial-GC engine, not SMP). Boot single-core by default; build with
+    // `--features smp` to develop AP bring-up.
+    #[cfg(not(feature = "smp"))]
+    {
+        let _ = smp_resp;
+        log::info!("[SMP] single-core boot (AP bring-up gated behind the `smp` feature)");
+    }
+
+    #[cfg(feature = "smp")]
+    {
+        let resp = match smp_resp {
+            Some(r) => r,
+            None => {
+                log::warn!("[SMP] Limine SMP response missing — single-core only");
+                return;
+            }
+        };
+
+        let cpus = resp.cpus();
+        let ap_count = cpus.iter().filter(|c| c.lapic_id != bsp_lapic_id).count();
+        if ap_count == 0 {
+            log::info!("[SMP] No APs — single-core");
             return;
         }
-    };
+        log::info!("[SMP] {} total CPU(s) — waking {} AP(s)", cpus.len(), ap_count);
 
-    let cpus = resp.cpus();
-    let ap_count = cpus.iter().filter(|c| c.lapic_id != bsp_lapic_id).count();
-    if ap_count == 0 {
-        log::info!("[SMP] No APs — single-core");
-        return;
-    }
-    log::info!("[SMP] {} total CPU(s) — waking {} AP(s)", cpus.len(), ap_count);
-
-    let mut cpu_idx: u32 = 1;
-    for cpu in cpus {
-        if cpu.lapic_id == bsp_lapic_id { continue; }
-        if cpu_idx as usize >= MAX_CPUS {
-            log::warn!("[SMP] MAX_CPUS limit reached — skipping remaining APs");
-            break;
-        }
-        unsafe {
-            PER_CPU_DATA[cpu_idx as usize].cpu_id   = cpu_idx;
-            PER_CPU_DATA[cpu_idx as usize].lapic_id = cpu.lapic_id;
-        }
-        CPU_COUNT.store(cpu_idx + 1, Ordering::Release);
-        cpu.bootstrap(ap_entry as MpGotoFunction, cpu_idx as u64);
-        cpu_idx += 1;
-    }
-
-    // Wait up to ~2 s per AP to come online.
-    let expected = cpu_idx as usize;
-    'outer: for i in 1..expected {
-        for _ in 0..200u32 {
-            if unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) } {
-                continue 'outer;
+        let mut cpu_idx: u32 = 1;
+        for cpu in cpus {
+            if cpu.lapic_id == bsp_lapic_id { continue; }
+            if cpu_idx as usize >= MAX_CPUS {
+                log::warn!("[SMP] MAX_CPUS limit reached — skipping remaining APs");
+                break;
             }
-            for _ in 0..5_000_000usize { core::hint::spin_loop(); }
+            unsafe {
+                PER_CPU_DATA[cpu_idx as usize].cpu_id   = cpu_idx;
+                PER_CPU_DATA[cpu_idx as usize].lapic_id = cpu.lapic_id;
+            }
+            CPU_COUNT.store(cpu_idx + 1, Ordering::Release);
+            cpu.bootstrap(ap_entry as MpGotoFunction, cpu_idx as u64);
+            cpu_idx += 1;
         }
-        log::warn!("[SMP] CPU {} (lapic={}) timed out",
-            i, unsafe { PER_CPU_DATA[i].lapic_id });
-    }
 
-    CPU_COUNT.store(cpu_idx, Ordering::Release);
-    let online = (0..expected)
-        .filter(|&i| unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) })
-        .count();
-    log::info!("[SMP] {}/{} CPU(s) online", online, expected);
+        // Wait for each AP to come online — bounded in WALL-CLOCK time via the
+        // monotonic clock, NOT a spin count (PAUSE is ~140 cycles on Skylake, so a
+        // spin budget is ~minutes per AP on real hardware when an AP fails to start).
+        let expected = cpu_idx as usize;
+        const AP_TIMEOUT_NS: u64 = 500_000_000; // 0.5 s per AP, then continue
+        for i in 1..expected {
+            let deadline = crate::arch::rdtsc_ns().wrapping_add(AP_TIMEOUT_NS);
+            while !unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) } {
+                if crate::arch::rdtsc_ns() >= deadline {
+                    log::warn!("[SMP] CPU {} (lapic={}) timed out — continuing",
+                        i, unsafe { PER_CPU_DATA[i].lapic_id });
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        }
+
+        CPU_COUNT.store(cpu_idx, Ordering::Release);
+        let online = (0..expected)
+            .filter(|&i| unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) })
+            .count();
+        log::info!("[SMP] {}/{} CPU(s) online", online, expected);
+    }
 }
 
 /// Broadcast a reschedule IPI to all other online CPUs.
