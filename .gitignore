@@ -73,3 +73,8 @@ apps/_x86_aot_backup/
 *.iso
 iso_root/
 *.kernel
+
+# Dart/Flutter package build artifacts
+packages/*/.dart_tool/
+packages/*/pubspec.lock
+packages/*/.flutter-plugins*
