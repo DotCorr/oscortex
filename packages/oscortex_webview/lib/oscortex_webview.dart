@@ -77,56 +77,70 @@ class OscWebViewController {
 
   // ── App → engine methods ────────────────────────────────────────────────────
 
-  /// Create the engine's render surface; returns the OSCortex `surfaceId` (or -1).
+  /// Invoke a channel method, tolerating the absence of an engine service:
+  /// before the `oscortex/webview` service binds (scaffold phase, or if it
+  /// crashed) `invokeMethod` raises [MissingPluginException]; we treat that as
+  /// "no engine yet" and return null so callers (incl. the widget) stay inert
+  /// rather than throwing. Any other error propagates.
+  Future<T?> _invoke<T>(String method, [Map<String, dynamic>? extra]) async {
+    try {
+      return await _channel.invokeMethod<T>(method, _a(extra));
+    } on MissingPluginException {
+      return null;
+    }
+  }
+
+  /// Create the engine's render surface; returns the OSCortex `surfaceId`
+  /// (or -1 if no engine service is bound yet).
   Future<int> create({
     required int width,
     required int height,
     double dpr = 1.0,
     String? initialUrl,
   }) async {
-    final Map<String, dynamic>? r =
-        await _channel.invokeMapMethod<String, dynamic>(
-      'create',
-      _a(<String, dynamic>{
-        'width': width,
-        'height': height,
-        'dpr': dpr,
-        'initialUrl': initialUrl,
-      }),
-    );
-    return (r?['surfaceId'] as int?) ?? -1;
+    try {
+      final Map<String, dynamic>? r =
+          await _channel.invokeMapMethod<String, dynamic>(
+        'create',
+        _a(<String, dynamic>{
+          'width': width,
+          'height': height,
+          'dpr': dpr,
+          'initialUrl': initialUrl,
+        }),
+      );
+      return (r?['surfaceId'] as int?) ?? -1;
+    } on MissingPluginException {
+      return -1;
+    }
   }
 
-  Future<void> destroy() => _channel.invokeMethod<void>('destroy', _a());
+  Future<void> destroy() => _invoke<void>('destroy');
 
   Future<void> loadUrl(String url, {Map<String, String>? headers}) =>
-      _channel.invokeMethod<void>(
-          'loadUrl', _a(<String, dynamic>{'url': url, 'headers': headers}));
+      _invoke<void>('loadUrl', <String, dynamic>{'url': url, 'headers': headers});
 
   Future<void> loadHtml(String html, {String? baseUrl}) =>
-      _channel.invokeMethod<void>(
-          'loadHtml', _a(<String, dynamic>{'html': html, 'baseUrl': baseUrl}));
+      _invoke<void>('loadHtml', <String, dynamic>{'html': html, 'baseUrl': baseUrl});
 
-  Future<void> reload() => _channel.invokeMethod<void>('reload', _a());
-  Future<void> stopLoading() => _channel.invokeMethod<void>('stopLoading', _a());
-  Future<void> goBack() => _channel.invokeMethod<void>('goBack', _a());
-  Future<void> goForward() => _channel.invokeMethod<void>('goForward', _a());
+  Future<void> reload() => _invoke<void>('reload');
+  Future<void> stopLoading() => _invoke<void>('stopLoading');
+  Future<void> goBack() => _invoke<void>('goBack');
+  Future<void> goForward() => _invoke<void>('goForward');
 
-  Future<bool> canGoBack() async =>
-      (await _channel.invokeMethod<bool>('canGoBack', _a())) ?? false;
+  Future<bool> canGoBack() async => (await _invoke<bool>('canGoBack')) ?? false;
   Future<bool> canGoForward() async =>
-      (await _channel.invokeMethod<bool>('canGoForward', _a())) ?? false;
+      (await _invoke<bool>('canGoForward')) ?? false;
 
-  Future<String?> currentUrl() =>
-      _channel.invokeMethod<String>('currentUrl', _a());
-  Future<String?> getTitle() => _channel.invokeMethod<String>('getTitle', _a());
+  Future<String?> currentUrl() => _invoke<String>('currentUrl');
+  Future<String?> getTitle() => _invoke<String>('getTitle');
 
   Future<Object?> evalJs(String source) =>
-      _channel.invokeMethod<Object>('evalJs', _a(<String, dynamic>{'source': source}));
+      _invoke<Object>('evalJs', <String, dynamic>{'source': source});
 
   Future<void> resize({required int width, required int height, double dpr = 1.0}) =>
-      _channel.invokeMethod<void>('resize',
-          _a(<String, dynamic>{'width': width, 'height': height, 'dpr': dpr}));
+      _invoke<void>('resize',
+          <String, dynamic>{'width': width, 'height': height, 'dpr': dpr});
 
   /// Tell the engine/kernel where the webview rect lives on screen + its scroll
   /// offset, so the web surface can be positioned and clipped to it.
@@ -138,16 +152,14 @@ class OscWebViewController {
     int scrollDx = 0,
     int scrollDy = 0,
   }) =>
-      _channel.invokeMethod<void>(
-          'setViewport',
-          _a(<String, dynamic>{
-            'x': x,
-            'y': y,
-            'w': w,
-            'h': h,
-            'scrollDx': scrollDx,
-            'scrollDy': scrollDy,
-          }));
+      _invoke<void>('setViewport', <String, dynamic>{
+        'x': x,
+        'y': y,
+        'w': w,
+        'h': h,
+        'scrollDx': scrollDx,
+        'scrollDy': scrollDy,
+      });
 
   /// Forward a pointer event in webview-local coordinates. [type] is an
   /// `OscInput.pointer*` code; [button] a button bitmask; [modifiers] a key-mod mask.
@@ -158,15 +170,13 @@ class OscWebViewController {
     int button = 0,
     int modifiers = 0,
   }) =>
-      _channel.invokeMethod<void>(
-          'dispatchInput',
-          _a(<String, dynamic>{
-            'type': type,
-            'x': x,
-            'y': y,
-            'button': button,
-            'modifiers': modifiers,
-          }));
+      _invoke<void>('dispatchInput', <String, dynamic>{
+        'type': type,
+        'x': x,
+        'y': y,
+        'button': button,
+        'modifiers': modifiers,
+      });
 
   Future<void> dispatchScroll({
     required double x,
@@ -174,8 +184,8 @@ class OscWebViewController {
     required double dx,
     required double dy,
   }) =>
-      _channel.invokeMethod<void>('dispatchScroll',
-          _a(<String, dynamic>{'x': x, 'y': y, 'dx': dx, 'dy': dy}));
+      _invoke<void>('dispatchScroll',
+          <String, dynamic>{'x': x, 'y': y, 'dx': dx, 'dy': dy});
 
   Future<void> dispatchKey({
     required int type,
@@ -183,17 +193,15 @@ class OscWebViewController {
     int modifiers = 0,
     String? text,
   }) =>
-      _channel.invokeMethod<void>(
-          'dispatchKey',
-          _a(<String, dynamic>{
-            'type': type,
-            'keyCode': keyCode,
-            'modifiers': modifiers,
-            'text': text,
-          }));
+      _invoke<void>('dispatchKey', <String, dynamic>{
+        'type': type,
+        'keyCode': keyCode,
+        'modifiers': modifiers,
+        'text': text,
+      });
 
-  Future<void> setVisible(bool visible) => _channel.invokeMethod<void>(
-      'setVisible', _a(<String, dynamic>{'visible': visible}));
+  Future<void> setVisible(bool visible) =>
+      _invoke<void>('setVisible', <String, dynamic>{'visible': visible});
 
   /// Stop receiving events for this instance.
   void dispose() {

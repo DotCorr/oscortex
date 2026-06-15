@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:oscortex_ui/oscortex_ui.dart';
+import 'package:oscortex_webview/oscortex_webview.dart';
 
 void main() {
   runApp(const WebLinkApp());
@@ -18,6 +19,11 @@ class WebLinkApp extends StatelessWidget {
   }
 }
 
+/// Web Link — the OSCortex system browser. Chrome (address/search bar, nav,
+/// progress) wrapping the native [OscWebView], whose page is rendered by the
+/// userspace web-engine service into an OSCortex compositor surface beneath this
+/// scene. Until that engine service binds, navigation is inert and the web region
+/// shows a placeholder (the controller tolerates a missing engine).
 class WebLinkHome extends StatefulWidget {
   const WebLinkHome({super.key});
 
@@ -26,364 +32,261 @@ class WebLinkHome extends StatefulWidget {
 }
 
 class _WebLinkHomeState extends State<WebLinkHome> {
-  final _controller =
-      TextEditingController(text: 'https://dccortec.com/docs/arch');
+  static const String _homeUrl = 'https://dotcorr.com/';
+
+  final OscWebViewController _web = OscWebViewController(1);
+  final TextEditingController _address = TextEditingController(text: _homeUrl);
+  final FocusNode _addressFocus = FocusNode();
+
+  int _progress = 0;
+  bool _loading = false;
+  bool _canBack = false;
+  bool _canForward = false;
+  bool _engineReady = false; // a render surface exists
+  bool _createRequested = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _web.onUrlChanged = (String url) {
+      if (!_addressFocus.hasFocus) _address.text = url;
+    };
+    // onTitleChanged is wired when tabs land (which display the page title).
+    _web.onProgress = (int p) {
+      setState(() => _progress = p);
+    };
+    _web.onLoadStarted = (String _) {
+      setState(() => _loading = true);
+    };
+    _web.onLoadFinished = (String _) {
+      setState(() {
+        _loading = false;
+        _progress = 100;
+      });
+    };
+    _web.onLoadError = (int _, String _, String _) {
+      setState(() => _loading = false);
+    };
+    _web.onNavState = (bool back, bool fwd) {
+      setState(() {
+        _canBack = back;
+        _canForward = fwd;
+      });
+    };
+  }
 
   @override
   void dispose() {
-    _controller.dispose();
+    _web.dispose();
+    _address.dispose();
+    _addressFocus.dispose();
     super.dispose();
+  }
+
+  /// Turn raw omnibox input into a URL: keep explicit schemes, assume https for
+  /// bare hosts, otherwise treat it as a web search (the "search" wrapper).
+  String _toUrl(String input) {
+    final String s = input.trim();
+    if (s.isEmpty) return s;
+    if (RegExp(r'^[a-zA-Z][a-zA-Z0-9+.\-]*://').hasMatch(s)) return s;
+    if (!s.contains(' ') && RegExp(r'^[^\s/]+\.[^\s/]+').hasMatch(s)) {
+      return 'https://$s';
+    }
+    return 'https://duckduckgo.com/?q=${Uri.encodeQueryComponent(s)}';
+  }
+
+  void _navigate() {
+    final String url = _toUrl(_address.text);
+    if (url.isEmpty) return;
+    _addressFocus.unfocus();
+    setState(() {
+      _loading = true;
+      _progress = 0;
+    });
+    _web.loadUrl(url);
+  }
+
+  Future<void> _ensureSurface(Size size, double dpr) async {
+    if (_createRequested || size.isEmpty) return;
+    _createRequested = true;
+    final int sid = await _web.create(
+      width: (size.width * dpr).round(),
+      height: (size.height * dpr).round(),
+      dpr: dpr,
+      initialUrl: _toUrl(_address.text),
+    );
+    if (mounted && sid >= 0) setState(() => _engineReady = true);
   }
 
   @override
   Widget build(BuildContext context) {
+    final double dpr = MediaQuery.of(context).devicePixelRatio;
     return Scaffold(
       backgroundColor: OscColors.bodyBg,
-      body: Stack(
-        children: [
-          // ── Subtle emerald radial gradient background
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  center: const Alignment(-0.6, -0.8),
-                  radius: 1.4,
-                  colors: [
-                    OscColors.green.withValues(alpha: 0.045),
-                    OscColors.bodyBg.withValues(alpha: 0.0),
-                  ],
-                  stops: const [0.0, 0.7],
-                ),
+      body: SafeArea(
+        child: Column(
+          children: <Widget>[
+            _toolbar(),
+            _progressBar(),
+            Expanded(
+              child: LayoutBuilder(
+                builder: (BuildContext context, BoxConstraints c) {
+                  final Size size = Size(c.maxWidth, c.maxHeight);
+                  WidgetsBinding.instance.addPostFrameCallback(
+                      (_) => _ensureSurface(size, dpr));
+                  return _engineReady
+                      ? OscWebView(controller: _web)
+                      : _placeholder();
+                },
               ),
             ),
-          ),
-          // ── Second subtle gradient from bottom-right
-          Positioned.fill(
-            child: DecoratedBox(
-              decoration: BoxDecoration(
-                gradient: RadialGradient(
-                  center: const Alignment(0.9, 1.0),
-                  radius: 1.2,
-                  colors: [
-                    OscColors.violet.withValues(alpha: 0.025),
-                    Colors.transparent,
-                  ],
-                  stops: const [0.0, 0.6],
-                ),
-              ),
-            ),
-          ),
-          // ── Main content
-          SafeArea(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 24),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // ── Title
-                  Text(
-                    'Web Link',
-                    style: OscTypography.heading1.copyWith(
-                      color: OscColors.textPrimary,
-                      letterSpacing: -0.5,
-                      height: 1.1,
-                    ),
-                  ),
-                  const SizedBox(height: 6),
-                  Row(
-                    children: [
-                      Container(
-                        width: 6,
-                        height: 6,
-                        decoration: const BoxDecoration(
-                          color: OscColors.green,
-                          shape: BoxShape.circle,
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Knowledge source & media gateway',
-                        style: OscTypography.caption.copyWith(
-                          fontSize: 14,
-                          color: OscColors.textMuted,
-                          fontWeight: FontWeight.w400,
-                          letterSpacing: 0.2,
-                        ),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 28),
-
-                  // ── URL Input
-                  TextField(
-                    controller: _controller,
-                    style: OscTypography.monoBody.copyWith(
-                      color: OscColors.textPrimary,
-                      fontSize: 14,
-                    ),
-                    decoration: const InputDecoration(
-                      labelText: 'Link target',
-                      prefixIcon: Icon(Icons.link_rounded),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-
-                  // ── Open Link button
-                  FilledButton.icon(
-                    onPressed: () {
-                      final url = _controller.text.trim();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(
-                          content: Row(
-                            children: [
-                              const Icon(Icons.open_in_new_rounded,
-                                  color: OscColors.green, size: 16),
-                              const SizedBox(width: 10),
-                              Expanded(
-                                child: Text(
-                                  'Queued link: $url',
-                                  overflow: TextOverflow.ellipsis,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      );
-                    },
-                    icon: const Icon(Icons.open_in_new_rounded, size: 18),
-                    label: const Text('Open Link'),
-                  ),
-                  const SizedBox(height: 32),
-
-                  // ── Knowledge Source Engine Card
-                  _buildKnowledgeSourceCard(),
-                  const SizedBox(height: 20),
-
-                  // ── Media Player Card
-                  _buildMediaPlayerCard(),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildKnowledgeSourceCard() {
-    return OscCard(
-      padding: EdgeInsets.zero,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // ── Card header bar
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-            decoration: const BoxDecoration(
-              border: Border(
-                bottom: BorderSide(color: OscColors.border, width: 1),
-              ),
-            ),
-            child: Row(
-              children: [
-                OscTag.green(label: 'KNOWLEDGE SOURCE ENGINE'),
-                const Spacer(),
-                Container(
-                  width: 8,
-                  height: 8,
-                  decoration: BoxDecoration(
-                    color: OscColors.green,
-                    shape: BoxShape.circle,
-                    boxShadow: [
-                      BoxShadow(
-                        color: OscColors.green.withValues(alpha: 0.5),
-                        blurRadius: 6,
-                        spreadRadius: 1,
-                      ),
-                    ],
-                  ),
-                ),
-                const SizedBox(width: 6),
-                Text(
-                  'LIVE',
-                  style: OscTypography.monoLabel.copyWith(
-                    color: OscColors.green,
-                    letterSpacing: 1.0,
-                  ),
-                ),
-              ],
-            ),
-          ),
-
-          // ── Card content
-          Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // URL preview
-                Row(
-                  children: [
-                    const Icon(Icons.language_rounded,
-                        color: OscColors.skyBlue, size: 14),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        _controller.text,
-                        style: OscTypography.monoBody.copyWith(
-                          fontSize: 12,
-                          color: OscColors.skyBlue,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 16),
-
-                // Page title
-                Text(
-                  'Operating Systems Architecture Evolution',
-                  style: OscTypography.heading3.copyWith(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w700,
-                    color: OscColors.textPrimary,
-                    height: 1.3,
-                  ),
-                ),
-                const SizedBox(height: 10),
-
-                // Description
-                Text(
-                  'Comprehensive guide covering microkernel design principles, '
-                  'memory-safe driver isolation, capability-based security models, '
-                  'and the convergence of embedded real-time constraints with '
-                  'modern desktop compositing pipelines. Explores how OSCortex '
-                  'synthesizes these paradigms into a unified bare-metal runtime.',
-                  style: OscTypography.body.copyWith(
-                    color: OscColors.textMuted,
-                    height: 1.65,
-                    fontWeight: FontWeight.w400,
-                  ),
-                ),
-                const SizedBox(height: 18),
-
-                // Meta tags row
-                Row(
-                  children: [
-                    _metaTag(Icons.schedule_rounded, '12 min read'),
-                    const SizedBox(width: 10),
-                    _metaTag(Icons.bookmark_outline_rounded, 'Saved'),
-                    const Spacer(),
-                    OscTag.green(label: 'Architecture'),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildMediaPlayerCard() {
-    return OscCard(
-      padding: EdgeInsets.zero,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // ── Header bar
-          Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
-            decoration: const BoxDecoration(
-              border: Border(
-                bottom: BorderSide(color: OscColors.border, width: 1),
-              ),
-            ),
-            child: Row(
-              children: [
-                OscTag.violet(label: 'NOW PLAYING'),
-                const Spacer(),
-                Icon(Icons.volume_up_rounded,
-                    size: 16, color: OscColors.violetLight.withValues(alpha: 0.6)),
-              ],
-            ),
-          ),
-
-          // ── Body
-          Padding(
-            padding: const EdgeInsets.all(18),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // Track info
-                Text(
-                  'Ambient Waves',
-                  style: OscTypography.heading3.copyWith(
-                    fontSize: 17,
-                    fontWeight: FontWeight.w700,
-                    color: OscColors.textPrimary,
-                    height: 1.2,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Cortex Generative Radio',
-                  style: OscTypography.body.copyWith(
-                    color: OscColors.textMuted,
-                    fontWeight: FontWeight.w400,
-                  ),
-                ),
-                const SizedBox(height: 20),
-
-                // Waveform visualiser
-                const Center(
-                  child: OscWaveform(
-                    barCount: 8,
-                    height: 48,
-                    barWidth: 6,
-                    barGap: 3,
-                  ),
-                ),
-                const SizedBox(height: 20),
-
-                // Tags
-                Row(
-                  children: [
-                    OscTag.violet(
-                      label: 'Local Sync',
-                      icon: Icons.sync_rounded,
-                    ),
-                    const SizedBox(width: 10),
-                    OscTag.violet(
-                      label: 'Spatial Audio Active',
-                      icon: Icons.spatial_audio_off_rounded,
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _metaTag(IconData icon, String label) {
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Icon(icon, size: 13, color: OscColors.textMuted),
-        const SizedBox(width: 5),
-        Text(
-          label,
-          style: OscTypography.caption.copyWith(
-            fontWeight: FontWeight.w500,
-          ),
+          ],
         ),
-      ],
+      ),
+    );
+  }
+
+  Widget _toolbar() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: const BoxDecoration(
+        color: OscColors.canvasBg,
+        border: Border(bottom: BorderSide(color: OscColors.border)),
+      ),
+      child: Row(
+        children: <Widget>[
+          OscIconButton(
+            icon: Icons.arrow_back_rounded,
+            tooltip: 'Back',
+            onPressed: _canBack ? _web.goBack : null,
+          ),
+          const SizedBox(width: 4),
+          OscIconButton(
+            icon: Icons.arrow_forward_rounded,
+            tooltip: 'Forward',
+            onPressed: _canForward ? _web.goForward : null,
+          ),
+          const SizedBox(width: 4),
+          OscIconButton(
+            icon: _loading ? Icons.close_rounded : Icons.refresh_rounded,
+            tooltip: _loading ? 'Stop' : 'Reload',
+            onPressed: _loading ? _web.stopLoading : _web.reload,
+          ),
+          const SizedBox(width: 10),
+          Expanded(child: _addressBar()),
+        ],
+      ),
+    );
+  }
+
+  Widget _addressBar() {
+    return TextField(
+      controller: _address,
+      focusNode: _addressFocus,
+      textInputAction: TextInputAction.go,
+      onSubmitted: (_) => _navigate(),
+      style: OscTypography.monoBody.copyWith(
+        color: OscColors.textPrimary,
+        fontSize: 13,
+      ),
+      decoration: InputDecoration(
+        isDense: true,
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        hintText: 'Search or enter address',
+        prefixIcon: const Icon(Icons.travel_explore_rounded, size: 16),
+        suffixIcon: IconButton(
+          icon: const Icon(Icons.subdirectory_arrow_left_rounded, size: 16),
+          color: OscColors.textMuted,
+          tooltip: 'Go',
+          onPressed: _navigate,
+        ),
+        filled: true,
+        fillColor: OscColors.surface,
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: OscColors.border),
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: OscColors.border),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: OscColors.green),
+        ),
+      ),
+    );
+  }
+
+  Widget _progressBar() {
+    // A 2px accent line while loading; invisible otherwise (keeps layout stable).
+    return SizedBox(
+      height: 2,
+      child: (_loading && _progress > 0 && _progress < 100)
+          ? LinearProgressIndicator(
+              value: _progress / 100.0,
+              minHeight: 2,
+              backgroundColor: Colors.transparent,
+              valueColor:
+                  const AlwaysStoppedAnimation<Color>(OscColors.green),
+            )
+          : const SizedBox.shrink(),
+    );
+  }
+
+  Widget _placeholder() {
+    // Shown until the web-engine service binds and a render surface exists.
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: RadialGradient(
+          center: const Alignment(-0.4, -0.7),
+          radius: 1.3,
+          colors: <Color>[
+            OscColors.green.withValues(alpha: 0.05),
+            OscColors.bodyBg.withValues(alpha: 0.0),
+          ],
+          stops: const <double>[0.0, 0.7],
+        ),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            const Icon(Icons.public_rounded, size: 44, color: OscColors.textDim),
+            const SizedBox(height: 16),
+            Text(
+              'Web Link',
+              style: OscTypography.heading2.copyWith(
+                color: OscColors.textPrimary,
+                letterSpacing: -0.4,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Container(
+                  width: 6,
+                  height: 6,
+                  decoration: const BoxDecoration(
+                    color: OscColors.amber,
+                    shape: BoxShape.circle,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  'web engine starting…',
+                  style: OscTypography.caption.copyWith(
+                    color: OscColors.textMuted,
+                    letterSpacing: 0.2,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
