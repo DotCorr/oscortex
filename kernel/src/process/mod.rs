@@ -803,7 +803,11 @@ pub fn spawn_with_bootstrap(
         p.caps = if bootstrap.rdi == crate::app_registry::HOST_MODE_SHELL {
             crate::security::ALL_CAPS
         } else {
-            crate::security::NO_CAPS
+            // Apps get NET so they can use the userspace TCP/DNS socket API
+            // (the abstraction layer). Everything else stays gated. The security
+            // phase will replace this blanket grant with a per-app declared/
+            // prompted NET permission rather than granting every app by default.
+            crate::security::Capabilities::NET
         };
         p.syscall_stack_base = sys_stack_base;
         p.syscall_stack_top = sys_stack_top;

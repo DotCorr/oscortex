@@ -491,6 +491,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x38A => sys_tcp_read(arg0, arg1, arg2),
         0x38B => sys_tcp_close(arg0),
         0x38C => sys_dhcp_discover(),
+        eabi::SYS_TCP_STATUS => sys_tcp_status(arg0),
 
         // Phase 51 — ext2 read-only filesystem
         0x38D => sys_ext2_mount(),
@@ -812,6 +813,7 @@ fn required_cap(number: u64) -> Option<crate::security::Capabilities> {
             || n == eabi::SYS_NET_SEND
             || n == eabi::SYS_NET_RECV => Some(Capabilities::NET),
         0x388 | 0x389 | 0x38A | 0x38B | 0x38C => Some(Capabilities::NET),
+        n if n == eabi::SYS_TCP_STATUS || n == eabi::SYS_DNS_RESOLVE => Some(Capabilities::NET),
         _ => None,
     }
 }
