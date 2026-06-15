@@ -305,10 +305,18 @@ fi
 echo "[1/5] Building kernel ELF..."
 touch "$ROOT/kernel/src/fs/initramfs.rs"
 cd "$ROOT"
+# Extra kernel cargo features (additive to the default arch-x86_64), e.g.
+# KERNEL_FEATURES=input-hud for the on-screen input debug HUD. See dev-tools/README.md.
+KERNEL_FEATURE_ARGS=()
+if [ -n "${KERNEL_FEATURES:-}" ]; then
+    echo "[1/5]   + kernel features: $KERNEL_FEATURES"
+    KERNEL_FEATURE_ARGS=(--features "$KERNEL_FEATURES")
+fi
 cargo +nightly build \
     --release \
     --package oscortex-kernel \
     --target x86_64-unknown-none \
+    "${KERNEL_FEATURE_ARGS[@]}" \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem
 

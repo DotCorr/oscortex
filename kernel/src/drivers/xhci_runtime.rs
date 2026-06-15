@@ -349,6 +349,7 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             if try_enumerate(rt) {
                 rt.enumerated = true;
                 log::info!("[USB-HID] device enumerated slot={} protocol={}", rt.slot, rt.hid_protocol);
+                crate::wm::set_input_source(crate::wm::INPUT_SRC_XHCI);
                 arm_hid_transfer(rt);
                 break;
             }

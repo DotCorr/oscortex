@@ -425,6 +425,7 @@ pub fn init() {
         PS2_DEVICES.store(devs, Ordering::Release);
         LAST_ACTIVITY_TSC.store(crate::arch::rdtsc(), Ordering::Relaxed);
         PS2_READY.store(true, Ordering::Release);
+        crate::wm::set_input_source(crate::wm::INPUT_SRC_PS2);
     }
 
     log::info!(

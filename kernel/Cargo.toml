@@ -47,3 +47,7 @@ limine-boot = []
 ai-cortex = []
 driver-wasm = []
 self-healing = []
+# Draw an on-screen input debug HUD (bound device + live pointer/key/scroll event
+# counts) over every frame. For diagnosing input on a VM/board with no serial.
+# Off in release ISOs (zero cost). See compositor::input_hud + dev-tools/README.md.
+input-hud = []

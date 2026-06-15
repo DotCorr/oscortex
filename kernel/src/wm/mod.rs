@@ -636,6 +636,59 @@ static CURSOR_BUTTONS: AtomicU32 = AtomicU32::new(0);
 static CURSOR_SEEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 static CURSOR_LAST_ACT_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+// ── Input introspection ──────────────────────────────────────────────────────
+//
+// Lightweight, always-on telemetry: which pointing/key device bound, and how many
+// events each kind has delivered. Cheap (a few relaxed atomics per event) and
+// genuinely useful for answering "is any input device live, and is it sending
+// events?" — the exact question when a board/VM shows no cursor. The optional
+// `input-hud` build feature draws these on-screen (see compositor::input_hud); the
+// counters themselves are unconditional so the data exists even without the HUD.
+
+/// Which input device last bound a pointer/key source.
+pub const INPUT_SRC_NONE: u8 = 0;
+pub const INPUT_SRC_VIRTIO: u8 = 1;
+pub const INPUT_SRC_XHCI: u8 = 2;
+pub const INPUT_SRC_PS2: u8 = 3;
+
+static INPUT_SOURCE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(INPUT_SRC_NONE);
+static PTR_COUNT: AtomicU32 = AtomicU32::new(0);
+static KEY_COUNT: AtomicU32 = AtomicU32::new(0);
+static SCROLL_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Last key event, packed `(scancode << 1) | pressed`.
+static LAST_KEY: AtomicU32 = AtomicU32::new(0);
+
+/// Record that an input device has bound (called once per device from its driver).
+pub fn set_input_source(src: u8) {
+    INPUT_SOURCE.store(src, Ordering::Relaxed);
+}
+/// The bound input source (`INPUT_SRC_*`), or `INPUT_SRC_NONE` if nothing bound.
+pub fn input_source() -> u8 {
+    INPUT_SOURCE.load(Ordering::Relaxed)
+}
+/// Short name for the bound input source.
+pub fn input_source_name() -> &'static str {
+    match input_source() {
+        INPUT_SRC_VIRTIO => "virtio",
+        INPUT_SRC_XHCI => "xhci",
+        INPUT_SRC_PS2 => "ps2",
+        _ => "none",
+    }
+}
+/// Event counts so far: `(pointer, key, scroll)`.
+pub fn input_counts() -> (u32, u32, u32) {
+    (
+        PTR_COUNT.load(Ordering::Relaxed),
+        KEY_COUNT.load(Ordering::Relaxed),
+        SCROLL_COUNT.load(Ordering::Relaxed),
+    )
+}
+/// Last key event as `(scancode, pressed)`.
+pub fn last_key() -> (u32, bool) {
+    let v = LAST_KEY.load(Ordering::Relaxed);
+    (v >> 1, (v & 1) != 0)
+}
+
 /// Current pointer position (absolute, framebuffer pixels).
 pub fn cursor_pos() -> (i32, i32) {
     (CURSOR_X.load(Ordering::Relaxed), CURSOR_Y.load(Ordering::Relaxed))
@@ -660,6 +713,7 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
     CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
     CURSOR_SEEN.store(true, Ordering::Relaxed);
     CURSOR_LAST_ACT_NS.store(crate::arch::rdtsc_ns(), Ordering::Relaxed);
+    PTR_COUNT.fetch_add(1, Ordering::Relaxed);
 
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
 
@@ -696,6 +750,7 @@ pub fn push_pointer(x: i32, y: i32, buttons: u32) {
 /// Deliver a mouse scroll-wheel tick. `dz` is the signed wheel delta
 /// (negative = scroll toward the user / content down, positive = away / up).
 pub fn push_scroll(x: i32, y: i32, dz: i32) {
+    SCROLL_COUNT.fetch_add(1, Ordering::Relaxed);
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
     let dz_bits = dz as u32 as u64; // preserve sign through i32→u32→u64
 
@@ -716,6 +771,8 @@ pub fn push_scroll(x: i32, y: i32, dz: i32) {
 }
 
 pub fn push_key(scancode: u32, pressed: bool) {
+    KEY_COUNT.fetch_add(1, Ordering::Relaxed);
+    LAST_KEY.store((scancode << 1) | (pressed as u32), Ordering::Relaxed);
     // F2 (PS/2 set-1 make 0x3C) toggles the kernel boot screen's verbose log
     // overlay. Handled here so it works during the engine warm-up before any app
     // is focused; the keypress is still forwarded for normal handling.

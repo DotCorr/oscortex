@@ -68,6 +68,40 @@ your fastest localizer when there's no serial.
 `kernel/src/logger.rs` for deep probe visibility. UTM VMs have no serial port by
 default — add one (or use the on-screen boot phases) to debug on-device.
 
+## On-screen input HUD (`--features input-hud`)
+
+When a VM/board shows **no cursor or no response to input** and there's no serial,
+build the kernel with `--features input-hud`. A compact panel is drawn over every
+frame (bottom-left):
+
+```
+INPUT src=virtio p=142 k=0 s=3      ← bound device + pointer/key/scroll event counts
+xy=640,360 btn=1 key=0x00-          ← last pointer pos / buttons / last key
+```
+
+Read it like this:
+- **`src=none` + red border** → no input device bound. The kernel never found a
+  pointer/keyboard (wrong VM device set — see the device matrix above).
+- **`src=…` + cyan border but `p=` never climbs** as you move the mouse → a device
+  bound but events aren't arriving (IRQ not wired, queue not kicked, descriptor
+  mis-parse). The device is the suspect, not the cursor draw.
+- **`p=` climbs but `xy=` is pinned at an edge / off-screen** → events arrive but the
+  coordinates are scaled/clamped wrong (e.g. absolute-axis range mismatch).
+- **`btn=` flips on click, `key=0x..` changes on keypress** → input is fully working.
+
+The telemetry counters themselves (`wm::input_counts`, `wm::input_source`) are always
+compiled in (a few relaxed atomics); only the on-screen drawing is gated by the
+feature, so **release ISOs are unchanged and pay zero cost**. Build a debug image:
+
+```sh
+# x86_64 debug ISO with the HUD
+X86_AOT=1 SKIP_CORE_APPS=1 KERNEL_FEATURES=input-hud bash scripts/build-iso.sh
+# aarch64 .kernel with the HUD
+cargo +nightly build --release --target aarch64-unknown-none -p oscortex-kernel \
+  --no-default-features --features arch-aarch64,limine-boot,input-hud \
+  -Z build-std=core,compiler_builtins,alloc -Z build-std-features=compiler-builtins-mem
+```
+
 ## Build fragility (important)
 
 The aarch64 and x86 builds **share the `initramfs/` directory** and clobber each
