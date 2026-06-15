@@ -70,3 +70,6 @@ iso_root_aarch64/
 oscortex-aarch64.iso
 tools/flutter-engine/linux-arm64/
 apps/_x86_aot_backup/
+*.iso
+iso_root/
+*.kernel
