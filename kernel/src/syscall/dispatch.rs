@@ -492,6 +492,7 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x38B => sys_tcp_close(arg0),
         0x38C => sys_dhcp_discover(),
         eabi::SYS_TCP_STATUS => sys_tcp_status(arg0),
+        eabi::SYS_DNS_RESOLVE => sys_dns_resolve(arg0, arg1),
 
         // Phase 51 — ext2 read-only filesystem
         0x38D => sys_ext2_mount(),

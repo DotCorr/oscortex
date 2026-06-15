@@ -26,9 +26,10 @@ use smoltcp::socket::tcp::{self as tcp_sock, Socket as TcpSocket};
 use smoltcp::socket::udp::{self as udp_sock, Socket as UdpSocket};
 use smoltcp::socket::icmp::{self as icmp_sock, Socket as IcmpSocket};
 use smoltcp::socket::dhcpv4::{Socket as DhcpSocket, Event as DhcpEvent};
+use smoltcp::socket::dns::{Socket as DnsSocket, GetQueryResultError};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, IpAddress, IpCidr, Ipv4Address,
+    DnsQueryType, EthernetAddress, IpAddress, IpCidr, Ipv4Address,
     IpEndpoint,
 };
 
@@ -139,6 +140,8 @@ struct TcpStack {
     icmp_handle: Option<SocketHandle>,
     // Phase 52: DHCP socket
     dhcp_handle: Option<SocketHandle>,
+    // DNS resolver socket (servers seeded from DHCP; default public resolver).
+    dns_handle: Option<SocketHandle>,
     ip:      Ipv4Address,
 }
 
@@ -203,6 +206,14 @@ pub fn init_smoltcp() {
     let icmp_socket = IcmpSocket::new(icmp_rx, icmp_tx);
     let icmp_handle = sockets.add(icmp_socket);
 
+    // DNS resolver. Seed with a public resolver so name lookups work even before
+    // DHCP; the DHCP ACK then swaps in the network's own servers (update_servers).
+    let dns_socket = DnsSocket::new(
+        &[IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8))],
+        vec![None, None],
+    );
+    let dns_handle = sockets.add(dns_socket);
+
     let _g = TCP_LOCK.lock();
     let stack = unsafe { &mut *TCP_STACK.0.get() };
     *stack = Some(TcpStack {
@@ -211,6 +222,7 @@ pub fn init_smoltcp() {
         handles: [None; MAX_TCP_SOCKETS],
         icmp_handle: Some(icmp_handle),
         dhcp_handle: None,
+        dns_handle: Some(dns_handle),
         ip: DEFAULT_IP,
     });
 
@@ -347,6 +359,50 @@ pub fn tcp_close(fd: usize) -> Result<(), i64> {
         s.handles[fd] = None;
     }
     Ok(())
+}
+
+/// Resolve a hostname to an IPv4 address (big-endian u32) via the DNS socket.
+/// Drives the stack until the query completes or a ~5s timeout. Returns the
+/// first A record, or a negative errno (-22 bad name, -2 failed/no A, -110 timeout).
+pub fn dns_resolve(name: &str) -> Result<u32, i64> {
+    let _g = TCP_LOCK.lock();
+    let stack = unsafe { &mut *TCP_STACK.0.get() };
+    let s = stack.as_mut().ok_or(-1i64)?;
+    let dns_h = s.dns_handle.ok_or(-1i64)?;
+
+    // Start an A-record query (disjoint &mut borrows of iface + sockets).
+    let handle = {
+        let cx = s.iface.context();
+        let sock = s.sockets.get_mut::<DnsSocket>(dns_h);
+        sock.start_query(cx, name, DnsQueryType::A).map_err(|_| -22i64)?
+    };
+
+    // Poll the stack until the resolver answers or we time out.
+    let start = crate::arch::rdtsc_ns();
+    const TIMEOUT_NS: u64 = 5_000_000_000;
+    loop {
+        {
+            let mut dev = VirtioNetDev;
+            s.iface.poll(now(), &mut dev, &mut s.sockets);
+        }
+        let sock = s.sockets.get_mut::<DnsSocket>(dns_h);
+        match sock.get_query_result(handle) {
+            Ok(addrs) => {
+                for a in addrs.iter() {
+                    if let IpAddress::Ipv4(v4) = a {
+                        return Ok(u32::from_be_bytes(v4.octets()));
+                    }
+                }
+                return Err(-2); // resolved but no A record
+            }
+            Err(GetQueryResultError::Pending) => {}
+            Err(_) => return Err(-2), // failed
+        }
+        if crate::arch::rdtsc_ns().wrapping_sub(start) > TIMEOUT_NS {
+            s.sockets.get_mut::<DnsSocket>(dns_h).cancel_query(handle);
+            return Err(-110); // ETIMEDOUT
+        }
+    }
 }
 
 /// Query current IP address (big-endian u32).

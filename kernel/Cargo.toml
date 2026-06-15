@@ -26,6 +26,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp",
     "socket-icmp",
     "socket-dhcpv4",
+    "socket-dns",
+    "proto-dns",
     "medium-ethernet",
     "log",
     "iface-max-route-count-4",
@@ -33,6 +35,9 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "iface-max-addr-count-4",
     "iface-max-multicast-group-count-4",
     "assembler-max-segment-count-4",
+    "dns-max-name-size-255",
+    "dns-max-result-count-2",
+    "dns-max-server-count-2",
 ] }
 
 [features]

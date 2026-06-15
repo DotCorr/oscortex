@@ -1338,6 +1338,23 @@ pub(crate) fn sys_tcp_status(fd: u64) -> i64 {
     }
 }
 
+/// Resolve a hostname to an IPv4 address. arg0=name_ptr, arg1=name_len.
+/// Returns the address as a big-endian u32 (≥0), or a negative errno.
+pub(crate) fn sys_dns_resolve(name_ptr: u64, name_len: u64) -> i64 {
+    let bytes = match unsafe { read_user_bytes(name_ptr, (name_len as usize).min(255)) } {
+        Some(b) => b,
+        None => return -14, // EFAULT
+    };
+    let name = match core::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(_) => return -22, // EINVAL
+    };
+    match crate::net::tcp::dns_resolve(name) {
+        Ok(ip) => ip as i64,
+        Err(e) => e,
+    }
+}
+
 /// Trigger DHCP DISCOVER.  Returns assigned IP as BE u32, or 0 on failure.
 pub(crate) fn sys_dhcp_discover() -> i64 {
     crate::net::tcp::dhcp_discover() as i64
