@@ -890,6 +890,12 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             handle_shell_platform_message(msg);
         }
 
+        // ── App networking (BasicMessageChannel<ByteData>, binary codec) ─────
+        //    Compact opcode framing → kernel TCP syscalls. See handle_net_channel.
+        b"oscortex/net" => {
+            handle_net_channel(msg);
+        }
+
         // ── Text input (JSONMethodCodec) — THE critical channel ──────────
         b"flutter/textinput" => {
             handle_textinput_channel(msg);
@@ -953,6 +959,74 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             }
         }
     }
+}
+
+/// Max bytes returned by a single `recv` (apps call repeatedly for more).
+const NET_RECV_CAP: usize = 8192;
+
+/// App networking channel — `oscortex/net`, a `BasicMessageChannel<ByteData>`
+/// (binary codec) so TCP byte streams pass through unmangled. The Dart message
+/// is a compact opcode frame; the reply is raw little-endian bytes:
+///
+///   connect  [0x01, ip(4 BE), port(2 BE)]   → i32 fd
+///   status   [0x02, fd(4 LE)]               → i32 (1 established / 0 connecting / <0 err)
+///   send     [0x03, fd(4 LE), data…]        → i32 bytes written (-11 = EAGAIN)
+///   recv     [0x04, fd(4 LE), max(4 LE)]    → i32 n, then n data bytes (-11 = no data yet)
+///   close    [0x05, fd(4 LE)]               → i32 (0 / <0 err)
+///
+/// All ints are little-endian. Errors are negative errnos straight from the
+/// kernel TCP syscalls (which this just marshals).
+fn handle_net_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        net_reply_i32(msg, -22); // EINVAL
+        return;
+    };
+
+    fn rd_u32_le(b: &[u8], off: usize) -> u32 {
+        if off + 4 <= b.len() {
+            u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+        } else {
+            0
+        }
+    }
+
+    match payload[0] {
+        0x01 => {
+            // connect: ip is big-endian (network order), port big-endian.
+            if payload.len() < 7 {
+                net_reply_i32(msg, -22);
+                return;
+            }
+            let ip = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let port = u16::from_be_bytes([payload[5], payload[6]]);
+            net_reply_i32(msg, sys::tcp_connect(ip, port) as i32);
+        }
+        0x02 => net_reply_i32(msg, sys::tcp_status(rd_u32_le(payload, 1)) as i32),
+        0x03 => {
+            let fd = rd_u32_le(payload, 1);
+            let data: &[u8] = if payload.len() > 5 { &payload[5..] } else { &[] };
+            net_reply_i32(msg, sys::tcp_write(fd, data) as i32);
+        }
+        0x04 => {
+            let fd = rd_u32_le(payload, 1);
+            let max = (rd_u32_le(payload, 5) as usize).min(NET_RECV_CAP);
+            // Single buffer: [i32 n | data]. Read into [4..], then prefix n.
+            let mut out = [0u8; 4 + NET_RECV_CAP];
+            let n = sys::tcp_read(fd, &mut out[4..4 + max]) as i32;
+            let body = if n > 0 { (n as usize).min(max) } else { 0 };
+            out[..4].copy_from_slice(&n.to_le_bytes());
+            respond_platform_message(msg, &out[..4 + body]);
+        }
+        0x05 => net_reply_i32(msg, sys::tcp_close(rd_u32_le(payload, 1)) as i32),
+        _ => net_reply_i32(msg, -22),
+    }
+}
+
+/// Reply on `oscortex/net` with a little-endian i32 result/status.
+fn net_reply_i32(msg: &FlutterPlatformMessage, v: i32) {
+    respond_platform_message(msg, &v.to_le_bytes());
 }
 
 // ════════════════════════════════════════════════════════════════════════════

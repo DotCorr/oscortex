@@ -85,6 +85,14 @@ pub const SYS_CLIPBOARD_GET: u64 = 0x4B4;
 pub const SYS_APP_CLOSE_FOREGROUND: u64 = 0x4B5;
 pub const SYS_BEEP: u64 = 0x4B6;
 
+// App networking — TCP socket calls (mirrors abi.rs / dispatch.rs). Connect is
+// async: poll SYS_TCP_STATUS until it returns 1 before writing.
+pub const SYS_TCP_CONNECT: u64 = 0x388;
+pub const SYS_TCP_WRITE: u64 = 0x389;
+pub const SYS_TCP_READ: u64 = 0x38A;
+pub const SYS_TCP_CLOSE: u64 = 0x38B;
+pub const SYS_TCP_STATUS: u64 = 0x4B7;
+
 // Mouse-cursor shapes accepted by SYS_CURSOR_SHAPE_SET (mirrors abi.rs).
 pub const CURSOR_SHAPE_BASIC: u32 = 0;
 pub const CURSOR_SHAPE_TEXT: u32 = 1;
@@ -895,5 +903,37 @@ pub fn app_close_foreground() -> i64 {
 /// Emit a PC-speaker tone (freq 0 = default system beep).
 pub fn beep(freq_hz: u32, duration_ms: u32) -> i64 {
     unsafe { syscall2(SYS_BEEP, freq_hz as u64, duration_ms as u64) }
+}
+
+// ── App networking — TCP socket calls (back the oscortex/net channel) ─────────
+
+/// Open a TCP connection (async). `ip` is big-endian (network order); returns a
+/// socket fd ≥ 0, or a negative errno. Poll `tcp_status` until it returns 1
+/// before writing.
+pub fn tcp_connect(ip_be: u32, port: u16) -> i64 {
+    unsafe { syscall2(SYS_TCP_CONNECT, ip_be as u64, port as u64) }
+}
+
+/// Poll an outbound connect: 1 = established (may send), 0 = still connecting,
+/// negative = refused/reset.
+pub fn tcp_status(fd: u32) -> i64 {
+    unsafe { syscall1(SYS_TCP_STATUS, fd as u64) }
+}
+
+/// Write to a TCP socket. Returns bytes written, or a negative errno
+/// (-11 EAGAIN if the send buffer is momentarily full).
+pub fn tcp_write(fd: u32, data: &[u8]) -> i64 {
+    unsafe { syscall3(SYS_TCP_WRITE, fd as u64, data.as_ptr() as u64, data.len() as u64) }
+}
+
+/// Read from a TCP socket. Returns bytes read, or a negative errno
+/// (-11 EAGAIN if no data is available yet).
+pub fn tcp_read(fd: u32, buf: &mut [u8]) -> i64 {
+    unsafe { syscall3(SYS_TCP_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Close a TCP socket.
+pub fn tcp_close(fd: u32) -> i64 {
+    unsafe { syscall1(SYS_TCP_CLOSE, fd as u64) }
 }
 
