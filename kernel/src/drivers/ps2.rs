@@ -359,8 +359,21 @@ fn handle_mouse_byte(byte: u8) {
 /// IDT vectors are registered (i.e., after `idt::init()`).
 pub fn init() {
     unsafe {
-        // Flush output buffer.
-        while in8(PS2_STATUS) & STATUS_OBF != 0 {
+        // Absent i8042 (firmware without a legacy PS/2 controller — e.g. some
+        // UEFI/UTM profiles) reads 0xFF on the status port. 0xFF & STATUS_OBF is
+        // always set, so the flush loops below would spin forever. Detect the
+        // open-bus 0xFF and skip PS/2 entirely (leaving PS2_READY false → the WM
+        // falls back to other input). This is the i8042 analogue of the legacy
+        // PIT hang.
+        if in8(PS2_STATUS) == 0xFF {
+            log::warn!("[PS2] no i8042 controller (status=0xFF) — skipping PS/2 init");
+            return;
+        }
+
+        // Flush output buffer (BOUNDED: a stuck-OBF / open-bus controller must
+        // not spin forever; a real i8042 has at most a couple of bytes queued).
+        for _ in 0..4096 {
+            if in8(PS2_STATUS) & STATUS_OBF == 0 { break; }
             let _ = in8(PS2_DATA);
         }
 
@@ -368,8 +381,9 @@ pub fn init() {
         wait_write(); out8(PS2_STATUS, 0xAD); // disable port 1
         wait_write(); out8(PS2_STATUS, 0xA7); // disable port 2
 
-        // Flush again after disable.
-        while in8(PS2_STATUS) & STATUS_OBF != 0 {
+        // Flush again after disable (bounded, same rationale).
+        for _ in 0..4096 {
+            if in8(PS2_STATUS) & STATUS_OBF == 0 { break; }
             let _ = in8(PS2_DATA);
         }
 
