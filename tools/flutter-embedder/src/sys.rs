@@ -32,6 +32,10 @@ pub const SYS_SURFACE_CREATE: u64 = 0x300;
 pub const SYS_SURFACE_UPLOAD_RGBA32: u64 = 0x303;
 pub const SYS_SURFACE_DESTROY: u64 = 0x302;
 pub const SYS_SURFACE_FLIP: u64 = 0x312;
+pub const SYS_SURFACE_Z_SET: u64 = 0x30A;
+pub const SYS_SURFACE_GEOMETRY_SET: u64 = 0x30C;
+pub const SYS_SURFACE_VISIBILITY_SET: u64 = 0x30E;
+pub const SYS_SURFACE_CLIP_SET: u64 = 0x30F;
 pub const SYS_FB_SIZE_PACKED: u64 = 0x305;
 pub const SYS_VSYNC_WAIT_NONBLOCK: u64 = 0x307;
 
@@ -463,6 +467,30 @@ pub fn surface_create(width: u32, height: u32) -> i64 {
 /// Destroy a compositor surface.
 pub fn surface_destroy(surface_id: u32) -> i64 {
     unsafe { syscall1(SYS_SURFACE_DESTROY, surface_id as u64) }
+}
+
+/// Set a surface's stacking order (higher z draws on top).
+pub fn surface_z_set(surface_id: u32, z: i32) -> i64 {
+    unsafe { syscall2(SYS_SURFACE_Z_SET, surface_id as u64, (z as u32) as u64) }
+}
+
+/// Set a surface's on-screen position + size. (xy/wh packed as the kernel expects.)
+pub fn surface_geometry_set(surface_id: u32, x: i32, y: i32, w: u32, h: u32) -> i64 {
+    let xy = (((x as u32) as u64) << 32) | ((y as u32) as u64);
+    let wh = ((w as u64) << 32) | (h as u64);
+    unsafe { syscall3(SYS_SURFACE_GEOMETRY_SET, surface_id as u64, xy, wh) }
+}
+
+/// Clip a surface to the given screen-space rect.
+pub fn surface_clip_set(surface_id: u32, x: i32, y: i32, w: u32, h: u32) -> i64 {
+    let xy = (((x as u32) as u64) << 32) | ((y as u32) as u64);
+    let wh = ((w as u64) << 32) | (h as u64);
+    unsafe { syscall3(SYS_SURFACE_CLIP_SET, surface_id as u64, xy, wh) }
+}
+
+/// Show or hide a surface.
+pub fn surface_visibility_set(surface_id: u32, visible: bool) -> i64 {
+    unsafe { syscall2(SYS_SURFACE_VISIBILITY_SET, surface_id as u64, visible as u64) }
 }
 
 /// Returns `(width << 32) | height` for the physical framebuffer.

@@ -896,6 +896,14 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             handle_net_channel(msg);
         }
 
+        // ── Native webview (MethodChannel, StandardMethodCodec) ──────────────
+        //    Manages a compositor surface for web content + events. The renderer
+        //    behind it is a stub today; a Servo service replaces it. See
+        //    handle_webview_channel + docs/browser-architecture.md.
+        b"oscortex/webview" => {
+            handle_webview_channel(msg);
+        }
+
         // ── Text input (JSONMethodCodec) — THE critical channel ──────────
         b"flutter/textinput" => {
             handle_textinput_channel(msg);
@@ -1027,6 +1035,321 @@ fn handle_net_channel(msg: &FlutterPlatformMessage) {
 /// Reply on `oscortex/net` with a little-endian i32 result/status.
 fn net_reply_i32(msg: &FlutterPlatformMessage, v: i32) {
     respond_platform_message(msg, &v.to_le_bytes());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Native webview — `oscortex/webview` (StandardMethodCodec).
+//
+// The web engine renders into its OWN compositor surface, z-stacked above this
+// app's Flutter surface and clipped to the viewport the Web Link app reports, so
+// it shows in the web region beneath the chrome. The renderer here is a STUB
+// (fills the surface a solid color + drives navigation events) that proves the
+// whole pipeline — app → channel → surface → composite → events — end to end
+// without a real engine; a Servo service replaces the stub behind this contract.
+// See docs/browser-architecture.md.
+
+/// One native webview instance (single-view for now).
+struct WebviewState {
+    view_id: i32,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    buf_va: u64, // mmap'd scratch RGBA buffer
+    buf_len: usize,
+}
+static mut WEBVIEW: Option<WebviewState> = None;
+/// Web surface stacks above the app's Flutter surface (clipped to the web rect).
+const WEBVIEW_Z: i32 = 1000;
+static WEBVIEW_CH: &[u8] = b"oscortex/webview\0";
+
+// ── StandardMethodCodec decode (generalizes std_find_kind) ───────────────────
+
+/// The method name of a StandardMethodCodec call (value 0 = a string).
+fn std_method_name(buf: &[u8]) -> Option<&[u8]> {
+    if *buf.first()? != 7 {
+        return None;
+    }
+    let (n, j) = std_read_size(buf, 1)?;
+    buf.get(j..j + n)
+}
+
+/// Offset of the value for `key` in the arguments map (value 1, a map).
+fn std_arg_value_off(buf: &[u8], key: &[u8]) -> Option<usize> {
+    let i = std_skip_value(buf, 0)?; // past the method name
+    if *buf.get(i)? != 13 {
+        return None; // arguments must be a map
+    }
+    let (n, mut j) = std_read_size(buf, i + 1)?;
+    for _ in 0..n {
+        let key_start = j;
+        let after_key = std_skip_value(buf, j)?;
+        let after_val = std_skip_value(buf, after_key)?;
+        if *buf.get(key_start)? == 7 {
+            let (klen, ks) = std_read_size(buf, key_start + 1)?;
+            if buf.get(ks..ks + klen)? == key {
+                return Some(after_key);
+            }
+        }
+        j = after_val;
+    }
+    None
+}
+
+fn std_arg_str<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let v = std_arg_value_off(buf, key)?;
+    if *buf.get(v)? != 7 {
+        return None;
+    }
+    let (n, s) = std_read_size(buf, v + 1)?;
+    buf.get(s..s + n)
+}
+
+fn std_arg_int(buf: &[u8], key: &[u8]) -> Option<i64> {
+    let v = std_arg_value_off(buf, key)?;
+    match *buf.get(v)? {
+        3 => {
+            let b = buf.get(v + 1..v + 5)?;
+            Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+        }
+        4 => {
+            let b = buf.get(v + 1..v + 9)?;
+            Some(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        }
+        _ => None,
+    }
+}
+
+// ── StandardMethodCodec encode into a fixed buffer (no alloc) ────────────────
+
+struct StdEnc {
+    buf: [u8; 512],
+    len: usize,
+}
+impl StdEnc {
+    fn new() -> Self {
+        Self { buf: [0; 512], len: 0 }
+    }
+    fn raw(&mut self, x: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = x;
+            self.len += 1;
+        }
+    }
+    fn raw_bytes(&mut self, s: &[u8]) {
+        for &x in s {
+            self.raw(x);
+        }
+    }
+    fn size(&mut self, n: usize) {
+        if n < 254 {
+            self.raw(n as u8);
+        } else if n <= 0xFFFF {
+            self.raw(254);
+            self.raw(n as u8);
+            self.raw((n >> 8) as u8);
+        } else {
+            self.raw(255);
+            self.raw(n as u8);
+            self.raw((n >> 8) as u8);
+            self.raw((n >> 16) as u8);
+            self.raw((n >> 24) as u8);
+        }
+    }
+    fn val_str(&mut self, s: &[u8]) {
+        self.raw(7);
+        self.size(s.len());
+        self.raw_bytes(s);
+    }
+    fn val_i32(&mut self, v: i32) {
+        self.raw(3);
+        self.raw_bytes(&v.to_le_bytes());
+    }
+    fn val_bool(&mut self, v: bool) {
+        self.raw(if v { 1 } else { 2 });
+    }
+    fn map(&mut self, n: usize) {
+        self.raw(13);
+        self.size(n);
+    }
+    fn slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+// ── Event emitters (engine → app: StandardMethodCodec method calls) ──────────
+
+fn webview_send(payload: &[u8]) {
+    let send_fn_va = SEND_PLATFORM_MESSAGE_FN.load(Ordering::SeqCst);
+    let engine = ENGINE.load(Ordering::SeqCst);
+    if send_fn_va == 0 || engine == 0 {
+        return;
+    }
+    let msg = FlutterPlatformMessage {
+        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+        channel: WEBVIEW_CH.as_ptr() as u64,
+        message: payload.as_ptr() as u64,
+        message_size: payload.len(),
+        response_handle: 0,
+    };
+    let send: SendPlatformMessageFn = unsafe { core::mem::transmute(send_fn_va) };
+    let _ = unsafe { send(engine, &msg as *const _) };
+}
+
+/// Emit a `{viewId, url}` event (urlChanged / loadStarted / loadFinished).
+fn webview_emit_url(view_id: i32, method: &[u8], url: &[u8]) {
+    let mut e = StdEnc::new();
+    e.val_str(method);
+    e.map(2);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"url");
+    e.val_str(url);
+    webview_send(e.slice());
+}
+
+fn webview_emit_progress(view_id: i32, progress: i32) {
+    let mut e = StdEnc::new();
+    e.val_str(b"loadProgress");
+    e.map(2);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"progress");
+    e.val_i32(progress);
+    webview_send(e.slice());
+}
+
+fn webview_emit_nav(view_id: i32, back: bool, fwd: bool) {
+    let mut e = StdEnc::new();
+    e.val_str(b"navState");
+    e.map(3);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"canGoBack");
+    e.val_bool(back);
+    e.val_str(b"canGoForward");
+    e.val_bool(fwd);
+    webview_send(e.slice());
+}
+
+/// Stub render: fill the web surface with a solid RGBA color + submit it.
+unsafe fn webview_fill(st: &mut WebviewState, rgba: u32) {
+    let needed = (st.width as usize) * (st.height as usize) * 4;
+    if st.buf_va == 0 || st.buf_len < needed {
+        st.buf_va = sys::mmap_anon(needed);
+        st.buf_len = needed;
+    }
+    if st.buf_va == 0 {
+        return;
+    }
+    let px = unsafe {
+        core::slice::from_raw_parts_mut(st.buf_va as *mut u32, (st.width * st.height) as usize)
+    };
+    for p in px.iter_mut() {
+        *p = rgba;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(st.buf_va as *const u8, needed) };
+    let _ = sys::gpu_submit_strided(st.surface_id, bytes, (st.width as usize) * 4);
+}
+
+fn handle_webview_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        return;
+    };
+    let method = std_method_name(payload).unwrap_or(b"");
+    let view_id = std_arg_int(payload, b"viewId").unwrap_or(0) as i32;
+
+    match method {
+        b"create" => {
+            let w = std_arg_int(payload, b"width").unwrap_or(1).max(1) as u32;
+            let h = std_arg_int(payload, b"height").unwrap_or(1).max(1) as u32;
+            let sid = sys::surface_create(w, h);
+            let surface = if sid >= 0 {
+                let sid = sid as u32;
+                let mut st = WebviewState {
+                    view_id,
+                    surface_id: sid,
+                    width: w,
+                    height: h,
+                    buf_va: 0,
+                    buf_len: 0,
+                };
+                unsafe {
+                    webview_fill(&mut st, 0xFF2A2A2A); // dark gray placeholder
+                    *core::ptr::addr_of_mut!(WEBVIEW) = Some(st);
+                }
+                sid as i32
+            } else {
+                -1
+            };
+            let mut e = StdEnc::new();
+            e.raw(0x00); // success envelope
+            e.map(1);
+            e.val_str(b"surfaceId");
+            e.val_i32(surface);
+            respond_platform_message(msg, e.slice());
+            if surface >= 0 {
+                webview_emit_nav(view_id, false, false);
+            }
+        }
+        b"setViewport" => {
+            let x = std_arg_int(payload, b"x").unwrap_or(0) as i32;
+            let y = std_arg_int(payload, b"y").unwrap_or(0) as i32;
+            let w = std_arg_int(payload, b"w").unwrap_or(0).max(0) as u32;
+            let h = std_arg_int(payload, b"h").unwrap_or(0).max(0) as u32;
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of!(WEBVIEW)).as_ref() {
+                    let sid = st.surface_id;
+                    let _ = sys::surface_geometry_set(sid, x, y, w, h);
+                    let _ = sys::surface_clip_set(sid, x, y, w, h);
+                    let _ = sys::surface_z_set(sid, WEBVIEW_Z);
+                }
+            }
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"loadUrl" => {
+            let url = std_arg_str(payload, b"url").unwrap_or(b"");
+            webview_emit_url(view_id, b"loadStarted", url);
+            webview_emit_url(view_id, b"urlChanged", url);
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of_mut!(WEBVIEW)).as_mut() {
+                    webview_fill(st, 0xFF202830); // tint to show the nav took effect
+                }
+            }
+            webview_emit_progress(view_id, 100);
+            webview_emit_url(view_id, b"loadFinished", url);
+            webview_emit_nav(view_id, false, false);
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"destroy" => {
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of!(WEBVIEW)).as_ref() {
+                    let _ = sys::surface_destroy(st.surface_id);
+                }
+                *core::ptr::addr_of_mut!(WEBVIEW) = None;
+            }
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"canGoBack" | b"canGoForward" => {
+            let mut e = StdEnc::new();
+            e.raw(0x00);
+            e.val_bool(false);
+            respond_platform_message(msg, e.slice());
+        }
+        b"getTitle" => {
+            let mut e = StdEnc::new();
+            e.raw(0x00);
+            e.val_str(b"OSCortex Web (stub)");
+            respond_platform_message(msg, e.slice());
+        }
+        // goBack / goForward / reload / stopLoading / resize / setVisible /
+        // dispatchInput / dispatchScroll / dispatchKey / evalJs / currentUrl:
+        // acknowledged (no-op in the stub).
+        _ => respond_platform_message(msg, METHOD_SUCCESS_NULL),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
