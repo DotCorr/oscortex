@@ -452,6 +452,7 @@ pub fn dhcp_discover() -> u32 {
             if let Some(s) = stack.as_mut() {
                 let mut dev = VirtioNetDev;
                 s.iface.poll(now(), &mut dev, &mut s.sockets);
+                let mut dhcp_dns: Option<Vec<IpAddress>> = None;
                 if let Some(h) = s.dhcp_handle {
                     let sock = s.sockets.get_mut::<DhcpSocket>(h);
                     if let Some(event) = sock.poll() {
@@ -469,12 +470,25 @@ pub fn dhcp_discover() -> u32 {
                                     s.iface.routes_mut().add_default_ipv4_route(gw).ok();
                                 }
                                 s.ip = ip;
+                                if !cfg.dns_servers.is_empty() {
+                                    let mut v: Vec<IpAddress> = Vec::new();
+                                    for a in cfg.dns_servers.iter() {
+                                        v.push(IpAddress::Ipv4(*a));
+                                    }
+                                    dhcp_dns = Some(v);
+                                }
                             }
                             DhcpEvent::Deconfigured => {
                                 log::info!("[dhcp] deconfigured");
                             }
                         }
                     }
+                }
+                // Point the resolver at the network's own DNS servers (the DHCP
+                // socket borrow has ended, so s.sockets is free again).
+                if let (Some(dns_h), Some(servers)) = (s.dns_handle, dhcp_dns) {
+                    s.sockets.get_mut::<DnsSocket>(dns_h).update_servers(&servers);
+                    log::info!("[dns] {} resolver(s) from DHCP", servers.len());
                 }
             }
         }
