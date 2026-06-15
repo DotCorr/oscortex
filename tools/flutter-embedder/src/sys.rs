@@ -96,6 +96,7 @@ pub const SYS_TCP_WRITE: u64 = 0x389;
 pub const SYS_TCP_READ: u64 = 0x38A;
 pub const SYS_TCP_CLOSE: u64 = 0x38B;
 pub const SYS_TCP_STATUS: u64 = 0x4B7;
+pub const SYS_DNS_RESOLVE: u64 = 0x4B8;
 
 // Mouse-cursor shapes accepted by SYS_CURSOR_SHAPE_SET (mirrors abi.rs).
 pub const CURSOR_SHAPE_BASIC: u32 = 0;
@@ -963,5 +964,10 @@ pub fn tcp_read(fd: u32, buf: &mut [u8]) -> i64 {
 /// Close a TCP socket.
 pub fn tcp_close(fd: u32) -> i64 {
     unsafe { syscall1(SYS_TCP_CLOSE, fd as u64) }
+}
+
+/// Resolve a hostname → IPv4 (big-endian u32 ≥ 0), or a negative errno.
+pub fn dns_resolve(name: &[u8]) -> i64 {
+    unsafe { syscall2(SYS_DNS_RESOLVE, name.as_ptr() as u64, name.len() as u64) }
 }
 

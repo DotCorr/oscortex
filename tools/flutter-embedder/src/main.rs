@@ -1028,6 +1028,15 @@ fn handle_net_channel(msg: &FlutterPlatformMessage) {
             respond_platform_message(msg, &out[..4 + body]);
         }
         0x05 => net_reply_i32(msg, sys::tcp_close(rd_u32_le(payload, 1)) as i32),
+        0x06 => {
+            // resolve: [0x06, hostname bytes] → reply u32 LE (BE-order IPv4),
+            // or 0 on failure. (NOT net_reply_i32: a valid high-bit IP like
+            // 200.x.x.x would look negative as i32; reply the raw u32 instead.)
+            let name: &[u8] = if payload.len() > 1 { &payload[1..] } else { &[] };
+            let r = sys::dns_resolve(name);
+            let ip: u32 = if r >= 0 { r as u32 } else { 0 };
+            respond_platform_message(msg, &ip.to_le_bytes());
+        }
         _ => net_reply_i32(msg, -22),
     }
 }

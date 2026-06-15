@@ -43,6 +43,21 @@ class OscortexSocket {
   static const int _opSend = 0x03;
   static const int _opRecv = 0x04;
   static const int _opClose = 0x05;
+  static const int _opResolve = 0x06;
+
+  /// Resolve [host] to a dotted-quad IPv4 string, or null on failure.
+  /// (DNS A-record lookup via the kernel resolver.)
+  static Future<String?> resolve(String host) async {
+    final List<int> name = host.codeUnits;
+    final Uint8List req = Uint8List(1 + name.length)..[0] = _opResolve;
+    req.setRange(1, 1 + name.length, name);
+    final ByteData? reply = await _channel.send(ByteData.sublistView(req));
+    if (reply == null || reply.lengthInBytes < 4) return null;
+    // BE-order IPv4 as an unsigned u32; 0 = failure sentinel.
+    final int v = reply.getUint32(0, Endian.little);
+    if (v == 0) return null;
+    return '${(v >> 24) & 0xFF}.${(v >> 16) & 0xFF}.${(v >> 8) & 0xFF}.${v & 0xFF}';
+  }
 
   /// Send a request frame, return the leading little-endian i32 result.
   static Future<int> _callI32(Uint8List req) async {

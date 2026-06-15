@@ -177,4 +177,21 @@ void main() {
     expect(reqText, contains('Host: example.com\r\n'));
     expect(reqText, contains('Connection: close'));
   }, timeout: const Timeout(Duration(seconds: 15)));
+
+  test('resolve sends [op, hostname] and parses the u32 IPv4 reply', () async {
+    messenger().setMockMessageHandler(channelName, (ByteData? message) async {
+      final Uint8List f = bytesOf(message);
+      expect(f[0], 0x06);
+      expect(String.fromCharCodes(f.sublist(1)), 'example.com');
+      final int v = (93 << 24) | (184 << 16) | (216 << 8) | 34; // 93.184.216.34
+      return ByteData(4)..setUint32(0, v, Endian.little);
+    });
+    expect(await OscortexSocket.resolve('example.com'), '93.184.216.34');
+  });
+
+  test('resolve returns null on the 0 failure sentinel', () async {
+    messenger().setMockMessageHandler(channelName,
+        (ByteData? m) async => ByteData(4)..setUint32(0, 0, Endian.little));
+    expect(await OscortexSocket.resolve('nope.invalid'), isNull);
+  });
 }
