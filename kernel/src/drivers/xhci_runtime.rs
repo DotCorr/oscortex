@@ -147,6 +147,11 @@ pub struct XhciRuntime {
     last_hid: [u8; HID_LEN],
     cur_x: i32,
     cur_y: i32,
+    // True when the HID interface is an ABSOLUTE pointer (USB tablet) rather than
+    // a boot keyboard/mouse. UTM/QEMU's default pointer is `usb-tablet`, which has
+    // bInterfaceProtocol=0 (no boot protocol) and reports absolute X/Y — without
+    // this it was misrouted to the boot-keyboard handler (no pointer in UTM).
+    hid_is_tablet: bool,
 }
 
 static RUNTIME_OK: AtomicBool = AtomicBool::new(false);
@@ -333,6 +338,7 @@ pub fn start(ctrl: &XhciController) -> Result<(), &'static str> {
             last_hid: [0; HID_LEN],
             cur_x: 64,
             cur_y: 64,
+            hid_is_tablet: false,
         });
         RUNTIME_OK.store(true, Ordering::Release);
         log::info!("[USB] XHCI runtime started");
@@ -546,6 +552,13 @@ fn route_report(report: &[u8], rt: &mut XhciRuntime) {
     let old = rt.last_hid;
     rt.last_hid.copy_from_slice(report);
 
+    // Absolute pointer (USB tablet, e.g. UTM's default): parse abs X/Y. Deduped
+    // above (an unchanged abs report is the same position, safe to skip).
+    if rt.hid_is_tablet {
+        route_tablet(report, rt);
+        return;
+    }
+
     if rt.hid_protocol == 1 || rt.hid_protocol == 0 {
         if let Some((sc, pressed)) = usb_hid::handle_boot_keyboard_report(report) {
             crate::wm::push_key(sc, pressed);
@@ -576,6 +589,27 @@ fn route_mouse(report: &[u8], rt: &mut XhciRuntime) {
     rt.cur_x = (rt.cur_x + dx).clamp(0, w as i32 - 1);
     rt.cur_y = (rt.cur_y + dy).clamp(0, h as i32 - 1);
     crate::wm::push_pointer(rt.cur_x, rt.cur_y, buttons);
+    if wheel != 0 {
+        crate::wm::push_scroll(rt.cur_x, rt.cur_y, wheel);
+    }
+}
+
+/// USB tablet (absolute) report: byte0 = buttons (b0 L, b1 R, b2 M), bytes1-2 =
+/// absolute X (u16 LE, 0..=32767), bytes3-4 = absolute Y, byte5 = wheel (i8).
+/// This is QEMU/UTM's `usb-tablet` format. Map the absolute range onto the
+/// framebuffer and feed the WM's unified pointer state.
+fn route_tablet(report: &[u8], rt: &mut XhciRuntime) {
+    if report.len() < 5 {
+        return;
+    }
+    let buttons = (report[0] as u32) & 0x7;
+    let ax = u16::from_le_bytes([report[1], report[2]]) as u32;
+    let ay = u16::from_le_bytes([report[3], report[4]]) as u32;
+    let (w, h) = crate::drivers::fb::size_px().unwrap_or((1024, 768));
+    rt.cur_x = ((ax * w.saturating_sub(1)) / 32767) as i32;
+    rt.cur_y = ((ay * h.saturating_sub(1)) / 32767) as i32;
+    crate::wm::push_pointer(rt.cur_x, rt.cur_y, buttons);
+    let wheel = report.get(5).map(|b| *b as i8 as i32).unwrap_or(0);
     if wheel != 0 {
         crate::wm::push_scroll(rt.cur_x, rt.cur_y, wheel);
     }
@@ -735,11 +769,64 @@ unsafe fn try_enumerate(rt: &mut XhciRuntime) -> bool {
         return false;
     }
 
+    // For a non-boot HID interface (bInterfaceProtocol=0), read the HID report
+    // descriptor to classify it: UTM/QEMU's default pointer is `usb-tablet`,
+    // which is protocol 0 and reports ABSOLUTE X/Y. Without this it falls through
+    // to the boot-keyboard handler and the pointer never moves.
+    if rt.hid_protocol == 0 {
+        // GET_DESCRIPTOR(HID Report = 0x22, index 0) to interface 0.
+        if control_xfer(rt, 0x81, 0x06, 0x2200, 0, 128, rt.ctrl_buf_phys) {
+            let rd = core::slice::from_raw_parts(p2v(rt.ctrl_buf_phys) as *const u8, 128);
+            rt.hid_is_tablet = report_desc_is_pointer(rd);
+            log::info!(
+                "[USB-HID] protocol=0 → {}",
+                if rt.hid_is_tablet { "absolute pointer (tablet)" } else { "keyboard/other" }
+            );
+        }
+    }
+
     // HID class requests: SET_PROTOCOL(boot=0) so reports are boot-format, and
-    // SET_IDLE(0) so the device only reports on change. Best-effort.
+    // SET_IDLE(0) so the device only reports on change. Best-effort. (A tablet has
+    // no boot protocol; SET_PROTOCOL is a harmless no-op for it.)
     let _ = control_xfer(rt, 0x21, 0x0B, 0, 0, 0, 0); // SET_PROTOCOL boot
     let _ = control_xfer(rt, 0x21, 0x0A, 0, 0, 0, 0); // SET_IDLE infinite
     true
+}
+
+/// Scan a HID report descriptor for a top-level Generic-Desktop Mouse/Pointer
+/// usage → absolute/relative pointer device (e.g. a USB tablet). Minimal item
+/// walk: item byte = bTag(4)|bType(2)|bSize(2); 0x04 = Usage Page (global),
+/// 0x08 = Usage (local). Generic Desktop page = 0x01; Mouse = 0x02, Pointer =
+/// 0x01, Keyboard = 0x06.
+fn report_desc_is_pointer(rd: &[u8]) -> bool {
+    let mut generic_desktop = false;
+    let mut i = 0usize;
+    while i < rd.len() {
+        let b = rd[i];
+        if b == 0 {
+            break;
+        }
+        let dlen = match b & 0x03 {
+            3 => 4,
+            n => n as usize,
+        };
+        let tag = b & 0xFC;
+        let data = if dlen >= 1 { rd.get(i + 1).copied().unwrap_or(0) } else { 0 };
+        if tag == 0x04 {
+            // Usage Page
+            generic_desktop = data == 0x01;
+        } else if tag == 0x08 && generic_desktop {
+            // Usage
+            if data == 0x02 || data == 0x01 {
+                return true; // Mouse / Pointer
+            }
+            if data == 0x06 {
+                return false; // Keyboard
+            }
+        }
+        i += 1 + dlen;
+    }
+    false
 }
 
 unsafe fn arm_hid_transfer(rt: &mut XhciRuntime) {
