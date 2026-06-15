@@ -79,3 +79,7 @@ packages/*/.dart_tool/
 packages/*/pubspec.lock
 packages/*/.flutter-plugins*
 packages/*/build/
+
+# osx CLI per-app build config + outputs
+apps/*/.osx/
+apps/*/build/osx/

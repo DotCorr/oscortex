@@ -316,7 +316,7 @@ cargo +nightly build \
     --release \
     --package oscortex-kernel \
     --target x86_64-unknown-none \
-    "${KERNEL_FEATURE_ARGS[@]}" \
+    ${KERNEL_FEATURE_ARGS[@]+"${KERNEL_FEATURE_ARGS[@]}"} \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem
 
