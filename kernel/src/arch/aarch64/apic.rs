@@ -199,16 +199,14 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
                 || crate::wm::embedder_baton_due(target))
             && cur != target
         {
-            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
-                // SINGLE-CORE: keep the proven set_state_try-only behaviour (the
-                // BISECT) so the shipped single-core ARM path is byte-unchanged. The
-                // ISR-initiated resume is MULTI-CORE only, where the app runs on its
-                // own home AP and this re-enters it from that AP's timer ISR.
-                let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
-                if smp && crate::process::try_claim_cpu_for_try(target, my_cpu) {
-                    crate::process::enter_user_by_pid_noreturn_try(target);
-                }
-            }
+            // WAKE ONLY — do NOT do the ISR-initiated resume here. The prior session
+            // fingered enter_user_by_pid_noreturn_try from the timer ISR as the cause
+            // of "pid=2 Dart corruption", and re-enabling it reproduced exactly that:
+            // a real EL0 data abort (EC=0x24) in engine code on the AP. Marking the
+            // target Running and letting the cooperative hand-off (the sys_thread_create
+            // immediate-enter + futex hand-off, which complete the engine bootstrap on
+            // x86) enter it avoids resuming a thread from an ISR mid-EL1-critical-state.
+            let _ = crate::process::set_state_try(target, crate::process::ProcState::Running);
         }
         return;
     }
