@@ -485,6 +485,17 @@ pub fn launch(app_id: u32, _flags: u32) -> i64 {
     // aot_va=0: the embedder ignores it in APP mode when is_aot=false.
     crate::process::set_bootstrap_regs(child_pid, HOST_MODE_APP, app_id as u64, 0);
 
+    // SMP: the app host was pinned to a dedicated APPLICATION core inside
+    // spawn_with_bootstrap (atomically, before it became Running — see the
+    // home_cpu assignment there). On single-core boots that pin is 0 (the BSP),
+    // so this is purely informational. The home_cpu is inherited by every thread
+    // the host spawns (see spawn_thread), so the whole engine stays on its core,
+    // with its OWN per-CPU GPR scratch — eliminating the cooperative-context
+    // corruption that crashed the shell's dart:io EventHandler when a 2nd engine
+    // launched on a single shared core.
+    log::error!("[APP] app_id={} host_pid={} home_cpu={}",
+        app_id, child_pid, crate::process::home_cpu_of(child_pid));
+
     // Track the running instance for crash auto-recovery (see note_thread_exit).
     note_running(child_pid, app_id);
 

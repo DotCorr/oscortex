@@ -181,11 +181,18 @@ pub fn init(smp_resp: Option<&'static MpResponse>) {
             }
         }
 
-        CPU_COUNT.store(cpu_idx, Ordering::Release);
+        // Publish the ONLINE count, not the configured count. The scheduler reads
+        // `CPU_COUNT > 1` to decide whether to take the home-pinned SMP path, and
+        // `pick_home_cpu_for_app` pins apps to cores `1..CPU_COUNT`. If an AP failed
+        // to come online we MUST NOT advertise it — otherwise an app pinned to that
+        // dead core would never be scheduled (starves at a black screen). APs come
+        // online contiguously from index 1 under Limine, so the online count is also
+        // a valid scan range for `current_cpu_id()`.
         let online = (0..expected)
             .filter(|&i| unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) })
             .count();
-        log::info!("[SMP] {}/{} CPU(s) online", online, expected);
+        CPU_COUNT.store(online as u32, Ordering::Release);
+        log::error!("[SMP] {}/{} CPU(s) online — CPU_COUNT={}", online, expected, online);
     }
 }
 

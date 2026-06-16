@@ -25,72 +25,91 @@ pub(crate) static PAGE_TABLE_LOCK: Mutex<()> = Mutex::new(());
 /// and hand back a guard that releases nothing until depth returns to zero. This
 /// is sound because all writers run on one core (the scheduler is cooperative /
 /// single-CPU) — there is no second core to race the page-table structure.
-static PAGE_TABLE_LOCK_DEPTH: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+/// PER-CPU re-entrancy depth for the page-table critical section. This MUST be
+/// per-CPU. A single global counter was a critical SMP-safety bug: when core 0 held
+/// the section (depth=1, holding the real lock) and core 1 called lock_page_table(),
+/// core 1's fetch_add saw prev=1 (non-zero), concluded it was a NESTED call, and
+/// BYPASSED the real lock — both cores then mutated page tables in parallel and
+/// corrupted them (observed: KERNEL PANIC "corrupt PTE — a page table was
+/// overwritten"). With a per-CPU counter each core's FIRST acquisition (prev==0)
+/// takes the real cross-core lock and blocks until the other core releases.
+static PAGE_TABLE_LOCK_DEPTH: [core::sync::atomic::AtomicU32; crate::arch::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
 
 pub(crate) struct PageTableGuard {
     outer: Option<spin::MutexGuard<'static, ()>>,
-    /// aarch64 only: DAIF captured by the OUTER acquisition before it masked
-    /// IRQs. Restored when the outer guard drops. Unused on nested guards (IRQs
-    /// stay masked for the whole outer section).
+    /// CPU that took this guard (index into PAGE_TABLE_LOCK_DEPTH). Stable for the
+    /// section: on aarch64 IRQs are masked (no preemption/migration); on x86 the
+    /// guard is short-lived and the outer drop runs on the same core.
+    cpu: usize,
+    /// aarch64 only: IRQ state captured by the OUTER acquisition before it masked
+    /// IRQs, restored on outer drop. x86 keeps its original non-masking behaviour
+    /// (masking the whole section there starved the app core's timer-ISR frame pump
+    /// during heavy demand-paging → app never presented).
     #[cfg(target_arch = "aarch64")]
-    saved_daif: u64,
+    saved_irq: u64,
 }
 
 impl Drop for PageTableGuard {
     fn drop(&mut self) {
         if self.outer.is_some() {
-            // Outermost guard: clear depth, release the real lock, THEN re-enable
-            // IRQs. The lock byte must be released before IRQs come back on, or a
-            // freshly-unmasked timer tick could switch to a thread that spins on
-            // the still-held lock with IRQs masked → single-core deadlock.
-            PAGE_TABLE_LOCK_DEPTH.store(0, core::sync::atomic::Ordering::Release);
-            let _ = self.outer.take(); // drop the MutexGuard now (IRQs still masked)
+            // Outermost guard: clear depth, release the real lock, THEN (aarch64)
+            // re-enable IRQs / (x86) re-enable preemption. The lock byte must be
+            // released before preemption/IRQs come back, or a freshly-allowed
+            // switch could land on a thread that spins on the still-held lock.
+            PAGE_TABLE_LOCK_DEPTH[self.cpu].store(0, core::sync::atomic::Ordering::Release);
+            let _ = self.outer.take();
             #[cfg(target_arch = "aarch64")]
-            crate::arch::aarch64::cpu::interrupts_restore(self.saved_daif);
+            crate::arch::aarch64::cpu::interrupts_restore(self.saved_irq);
         } else {
-            PAGE_TABLE_LOCK_DEPTH.fetch_sub(1, core::sync::atomic::Ordering::Release);
+            PAGE_TABLE_LOCK_DEPTH[self.cpu].fetch_sub(1, core::sync::atomic::Ordering::Release);
         }
+        // x86: balance the preempt_disable() done in every lock_page_table() call
+        // (outer AND nested). Done last so the real lock is already released.
+        #[cfg(not(target_arch = "aarch64"))]
+        crate::process::preempt_enable(self.cpu as u32);
     }
 }
 
-/// Acquire the page-table critical section, re-entrant on a single core.
-///
-/// On aarch64 the outer acquisition also MASKS IRQs for the whole critical
-/// section. The reentrant depth counter is only sound if the section cannot be
-/// interleaved by another thread; but syscalls run with IRQs unmasked, so a
-/// generic-timer tick can preempt a lock holder mid-section and switch to a
-/// sibling, which then sees a non-zero depth and proceeds as a bogus "nested"
-/// writer — desynchronising the depth counter from the real lock and eventually
-/// stranding the lock held while depth reads 0 (a later outer acquire then spins
-/// forever with IRQs masked in the demand-abort handler). Masking IRQs around
-/// the outer section makes it genuinely uninterruptible, so nesting only ever
-/// means true same-stack re-entry (e.g. a demand fault during a page-table walk,
-/// which already runs IRQs-masked). x86 keeps its original behaviour.
+/// Acquire the page-table critical section. Re-entrant PER-CPU, SMP-safe across
+/// cores. The FIRST acquisition on each core takes the real cross-core
+/// `PAGE_TABLE_LOCK`, which blocks until any OTHER core holding it releases — the
+/// cross-core serialisation the old GLOBAL depth counter silently skipped (a 2nd
+/// core saw depth>0, treated itself as a bogus "nested" writer, and mutated page
+/// tables in parallel → corruption). aarch64 additionally masks IRQs for the whole
+/// section so its per-CPU depth cannot be desynchronised by a same-core preemption;
+/// x86 keeps its original non-masking behaviour (proven stable, and masking here
+/// starved the app core's frame pump).
 #[inline]
 pub(crate) fn lock_page_table() -> PageTableGuard {
-    // Mask IRQs BEFORE touching the depth counter so the fetch_add → lock
-    // sequence cannot be preempted. On a nested call IRQs are already masked
-    // (the outer masked them); this is then an idempotent no-op.
     #[cfg(target_arch = "aarch64")]
-    let saved_daif = crate::arch::aarch64::cpu::interrupts_save_and_disable();
-    let prev = PAGE_TABLE_LOCK_DEPTH.fetch_add(1, core::sync::atomic::Ordering::Acquire);
+    let saved_irq = crate::arch::aarch64::cpu::interrupts_save_and_disable();
+    // x86: disable preemption (NOT IRQs) for the section. This pins the thread to
+    // its cpu (timer-preempt bails) so the per-CPU depth counter can't be stranded
+    // by a mid-section migration — which would re-expose the cross-core lock bypass
+    // — while keeping IRQs on so the app core's timer-ISR frame pump still fires.
+    // Returns the pinned cpu; use it for the depth slot so disable/enable balance.
+    #[cfg(not(target_arch = "aarch64"))]
+    let cpu = crate::process::preempt_disable() as usize;
+    #[cfg(target_arch = "aarch64")]
+    let cpu = crate::arch::smp::current_cpu_id() as usize;
+    let prev = PAGE_TABLE_LOCK_DEPTH[cpu].fetch_add(1, core::sync::atomic::Ordering::Acquire);
     if prev == 0 {
-        // First (outer) acquisition on this core: take the real lock.
+        // First (outer) acquisition on this core: take the real cross-core lock.
         let g = PAGE_TABLE_LOCK.lock();
         PageTableGuard {
             outer: Some(g),
+            cpu,
             #[cfg(target_arch = "aarch64")]
-            saved_daif,
+            saved_irq,
         }
     } else {
-        // Nested acquisition: the outer guard already holds the lock (and already
-        // masked IRQs). `saved_daif` here is "already masked" and is discarded on
-        // drop — only the outer guard restores DAIF.
+        // Nested (same-core, same-stack) re-entry: we already hold the lock.
         PageTableGuard {
             outer: None,
+            cpu,
             #[cfg(target_arch = "aarch64")]
-            saved_daif,
+            saved_irq,
         }
     }
 }
@@ -1006,7 +1025,20 @@ pub unsafe fn map_user_page_with_flags(
 
 /// Walk a user PML4 and return the physical frame already mapped at `virt`,
 /// or `None` if the page is not yet mapped.
+/// A page-table root is only walkable if it is a plausible physical frame: non-zero
+/// (phys 0 is the reserved/null frame — a freed process clears its pml4_phys to 0)
+/// and within addressable RAM. Walking a freed/null root would deref phys 0 →
+/// `phys_to_virt(0)` = the HHDM base, which is unmapped → unrecoverable kernel page
+/// fault. This is the SMP teardown hazard: crash-recovery frees a dead app's pml4
+/// while another core still holds a stale reference (e.g. a futex physaddr lookup).
+/// Treating an insane root as "nothing mapped" keeps the kernel alive.
+#[inline]
+fn pml4_root_walkable(pml4_phys: u64) -> bool {
+    pml4_phys != 0 && pml4_phys < 0x0000_0004_0000_0000
+}
+
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+    if !pml4_root_walkable(pml4_phys) { return None; }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page(pml4_phys, virt) }
@@ -1019,6 +1051,7 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
 /// Walk a user PML4 and return the physical frame mapped at `virt` along with
 /// its writable and executable flags.
 pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+    if !pml4_root_walkable(pml4_phys) { return None; }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     { x86_64_impl::translate_user_page_flags(pml4_phys, virt) }
@@ -1030,6 +1063,9 @@ pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool
 
 /// Free all frames in a user PML4 and the PML4 itself.
 pub fn free_user_pml4(pml4_phys: u64) {
+    // Never walk/free a null or insane root: a double-free or a stale 0 would
+    // otherwise deref phys 0 and panic the kernel (see pml4_root_walkable).
+    if !pml4_root_walkable(pml4_phys) { return; }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     x86_64_impl::free_user_pml4(pml4_phys);
@@ -1070,6 +1106,7 @@ pub unsafe fn update_user_page(
 /// # Safety
 /// `pml4_phys` must be a valid allocated PML4.
 pub unsafe fn unmap_user_page(pml4_phys: u64, virt: u64) -> Result<u64, &'static str> {
+    if !pml4_root_walkable(pml4_phys) { return Err("dead/null pml4"); }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
     {
@@ -1092,6 +1129,7 @@ pub static UNMAP_FREED: core::sync::atomic::AtomicU64 = core::sync::atomic::Atom
 
 /// Unmap a range of virtual addresses in a specific PML4 and free their physical frames.
 pub fn unmap_user_range(pml4_phys: u64, start_va: u64, size: u64) {
+    if !pml4_root_walkable(pml4_phys) { return; }
     if size == 0 { return; }
     let start = start_va & !0xFFF;
     let end = (start_va + size + 4095) & !0xFFF;

@@ -182,6 +182,13 @@ pub struct Process {
     /// away — preventing the mid-critical-section corruption that broke preempted
     /// Dart engine threads. Defaults true. See [[redox-blueprint]].
     pub is_preemptable: bool,
+    /// SMP: HOME CPU core for this thread's engine (process group). The scheduler
+    /// runs a thread ONLY on its home core, so a whole Flutter engine stays on ONE
+    /// core (cooperative hand-off + per-CPU scratch never split). Different engines
+    /// get different home cores → parallel. 0 = BSP (default; single-core path).
+    /// Threads inherit their creator's home_cpu; an app host is assigned in
+    /// app_registry::launch. Only consulted when CPU_COUNT > 1.
+    pub home_cpu: u32,
     /// aarch64 only: full EL0 trap-frame snapshot (x0..x30, SP_EL0, ELR, SPSR,
     /// ESR) captured when this thread is timer-preempted at an arbitrary user
     /// instruction. The shared `UserRegs` carries only the x86-named subset, so
@@ -279,6 +286,7 @@ impl Process {
             user_stack_size: 0,
             current_cpu: None,
             is_preemptable: true,
+            home_cpu: 0,
             #[cfg(target_arch = "aarch64")]
             arch_trapframe: [0u64; 102],
             #[cfg(target_arch = "aarch64")]
@@ -650,6 +658,33 @@ pub fn preempt_disabled() -> bool {
     c < crate::arch::smp::MAX_CPUS && PREEMPT_DEPTH[c].load(Ordering::Acquire) > 0
 }
 
+/// Disable preemption on the CURRENT cpu and return that cpu index. The timer-
+/// preempt path bails while PREEMPT_DEPTH>0, so the caller's thread cannot be
+/// switched away or migrated — WITHOUT masking IRQs (timer ticks still fire, so a
+/// frame pump on this core keeps running). Pair with `preempt_enable(cpu)` using
+/// the RETURNED cpu so the dec lands on the same slot even if a migration somehow
+/// occurred in the tiny pre-disable window. Used by the page-table critical section
+/// to keep its per-CPU re-entrancy depth sound on x86 (no IRQ mask there).
+#[inline]
+pub fn preempt_disable() -> u32 {
+    // Briefly mask IRQs so reading the current cpu and bumping its PREEMPT_DEPTH is
+    // ATOMIC — otherwise a timer preemption between the two could migrate the thread
+    // and we'd disable preemption on the WRONG cpu (the thread then runs preemptible
+    // on its new cpu, and a page-table section's per-CPU depth gets stranded on the
+    // old cpu → cross-core lock bypass → page-table corruption, observed ~1/6). Once
+    // PREEMPT_DEPTH is bumped, preemption is disabled, so after we restore IRQs the
+    // thread can no longer migrate; the cpu stays valid for the whole section.
+    let irq = crate::arch::interrupts_save_and_disable();
+    let cpu = ptable_cpu_idx();
+    preempt_disable_cpu(cpu);
+    crate::arch::interrupts_restore(irq);
+    cpu
+}
+#[inline]
+pub fn preempt_enable(cpu: u32) {
+    preempt_enable_cpu(cpu);
+}
+
 /// Global context-switch serialization lock (Redox-blueprint #2). Reserved for the
 /// M4 two-layer `switch_to`; declared now so the foundation is in one place.
 #[allow(dead_code)]
@@ -864,6 +899,18 @@ pub fn spawn_with_bootstrap(
             // prompted NET permission rather than granting every app by default.
             crate::security::Capabilities::NET
         };
+        // SMP home-core assignment — done HERE, atomically before the process
+        // becomes Running, so there is no window where core 0 could schedule a
+        // freshly-spawned app host (home_cpu still defaulting to 0) and leave a
+        // stale `current_cpu` claim that the real home core then can't reclaim.
+        // An app host (HOST_MODE_APP) is pinned to a dedicated application core;
+        // the shell and everything else stays on the BSP (0). On single-core
+        // boots pick_home_cpu_for_app returns 0, so this is a no-op there.
+        p.home_cpu = if bootstrap.rdi == crate::app_registry::HOST_MODE_APP {
+            pick_home_cpu_for_app()
+        } else {
+            0
+        };
         p.syscall_stack_base = sys_stack_base;
         p.syscall_stack_top = sys_stack_top;
         p.xstate = XStateBuf::default();
@@ -894,6 +941,13 @@ pub fn spawn_with_bootstrap(
         name, pid, entry, bootstrap.rdi, bootstrap.rsi, bootstrap.rdx, bootstrap.parent_pid,
         caps_of(pid)
     );
+    // SMP: the new process is born Running and may be HOME-PINNED to another core
+    // (an app host → an AP). The spawning core (the shell, on the BSP) must poke the
+    // other cores so the home core wakes from its idle `hlt` and picks the newborn
+    // up immediately, instead of waiting for its next timer tick — which a busy/
+    // starved sibling core (notably under TCG SMP) may delay indefinitely, leaving
+    // the freshly-launched app stuck unscheduled (the "app never ran" freeze).
+    crate::arch::smp::broadcast_resched_ipi();
     Ok(pid)
 }
 
@@ -1061,6 +1115,35 @@ pub fn set_preemptable(pid: u32, value: bool) {
     }
 }
 
+/// SMP: pin `pid` (and its engine, since threads inherit it) to a home CPU core.
+/// The SMP home core a process (and its thread group) is pinned to. 0 = BSP.
+pub fn home_cpu_of(pid: u32) -> u32 {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid { p.home_cpu } else { 0 }
+}
+
+/// ISR-safe (try-lock) read of a process's home core. Returns None if the table
+/// lock is momentarily contended (the caller simply skips this tick). Used by the
+/// per-core timer-ISR wake-assist so a core only ever touches its own home threads.
+pub fn home_cpu_of_try(pid: u32) -> Option<u32> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    Some(if p.pid == pid { p.home_cpu } else { 0 })
+}
+
+/// Round-robin a freshly-launched engine onto a core OTHER than the BSP (0, the
+/// shell's core) when >1 core is online; else the BSP. First app → core 1.
+pub fn pick_home_cpu_for_app() -> u32 {
+    let n = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire);
+    if n <= 1 {
+        return 0;
+    }
+    static NEXT_APP_CPU: AtomicU32 = AtomicU32::new(0);
+    let k = NEXT_APP_CPU.fetch_add(1, Ordering::Relaxed);
+    1 + (k % (n - 1))
+}
+
 /// Is `pid` currently preemptable? Defaults true for unknown/dead pids so callers
 /// never wedge on a stale id.
 pub fn is_preemptable(pid: u32) -> bool {
@@ -1222,6 +1305,15 @@ pub fn try_claim_cpu_for_try(pid: u32, my_cpu: u32) -> bool {
         let idx = idx_of(pid);
         let p = unsafe { &mut PTABLE[idx] };
         if p.pid == pid && p.state == ProcState::Running {
+            // SMP home-core: only the target's HOME core may claim it. This is what
+            // lets the per-core timer-ISR wake-assist run on every core safely — the
+            // BSP wakes only home_cpu==0 threads (the shell), an AP wakes only its
+            // own home-pinned threads (a launched app). Two cores never claim the
+            // same user thread. On single-core home_cpu is always 0 == my_cpu.
+            let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+            if smp && p.home_cpu != my_cpu {
+                return false;
+            }
             if p.current_cpu.is_none() || p.current_cpu == Some(my_cpu) {
                 p.current_cpu = Some(my_cpu);
                 return true;
@@ -1363,6 +1455,17 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
         }
     }
 
+    // SMP: with >1 core online, an app host is pinned to its own APPLICATION core
+    // (home_cpu, set in spawn_with_bootstrap), so the launched engine runs with its
+    // OWN per-CPU GPR scratch — never sharing the cooperative context that corrupts
+    // a 2nd engine on a single core. We KEEP foreground-exclusive (the shell is
+    // suspended while an app is foreground): letting the shell run concurrently with
+    // the app trips Dart's isolate-confinement check ("Isolate main is owned by os
+    // thread X, failed to schedule from os thread Y" → sys_abort). Exclusive + the
+    // `home_cpu == my_cpu` filter together give: the app runs ALONE on its core, the
+    // shell stays parked on the BSP — separate scratch, no concurrent shell engine.
+    let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+
     let focus = fg;
     let input_target = if focus != 0 { focus } else { 1 };
     // Only honour the input shortcut when the target belongs to the foreground
@@ -1371,7 +1474,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     if input_ok && input_target != 0 && crate::wm::input_pending_for(input_target) > 0 {
         if current != input_target {
             let target = unsafe { &mut PTABLE[idx_of(input_target)] };
-            if target.pid == input_target && target.state == ProcState::Running {
+            if target.pid == input_target && target.state == ProcState::Running
+                && (!smp || target.home_cpu == my_cpu)
+            {
                 if target.current_cpu.is_none() || target.current_cpu == Some(my_cpu) {
                     target.current_cpu = Some(my_cpu);
                     return Some(input_target);
@@ -1385,7 +1490,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     // the SHELL's own baton triggers this (the app's baton runs the app instead).
     if !exclusive && current != 1 && crate::wm::embedder_baton_due(1) {
         let embedder = unsafe { &mut PTABLE[idx_of(1)] };
-        if embedder.pid == 1 && embedder.state == ProcState::Running {
+        if embedder.pid == 1 && embedder.state == ProcState::Running
+            && (!smp || embedder.home_cpu == my_cpu)
+        {
             if embedder.current_cpu.is_none() || embedder.current_cpu == Some(my_cpu) {
                 embedder.current_cpu = Some(my_cpu);
                 return Some(1);
@@ -1403,6 +1510,9 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
         let idx = (start + off) % MAX_PROCS;
         let p = unsafe { &mut PTABLE[idx] };
         if p.pid != 0 && p.state == ProcState::Running {
+            if smp && p.home_cpu != my_cpu {
+                continue; // SMP: this thread's engine is pinned to another core
+            }
             if exclusive && get_group_leader_locked(p.pid) != fg_group {
                 continue; // not in the foreground app's group — skip while it runs
             }
@@ -1419,6 +1529,7 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     if res.is_none() && current != 0 {
         let c = unsafe { &mut PTABLE[idx_of(current)] };
         if c.pid == current && c.state == ProcState::Running
+            && (!smp || c.home_cpu == my_cpu)
             && (!exclusive || get_group_leader_locked(current) == fg_group)
         {
             if c.current_cpu.is_none() || c.current_cpu == Some(my_cpu) {
@@ -1532,14 +1643,14 @@ pub fn spawn_thread(
     arg: u64,
     stack_size: usize,
 ) -> Result<u32, &'static str> {
-    let (parent_pml4_phys, owning_pid) = {
+    let (parent_pml4_phys, owning_pid, parent_home_cpu) = {
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &PTABLE[idx_of(parent_pid)] };
         if p.pid != parent_pid || p.state == ProcState::Dead {
             log::error!("[spawn_thread] parent not found pid={}", parent_pid);
             return Err("parent not found");
         }
-        (p.pml4_phys, get_group_leader_locked(parent_pid))
+        (p.pml4_phys, get_group_leader_locked(parent_pid), p.home_cpu)
     };
 
     let tid = match alloc_pid() {
@@ -1681,6 +1792,7 @@ pub fn spawn_thread(
         let p = unsafe { &mut PTABLE[idx_of(tid)] };
         p.pid                = tid;
         p.pml4_phys          = parent_pml4_phys; // shared with parent
+        p.home_cpu           = parent_home_cpu;  // SMP: thread stays on its engine's core
         p.regs               = regs;
         p.state              = ProcState::Running;
         p.exit_code          = 0;

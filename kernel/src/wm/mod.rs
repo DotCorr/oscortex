@@ -22,9 +22,16 @@ fn canonical_pid(pid: u32) -> u32 {
     }
 }
 
+/// Visibility test between an event's owner and a consumer. BOTH pids MUST be
+/// already canonical (group leaders). This is a RAW comparison that deliberately
+/// does NOT call `canonical_pid` — that would take PTABLE_LOCK, and this runs
+/// inside `with_queue` (WM lock held). Acquiring PTABLE_LOCK under the WM lock
+/// inverts the scheduler's PTABLE→WM order (next_runnable_pid_locked calls
+/// input_pending_for while holding PTABLE_LOCK) → ABBA deadlock under SMP.
+/// Callers canonicalize at the WM-module boundary, before taking the WM lock.
 #[inline(always)]
 fn owner_visible_to_consumer(owner_pid: u32, consumer_pid: u32) -> bool {
-    owner_pid == 0 || owner_pid == canonical_pid(consumer_pid)
+    owner_pid == 0 || owner_pid == consumer_pid
 }
 
 struct EventQueue {
@@ -51,7 +58,10 @@ impl EventQueue {
     }
 
     fn push(&mut self, mut ev: WmEvent, owner_pid: u32) {
-        let owner_pid = canonical_pid(owner_pid);
+        // owner_pid is ALREADY canonical (canonicalized by the caller before the
+        // WM lock was taken). Do NOT call canonical_pid here — it takes PTABLE_LOCK
+        // under the WM lock and deadlocks against the scheduler (see
+        // owner_visible_to_consumer).
         ev.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
@@ -105,7 +115,7 @@ impl EventQueue {
     }
 
     fn push_front(&mut self, mut ev: WmEvent, owner_pid: u32) {
-        let owner_pid = canonical_pid(owner_pid);
+        // owner_pid is ALREADY canonical (see push() — never take PTABLE_LOCK here).
         ev.seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1).max(1);
 
@@ -524,9 +534,12 @@ pub fn push_event_for(owner_pid: u32, kind: u32, flags: u32, a: u64, b: u64) {
         );
     });
 
-    // Wake the waiter if they are eligible for this event.
+    // Wake the waiter if they are eligible for this event. We are now OUTSIDE the
+    // WM lock (the with_queue closure closed above), so canonicalizing the raw
+    // waiter pid here is safe — owner_visible_to_consumer itself is raw and must
+    // be fed canonical pids (owner_pid was canonicalized at fn entry).
     let waiter = WM_WAITER.load(Ordering::Acquire);
-    if waiter != 0 && owner_visible_to_consumer(owner_pid, waiter) {
+    if waiter != 0 && owner_visible_to_consumer(owner_pid, canonical_pid(waiter)) {
         WM_WAITER.store(0, Ordering::Release);
         crate::process::wake_process(waiter);
     }

@@ -627,16 +627,27 @@ unsafe extern "C" fn apic_timer_entry() {
 }
 
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
+    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
+
+    // AP idle-park during shell bring-up: until the shell's engine is up (and thus
+    // an app could be launched onto an AP), an AP has no home-pinned work. Doing the
+    // timerfd/wake/scheduler work here only contends with the BSP's first-frame
+    // bring-up (a boot stall under TCG SMP). EOI and return — the AP just halts.
+    if cpu_id != 0 && !crate::wm::flutter_init_ready() {
+        crate::arch::apic::eoi();
+        return;
+    }
+
     crate::syscall::check_timerfds_and_wake_try();
     crate::process::handle_pending_wakes_try();
-
-    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
 
     // Set a deferred-kick flag every ~500 ms (500 ticks × 1 ms/tick).
     // The flag is consumed in syscall context (sys_pthread_mutex_unlock or
     // sys_wm_event_wait) where spinlock acquisition is safe.  This ISR path
-    // only does an atomic store — completely lock-free.
-    if cpu_id == 0 {
+    // only does an atomic store — completely lock-free. Fired on ALL cores: a
+    // launched app runs on an AP and needs its own cooperative deadlocks broken
+    // (the global flag is consumed by whichever core's thread next yields).
+    {
         static TR_KICK_CTR: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let k = TR_KICK_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -731,35 +742,36 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         return;
     }
 
-    // SMP SAFETY: the scheduler is cooperative and BSP-only — it assumes at most
-    // ONE user thread runs at a time. Only CPU 0 may enter/run user threads. If an
-    // AP's timer ISR were allowed past here it would claim and enter a user thread
-    // (via the wake-assist below), running it CONCURRENTLY with the BSP. Two user
-    // threads executing in true parallel break the futex/condvar emulation's
-    // single-core assumptions → nondeterministic livelock (the smp>1 failure).
-    // Keep APs out: they EOI'd above and now simply return to halt.
-    if cpu_id != 0 {
-        return;
-    }
-
-    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall
-    // hlt loop, queued input can otherwise leave PID 1 runnable-but-unentered.
-    // If the interrupt lands in idle (cur=0), PID 1 is still the safe target
-    // for post-init WM input. If it lands in PID 1's own wm_event_wait loop,
-    // re-entering PID 1 makes it re-execute the syscall and drain the queue.
+    // SMP home-core model: each core runs ONLY threads pinned to its home_cpu, so
+    // the BSP and an AP never enter the SAME user thread concurrently. The old
+    // "BSP-only" gate (which parked every AP) is replaced by a per-target home-core
+    // check inside try_claim_cpu_for_try below: a core's wake-assist can only claim
+    // and enter a target whose home_cpu == this core. The shell (home 0) is woken by
+    // the BSP; a launched app (home 1+) is woken by its AP. On single-core there is
+    // only cpu 0 and home_cpu is always 0, so this is exactly the original path.
+    //
+    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall hlt
+    // loop, queued input/baton can leave it runnable-but-unentered. Re-entering the
+    // target makes it re-execute its wm_event_wait and drain the queue (pumping a
+    // frame). This is what pumps a launched app's frames on its application core.
+    let my_cpu = cpu_id;
     let cur = crate::process::current_pid();
     let focus = crate::wm::focus_pid();
     let target = if focus != 0 { focus } else { 1 };
-    if target != 0
+    // Only the target's HOME core runs the wake-assist for it. This guards the WHOLE
+    // block (not just the claim): set_state_try has a side effect, so an AP must not
+    // flip the shell's state to Running from core 1 (that races the shell's own
+    // cooperative state machine on core 0 — observed to freeze the shell's bring-up).
+    // On single-core, home_cpu is always 0 == my_cpu, so this is the original path.
+    let target_is_mine = crate::process::home_cpu_of_try(target) == Some(my_cpu);
+    if target != 0 && target_is_mine
         && crate::wm::flutter_init_ready()
         && !crate::wm::flutter_bootstrap_spin_active()
         && (cur == 0 || crate::process::is_blocked_try(cur))
         && (crate::wm::input_pending_for(target) > 0 || crate::wm::embedder_baton_due(target))
     {
         if crate::process::set_state_try(target, crate::process::ProcState::Running) {
-
             if cur != target {
-                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
                 if crate::process::try_claim_cpu_for_try(target, my_cpu) {
                     crate::process::enter_user_by_pid_noreturn_try(target);
                 }
