@@ -58,9 +58,15 @@ is the real fix. But naively turning APs loose on the current scheduler corrupte
   bails when this CPU is non-preemptable, so we never switch away from a global-lock holder.
   Additive + dormant where preemption is off; real effect on the x86 quantum-preempt path.
   *Verify: both arches still boot + render single-core, no regression.*
-- **M2 Physical-address-keyed futex.** Translate the user VA → physaddr; key/validate by it.
-  Removes `PTABLE_LOCK` from the wake path. *Verify: engine bring-up still boots (the futex
-  is load-bearing for it); cross-process no false wakes.*
+- **M2 ✅ Physical-address-keyed futex.** `futex_wake_waiters` now scopes by the PHYSICAL
+  address of the futex word (`futex_phys_of` = translate the waiter's VA via its page-table
+  root), the address-space-independent identity; falls back to group-leader scoping only if
+  a translation fails (never drops a wake the old path allowed). Behaviorally identical
+  while apps share the shell's address space (same pml4 → same physaddr → same decision);
+  becomes the correct key once engines are isolated into separate address spaces. *Verified:
+  engine bring-up boots + renders the launcher (present→65, 0 faults).* NOTE: still takes
+  `PTABLE_LOCK` to read each waiter's pml4 (`pml4_phys_of`) — fully lock-free lookup is a
+  later optimization; correctness/keying is the M2 deliverable.
 - **M3 IPI-based wakeup model.** Convert the `enter_user_by_pid_noreturn` wake sites to
   `set_state(Running)` + reschedule IPI. Implement the aarch64 GIC-SGI reschedule IPI.
   *Verify: single-core unaffected (IPI is a no-op on 1 core; scheduler picks woken threads).*

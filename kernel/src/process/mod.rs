@@ -1463,6 +1463,20 @@ pub fn get_user_context(pid: u32) -> Option<UserContext> {
     })
 }
 
+/// Page-table root (PML4 on x86, TTBR0 on aarch64) of any LIVE process — including
+/// Blocked ones (unlike `get_user_context`, which requires Running). Used by the
+/// futex to compute a waiter's PHYSICAL futex address for SMP-correct wake scoping
+/// (a Blocked futex waiter must still be locatable). Returns None for Dead slots.
+pub fn pml4_phys_of(pid: u32) -> Option<u64> {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state != ProcState::Dead {
+        Some(p.pml4_phys)
+    } else {
+        None
+    }
+}
+
 pub fn current_syscall_stack_top() -> Option<u64> {
     let pid = current_pid();
     if pid == 0 {
