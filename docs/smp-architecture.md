@@ -67,9 +67,17 @@ is the real fix. But naively turning APs loose on the current scheduler corrupte
   engine bring-up boots + renders the launcher (present→65, 0 faults).* NOTE: still takes
   `PTABLE_LOCK` to read each waiter's pml4 (`pml4_phys_of`) — fully lock-free lookup is a
   later optimization; correctness/keying is the M2 deliverable.
-- **M3 IPI-based wakeup model.** Convert the `enter_user_by_pid_noreturn` wake sites to
-  `set_state(Running)` + reschedule IPI. Implement the aarch64 GIC-SGI reschedule IPI.
-  *Verify: single-core unaffected (IPI is a no-op on 1 core; scheduler picks woken threads).*
+- **M3 ✅ Reschedule-IPI primitive on both arches.** x86 was already complete
+  (`broadcast_resched_ipi` → `send_resched_ipi` → vector 0x40 → `apic_resched_handler`),
+  and `set_state(Running)` already calls `broadcast_resched_ipi` on a wake. Filled the
+  aarch64 gap: `gic::send_sgi_all_but_self`/`send_sgi` (write GICD_SGIR), `SGI_RESCHED`
+  (SGI 0), `broadcast_resched_ipi` now sends it (guarded on `CPU_COUNT > 1` so single-core
+  never touches the GIC — it's on the hot set_state path), and the IRQ handler recognizes
+  + EOIs SGI 0. *Compile-verified both arches × {default, smp}; provably single-core-neutral
+  (guarded no-op + the SGI-0 branch is unreachable on one core). SGI delivery + the actual
+  rerun-scheduler-on-IPI action are exercised at M5 (APs idle until then).* NOTE: the wake
+  sites still use the cooperative direct-enter on the same core; M3 adds the CROSS-core
+  signal — replacing direct-enter wholesale waits for M4/M5's per-CPU run queues.
 - **M4 Two-layer `switch_to` + per-CPU current/idle contexts.** Build the high-level switch
   over `context_switch`; give each CPU an idle context. *Verify: BSP uses it with no
   regression; an AP runs a per-CPU idle loop (heartbeat log) under `--features smp`.*

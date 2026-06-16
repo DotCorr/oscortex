@@ -72,6 +72,14 @@ pub fn start_scheduler_tick() {
 fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     let intid = super::gic::acknowledge();
 
+    // Cross-core reschedule IPI (SMP, SGI 0). Taking the interrupt already woke
+    // this core from wfi; EOI and return. Once APs run the scheduler (M5), this is
+    // where the woken core re-picks a runnable thread.
+    if intid == super::gic::SGI_RESCHED {
+        super::gic::eoi(intid);
+        return;
+    }
+
     // Non-timer interrupts. virtio-mmio input SPIs (slot i → INTID 48+i) drive the
     // pointer/keyboard; drain them into the WM queue, then EOI. Everything else is
     // spurious/unhandled: EOI (if real) and return.

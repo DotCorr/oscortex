@@ -405,7 +405,14 @@ pub fn init(_smp_resp: Option<&'static MpResponse>) {
     log::info!("[SMP] single-core boot (AP bring-up gated behind the `smp` feature)");
 }
 
-/// Broadcast a reschedule IPI to all other online CPUs.
-///
-/// TODO(arm): send a GIC SGI to the target CPU interface(s). No-op (single core).
-pub fn broadcast_resched_ipi() {}
+/// Broadcast a reschedule IPI (GIC SGI) to all other online CPUs, so a thread
+/// made runnable on this core gets promptly picked up by the core it's affined
+/// to. Guarded on CPU_COUNT > 1: single-core never touches the GIC (this is on
+/// the hot `set_state(Running)` path), and the SGI is "all-but-self" so it
+/// reaches no one anyway on one core. The receiving core's IRQ handler EOIs it
+/// and (once APs schedule, M5) reruns its scheduler.
+pub fn broadcast_resched_ipi() {
+    if CPU_COUNT.load(Ordering::Acquire) > 1 {
+        crate::arch::aarch64::gic::send_sgi_all_but_self(crate::arch::aarch64::gic::SGI_RESCHED);
+    }
+}
