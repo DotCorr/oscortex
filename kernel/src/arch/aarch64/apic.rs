@@ -182,16 +182,33 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         let cur = crate::process::current_pid();
         let focus = crate::wm::focus_pid();
         let target = if focus != 0 { focus } else { 1 };
-        if target != 0
+        // HOME-CORE per-core wake-assist (mirrors x86 idt.rs). Only the target's HOME
+        // core re-enters it: the BSP pumps the shell (home 0), an AP pumps the app
+        // pinned to it (home 1+). try_claim_cpu_for_try is home-gated so this can't
+        // steal another core's thread. The ISR-initiated resume below was previously
+        // disabled (// BISECT) as the suspected cause of "pid=2 Dart corruption" — but
+        // that predates the 2026-06-16 per-CPU page-table-lock + ABBA lock-order fixes,
+        // the real corruption source. Re-enabled: the app's engine bootstrap stalls at
+        // FlutterEngineRunInitialized without it (the worker the isolate launch waits
+        // on is parked and only this resume re-enters it), exactly as on x86.
+        let my_cpu = super::smp::current_cpu_id();
+        let target_is_mine = crate::process::home_cpu_of_try(target) == Some(my_cpu);
+        if target != 0 && target_is_mine
             && (cur == 0 || crate::process::is_blocked_try(cur))
             && (crate::wm::input_pending_for(target) > 0
                 || crate::wm::embedder_baton_due(target))
             && cur != target
         {
-            // BISECT: just wake the target; let normal cooperative scheduling enter
-            // it (the ISR-initiated resume enter_user_by_pid_noreturn_try is the
-            // prime suspect for the residual pid=2 Dart corruption — disabled to test).
-            let _ = crate::process::set_state_try(target, crate::process::ProcState::Running);
+            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+                // SINGLE-CORE: keep the proven set_state_try-only behaviour (the
+                // BISECT) so the shipped single-core ARM path is byte-unchanged. The
+                // ISR-initiated resume is MULTI-CORE only, where the app runs on its
+                // own home AP and this re-enters it from that AP's timer ISR.
+                let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+                if smp && crate::process::try_claim_cpu_for_try(target, my_cpu) {
+                    crate::process::enter_user_by_pid_noreturn_try(target);
+                }
+            }
         }
         return;
     }

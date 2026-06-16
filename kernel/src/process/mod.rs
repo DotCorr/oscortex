@@ -911,6 +911,12 @@ pub fn spawn_with_bootstrap(
         } else {
             0
         };
+        // Wake the dormant application core: it idles (wfi) until it has home-pinned
+        // work. Flag it now (atomic, no lock); the reschedule IPI at the end of this
+        // fn then kicks it out of wfi to engage scheduling.
+        if p.home_cpu != 0 {
+            mark_cpu_has_work(p.home_cpu);
+        }
         p.syscall_stack_base = sys_stack_base;
         p.syscall_stack_top = sys_stack_top;
         p.xstate = XStateBuf::default();
@@ -1121,6 +1127,30 @@ pub fn home_cpu_of(pid: u32) -> u32 {
     let _g = PTABLE_LOCK.lock();
     let p = unsafe { &PTABLE[idx_of(pid)] };
     if p.pid == pid { p.home_cpu } else { 0 }
+}
+
+/// Per-application-core "has home-pinned work" flag. A secondary core (AP) stays
+/// fully dormant — `wfi`, no run-queue polling, its timer ISR does nothing — until
+/// an app is actually pinned to it. Apps only launch well after boot, so before the
+/// first launch an AP has nothing to run, and engaging it early makes its timer-ISR
+/// work contend with the BSP's timing-sensitive shell first-frame bring-up (observed
+/// on aarch64-HVF: engaging at flutter_init_ready stalled the shell at present=1).
+/// Set (once) when an app host is assigned to a core; the spawn's reschedule IPI then
+/// kicks that core out of `wfi` to engage. Never cleared (after the first launch the
+/// AP schedules normally — boot is long over).
+pub static CPU_HAS_HOME_WORK: [core::sync::atomic::AtomicBool; crate::arch::smp::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; crate::arch::smp::MAX_CPUS];
+
+#[inline]
+pub fn mark_cpu_has_work(cpu: u32) {
+    if (cpu as usize) < crate::arch::smp::MAX_CPUS {
+        CPU_HAS_HOME_WORK[cpu as usize].store(true, Ordering::Release);
+    }
+}
+#[inline]
+pub fn cpu_has_home_work(cpu: u32) -> bool {
+    (cpu as usize) < crate::arch::smp::MAX_CPUS
+        && CPU_HAS_HOME_WORK[cpu as usize].load(Ordering::Acquire)
 }
 
 /// ISR-safe (try-lock) read of a process's home core. Returns None if the table

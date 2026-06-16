@@ -244,19 +244,50 @@ pub extern "C" fn ap_main(cpu_idx: u64) -> ! {
     CPU_COUNT.fetch_add(1, Ordering::AcqRel);
     log::error!("[SMP] AP cpu={} ONLINE (mpidr={:#x})", cpu_idx, read_mpidr());
 
-    // AP stays ONLINE but IDLE (not engaged) — proven-stable on smp 1/2/4 with no
-    // regression. Co-scheduling the engine across cores was attempted 6 ways
-    // (2026-06-14): the contention/affinity/bring-up issues were each solved, but
-    // bolting SMP onto the cooperative hand-off model still does NOT converge the
-    // Dart GC stop-the-world safepoint — the app renders then freezes anyway. The
-    // real fix is the Redox-style scheduler rework (per-CPU switch_to contexts +
-    // affinity run-queue replacing the cooperative hand-off), a multi-session
-    // effort; the infra for it (engaged flag, is_preemptable, sticky affinity,
-    // enter_user back-off, physaddr-scoped futex, AP bring-up) is now in place.
-    // See [[smp-bringup]] / [[redox-blueprint]]. Until then, idle = no regression.
-    let _ = cpu_idx;
+    // ENGAGE this AP in HOME-CORE user scheduling (mirrors x86 sched::ap_start).
+    //
+    // History: co-scheduling was attempted 6 ways on 2026-06-14 and froze, blamed on
+    // a "Dart GC safepoint that won't converge" — but those attempts PREDATE the
+    // 2026-06-16 arch-neutral SMP-safety fixes (per-CPU page-table lock depth that
+    // had let a 2nd core bypass the lock → real page-table corruption; the PTABLE↔WM
+    // ABBA lock-order fix). The "pid=2 Dart corruption" chased back then is very
+    // likely those exact bugs, now fixed. The x86 home-core model (pin each WHOLE
+    // engine to one core + foreground-exclusive, so an engine's threads never spread
+    // across cores and there is no cross-core GC safepoint) launches+renders apps on
+    // x86 this session. Apply the same here and let the live HVF test (real parallel
+    // cores) say whether it converges. If it regresses, this is reverted — not
+    // shipped as "done".
+    //
+    // Stay FULLY DORMANT (wfi, engaged=false → timer ISR does nothing per cpu_engaged)
+    // until an app is actually pinned to THIS core. Engaging earlier (e.g. at
+    // flutter_init_ready) makes this core's timer-ISR work contend with the BSP's
+    // timing-sensitive shell first-frame bring-up — observed to stall the shell at
+    // present=1 on HVF. Apps only launch well after the shell is up, so there is
+    // nothing for this core to do before then. spawn_with_bootstrap sets the
+    // CPU_HAS_HOME_WORK flag and broadcasts a reschedule IPI (GIC SGI), which wakes
+    // us from wfi the instant an app is assigned here.
+    while !sched_ready() {
+        core::hint::spin_loop();
+    }
+    // enable_and_halt (not raw wfi): IRQs enabled so the timer/SGI is actually taken
+    // each wake (its handler no-ops here via cpu_engaged), then we re-check the flag.
+    while !crate::process::cpu_has_home_work(cpu_idx as u32) {
+        crate::arch::enable_and_halt();
+    }
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
+        if idx < MAX_CPUS {
+            table[idx].engaged.store(true, Ordering::Release);
+        }
+    }
+    log::error!("[SMP] AP cpu={} ENGAGING home-pinned scheduler (app pinned here)", cpu_idx);
     loop {
-        unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
+        // home_cpu filter inside next_runnable_pid restricts the pick to engine(s)
+        // pinned to THIS core, on its own per-CPU state.
+        if let Some(pid) = crate::process::next_runnable_pid(0) {
+            crate::process::enter_user_by_pid_noreturn(pid);
+        }
+        crate::arch::enable_and_halt();
     }
 }
 
