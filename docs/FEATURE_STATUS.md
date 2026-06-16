@@ -16,6 +16,7 @@ artifact) · **UNVERIFIED** (built, not proven on the real artifact) · **STUB**
 | Pointer + keyboard input | DONE (prior session) | usb-tablet (x86) / virtio (arm); verified via HUD |
 | **x86 app launch + render (SMP)** | **DONE (this session, headless)** | Verified `-smp 2`: Files renders, 0 panics. **UNVERIFIED on bare metal.** ~70–85% of runs render; intermittent **non-fatal** first-frame stall remains |
 | x86 app launch (single core) | KNOWN-BROKEN, recoverable | Original dart:io crash; OS now survives it (resilience) but app doesn't render. SMP is the fix |
+| **aarch64 app launch** | **KNOWN-BROKEN (freezes)** | Live-tested 2026-06-17 under HVF: tapping an app launches the 2nd engine, which stalls at FlutterEngineRunInitialized (no crash) → whole UI freezes. SAME single-core cooperative-scheduler root cause as x86. A prior note claimed this was "solved via serial-GC" — that was WRONG/incomplete. Fix = wire the home-core SMP path for aarch64 (the x86 timer-ISR home-core wake-assist has no aarch64 mirror yet) |
 | Crash auto-recovery | DONE (prior session) | kill group → refocus → relaunch |
 | Package pipeline (stream/sign/install) | DONE (prior session) | Ed25519, SHA256, cache |
 | Capability enforcement | DONE (prior session) | conservative (NET gated) |
