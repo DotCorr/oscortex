@@ -196,6 +196,21 @@ mod x86_64_impl {
         Some(phys)
     }
 
+    /// Checked page-table-frame → HHDM virt for READ-ONLY WALKS. Returns None if the
+    /// frame is null or out of addressable RAM instead of panicking. A walk can read
+    /// an insane table pointer when a stale pml4 reference (e.g. a futex physaddr
+    /// lookup during an app's crash-recovery teardown on another core) walks a page
+    /// table whose lower levels were freed and reused under SMP. Degrading to "not
+    /// mapped" keeps the kernel alive; the bare phys_to_virt (which panics on garbage,
+    /// a useful invariant for the WRITE paths) is unchanged.
+    #[inline]
+    fn walk_table(phys: u64) -> Option<*const u64> {
+        if phys == 0 || phys >= 0x0000_0004_0000_0000 {
+            return None;
+        }
+        Some(phys.wrapping_add(frame_allocator::hhdm_offset()) as *const u64)
+    }
+
     unsafe fn ensure_next_table(entry: *mut u64) -> Option<u64> {
         let e = unsafe { entry.read_volatile() };
         if e & PageFlags::PRESENT.bits() != 0 {
@@ -340,16 +355,16 @@ mod x86_64_impl {
         let present  = PageFlags::PRESENT.bits();
 
         unsafe {
-            let pml4 = phys_to_virt(pml4_phys) as *const u64;
+            let pml4 = walk_table(pml4_phys)?;
             let pml4e = pml4.add(pml4_idx).read_volatile();
             if pml4e & present == 0 { return None; }
-            let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *const u64;
+            let pdpt = walk_table(pml4e & PHYS_MASK)?;
             let pdpte = pdpt.add(pdpt_idx).read_volatile();
             if pdpte & present == 0 { return None; }
-            let pd = phys_to_virt(pdpte & PHYS_MASK) as *const u64;
+            let pd = walk_table(pdpte & PHYS_MASK)?;
             let pde = pd.add(pd_idx).read_volatile();
             if pde & present == 0 { return None; }
-            let pt = phys_to_virt(pde & PHYS_MASK) as *const u64;
+            let pt = walk_table(pde & PHYS_MASK)?;
             let pte = pt.add(pt_idx).read_volatile();
             if pte & present == 0 { return None; }
             Some(pte & PHYS_MASK)
@@ -364,16 +379,16 @@ mod x86_64_impl {
         let present  = PageFlags::PRESENT.bits();
 
         unsafe {
-            let pml4 = phys_to_virt(pml4_phys) as *const u64;
+            let pml4 = walk_table(pml4_phys)?;
             let pml4e = pml4.add(pml4_idx).read_volatile();
             if pml4e & present == 0 { return None; }
-            let pdpt = phys_to_virt(pml4e & PHYS_MASK) as *const u64;
+            let pdpt = walk_table(pml4e & PHYS_MASK)?;
             let pdpte = pdpt.add(pdpt_idx).read_volatile();
             if pdpte & present == 0 { return None; }
-            let pd = phys_to_virt(pdpte & PHYS_MASK) as *const u64;
+            let pd = walk_table(pdpte & PHYS_MASK)?;
             let pde = pd.add(pd_idx).read_volatile();
             if pde & present == 0 { return None; }
-            let pt = phys_to_virt(pde & PHYS_MASK) as *const u64;
+            let pt = walk_table(pde & PHYS_MASK)?;
             let pte = pt.add(pt_idx).read_volatile();
             if pte & present == 0 { return None; }
             let phys = pte & PHYS_MASK;
@@ -423,13 +438,16 @@ mod x86_64_impl {
     /// Walk a user PML4 and free every page frame reachable through it
     /// (but not the kernel-half entries 256–511, which are shared).
     pub fn free_user_pml4(pml4_phys: u64) {
-        let pml4 = phys_to_virt(pml4_phys) as *const u64;
+        // Use walk_table (bounds-checked) for every table-pointer deref so a garbage
+        // table pointer (a double-free, or an address space already disturbed by an
+        // SMP race) skips that subtree instead of phys_to_virt-panicking the kernel.
+        let pml4 = match walk_table(pml4_phys) { Some(p) => p, None => return };
         // Only walk lower-half entries (0–255).
         for i in 0..256usize {
             let pml4e = unsafe { pml4.add(i).read_volatile() };
             if pml4e & PageFlags::PRESENT.bits() == 0 { continue; }
             let pdpt_phys = pml4e & PHYS_MASK;
-            let pdpt = phys_to_virt(pdpt_phys) as *const u64;
+            let pdpt = match walk_table(pdpt_phys) { Some(p) => p, None => continue };
             for j in 0..512usize {
                 let pdpte = unsafe { pdpt.add(j).read_volatile() };
                 if pdpte & PageFlags::PRESENT.bits() == 0 { continue; }
@@ -438,7 +456,7 @@ mod x86_64_impl {
                     continue;
                 }
                 let pd_phys = pdpte & PHYS_MASK;
-                let pd = phys_to_virt(pd_phys) as *const u64;
+                let pd = match walk_table(pd_phys) { Some(p) => p, None => continue };
                 for k in 0..512usize {
                     let pde = unsafe { pd.add(k).read_volatile() };
                     if pde & PageFlags::PRESENT.bits() == 0 { continue; }
@@ -447,7 +465,7 @@ mod x86_64_impl {
                         continue;
                     }
                     let pt_phys = pde & PHYS_MASK;
-                    let pt = phys_to_virt(pt_phys) as *const u64;
+                    let pt = match walk_table(pt_phys) { Some(p) => p, None => continue };
                     for l in 0..512usize {
                         let pte = unsafe { pt.add(l).read_volatile() };
                         if pte & PageFlags::PRESENT.bits() != 0 {
