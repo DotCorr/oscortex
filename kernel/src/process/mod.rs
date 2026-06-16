@@ -25,7 +25,7 @@ pub mod elf;
 pub mod posix_trampolines;
 
 use alloc::alloc::{alloc, dealloc, Layout};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 use crate::mm::{frame_allocator, paging};
@@ -549,6 +549,7 @@ impl PTableLock {
                 PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
                 PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
             }
+            preempt_disable_cpu(my_cpu); // non-preemptable while holding PTABLE_LOCK
             PTableGuard { is_outer: true }
         }
     }
@@ -567,6 +568,7 @@ impl PTableLock {
                     PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
                     PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
                 }
+                preempt_disable_cpu(my_cpu); // non-preemptable while holding PTABLE_LOCK
                 Some(PTableGuard { is_outer: true })
             } else {
                 None
@@ -584,6 +586,7 @@ impl Drop for PTableGuard {
                 PTABLE_LOCK.holder.store(0xFFFF_FFFF, Ordering::Release);
                 PTABLE_LOCK_GUARD = None;
             }
+            preempt_enable_cpu(my_cpu); // preemptable again once PTABLE_LOCK is released
         } else {
             let my_cpu = ptable_cpu_idx();
             unsafe {
@@ -599,6 +602,58 @@ static mut PTABLE_LOCK_GUARD: Option<spin::MutexGuard<'static, ()>> = None;
 static mut PTABLE_LOCK_RECURSION: [u32; 64] = [0; 64];
 
 pub(crate) static PTABLE_LOCK: PTableLock = PTableLock::new();
+
+// ── SMP M1: per-CPU preempt-disable + non-preemptable bail ───────────────────
+//
+// Redox-blueprint pattern #2 ("the key to safe preemption"): never switch AWAY
+// from a CPU that is in a critical section. Here the critical section is "this
+// CPU holds PTABLE_LOCK" — auto-tracked by incrementing this CPU's preempt depth
+// on the OUTER PTABLE_LOCK acquire and decrementing it on the outer release. The
+// timer-preempt path checks `preempt_disabled()` and bails when set.
+//
+// Why this matters even single-core (x86): the timer ISR's `timer_preempt_switch_
+// try` does a *recursive* PTABLE_LOCK `try_lock`, which SUCCEEDS when the
+// interrupted thread already holds the lock — it could then switch threads while
+// the lock is logically held, leaving `holder` pinned to this CPU and wedging
+// every later PTABLE_LOCK user. Bailing when preempt-disabled closes that hole.
+// One slot per CPU; only the owning CPU touches its slot (+ its own ISR reads it).
+pub static PREEMPT_DEPTH: [AtomicU32; crate::arch::smp::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
+
+#[inline(always)]
+fn preempt_disable_cpu(cpu: u32) {
+    if (cpu as usize) < crate::arch::smp::MAX_CPUS {
+        PREEMPT_DEPTH[cpu as usize].fetch_add(1, Ordering::AcqRel);
+    }
+}
+#[inline(always)]
+fn preempt_enable_cpu(cpu: u32) {
+    if (cpu as usize) < crate::arch::smp::MAX_CPUS {
+        // Saturating: never wrap below zero on an unbalanced release.
+        let slot = &PREEMPT_DEPTH[cpu as usize];
+        let mut cur = slot.load(Ordering::Acquire);
+        while cur > 0 {
+            match slot.compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
+    }
+}
+
+/// True if THIS CPU is currently non-preemptable (in a PTABLE_LOCK critical
+/// section, or another future preempt-disabled region). The timer-preempt path
+/// must not switch away when this is set.
+#[inline]
+pub fn preempt_disabled() -> bool {
+    let c = ptable_cpu_idx() as usize;
+    c < crate::arch::smp::MAX_CPUS && PREEMPT_DEPTH[c].load(Ordering::Acquire) > 0
+}
+
+/// Global context-switch serialization lock (Redox-blueprint #2). Reserved for the
+/// M4 two-layer `switch_to`; declared now so the foundation is in one place.
+#[allow(dead_code)]
+pub static CONTEXT_SWITCH_LOCK: AtomicBool = AtomicBool::new(false);
 
 /// Bitmask of processes with a pending wake-up to be processed lock-free.
 pub static PENDING_WAKES: [AtomicU32; 8] = [
@@ -2127,6 +2182,11 @@ fn user_launch_task() {
 ///
 /// Returns `None` if there is no other runnable thread (no switch occurs).
 pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
+    // SMP M1 (non-preemptable bail): never switch away while this CPU holds
+    // PTABLE_LOCK — doing so would leave the lock pinned to this CPU and wedge it.
+    if preempt_disabled() {
+        return None;
+    }
     let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
@@ -2192,6 +2252,12 @@ pub fn timer_preempt_switch(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, U
 
 /// Try-lock variant of `timer_preempt_switch` to avoid ISR deadlocks.
 pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u32, UserRegs, u64)> {
+    // SMP M1 (non-preemptable bail): if the interrupted thread holds PTABLE_LOCK,
+    // a recursive try_lock below would SUCCEED and let us switch threads mid-
+    // critical-section, pinning the lock to this CPU forever. Bail instead.
+    if preempt_disabled() {
+        return None;
+    }
     let my_cpu = crate::arch::smp::current_cpu_id();
     let fs = crate::arch::cpu::get_fs_base();
 
