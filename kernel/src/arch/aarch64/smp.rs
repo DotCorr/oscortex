@@ -241,6 +241,14 @@ pub extern "C" fn ap_main(cpu_idx: u64) -> ! {
     }
     // Per-core GIC CPU interface (GICv2: banked per-core at the same MMIO base).
     crate::arch::aarch64::gic::init_cpu_interface();
+    // CRITICAL per-core EL1 setup the AP was MISSING: enable FP/SIMD (CPACR_EL1) AND
+    // EL0 counter access (CNTKCTL_EL1.EL0VCTEN/EL0PCTEN). These are PER-CPU registers
+    // at reset on a secondary core. Without CNTKCTL, the app's inline CNTVCT_EL0 read
+    // (liboscortex_libc monotonic clock, called constantly by the Dart VM) traps to
+    // EL1 with EC=0x18 → report_unhandled → the engine bootstrap deterministically
+    // wedged on the AP (4/4). The x86 AP does this in ap_init; aarch64 ap_main never
+    // did. This is the fix for the aarch64 SMP app-launch freeze.
+    crate::arch::aarch64::cpu::enable_fpu_simd();
     CPU_COUNT.fetch_add(1, Ordering::AcqRel);
     log::error!("[SMP] AP cpu={} ONLINE (mpidr={:#x})", cpu_idx, read_mpidr());
 
