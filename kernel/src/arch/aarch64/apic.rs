@@ -199,14 +199,22 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
                 || crate::wm::embedder_baton_due(target))
             && cur != target
         {
-            // WAKE ONLY — do NOT do the ISR-initiated resume here. The prior session
-            // fingered enter_user_by_pid_noreturn_try from the timer ISR as the cause
-            // of "pid=2 Dart corruption", and re-enabling it reproduced exactly that:
-            // a real EL0 data abort (EC=0x24) in engine code on the AP. Marking the
-            // target Running and letting the cooperative hand-off (the sys_thread_create
-            // immediate-enter + futex hand-off, which complete the engine bootstrap on
-            // x86) enter it avoids resuming a thread from an ISR mid-EL1-critical-state.
-            let _ = crate::process::set_state_try(target, crate::process::ProcState::Running);
+            // The cooperative hand-off alone does NOT re-enter the force_wake-released
+            // engine thread on the AP, so the bootstrap stalls without an ISR resume.
+            // The resume corrupts ONLY when it re-enters a thread with no valid saved
+            // FP (build_image zeroes v0–v31 incl. callee-saved v8–v15 → EC=0x24). So:
+            // resume MULTI-CORE only, and ONLY when the target has a valid FP image
+            // (aarch64_fp_valid) — i.e. exactly the case where restoring FP is correct.
+            // No valid FP → wake-only (skip), never enter with garbage FP.
+            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+                let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+                if smp
+                    && crate::process::aarch64_fp_valid(target)
+                    && crate::process::try_claim_cpu_for_try(target, my_cpu)
+                {
+                    crate::process::enter_user_by_pid_noreturn_try(target);
+                }
+            }
         }
         return;
     }

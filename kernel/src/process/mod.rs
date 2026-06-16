@@ -409,6 +409,24 @@ pub fn aarch64_take_fp(pid: u32) -> Option<[u64; 66]> {
     Some(out)
 }
 
+/// aarch64 ISR-safe (try_lock) check: does `pid` have a VALID saved FP image?
+/// The home-gated timer-ISR wake-assist resume uses this to NEVER re-enter a thread
+/// that lacks a valid FP — resuming with no image zeroes v0–v31 incl. AAPCS64
+/// callee-saved v8–v15, corrupting an already-run engine thread (the EC=0x24 SMP
+/// data abort). When the FP isn't valid the resume is skipped (the thread is left
+/// Running for the cooperative path / a later tick), trading a possible extra stall
+/// for never shipping corrupted FP state. Returns false on lock contention (skip).
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64_fp_valid(pid: u32) -> bool {
+    match PTABLE_LOCK.try_lock() {
+        Some(_g) => {
+            let p = unsafe { &PTABLE[idx_of(pid)] };
+            p.pid == pid && p.arch_fp_valid
+        }
+        None => false,
+    }
+}
+
 /// aarch64: read the callee-saved x24–x28 captured for `pid` (used to populate
 /// EnterUserRegs so the cooperative/re-exec resume restores them).
 #[cfg(target_arch = "aarch64")]
