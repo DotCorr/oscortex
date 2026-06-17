@@ -505,6 +505,14 @@ fn report_unhandled(f: &TrapFrame, kind: u64, ec: u64) -> ! {
     uart::puthex_full(f.x[17]);
     uart::puts(" pid=");
     uart::puthex(crate::process::current_pid() as u64);
+    // DIAG: concurrent-state context — is the faulting thread the foreground app or
+    // a backgrounded shell thread that should have been suspended (exclusive)?
+    uart::puts(" focus=");
+    uart::puthex(crate::wm::focus_pid() as u64);
+    uart::puts(" cpu=");
+    uart::puthex(crate::arch::aarch64::smp::current_cpu_id() as u64);
+    uart::puts(" home=");
+    uart::puthex(crate::process::home_cpu_of_try(crate::process::current_pid()).unwrap_or(0xFF) as u64);
     uart::puts("\n");
 
     // Frame-pointer chain walk: with ELR=0 and x30=0 the immediate caller is lost
