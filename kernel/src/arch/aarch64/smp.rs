@@ -282,6 +282,14 @@ pub extern "C" fn ap_main(cpu_idx: u64) -> ! {
     while !crate::process::cpu_has_home_work(cpu_idx as u32) {
         crate::arch::enable_and_halt();
     }
+    // Arm THIS core's generic timer NOW (an app is pinned here). The virtual timer
+    // and its GIC PPI enable are per-CPU; the BSP's start_scheduler_tick only armed
+    // core 0. Without this the AP takes ZERO timer interrupts → no preemption, no
+    // ISR wake-assist → the app's engine bootstrap deadlocks (FlutterEngineRunInitialized
+    // creates worker threads that need an async wake the cooperative-only path can't
+    // deliver). Arming here (not earlier) keeps the AP dormant during the BSP's
+    // timing-sensitive shell first-frame bring-up.
+    crate::arch::aarch64::apic::start_scheduler_tick_ap();
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
         if idx < MAX_CPUS {

@@ -26,7 +26,6 @@ pub mod posix_trampolines;
 
 use alloc::alloc::{alloc, dealloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use spin::Mutex;
 
 use crate::mm::{frame_allocator, paging};
 
@@ -252,6 +251,17 @@ pub struct Process {
     /// and aborted (synchronization_posix.cc:164).
     #[cfg(target_arch = "aarch64")]
     pub aarch64_ret_in_x0: bool,
+    /// aarch64 only: true once this thread has been entered into EL0 at least once
+    /// (i.e. it has run user code). A FRESH thread (never entered) correctly starts
+    /// with ZEROED v0–v31 — zeroing its FP on first entry is right, not corruption.
+    /// An ALREADY-RUN thread must always have a valid saved FP image (captured at
+    /// every SVC entry / timer-preempt); reaching a resume with `entered_once &&
+    /// !arch_fp_valid` would be the genuine corruption case and is logged loudly.
+    /// This flag lets the wake-assist resume tell the two apart, so it can safely
+    /// re-enter a fresh worker (the engine-bootstrap stall) without ever zeroing a
+    /// live thread's FP.
+    #[cfg(target_arch = "aarch64")]
+    pub aarch64_entered_once: bool,
 }
 
 impl Process {
@@ -311,6 +321,8 @@ impl Process {
             user_x28: 0,
             #[cfg(target_arch = "aarch64")]
             aarch64_ret_in_x0: false,
+            #[cfg(target_arch = "aarch64")]
+            aarch64_entered_once: false,
         }
     }
 }
@@ -409,21 +421,29 @@ pub fn aarch64_take_fp(pid: u32) -> Option<[u64; 66]> {
     Some(out)
 }
 
-/// aarch64 ISR-safe (try_lock) check: does `pid` have a VALID saved FP image?
-/// The home-gated timer-ISR wake-assist resume uses this to NEVER re-enter a thread
-/// that lacks a valid FP — resuming with no image zeroes v0–v31 incl. AAPCS64
-/// callee-saved v8–v15, corrupting an already-run engine thread (the EC=0x24 SMP
-/// data abort). When the FP isn't valid the resume is skipped (the thread is left
-/// Running for the cooperative path / a later tick), trading a possible extra stall
-/// for never shipping corrupted FP state. Returns false on lock contention (skip).
+/// aarch64 ISR-safe (try_lock): is it FP-SAFE for the wake-assist resume to
+/// re-enter `pid`? Decides atomically under one lock:
+///   * `Some(true)`  — FRESH thread (never entered EL0): first entry correctly
+///     zeroes v0–v31, OR an already-run thread WITH a valid saved FP image (the
+///     resume path restores it via a blocking lock).
+///   * `Some(false)` — already-run thread with NO valid FP: the genuine
+///     corruption case (resuming would zero a live thread's callee-saved v8–v15).
+///     The caller logs loudly and SKIPS — it must never zero a live FP.
+///   * `None`         — lock busy: caller skips this tick.
+/// This replaces the old `aarch64_fp_valid`-only gate, which wrongly skipped a
+/// FRESH engine worker (→ the bootstrap stall) because a fresh thread has no
+/// captured FP yet — even though zeroing its FP on first entry is correct.
 #[cfg(target_arch = "aarch64")]
-pub fn aarch64_fp_valid(pid: u32) -> bool {
-    match PTABLE_LOCK.try_lock() {
-        Some(_g) => {
-            let p = unsafe { &PTABLE[idx_of(pid)] };
-            p.pid == pid && p.arch_fp_valid
-        }
-        None => false,
+pub fn aarch64_resume_fp_safe_try(pid: u32) -> Option<bool> {
+    let _g = PTABLE_LOCK.try_lock()?;
+    let p = unsafe { &PTABLE[idx_of(pid)] };
+    if p.pid != pid {
+        return None;
+    }
+    if !p.aarch64_entered_once {
+        Some(true) // fresh — zeroing FP on first entry is correct
+    } else {
+        Some(p.arch_fp_valid) // already-run — must have a valid saved FP
     }
 }
 
@@ -514,13 +534,29 @@ pub fn get_group_leader(pid: u32) -> u32 {
 
 pub(crate) fn get_group_leader_locked(pid: u32) -> u32 {
     let mut curr = pid;
-    loop {
+    // BOUNDED walk: a parent chain can visit at most MAX_PROCS distinct pids. A
+    // CYCLE in the chain (a thread whose parent_pid links back into the chain —
+    // possible from a spawn/exit race or a stale reused slot under SMP) would
+    // otherwise make this `loop` spin FOREVER while PTABLE_LOCK is held, hard-
+    // hanging every core that then blocks on the lock (the aarch64 SMP app-launch
+    // freeze: core 1 wedged here at get_group_leader+0x184 holding PTABLE_LOCK).
+    // On overflow we return the current pid (best-effort leader) and log once, so
+    // the scheduler keeps running and the cyclic linkage is visible to fix at root.
+    for _ in 0..MAX_PROCS {
         let p = unsafe { &PTABLE[idx_of(curr)] };
         if p.pid == curr && p.is_thread && p.parent_pid != 0 {
             curr = p.parent_pid;
         } else {
-            break;
+            return curr;
         }
+    }
+    static CYCLE_LOG: AtomicU32 = AtomicU32::new(0);
+    if CYCLE_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+        log::error!(
+            "[group-leader] CYCLE in parent chain starting pid={} (walk exceeded {} hops) — \
+             returning {} as leader; investigate parent_pid linkage (spawn/exit race?)",
+            pid, MAX_PROCS, curr
+        );
     }
     curr
 }
@@ -537,8 +573,18 @@ pub struct PTableGuard {
 }
 
 pub struct PTableLock {
-    inner: Mutex<()>,
-    holder: AtomicU32,
+    /// 0 = free; otherwise `cpu_id + 1` of the owning CPU. This single atomic IS
+    /// the lock — acquisition is a CAS, so "locked" and "which CPU owns it" become
+    /// ONE atomic step. The previous design wrapped a `spin::Mutex` and recorded
+    /// the owner in a SEPARATE `holder` atomic + stashed the guard in a single
+    /// `static mut PTABLE_LOCK_GUARD`. Under true parallel cores (HVF) those three
+    /// desynchronized: there were windows where the Mutex was locked but `holder`
+    /// read FREE (and vice-versa), and the lone `static mut` guard slot raced
+    /// between cores — leaving the inner Mutex permanently locked with holder=FREE,
+    /// so every core spun forever on acquire (the aarch64 SMP app-launch wedge,
+    /// observed as `ptable_holder=cpuFREE states=(locked)`). One CAS'd owner word
+    /// removes the gap entirely.
+    owner: AtomicU32,
 }
 
 /// CPU index used to key PTABLE_LOCK_RECURSION / the holder atomic. Always a
@@ -555,66 +601,66 @@ fn ptable_cpu_idx() -> u32 {
 
 impl PTableLock {
     pub const fn new() -> Self {
-        Self {
-            inner: Mutex::new(()),
-            holder: AtomicU32::new(0xFFFF_FFFF),
-        }
+        Self { owner: AtomicU32::new(0) }
     }
 
     pub fn lock(&self) -> PTableGuard {
-        let my_cpu = ptable_cpu_idx();
-        if self.holder.load(Ordering::Acquire) == my_cpu {
-            unsafe {
-                PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
-            }
-            PTableGuard { is_outer: false }
-        } else {
-            let g = self.inner.lock();
-            self.holder.store(my_cpu, Ordering::Release);
-            unsafe {
-                PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
-                PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
-            }
-            preempt_disable_cpu(my_cpu); // non-preemptable while holding PTABLE_LOCK
-            PTableGuard { is_outer: true }
+        let me = ptable_cpu_idx() + 1; // owner value (cpu_id + 1; 0 means free)
+        // Re-entrant: this CPU already owns it — bump the per-CPU recursion count.
+        if self.owner.load(Ordering::Acquire) == me {
+            unsafe { PTABLE_LOCK_RECURSION[(me - 1) as usize] += 1; }
+            return PTableGuard { is_outer: false };
         }
+        // Acquire: CAS the owner word 0 -> me. Atomic, so there is no window where
+        // the lock is held but the owner is unrecorded (the SMP desync bug).
+        loop {
+            if self
+                .owner
+                .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            // Spin read-only (no atomic RMW) until it looks free, then retry CAS.
+            while self.owner.load(Ordering::Relaxed) != 0 {
+                core::hint::spin_loop();
+            }
+        }
+        unsafe { PTABLE_LOCK_RECURSION[(me - 1) as usize] = 1; }
+        preempt_disable_cpu(me - 1); // non-preemptable while holding PTABLE_LOCK
+        PTableGuard { is_outer: true }
     }
 
     pub fn try_lock(&self) -> Option<PTableGuard> {
-        let my_cpu = ptable_cpu_idx();
-        if self.holder.load(Ordering::Acquire) == my_cpu {
-            unsafe {
-                PTABLE_LOCK_RECURSION[my_cpu as usize] += 1;
-            }
-            Some(PTableGuard { is_outer: false })
+        let me = ptable_cpu_idx() + 1;
+        if self.owner.load(Ordering::Acquire) == me {
+            unsafe { PTABLE_LOCK_RECURSION[(me - 1) as usize] += 1; }
+            return Some(PTableGuard { is_outer: false });
+        }
+        if self
+            .owner
+            .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            unsafe { PTABLE_LOCK_RECURSION[(me - 1) as usize] = 1; }
+            preempt_disable_cpu(me - 1);
+            Some(PTableGuard { is_outer: true })
         } else {
-            if let Some(g) = self.inner.try_lock() {
-                self.holder.store(my_cpu, Ordering::Release);
-                unsafe {
-                    PTABLE_LOCK_RECURSION[my_cpu as usize] = 1;
-                    PTABLE_LOCK_GUARD = Some(core::mem::transmute(g));
-                }
-                preempt_disable_cpu(my_cpu); // non-preemptable while holding PTABLE_LOCK
-                Some(PTableGuard { is_outer: true })
-            } else {
-                None
-            }
+            None
         }
     }
 }
 
 impl Drop for PTableGuard {
     fn drop(&mut self) {
+        let my_cpu = ptable_cpu_idx();
         if self.is_outer {
-            let my_cpu = ptable_cpu_idx();
-            unsafe {
-                PTABLE_LOCK_RECURSION[my_cpu as usize] = 0;
-                PTABLE_LOCK.holder.store(0xFFFF_FFFF, Ordering::Release);
-                PTABLE_LOCK_GUARD = None;
-            }
+            unsafe { PTABLE_LOCK_RECURSION[my_cpu as usize] = 0; }
+            // Release the owner word LAST (Release ordering publishes all the PTABLE
+            // writes made under the lock). A single store; no separate guard to drop.
+            PTABLE_LOCK.owner.store(0, Ordering::Release);
             preempt_enable_cpu(my_cpu); // preemptable again once PTABLE_LOCK is released
         } else {
-            let my_cpu = ptable_cpu_idx();
             unsafe {
                 if PTABLE_LOCK_RECURSION[my_cpu as usize] > 0 {
                     PTABLE_LOCK_RECURSION[my_cpu as usize] -= 1;
@@ -624,7 +670,6 @@ impl Drop for PTableGuard {
     }
 }
 
-static mut PTABLE_LOCK_GUARD: Option<spin::MutexGuard<'static, ()>> = None;
 static mut PTABLE_LOCK_RECURSION: [u32; 64] = [0; 64];
 
 pub(crate) static PTABLE_LOCK: PTableLock = PTableLock::new();
@@ -957,6 +1002,9 @@ pub fn spawn_with_bootstrap(
         {
             p.arch_frame_valid = false;
             p.arch_fp_valid = false;
+            // Fresh PCB → has not run user code yet; first EL0 entry zeroes its FP
+            // (correct for a fresh thread). Set true on entry (see enter_user_*).
+            p.aarch64_entered_once = false;
         }
     }
 
@@ -1456,7 +1504,7 @@ pub fn debug_runnable_states() -> alloc::string::String {
         // field, not the loop var) so a slot whose .pid != index reveals a
         // reused/cleared entry — the mechanism behind a worker thread that runs
         // yet never appears under its expected index.
-        for idx in 1usize..=12 {
+        for idx in 1usize..=24 {
             let p = unsafe { &PTABLE[idx] };
             if p.pid == 0 { continue; }
             let st = match p.state {
@@ -1466,8 +1514,9 @@ pub fn debug_runnable_states() -> alloc::string::String {
                 ProcState::Dead => 'D',
             };
             let cpu = match p.current_cpu { Some(c) => c as i32, None => -1 };
-            // slot[idx]=pid:state c cpu
-            let _ = write!(s, "s{}={}{}{} ", idx, p.pid, st, cpu);
+            // slot[idx]=pid:state:cpu:home (home_cpu reveals a worker pinned to the
+            // wrong core; current_cpu -1 = unclaimed).
+            let _ = write!(s, "s{}={}{}c{}h{} ", idx, p.pid, st, cpu, p.home_cpu);
         }
     } else {
         s.push_str("(locked)");
@@ -2035,6 +2084,11 @@ pub fn enter_user_by_pid_noreturn(req_pid: u32) -> ! {
         p.errno_to_deliver = 0; // consume it
         let pbt = p.preempted_by_timer;
         p.preempted_by_timer = false; // consume the flag
+        // aarch64: mark that this thread is (about to be) entered into EL0 — so a
+        // later wake-assist resume can tell a fresh worker (zero FP is correct)
+        // from an already-run thread (must have valid FP). See aarch64_entered_once.
+        #[cfg(target_arch = "aarch64")]
+        { p.aarch64_entered_once = true; }
         (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
          p.regs.rdi, p.regs.rsi, p.regs.rdx,
          p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,
@@ -2186,6 +2240,11 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
         p.errno_to_deliver = 0; // consume it
         let pbt = p.preempted_by_timer;
         p.preempted_by_timer = false; // consume the flag
+        // aarch64: this thread is (about to be) entered into EL0 — mark it so the
+        // wake-assist resume distinguishes fresh from already-run (see the blocking
+        // enter_user_by_pid_noreturn and aarch64_entered_once).
+        #[cfg(target_arch = "aarch64")]
+        { p.aarch64_entered_once = true; }
         let context = (p.pml4_phys, p.regs.rip, p.regs.rsp, p.regs.rflags, p.regs.rax,
          p.regs.rdi, p.regs.rsi, p.regs.rdx,
          p.regs.rbx, p.regs.rbp, p.regs.r8, p.regs.r9, p.regs.r10,

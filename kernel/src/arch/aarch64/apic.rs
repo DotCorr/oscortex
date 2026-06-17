@@ -57,6 +57,24 @@ pub fn start_scheduler_tick() {
     );
 }
 
+/// Arm THIS AP's generic timer for the periodic scheduler tick. The virtual timer
+/// (CNTV_CTL_EL0/CNTV_TVAL_EL0) and the timer PPI's GIC enable bit are BOTH per-CPU
+/// (GICv2 banks ISENABLER0 / INTIDs 0–31 per core), so `init_periodic` must run on
+/// each core that needs ticks — the BSP's `start_scheduler_tick` does NOT enable
+/// the timer on a secondary core. Without this an AP gets ZERO timer interrupts, so
+/// the home-pinned app it runs has no preemption and no ISR wake-assist, and its
+/// engine bootstrap deadlocks the moment a thread needs an async (timer-driven)
+/// wake. Called from `ap_main` once an app is actually pinned to this core (keeps
+/// the AP dormant during the BSP's timing-sensitive shell first-frame bring-up).
+pub fn start_scheduler_tick_ap() {
+    super::timer::init_periodic(SCHED_TICK_HZ);
+    log::error!(
+        "[apic] aarch64 AP cpu={} timer armed @ {} Hz — preemption + wake-assist live on this core",
+        super::smp::current_cpu_id(),
+        SCHED_TICK_HZ
+    );
+}
+
 /// Production IRQ handler — acknowledge at the GIC, and on a generic-timer PPI
 /// from EL0 run the shared cooperative-scheduler preemption hand-off, exactly
 /// mirroring `x86_64::idt::apic_timer_handler`.
@@ -201,18 +219,35 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         {
             // The cooperative hand-off alone does NOT re-enter the force_wake-released
             // engine thread on the AP, so the bootstrap stalls without an ISR resume.
-            // The resume corrupts ONLY when it re-enters a thread with no valid saved
-            // FP (build_image zeroes v0–v31 incl. callee-saved v8–v15 → EC=0x24). So:
-            // resume MULTI-CORE only, and ONLY when the target has a valid FP image
-            // (aarch64_fp_valid) — i.e. exactly the case where restoring FP is correct.
-            // No valid FP → wake-only (skip), never enter with garbage FP.
+            // FP-safety is decided by aarch64_resume_fp_safe_try (one atomic check):
+            //   * FRESH worker (never entered EL0) → safe: first entry correctly
+            //     ZEROES v0–v31. The OLD gate skipped these (no captured FP yet) — THE
+            //     bootstrap stall: the isolate-launch worker is freshly spawned, so it
+            //     was never re-entered and the engine wedged at FlutterEngineRunInitialized.
+            //   * already-run WITH valid FP → safe: the resume path restores it via a
+            //     BLOCKING lock, so a try_lock miss in the check doesn't matter.
+            //   * already-run WITHOUT valid FP → the genuine corruption case (would zero
+            //     live callee-saved v8–v15 → EC=0x24): SKIP + log loudly. Should never fire.
             if crate::process::set_state_try(target, crate::process::ProcState::Running) {
                 let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
-                if smp
-                    && crate::process::aarch64_fp_valid(target)
-                    && crate::process::try_claim_cpu_for_try(target, my_cpu)
-                {
-                    crate::process::enter_user_by_pid_noreturn_try(target);
+                match crate::process::aarch64_resume_fp_safe_try(target) {
+                    Some(true) => {
+                        if smp && crate::process::try_claim_cpu_for_try(target, my_cpu) {
+                            crate::process::enter_user_by_pid_noreturn_try(target);
+                        }
+                    }
+                    Some(false) => {
+                        static FP_CORRUPT_LOG: AtomicU32 = AtomicU32::new(0);
+                        let n = FP_CORRUPT_LOG.fetch_add(1, Ordering::Relaxed);
+                        if n < 64 {
+                            log::error!(
+                                "[arm-fp-guard] SKIP resume pid={} — already-run but NO valid FP \
+                                 (would zero v0-v31). Genuine corruption case; fix the FP save path.",
+                                target
+                            );
+                        }
+                    }
+                    None => {} // lock busy — wake-only this tick (state already set Running)
                 }
             }
         }
