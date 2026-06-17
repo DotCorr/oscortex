@@ -211,6 +211,7 @@ pub fn init() {
 
             status |= S_DRIVER_OK;
             w32(base, STATUS, status);
+            crate::wm::set_input_source(crate::wm::INPUT_SRC_VIRTIO);
 
             // Enable this slot's SPI at the GIC (level-triggered, routed to CPU0).
             let intid = SPI_BASE_INTID + slot as u32;

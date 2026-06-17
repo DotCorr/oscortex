@@ -32,6 +32,10 @@ pub const SYS_SURFACE_CREATE: u64 = 0x300;
 pub const SYS_SURFACE_UPLOAD_RGBA32: u64 = 0x303;
 pub const SYS_SURFACE_DESTROY: u64 = 0x302;
 pub const SYS_SURFACE_FLIP: u64 = 0x312;
+pub const SYS_SURFACE_Z_SET: u64 = 0x30A;
+pub const SYS_SURFACE_GEOMETRY_SET: u64 = 0x30C;
+pub const SYS_SURFACE_VISIBILITY_SET: u64 = 0x30E;
+pub const SYS_SURFACE_CLIP_SET: u64 = 0x30F;
 pub const SYS_FB_SIZE_PACKED: u64 = 0x305;
 pub const SYS_VSYNC_WAIT_NONBLOCK: u64 = 0x307;
 
@@ -84,6 +88,15 @@ pub const SYS_CLIPBOARD_SET: u64 = 0x4B3;
 pub const SYS_CLIPBOARD_GET: u64 = 0x4B4;
 pub const SYS_APP_CLOSE_FOREGROUND: u64 = 0x4B5;
 pub const SYS_BEEP: u64 = 0x4B6;
+
+// App networking — TCP socket calls (mirrors abi.rs / dispatch.rs). Connect is
+// async: poll SYS_TCP_STATUS until it returns 1 before writing.
+pub const SYS_TCP_CONNECT: u64 = 0x388;
+pub const SYS_TCP_WRITE: u64 = 0x389;
+pub const SYS_TCP_READ: u64 = 0x38A;
+pub const SYS_TCP_CLOSE: u64 = 0x38B;
+pub const SYS_TCP_STATUS: u64 = 0x4B7;
+pub const SYS_DNS_RESOLVE: u64 = 0x4B8;
 
 // Mouse-cursor shapes accepted by SYS_CURSOR_SHAPE_SET (mirrors abi.rs).
 pub const CURSOR_SHAPE_BASIC: u32 = 0;
@@ -455,6 +468,30 @@ pub fn surface_create(width: u32, height: u32) -> i64 {
 /// Destroy a compositor surface.
 pub fn surface_destroy(surface_id: u32) -> i64 {
     unsafe { syscall1(SYS_SURFACE_DESTROY, surface_id as u64) }
+}
+
+/// Set a surface's stacking order (higher z draws on top).
+pub fn surface_z_set(surface_id: u32, z: i32) -> i64 {
+    unsafe { syscall2(SYS_SURFACE_Z_SET, surface_id as u64, (z as u32) as u64) }
+}
+
+/// Set a surface's on-screen position + size. (xy/wh packed as the kernel expects.)
+pub fn surface_geometry_set(surface_id: u32, x: i32, y: i32, w: u32, h: u32) -> i64 {
+    let xy = (((x as u32) as u64) << 32) | ((y as u32) as u64);
+    let wh = ((w as u64) << 32) | (h as u64);
+    unsafe { syscall3(SYS_SURFACE_GEOMETRY_SET, surface_id as u64, xy, wh) }
+}
+
+/// Clip a surface to the given screen-space rect.
+pub fn surface_clip_set(surface_id: u32, x: i32, y: i32, w: u32, h: u32) -> i64 {
+    let xy = (((x as u32) as u64) << 32) | ((y as u32) as u64);
+    let wh = ((w as u64) << 32) | (h as u64);
+    unsafe { syscall3(SYS_SURFACE_CLIP_SET, surface_id as u64, xy, wh) }
+}
+
+/// Show or hide a surface.
+pub fn surface_visibility_set(surface_id: u32, visible: bool) -> i64 {
+    unsafe { syscall2(SYS_SURFACE_VISIBILITY_SET, surface_id as u64, visible as u64) }
 }
 
 /// Returns `(width << 32) | height` for the physical framebuffer.
@@ -895,5 +932,42 @@ pub fn app_close_foreground() -> i64 {
 /// Emit a PC-speaker tone (freq 0 = default system beep).
 pub fn beep(freq_hz: u32, duration_ms: u32) -> i64 {
     unsafe { syscall2(SYS_BEEP, freq_hz as u64, duration_ms as u64) }
+}
+
+// ── App networking — TCP socket calls (back the oscortex/net channel) ─────────
+
+/// Open a TCP connection (async). `ip` is big-endian (network order); returns a
+/// socket fd ≥ 0, or a negative errno. Poll `tcp_status` until it returns 1
+/// before writing.
+pub fn tcp_connect(ip_be: u32, port: u16) -> i64 {
+    unsafe { syscall2(SYS_TCP_CONNECT, ip_be as u64, port as u64) }
+}
+
+/// Poll an outbound connect: 1 = established (may send), 0 = still connecting,
+/// negative = refused/reset.
+pub fn tcp_status(fd: u32) -> i64 {
+    unsafe { syscall1(SYS_TCP_STATUS, fd as u64) }
+}
+
+/// Write to a TCP socket. Returns bytes written, or a negative errno
+/// (-11 EAGAIN if the send buffer is momentarily full).
+pub fn tcp_write(fd: u32, data: &[u8]) -> i64 {
+    unsafe { syscall3(SYS_TCP_WRITE, fd as u64, data.as_ptr() as u64, data.len() as u64) }
+}
+
+/// Read from a TCP socket. Returns bytes read, or a negative errno
+/// (-11 EAGAIN if no data is available yet).
+pub fn tcp_read(fd: u32, buf: &mut [u8]) -> i64 {
+    unsafe { syscall3(SYS_TCP_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) }
+}
+
+/// Close a TCP socket.
+pub fn tcp_close(fd: u32) -> i64 {
+    unsafe { syscall1(SYS_TCP_CLOSE, fd as u64) }
+}
+
+/// Resolve a hostname → IPv4 (big-endian u32 ≥ 0), or a negative errno.
+pub fn dns_resolve(name: &[u8]) -> i64 {
+    unsafe { syscall2(SYS_DNS_RESOLVE, name.as_ptr() as u64, name.len() as u64) }
 }
 

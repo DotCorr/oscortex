@@ -50,16 +50,6 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
     let user_rip = crate::arch::syscall::user_rip();
     record_syscall_trace(number, arg0, arg1, arg2, user_rip);
 
-    // Trace the first 32 syscalls made by pid=7 so we can see exactly which
-    // call triggers "Poll failed:" and from where.
-    {
-        static PID7_TRACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-        if crate::process::current_pid() == 7 {
-            let n = PID7_TRACE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            let _ = n;
-        }
-    }
-
     // Post-pid2-exit trace window: log every syscall (any pid) for the first
     // POSTEXIT_TRACE_LIMIT calls after PID-2's exit, so we can see exactly
     // what pid=1 does once it resumes from pthread_cond_wait.
@@ -501,6 +491,8 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         0x38A => sys_tcp_read(arg0, arg1, arg2),
         0x38B => sys_tcp_close(arg0),
         0x38C => sys_dhcp_discover(),
+        eabi::SYS_TCP_STATUS => sys_tcp_status(arg0),
+        eabi::SYS_DNS_RESOLVE => sys_dns_resolve(arg0, arg1),
 
         // Phase 51 — ext2 read-only filesystem
         0x38D => sys_ext2_mount(),
@@ -822,6 +814,7 @@ fn required_cap(number: u64) -> Option<crate::security::Capabilities> {
             || n == eabi::SYS_NET_SEND
             || n == eabi::SYS_NET_RECV => Some(Capabilities::NET),
         0x388 | 0x389 | 0x38A | 0x38B | 0x38C => Some(Capabilities::NET),
+        n if n == eabi::SYS_TCP_STATUS || n == eabi::SYS_DNS_RESOLVE => Some(Capabilities::NET),
         _ => None,
     }
 }

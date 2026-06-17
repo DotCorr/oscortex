@@ -1,0 +1,22 @@
+diff --git a/engine/src/flutter/shell/common/switches.cc b/engine/src/flutter/shell/common/switches.cc
+index 15d43a5f..e098116f 100644
+--- a/engine/src/flutter/shell/common/switches.cc
++++ b/engine/src/flutter/shell/common/switches.cc
+@@ -42,6 +42,17 @@ struct SwitchDesc {
+ static const std::string kAllowedDartFlags[] = {
+     "--enable-isolate-groups",
+     "--no-enable-isolate-groups",
++    // OSCortex: GC/heap tuning REQUIRED on the cooperative single-core scheduler
++    // (default multi-threaded GC safepoint never converges for a 2nd app engine,
++    // freezing the render thread). Prefix-matched, so "=value" forms are covered.
++    "--old_gen_heap_size",
++    "--new_gen_semi_max_size",
++    "--scavenger_tasks",
++    "--marker_tasks",
++    "--concurrent_mark",
++    "--concurrent_sweep",
++    "--no_concurrent_mark",
++    "--no_concurrent_sweep",
+ };
+ // clang-format on
+ 

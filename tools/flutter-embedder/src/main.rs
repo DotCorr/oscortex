@@ -890,6 +890,20 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             handle_shell_platform_message(msg);
         }
 
+        // ── App networking (BasicMessageChannel<ByteData>, binary codec) ─────
+        //    Compact opcode framing → kernel TCP syscalls. See handle_net_channel.
+        b"oscortex/net" => {
+            handle_net_channel(msg);
+        }
+
+        // ── Native webview (MethodChannel, StandardMethodCodec) ──────────────
+        //    Manages a compositor surface for web content + events. The renderer
+        //    behind it is a stub today; a Servo service replaces it. See
+        //    handle_webview_channel + docs/browser-architecture.md.
+        b"oscortex/webview" => {
+            handle_webview_channel(msg);
+        }
+
         // ── Text input (JSONMethodCodec) — THE critical channel ──────────
         b"flutter/textinput" => {
             handle_textinput_channel(msg);
@@ -915,16 +929,28 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
             respond_platform_message(msg, &[0x00u8]);
         }
 
-        b"flutter/navigation"
-        | b"flutter/system"
+        // StandardMethodCodec channels: the framework decodes the reply with
+        // StandardMethodCodec, so a success-null reply MUST be the binary
+        // envelope [0x00, 0x00] — NOT JSON `[null]`. Replying JSON here makes the
+        // framework throw `FormatException: Message corrupted` in
+        // StandardMethodCodec.decodeEnvelope. flutter/restoration is the loud one:
+        // RestorationManager probes it with StandardMethodCodec at startup on
+        // EVERY engine, so a JSON reply throws once per engine (shell + each app).
+        b"flutter/restoration"
+        | b"flutter/platform_views"
         | b"flutter/spellcheck"
         | b"flutter/processtext"
         | b"flutter/menu"
+        | b"flutter/scribe" => {
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+
+        // JSONMethodCodec / BasicMessageChannel (JSON/String) channels: a JSON
+        // `[null]` envelope is the correct graceful ack.
+        b"flutter/navigation"
+        | b"flutter/system"
         | b"flutter/contextmenu"
-        | b"flutter/scribe"
-        | b"flutter/restoration"
         | b"flutter/keyevent"
-        | b"flutter/platform_views"
         | b"flutter/isolate"
         | b"flutter/lifecycle" => {
             respond_platform_message(msg, JSON_SUCCESS_NULL);
@@ -940,6 +966,398 @@ fn dispatch_platform_channel(channel: &[u8], msg: &FlutterPlatformMessage) {
                 respond_platform_message(msg, default_platform_reply(msg));
             }
         }
+    }
+}
+
+/// Max bytes returned by a single `recv` (apps call repeatedly for more).
+const NET_RECV_CAP: usize = 8192;
+
+/// App networking channel — `oscortex/net`, a `BasicMessageChannel<ByteData>`
+/// (binary codec) so TCP byte streams pass through unmangled. The Dart message
+/// is a compact opcode frame; the reply is raw little-endian bytes:
+///
+///   connect  [0x01, ip(4 BE), port(2 BE)]   → i32 fd
+///   status   [0x02, fd(4 LE)]               → i32 (1 established / 0 connecting / <0 err)
+///   send     [0x03, fd(4 LE), data…]        → i32 bytes written (-11 = EAGAIN)
+///   recv     [0x04, fd(4 LE), max(4 LE)]    → i32 n, then n data bytes (-11 = no data yet)
+///   close    [0x05, fd(4 LE)]               → i32 (0 / <0 err)
+///
+/// All ints are little-endian. Errors are negative errnos straight from the
+/// kernel TCP syscalls (which this just marshals).
+fn handle_net_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        net_reply_i32(msg, -22); // EINVAL
+        return;
+    };
+
+    fn rd_u32_le(b: &[u8], off: usize) -> u32 {
+        if off + 4 <= b.len() {
+            u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+        } else {
+            0
+        }
+    }
+
+    match payload[0] {
+        0x01 => {
+            // connect: ip is big-endian (network order), port big-endian.
+            if payload.len() < 7 {
+                net_reply_i32(msg, -22);
+                return;
+            }
+            let ip = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let port = u16::from_be_bytes([payload[5], payload[6]]);
+            net_reply_i32(msg, sys::tcp_connect(ip, port) as i32);
+        }
+        0x02 => net_reply_i32(msg, sys::tcp_status(rd_u32_le(payload, 1)) as i32),
+        0x03 => {
+            let fd = rd_u32_le(payload, 1);
+            let data: &[u8] = if payload.len() > 5 { &payload[5..] } else { &[] };
+            net_reply_i32(msg, sys::tcp_write(fd, data) as i32);
+        }
+        0x04 => {
+            let fd = rd_u32_le(payload, 1);
+            let max = (rd_u32_le(payload, 5) as usize).min(NET_RECV_CAP);
+            // Single buffer: [i32 n | data]. Read into [4..], then prefix n.
+            let mut out = [0u8; 4 + NET_RECV_CAP];
+            let n = sys::tcp_read(fd, &mut out[4..4 + max]) as i32;
+            let body = if n > 0 { (n as usize).min(max) } else { 0 };
+            out[..4].copy_from_slice(&n.to_le_bytes());
+            respond_platform_message(msg, &out[..4 + body]);
+        }
+        0x05 => net_reply_i32(msg, sys::tcp_close(rd_u32_le(payload, 1)) as i32),
+        0x06 => {
+            // resolve: [0x06, hostname bytes] → reply u32 LE (BE-order IPv4),
+            // or 0 on failure. (NOT net_reply_i32: a valid high-bit IP like
+            // 200.x.x.x would look negative as i32; reply the raw u32 instead.)
+            let name: &[u8] = if payload.len() > 1 { &payload[1..] } else { &[] };
+            let r = sys::dns_resolve(name);
+            let ip: u32 = if r >= 0 { r as u32 } else { 0 };
+            respond_platform_message(msg, &ip.to_le_bytes());
+        }
+        _ => net_reply_i32(msg, -22),
+    }
+}
+
+/// Reply on `oscortex/net` with a little-endian i32 result/status.
+fn net_reply_i32(msg: &FlutterPlatformMessage, v: i32) {
+    respond_platform_message(msg, &v.to_le_bytes());
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Native webview — `oscortex/webview` (StandardMethodCodec).
+//
+// The web engine renders into its OWN compositor surface, z-stacked above this
+// app's Flutter surface and clipped to the viewport the Web Link app reports, so
+// it shows in the web region beneath the chrome. The renderer here is a STUB
+// (fills the surface a solid color + drives navigation events) that proves the
+// whole pipeline — app → channel → surface → composite → events — end to end
+// without a real engine; a Servo service replaces the stub behind this contract.
+// See docs/browser-architecture.md.
+
+/// One native webview instance (single-view for now).
+struct WebviewState {
+    view_id: i32,
+    surface_id: u32,
+    width: u32,
+    height: u32,
+    buf_va: u64, // mmap'd scratch RGBA buffer
+    buf_len: usize,
+}
+static mut WEBVIEW: Option<WebviewState> = None;
+/// Web surface stacks above the app's Flutter surface (clipped to the web rect).
+const WEBVIEW_Z: i32 = 1000;
+static WEBVIEW_CH: &[u8] = b"oscortex/webview\0";
+
+// ── StandardMethodCodec decode (generalizes std_find_kind) ───────────────────
+
+/// The method name of a StandardMethodCodec call (value 0 = a string).
+fn std_method_name(buf: &[u8]) -> Option<&[u8]> {
+    if *buf.first()? != 7 {
+        return None;
+    }
+    let (n, j) = std_read_size(buf, 1)?;
+    buf.get(j..j + n)
+}
+
+/// Offset of the value for `key` in the arguments map (value 1, a map).
+fn std_arg_value_off(buf: &[u8], key: &[u8]) -> Option<usize> {
+    let i = std_skip_value(buf, 0)?; // past the method name
+    if *buf.get(i)? != 13 {
+        return None; // arguments must be a map
+    }
+    let (n, mut j) = std_read_size(buf, i + 1)?;
+    for _ in 0..n {
+        let key_start = j;
+        let after_key = std_skip_value(buf, j)?;
+        let after_val = std_skip_value(buf, after_key)?;
+        if *buf.get(key_start)? == 7 {
+            let (klen, ks) = std_read_size(buf, key_start + 1)?;
+            if buf.get(ks..ks + klen)? == key {
+                return Some(after_key);
+            }
+        }
+        j = after_val;
+    }
+    None
+}
+
+fn std_arg_str<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let v = std_arg_value_off(buf, key)?;
+    if *buf.get(v)? != 7 {
+        return None;
+    }
+    let (n, s) = std_read_size(buf, v + 1)?;
+    buf.get(s..s + n)
+}
+
+fn std_arg_int(buf: &[u8], key: &[u8]) -> Option<i64> {
+    let v = std_arg_value_off(buf, key)?;
+    match *buf.get(v)? {
+        3 => {
+            let b = buf.get(v + 1..v + 5)?;
+            Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64)
+        }
+        4 => {
+            let b = buf.get(v + 1..v + 9)?;
+            Some(i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        }
+        _ => None,
+    }
+}
+
+// ── StandardMethodCodec encode into a fixed buffer (no alloc) ────────────────
+
+struct StdEnc {
+    buf: [u8; 512],
+    len: usize,
+}
+impl StdEnc {
+    fn new() -> Self {
+        Self { buf: [0; 512], len: 0 }
+    }
+    fn raw(&mut self, x: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = x;
+            self.len += 1;
+        }
+    }
+    fn raw_bytes(&mut self, s: &[u8]) {
+        for &x in s {
+            self.raw(x);
+        }
+    }
+    fn size(&mut self, n: usize) {
+        if n < 254 {
+            self.raw(n as u8);
+        } else if n <= 0xFFFF {
+            self.raw(254);
+            self.raw(n as u8);
+            self.raw((n >> 8) as u8);
+        } else {
+            self.raw(255);
+            self.raw(n as u8);
+            self.raw((n >> 8) as u8);
+            self.raw((n >> 16) as u8);
+            self.raw((n >> 24) as u8);
+        }
+    }
+    fn val_str(&mut self, s: &[u8]) {
+        self.raw(7);
+        self.size(s.len());
+        self.raw_bytes(s);
+    }
+    fn val_i32(&mut self, v: i32) {
+        self.raw(3);
+        self.raw_bytes(&v.to_le_bytes());
+    }
+    fn val_bool(&mut self, v: bool) {
+        self.raw(if v { 1 } else { 2 });
+    }
+    fn map(&mut self, n: usize) {
+        self.raw(13);
+        self.size(n);
+    }
+    fn slice(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+// ── Event emitters (engine → app: StandardMethodCodec method calls) ──────────
+
+fn webview_send(payload: &[u8]) {
+    let send_fn_va = SEND_PLATFORM_MESSAGE_FN.load(Ordering::SeqCst);
+    let engine = ENGINE.load(Ordering::SeqCst);
+    if send_fn_va == 0 || engine == 0 {
+        return;
+    }
+    let msg = FlutterPlatformMessage {
+        struct_size: core::mem::size_of::<FlutterPlatformMessage>(),
+        channel: WEBVIEW_CH.as_ptr() as u64,
+        message: payload.as_ptr() as u64,
+        message_size: payload.len(),
+        response_handle: 0,
+    };
+    let send: SendPlatformMessageFn = unsafe { core::mem::transmute(send_fn_va) };
+    let _ = unsafe { send(engine, &msg as *const _) };
+}
+
+/// Emit a `{viewId, url}` event (urlChanged / loadStarted / loadFinished).
+fn webview_emit_url(view_id: i32, method: &[u8], url: &[u8]) {
+    let mut e = StdEnc::new();
+    e.val_str(method);
+    e.map(2);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"url");
+    e.val_str(url);
+    webview_send(e.slice());
+}
+
+fn webview_emit_progress(view_id: i32, progress: i32) {
+    let mut e = StdEnc::new();
+    e.val_str(b"loadProgress");
+    e.map(2);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"progress");
+    e.val_i32(progress);
+    webview_send(e.slice());
+}
+
+fn webview_emit_nav(view_id: i32, back: bool, fwd: bool) {
+    let mut e = StdEnc::new();
+    e.val_str(b"navState");
+    e.map(3);
+    e.val_str(b"viewId");
+    e.val_i32(view_id);
+    e.val_str(b"canGoBack");
+    e.val_bool(back);
+    e.val_str(b"canGoForward");
+    e.val_bool(fwd);
+    webview_send(e.slice());
+}
+
+/// Stub render: fill the web surface with a solid RGBA color + submit it.
+unsafe fn webview_fill(st: &mut WebviewState, rgba: u32) {
+    let needed = (st.width as usize) * (st.height as usize) * 4;
+    if st.buf_va == 0 || st.buf_len < needed {
+        st.buf_va = sys::mmap_anon(needed);
+        st.buf_len = needed;
+    }
+    if st.buf_va == 0 {
+        return;
+    }
+    let px = unsafe {
+        core::slice::from_raw_parts_mut(st.buf_va as *mut u32, (st.width * st.height) as usize)
+    };
+    for p in px.iter_mut() {
+        *p = rgba;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(st.buf_va as *const u8, needed) };
+    let _ = sys::gpu_submit_strided(st.surface_id, bytes, (st.width as usize) * 4);
+}
+
+fn handle_webview_channel(msg: &FlutterPlatformMessage) {
+    let payload = if msg.message != 0 && msg.message_size != 0 {
+        unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
+    } else {
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        return;
+    };
+    let method = std_method_name(payload).unwrap_or(b"");
+    let view_id = std_arg_int(payload, b"viewId").unwrap_or(0) as i32;
+
+    match method {
+        b"create" => {
+            let w = std_arg_int(payload, b"width").unwrap_or(1).max(1) as u32;
+            let h = std_arg_int(payload, b"height").unwrap_or(1).max(1) as u32;
+            let sid = sys::surface_create(w, h);
+            let surface = if sid >= 0 {
+                let sid = sid as u32;
+                let mut st = WebviewState {
+                    view_id,
+                    surface_id: sid,
+                    width: w,
+                    height: h,
+                    buf_va: 0,
+                    buf_len: 0,
+                };
+                unsafe {
+                    webview_fill(&mut st, 0xFF2A2A2A); // dark gray placeholder
+                    *core::ptr::addr_of_mut!(WEBVIEW) = Some(st);
+                }
+                sid as i32
+            } else {
+                -1
+            };
+            let mut e = StdEnc::new();
+            e.raw(0x00); // success envelope
+            e.map(1);
+            e.val_str(b"surfaceId");
+            e.val_i32(surface);
+            respond_platform_message(msg, e.slice());
+            if surface >= 0 {
+                webview_emit_nav(view_id, false, false);
+            }
+        }
+        b"setViewport" => {
+            let x = std_arg_int(payload, b"x").unwrap_or(0) as i32;
+            let y = std_arg_int(payload, b"y").unwrap_or(0) as i32;
+            let w = std_arg_int(payload, b"w").unwrap_or(0).max(0) as u32;
+            let h = std_arg_int(payload, b"h").unwrap_or(0).max(0) as u32;
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of!(WEBVIEW)).as_ref() {
+                    let sid = st.surface_id;
+                    let _ = sys::surface_geometry_set(sid, x, y, w, h);
+                    let _ = sys::surface_clip_set(sid, x, y, w, h);
+                    let _ = sys::surface_z_set(sid, WEBVIEW_Z);
+                }
+            }
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"loadUrl" => {
+            let url = std_arg_str(payload, b"url").unwrap_or(b"");
+            webview_emit_url(view_id, b"loadStarted", url);
+            webview_emit_url(view_id, b"urlChanged", url);
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of_mut!(WEBVIEW)).as_mut() {
+                    webview_fill(st, 0xFF202830); // tint to show the nav took effect
+                }
+            }
+            webview_emit_progress(view_id, 100);
+            webview_emit_url(view_id, b"loadFinished", url);
+            webview_emit_nav(view_id, false, false);
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"destroy" => {
+            unsafe {
+                if let Some(st) = (*core::ptr::addr_of!(WEBVIEW)).as_ref() {
+                    let _ = sys::surface_destroy(st.surface_id);
+                }
+                *core::ptr::addr_of_mut!(WEBVIEW) = None;
+            }
+            respond_platform_message(msg, METHOD_SUCCESS_NULL);
+        }
+        b"canGoBack" | b"canGoForward" => {
+            let mut e = StdEnc::new();
+            e.raw(0x00);
+            e.val_bool(false);
+            respond_platform_message(msg, e.slice());
+        }
+        b"getTitle" => {
+            let mut e = StdEnc::new();
+            e.raw(0x00);
+            e.val_str(b"OSCortex Web (stub)");
+            respond_platform_message(msg, e.slice());
+        }
+        // goBack / goForward / reload / stopLoading / resize / setVisible /
+        // dispatchInput / dispatchScroll / dispatchKey / evalJs / currentUrl:
+        // acknowledged (no-op in the stub).
+        _ => respond_platform_message(msg, METHOD_SUCCESS_NULL),
     }
 }
 
@@ -1639,48 +2057,126 @@ fn textinput_feed_key(scancode: u32, pressed: bool) {
 
 // ── Mouse cursor channel ─────────────────────────────────────────────────────
 
+// ── Minimal StandardMessageCodec reader (binary) ─────────────────────────────
+// flutter/mousecursor uses StandardMethodCodec (a method call is
+// writeValue(methodName:String) + writeValue(arguments:Map)), NOT JSON. Type
+// bytes: 0=null 1=true 2=false 3=int32 4=int64 6=float64 7=string 8=uint8list
+// 9=int32list 10=int64list 11=float64list 12=list 13=map. Strings/sizes use the
+// readSize varint: <254 → 1 byte; 254 → u16; 255 → u32.
+
+/// Read a StandardMessageCodec size varint at `i`. Returns (size, next_index).
+fn std_read_size(buf: &[u8], i: usize) -> Option<(usize, usize)> {
+    let b = *buf.get(i)? as usize;
+    if b < 254 {
+        Some((b, i + 1))
+    } else if b == 254 {
+        Some(((*buf.get(i + 1)? as usize) | ((*buf.get(i + 2)? as usize) << 8), i + 3))
+    } else {
+        let v = (*buf.get(i + 1)? as usize)
+            | ((*buf.get(i + 2)? as usize) << 8)
+            | ((*buf.get(i + 3)? as usize) << 16)
+            | ((*buf.get(i + 4)? as usize) << 24);
+        Some((v, i + 5))
+    }
+}
+
+/// Advance past one StandardMessageCodec value starting at `i`. Handles the
+/// types that appear in framework method-call arguments (scalars, strings,
+/// nested list/map). Returns the index after the value.
+fn std_skip_value(buf: &[u8], i: usize) -> Option<usize> {
+    let t = *buf.get(i)?;
+    let i = i + 1;
+    match t {
+        0 | 1 | 2 => Some(i),     // null / true / false
+        3 => Some(i + 4),         // int32
+        4 => Some(i + 8),         // int64
+        6 => Some(((i + 7) & !7) + 8), // float64, 8-byte aligned to buffer start
+        7 | 8 => {                // string / uint8list
+            let (n, j) = std_read_size(buf, i)?;
+            Some(j + n)
+        }
+        12 | 13 => {              // list / map
+            let (n, mut j) = std_read_size(buf, i)?;
+            let count = if t == 13 { n * 2 } else { n };
+            for _ in 0..count {
+                j = std_skip_value(buf, j)?;
+            }
+            Some(j)
+        }
+        _ => None,
+    }
+}
+
+/// Decode a StandardMethodCodec method call and return the string value of the
+/// `kind` key in the arguments map, if present.
+fn std_find_kind(buf: &[u8]) -> Option<&[u8]> {
+    // [0] = method name (string). Skip it.
+    if *buf.first()? != 7 {
+        return None;
+    }
+    let i = std_skip_value(buf, 0)?;
+    // arguments must be a Map (type 13).
+    if *buf.get(i)? != 13 {
+        return None;
+    }
+    let (n, mut j) = std_read_size(buf, i + 1)?;
+    for _ in 0..n {
+        // key
+        if *buf.get(j)? == 7 {
+            let (klen, kstart) = std_read_size(buf, j + 1)?;
+            let key = buf.get(kstart..kstart + klen)?;
+            let after_key = kstart + klen;
+            if key == b"kind" {
+                if *buf.get(after_key)? == 7 {
+                    let (vlen, vstart) = std_read_size(buf, after_key + 1)?;
+                    return buf.get(vstart..vstart + vlen);
+                }
+                return None;
+            }
+            j = std_skip_value(buf, after_key)?;
+        } else {
+            j = std_skip_value(buf, j)?; // skip non-string key
+            j = std_skip_value(buf, j)?; // skip its value
+        }
+    }
+    None
+}
+
 fn handle_mousecursor_channel(msg: &FlutterPlatformMessage) {
     let payload = if msg.message != 0 && msg.message_size != 0 {
         unsafe { core::slice::from_raw_parts(msg.message as *const u8, msg.message_size) }
     } else {
-        respond_platform_message(msg, JSON_SUCCESS_NULL);
+        // flutter/mousecursor is StandardMethodCodec: a success-null reply is the
+        // binary envelope [0x00, 0x00], NOT JSON `[null]` (which the framework's
+        // StandardMethodCodec.decodeEnvelope rejects as "Message corrupted").
+        respond_platform_message(msg, METHOD_SUCCESS_NULL);
         return;
     };
-    let mut method = [0u8; 64];
-    if let Some((mlen, _)) = json_method_name(payload, &mut method) {
-        if &method[..mlen] == b"MouseCursor.activateSystemCursor" {
-            // args = { device, kind }. Map the Flutter cursor `kind` to a kernel
-            // cursor shape and apply it via SYS_CURSOR_SHAPE_SET so the compositor
-            // actually draws the matching pointer (hand on links, I-beam on text…).
-            if let Some(vi) = json_find_value(payload, b"kind") {
-                if payload.get(vi) == Some(&b'"') {
-                    let mut kind = [0u8; 32];
-                    if let Some((klen, _)) = json_parse_string(payload, vi, &mut kind) {
-                        let shape = cursor_kind_to_shape(&kind[..klen]);
-                        // De-dupe: Flutter spams activateSystemCursor on every
-                        // hover move. The kernel syscall redraws the cursor
-                        // (invalidate → composite), so calling it per-event is a
-                        // redraw STORM that freezes the cooperative core. Only hit
-                        // the kernel when the shape actually CHANGES.
-                        static LAST_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(u32::MAX);
-                        let changed = LAST_CURSOR_SHAPE.swap(shape, Ordering::Relaxed) != shape;
-                        if changed {
-                            sys::cursor_shape_set(shape);
-                        }
-                        static CUR_LOG: AtomicU32 = AtomicU32::new(0);
-                        if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
-                            write(b"[embedder/cursor] kind=");
-                            write(&kind[..klen]);
-                            write(b" -> shape=");
-                            write_dec(shape as u64);
-                            write(b"\n");
-                        }
-                    }
-                }
-            }
+    // args = { device, kind }. Map the Flutter cursor `kind` to a kernel cursor
+    // shape and apply it via SYS_CURSOR_SHAPE_SET so the compositor draws the
+    // matching pointer (hand on links, I-beam on text…). The request is binary
+    // StandardMethodCodec, so decode it as such (the old JSON parse silently
+    // failed → cursor shapes never changed).
+    if let Some(kind) = std_find_kind(payload) {
+        let shape = cursor_kind_to_shape(kind);
+        // De-dupe: Flutter spams activateSystemCursor on every hover move. The
+        // kernel syscall redraws the cursor (invalidate → composite), so calling
+        // it per-event is a redraw STORM. Only hit the kernel on a real change.
+        static LAST_CURSOR_SHAPE: AtomicU32 = AtomicU32::new(u32::MAX);
+        let changed = LAST_CURSOR_SHAPE.swap(shape, Ordering::Relaxed) != shape;
+        if changed {
+            sys::cursor_shape_set(shape);
+        }
+        static CUR_LOG: AtomicU32 = AtomicU32::new(0);
+        if CUR_LOG.fetch_add(1, Ordering::Relaxed) < 16 {
+            write(b"[embedder/cursor] kind=");
+            write(kind);
+            write(b" -> shape=");
+            write_dec(shape as u64);
+            write(b"\n");
         }
     }
-    respond_platform_message(msg, JSON_SUCCESS_NULL);
+    respond_platform_message(msg, METHOD_SUCCESS_NULL);
 }
 
 /// Map a Flutter `SystemMouseCursors` kind string to a kernel `CURSOR_SHAPE_*`.
@@ -2640,6 +3136,23 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     static ARG2: &[u8] = b"--enable-software-rendering=true\0";
     static ARG3: &[u8] = b"--disable-vm-service\0";
     static ARG4: &[u8] = b"--precompiled-mode\0";
+    // SERIAL-GC FIX (post-app-launch freeze). The default Dart VM runs parallel
+    // GC worker threads (scavenger + marker) plus concurrent mark/sweep threads;
+    // a collection is a stop-the-world safepoint that needs ALL of them to park
+    // simultaneously. On our cooperative single-core scheduler that safepoint can
+    // never converge for a 2nd app engine → its render thread freezes (the live
+    // repro: launch Files, sweep, present_callback stops advancing). Making GC
+    // fully SERIAL — run entirely on the mutator that triggered it, no background
+    // GC threads to coordinate — removes the safepoint convergence problem at its
+    // root. These flags ARE forwarded now: the AOT engine is rebuilt with
+    // engine-port/patches/0004 adding them to switches.cc kAllowedDartFlags
+    // (prefix-matched, so the "=value" forms pass), and --dart-flags is parsed
+    // unconditionally (not gated on !FLUTTER_RELEASE). DELIVERED via the single
+    // --dart-flags= switch (bare --flag argv items are NOT forwarded to the VM).
+    // AOT-only: the JIT/debug VM (x86) asserts num_tasks>0 and SIGABRTs on
+    // tasks=0, so the JIT path keeps the bare heap args below instead (ARG5-ARG7).
+    static ARG_DARTFLAGS_AOT: &[u8] =
+        b"--dart-flags=--scavenger_tasks=0,--marker_tasks=0,--no_concurrent_mark,--no_concurrent_sweep\0";
     static ARG5: &[u8] = b"--old_gen_heap_size=64\0";
     static ARG6: &[u8] = b"--new_gen_heap_size=8\0";
     static ARG7: &[u8] = b"--max_old_gen_heap_size=64\0";
@@ -2684,7 +3197,21 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
             ARG5.as_ptr(),
             ARG6.as_ptr(),
             ARG7.as_ptr(),
-            ARG8.as_ptr(),
+        ]);
+    // AOT/release argv: the 5 AOT-safe switches + the serial-GC --dart-flags. The
+    // patched release engine (both arches now) forwards the GC flags to the Dart
+    // VM — the post-app-launch freeze fix.
+    #[repr(transparent)]
+    struct ArgvPtrs6([*const u8; 6]);
+    unsafe impl Sync for ArgvPtrs6 {}
+    static ENGINE_ARGV_AOT: ArgvPtrs6 =
+        ArgvPtrs6([
+            ARG0.as_ptr(),
+            ARG1.as_ptr(),
+            ARG2.as_ptr(),
+            ARG3.as_ptr(),
+            ARG4.as_ptr(),
+            ARG_DARTFLAGS_AOT.as_ptr(),
         ]);
 
     let mut project_args = FlutterProjectArgsRaw {
@@ -2706,10 +3233,20 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
         icu_path.as_ptr() as u64,
     );
     // ARG0-ARG4 are AOT-safe (name, impeller=false, software-rendering,
-    // disable-vm-service, precompiled-mode). ARG5-ARG8 are JIT-era GC/heap
-    // workarounds that the RELEASE/AOT engine rejects as disallowed Dart VM flags
-    // (switches.cc:478 FATAL). So pass only the first 5 args under AOT.
-    let engine_argc: i32 = if is_aot { 5 } else { ENGINE_ARGV.0.len() as i32 };
+    // disable-vm-service, precompiled-mode). Under AOT on aarch64 we additionally
+    // pass the serial-GC --dart-flags switch (ENGINE_ARGV_AOT, argc=6) — the
+    // patched arm64 release engine forwards it to the Dart VM, which is the
+    // post-app-launch freeze fix (verified on aarch64).
+    //
+    // Both arches now run the patched release engine in AOT mode with prebuilt
+    // product-mode libapp.so snapshots, so both deliver the serial-GC --dart-flags
+    // (ENGINE_ARGV_AOT, argc=6). JIT path (no AOT snapshot) keeps the full 8-arg
+    // ENGINE_ARGV with bare heap flags — its debug VM asserts on tasks=0.
+    let (argv_ptr, engine_argc): (u64, i32) = if is_aot {
+        (ENGINE_ARGV_AOT.0.as_ptr() as u64, 6)
+    } else {
+        (ENGINE_ARGV.0.as_ptr() as u64, ENGINE_ARGV.0.len() as i32)
+    };
     write_i32_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_COMMAND_LINE_ARGC,
@@ -2718,7 +3255,7 @@ extern "C" fn main_embedder(host_mode: u64, app_id: u64, aot_va: u64) {
     write_u64_at(
         &mut project_args.bytes,
         OFF_PROJECT_ARGS_COMMAND_LINE_ARGV,
-        ENGINE_ARGV.0.as_ptr() as u64,
+        argv_ptr,
     );
     write_u64_at(
         &mut project_args.bytes,

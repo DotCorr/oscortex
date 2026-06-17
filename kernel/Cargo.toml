@@ -26,6 +26,8 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "socket-tcp",
     "socket-icmp",
     "socket-dhcpv4",
+    "socket-dns",
+    "proto-dns",
     "medium-ethernet",
     "log",
     "iface-max-route-count-4",
@@ -33,6 +35,9 @@ smoltcp = { version = "0.12", default-features = false, features = [
     "iface-max-addr-count-4",
     "iface-max-multicast-group-count-4",
     "assembler-max-segment-count-4",
+    "dns-max-name-size-255",
+    "dns-max-result-count-2",
+    "dns-max-server-count-2",
 ] }
 
 [features]
@@ -47,3 +52,11 @@ limine-boot = []
 ai-cortex = []
 driver-wasm = []
 self-healing = []
+# Multi-core (SMP) AP bring-up. OFF by default: the scheduler isn't fully SMP-safe
+# yet and AP bring-up hung real hardware (a 2016 Skylake Mac) at cortex::smp. The
+# proven-stable config is single-core (serial-GC engine). Enable for SMP dev.
+smp = []
+# Draw an on-screen input debug HUD (bound device + live pointer/key/scroll event
+# counts) over every frame. For diagnosing input on a VM/board with no serial.
+# Off in release ISOs (zero cost). See compositor::input_hud + dev-tools/README.md.
+input-hud = []

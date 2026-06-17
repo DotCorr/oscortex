@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 use spin::Mutex;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+/// On-screen input debug HUD (opt-in via `--features input-hud`; no-op otherwise).
+mod input_hud;
+
 /// The mouse-cursor shape the compositor currently draws. Set from userspace
 /// via `SYS_CURSOR_SHAPE_SET` when the Flutter framework activates a system
 /// cursor (e.g. hovering a button → click/hand, hovering a text field → I-beam).
@@ -954,6 +957,7 @@ pub fn render_frame() {
         // verbose log overlay) instead of raw logs. It fills its own black bg.
         crate::drivers::bootscreen::render();
         draw_software_cursor();
+        input_hud::draw();
         crate::drivers::fb::swap_buffers();
         crate::wm::push_vsync(frame);
         return;
@@ -1020,6 +1024,7 @@ pub fn render_frame() {
 
     drop(c);
     draw_software_cursor();
+    input_hud::draw();
     crate::drivers::fb::swap_buffers();
     let mut c = COMP.lock();
     c.frame_counter = c.frame_counter.wrapping_add(1);

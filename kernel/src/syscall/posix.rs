@@ -914,11 +914,19 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
             log::warn!("[startup-mutex] after-waiter-add pid={} mutex={:#x}", pid, mutex);
         }
 
-        if pid >= 2 && crate::process::get_group_leader(pid) == 1 {
+        // Deadlock breaker for ANY embedder host group (not just the shell, pid 1).
+        // A render thread can contend on a mutex held by a sibling parked in an
+        // infinite epoll_wait on a disarmed timerfd; force-waking the task runners
+        // pokes that timerfd so the holder runs and releases the mutex. This used
+        // to be gated on `group_leader == 1`, so it only ever rescued the SHELL —
+        // every launched APP (group leader = its own host pid, e.g. 10) was skipped
+        // and wedged a few frames after launch. Generalize to the thread's own host.
+        let host = crate::process::get_group_leader(pid);
+        if pid >= 2 && host != pid && host != 0 {
             static ENGINE_MUTEX_WAIT_KICK: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
             let kick = ENGINE_MUTEX_WAIT_KICK.fetch_add(1, Ordering::Relaxed);
-            crate::process::set_state(1, crate::process::ProcState::Running);
+            crate::process::set_state(host, crate::process::ProcState::Running);
             if kick < 32 || (kick & 15) == 0 {
                 if trace_startup_mutex {
                     log::warn!("[startup-mutex] before-force-wake pid={} mutex={:#x}", pid, mutex);
@@ -964,7 +972,10 @@ pub fn sys_pthread_mutex_lock(mutex: u64, sys_nr: u64) -> i64 {
 
         let mut mutex_handoff_target = || {
             crate::process::next_runnable_pid(pid).or_else(|| {
-                if pid >= 2 && crate::process::get_group_leader(pid) == 1 {
+                // Generalized from `group_leader == 1` (shell only) to any embedder
+                // worker thread, so a launched app's render threads also hand off to
+                // their host / siblings instead of stalling.
+                if pid >= 2 && crate::process::get_group_leader(pid) != pid {
                     super::prefer_embedder_if_baton_due(pid)
                         .or_else(|| crate::process::next_runnable_sibling_thread(pid))
                         .or_else(|| super::cooperative_sched_target(pid))

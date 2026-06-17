@@ -23,8 +23,15 @@ CONTAINER="oscx-engine"
 ARCH="${1:-x64}"
 MODE="${2:-release}"
 NAME="oscortex-${ARCH}-${MODE}"
-OUTDIR="out/oscortex_release"
-[ "$MODE" = "debug" ] && OUTDIR="out/oscortex_debug_unopt"
+# GN out-dir per target. The dir names differ by arch (arm64 was configured as a
+# plain linux release; x64 via the oscortex target), so map explicitly rather
+# than assuming a single dir.
+case "$ARCH-$MODE" in
+  arm64-release) OUTDIR="out/linux_release_arm64" ;;
+  x64-release)   OUTDIR="out/oscortex_release_x64" ;;
+  x64-debug)     OUTDIR="out/oscortex_debug_unopt_x64" ;;
+  *)             OUTDIR="out/oscortex_${MODE}" ;;
+esac
 R2_BUCKET="${R2_BUCKET:-oscortex-engine}"
 KEY="$ARTIFACT_VERSION/${NAME}.tar.gz"
 

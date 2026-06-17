@@ -1,0 +1,26 @@
+name: oscortex_cli
+description: >-
+  Build and run Flutter apps for OSCortex. Compiles a Flutter project into a
+  universal .osx bundle (native aarch64 + x86_64 in one artifact) and previews
+  it in an emulator across architectures.
+version: 0.1.0
+homepage: https://github.com/DotCorr/oscortex
+repository: https://github.com/DotCorr/oscortex
+issue_tracker: https://github.com/DotCorr/oscortex/issues
+# Dual-licensed AGPL-3.0-or-later OR commercial; see the repo LICENSE files.
+# Public entrypoint is the `osx` executable (see executables below). The package
+# name is `oscortex_cli` to be unambiguous on pub.dev.
+
+environment:
+  sdk: ^3.5.0
+
+executables:
+  osx: osx
+
+dependencies:
+  args: ^2.5.0
+  path: ^1.9.0
+
+dev_dependencies:
+  lints: ^4.0.0
+  test: ^1.25.0

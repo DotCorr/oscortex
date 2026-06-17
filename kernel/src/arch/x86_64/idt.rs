@@ -67,7 +67,7 @@ pub fn init() {
         IDT.entries[6].set(invalid_opcode_handler as *const () as u64, 0, 0);
         IDT.entries[7].set(device_not_avail_handler as *const () as u64, 0, 0);
         IDT.entries[8].set(double_fault_handler as *const () as u64, DOUBLE_FAULT_IST, 0);
-        IDT.entries[13].set(general_protection_handler as *const () as u64, 0, 0);
+        IDT.entries[13].set(gp_fault_entry as *const () as u64, 0, 0);
         IDT.entries[14].set(page_fault_entry as *const () as u64, 0, 0);
         IDT.entries[16].set(x87_fp_handler as *const () as u64, 0, 0);
         IDT.entries[17].set(alignment_check_handler as *const () as u64, 0, 0);
@@ -131,29 +131,72 @@ extern "x86-interrupt" fn device_not_avail_handler(_frame: InterruptFrame) {}
 extern "x86-interrupt" fn double_fault_handler(frame: InterruptFrame, _err: u64) -> ! {
     panic!("Double fault! ip={:#x}", frame.ip);
 }
-extern "x86-interrupt" fn general_protection_handler(frame: InterruptFrame, err: u64) {
-    crate::cortex::interrupt_hook(13, &frame, Some(err));
-    let user_mode = (frame.cs & 0x3) == 0x3;
+// #GP frame: same layout as PageFaultFrame (the CPU pushes an error code for #GP too).
+#[repr(C)]
+struct GpFaultFrame {
+    r15: u64, r14: u64, r13: u64, r12: u64,
+    r11: u64, r10: u64, r9: u64,  r8: u64,
+    rdi: u64, rsi: u64, rbp: u64, rbx: u64,
+    rdx: u64, rcx: u64, rax: u64,
+    err: u64,
+    rip: u64, cs: u64, rflags: u64, rsp: u64, ss: u64,
+}
+
+#[unsafe(naked)]
+unsafe extern "C" fn gp_fault_entry() {
+    core::arch::naked_asm!(
+        "push rax", "push rcx", "push rdx", "push rbx", "push rbp",
+        "push rsi", "push rdi", "push r8", "push r9", "push r10",
+        "push r11", "push r12", "push r13", "push r14", "push r15",
+        "mov rdi, rsp",
+        "call {handler}",
+        "pop r15", "pop r14", "pop r13", "pop r12", "pop r11",
+        "pop r10", "pop r9", "pop r8", "pop rdi", "pop rsi",
+        "pop rbp", "pop rbx", "pop rdx", "pop rcx", "pop rax",
+        "add rsp, 8",
+        "iretq",
+        handler = sym gp_fault_full_handler,
+    );
+}
+
+extern "C" fn gp_fault_full_handler(frame_ptr: *mut GpFaultFrame) {
+    let f = unsafe { &*frame_ptr };
+    let user_mode = (f.cs & 0x3) == 0x3;
     if user_mode {
         let pid = crate::process::current_pid();
         log::error!(
             "[GPF] SIGSEGV: ip={:#x} err={:#x} pid={} cs={:#x} sp={:#x} ss={:#x} rflags={:#x}",
-            frame.ip,
-            err,
-            pid,
-            frame.cs,
-            frame.sp,
-            frame.ss,
-            frame.flags
+            f.rip, f.err, pid, f.cs, f.rsp, f.ss, f.rflags
+        );
+        log::error!(
+            "[GPF] regs: rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x}",
+            f.rax, f.rbx, f.rcx, f.rdx, f.rsi, f.rdi, f.rbp
+        );
+        log::error!(
+            "[GPF] regs:  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            f.r8, f.r9, f.r10, f.r11, f.r12, f.r13, f.r14, f.r15
         );
         crate::syscall::dump_recent_syscalls(24);
+        // RESILIENCE: a userspace fault must NOT halt the whole OS (the old
+        // `halt_forever` turned one app's crash into a dead machine). A user-mode
+        // fault holds no kernel lock, so we can safely tear down the faulting
+        // process — `exit` triggers app crash auto-recovery for the app's group —
+        // and reschedule. The shell and every other process survive one app's
+        // crash. Mirrors sys_exit: die, run the next runnable, never park forever.
         if pid != 0 {
-            crate::process::kill(pid).ok();
+            crate::process::exit(pid, -1);
         }
         crate::process::set_current_pid(0);
-        crate::arch::halt_forever();
+        loop {
+            crate::process::handle_pending_wakes_try();
+            crate::syscall::check_timerfds_and_wake_try();
+            if let Some(next) = crate::process::next_runnable_pid(0) {
+                crate::process::enter_user_by_pid_noreturn(next);
+            }
+            crate::arch::enable_and_halt();
+        }
     }
-    panic!("GPF! ip={:#x} err={:#x}", frame.ip, err);
+    panic!("GPF! ip={:#x} err={:#x}", f.rip, f.err);
 }
 extern "x86-interrupt" fn page_fault_handler(frame: InterruptFrame, err: u64) {
     // Kept for any vestigial callers; primary handler is page_fault_entry below.
@@ -382,11 +425,21 @@ extern "C" fn page_fault_full_handler(frame_ptr: *mut PageFaultFrame) {
         }
         crate::syscall::dump_recent_syscalls(24);
         if user_mode {
+            // RESILIENCE (matches the #GP handler): a userspace page fault kills only
+            // the faulting process (triggering app crash auto-recovery) and reschedules
+            // — it must not halt the whole OS. A user-mode fault holds no kernel lock.
             if pid != 0 {
-                crate::process::kill(pid).ok();
+                crate::process::exit(pid, -1);
             }
             crate::process::set_current_pid(0);
-            crate::arch::halt_forever();
+            loop {
+                crate::process::handle_pending_wakes_try();
+                crate::syscall::check_timerfds_and_wake_try();
+                if let Some(next) = crate::process::next_runnable_pid(0) {
+                    crate::process::enter_user_by_pid_noreturn(next);
+                }
+                crate::arch::enable_and_halt();
+            }
         }
         panic!("Unresolvable kernel page fault: addr={:#x} err={:#x} ip={:#x}", cr2, frame.err, frame.rip);
     }
@@ -574,16 +627,27 @@ unsafe extern "C" fn apic_timer_entry() {
 }
 
 extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
+    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
+
+    // AP idle-park during shell bring-up: until the shell's engine is up (and thus
+    // an app could be launched onto an AP), an AP has no home-pinned work. Doing the
+    // timerfd/wake/scheduler work here only contends with the BSP's first-frame
+    // bring-up (a boot stall under TCG SMP). EOI and return — the AP just halts.
+    if cpu_id != 0 && !crate::wm::flutter_init_ready() {
+        crate::arch::apic::eoi();
+        return;
+    }
+
     crate::syscall::check_timerfds_and_wake_try();
     crate::process::handle_pending_wakes_try();
-
-    let cpu_id = crate::arch::x86_64::smp::this_cpu().cpu_id;
 
     // Set a deferred-kick flag every ~500 ms (500 ticks × 1 ms/tick).
     // The flag is consumed in syscall context (sys_pthread_mutex_unlock or
     // sys_wm_event_wait) where spinlock acquisition is safe.  This ISR path
-    // only does an atomic store — completely lock-free.
-    if cpu_id == 0 {
+    // only does an atomic store — completely lock-free. Fired on ALL cores: a
+    // launched app runs on an AP and needs its own cooperative deadlocks broken
+    // (the global flag is consumed by whichever core's thread next yields).
+    {
         static TR_KICK_CTR: core::sync::atomic::AtomicU32 =
             core::sync::atomic::AtomicU32::new(0);
         let k = TR_KICK_CTR.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -678,35 +742,36 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
         return;
     }
 
-    // SMP SAFETY: the scheduler is cooperative and BSP-only — it assumes at most
-    // ONE user thread runs at a time. Only CPU 0 may enter/run user threads. If an
-    // AP's timer ISR were allowed past here it would claim and enter a user thread
-    // (via the wake-assist below), running it CONCURRENTLY with the BSP. Two user
-    // threads executing in true parallel break the futex/condvar emulation's
-    // single-core assumptions → nondeterministic livelock (the smp>1 failure).
-    // Keep APs out: they EOI'd above and now simply return to halt.
-    if cpu_id != 0 {
-        return;
-    }
-
-    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall
-    // hlt loop, queued input can otherwise leave PID 1 runnable-but-unentered.
-    // If the interrupt lands in idle (cur=0), PID 1 is still the safe target
-    // for post-init WM input. If it lands in PID 1's own wm_event_wait loop,
-    // re-entering PID 1 makes it re-execute the syscall and drain the queue.
+    // SMP home-core model: each core runs ONLY threads pinned to its home_cpu, so
+    // the BSP and an AP never enter the SAME user thread concurrently. The old
+    // "BSP-only" gate (which parked every AP) is replaced by a per-target home-core
+    // check inside try_claim_cpu_for_try below: a core's wake-assist can only claim
+    // and enter a target whose home_cpu == this core. The shell (home 0) is woken by
+    // the BSP; a launched app (home 1+) is woken by its AP. On single-core there is
+    // only cpu 0 and home_cpu is always 0, so this is exactly the original path.
+    //
+    // Kernel-mode wake assist: when a Flutter runner is sleeping in a syscall hlt
+    // loop, queued input/baton can leave it runnable-but-unentered. Re-entering the
+    // target makes it re-execute its wm_event_wait and drain the queue (pumping a
+    // frame). This is what pumps a launched app's frames on its application core.
+    let my_cpu = cpu_id;
     let cur = crate::process::current_pid();
     let focus = crate::wm::focus_pid();
     let target = if focus != 0 { focus } else { 1 };
-    if target != 0
+    // Only the target's HOME core runs the wake-assist for it. This guards the WHOLE
+    // block (not just the claim): set_state_try has a side effect, so an AP must not
+    // flip the shell's state to Running from core 1 (that races the shell's own
+    // cooperative state machine on core 0 — observed to freeze the shell's bring-up).
+    // On single-core, home_cpu is always 0 == my_cpu, so this is the original path.
+    let target_is_mine = crate::process::home_cpu_of_try(target) == Some(my_cpu);
+    if target != 0 && target_is_mine
         && crate::wm::flutter_init_ready()
         && !crate::wm::flutter_bootstrap_spin_active()
         && (cur == 0 || crate::process::is_blocked_try(cur))
         && (crate::wm::input_pending_for(target) > 0 || crate::wm::embedder_baton_due(target))
     {
         if crate::process::set_state_try(target, crate::process::ProcState::Running) {
-
             if cur != target {
-                let my_cpu = crate::arch::smp::this_cpu().cpu_id;
                 if crate::process::try_claim_cpu_for_try(target, my_cpu) {
                     crate::process::enter_user_by_pid_noreturn_try(target);
                 }

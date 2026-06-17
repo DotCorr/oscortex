@@ -72,6 +72,14 @@ pub fn start_scheduler_tick() {
 fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     let intid = super::gic::acknowledge();
 
+    // Cross-core reschedule IPI (SMP, SGI 0). Taking the interrupt already woke
+    // this core from wfi; EOI and return. Once APs run the scheduler (M5), this is
+    // where the woken core re-picks a runnable thread.
+    if intid == super::gic::SGI_RESCHED {
+        super::gic::eoi(intid);
+        return;
+    }
+
     // Non-timer interrupts. virtio-mmio input SPIs (slot i → INTID 48+i) drive the
     // pointer/keyboard; drain them into the WM queue, then EOI. Everything else is
     // spurious/unhandled: EOI (if real) and return.
@@ -89,6 +97,16 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     super::timer::on_tick();
     // EOI now so the GIC can deliver the next timer interrupt right after eret.
     super::gic::eoi(intid);
+
+    // SMP: a secondary core that has NOT yet engaged user scheduling does ZERO
+    // work here (just the EOI above, which also wakes it from wfi to re-poll). This
+    // keeps an idling AP from touching PTABLE_LOCK / the wake machinery and thus
+    // from contending with the BSP during the engine's single-core bring-up — the
+    // contention that previously broke app launch under smp>1. The BSP (cpu 0) is
+    // always engaged.
+    if !super::smp::cpu_engaged(super::smp::current_cpu_id()) {
+        return;
+    }
 
     // Wake threads whose timerfd deadlines have elapsed, and deliver any pending
     // cross-thread wakes — exactly as the x86 APIC-timer ISR does (idt.rs). On
@@ -125,7 +143,11 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     // engine schedules frames forever (schedule_frame label=idle) but the baton is
     // never delivered, so FlutterEngineOnVsync is never called and no frame is
     // ever produced or presented. (aarch64 had only a no-op vsync_due() scaffold.)
-    if vsync_due() {
+    // GLOBAL per-tick work (vsync baton, WM tick, USB poll) runs on the BSP ONLY —
+    // these are single-driver subsystems; letting a 2nd core drive them too would
+    // double-deliver vsync batons / double-poll USB. APs only do per-CPU scheduling
+    // below.
+    if super::smp::current_cpu_id() == 0 && vsync_due() {
         crate::wm::tick();
         // Deliver the vsync baton ONLY — do NOT call compositor::tick() here: its
         // render_frame() does a full-screen blit/fill that, in the timer ISR under
@@ -160,16 +182,39 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
         let cur = crate::process::current_pid();
         let focus = crate::wm::focus_pid();
         let target = if focus != 0 { focus } else { 1 };
-        if target != 0
+        // HOME-CORE per-core wake-assist (mirrors x86 idt.rs). Only the target's HOME
+        // core re-enters it: the BSP pumps the shell (home 0), an AP pumps the app
+        // pinned to it (home 1+). try_claim_cpu_for_try is home-gated so this can't
+        // steal another core's thread. The ISR-initiated resume below was previously
+        // disabled (// BISECT) as the suspected cause of "pid=2 Dart corruption" — but
+        // that predates the 2026-06-16 per-CPU page-table-lock + ABBA lock-order fixes,
+        // the real corruption source. Re-enabled: the app's engine bootstrap stalls at
+        // FlutterEngineRunInitialized without it (the worker the isolate launch waits
+        // on is parked and only this resume re-enters it), exactly as on x86.
+        let my_cpu = super::smp::current_cpu_id();
+        let target_is_mine = crate::process::home_cpu_of_try(target) == Some(my_cpu);
+        if target != 0 && target_is_mine
             && (cur == 0 || crate::process::is_blocked_try(cur))
             && (crate::wm::input_pending_for(target) > 0
                 || crate::wm::embedder_baton_due(target))
             && cur != target
         {
-            // BISECT: just wake the target; let normal cooperative scheduling enter
-            // it (the ISR-initiated resume enter_user_by_pid_noreturn_try is the
-            // prime suspect for the residual pid=2 Dart corruption — disabled to test).
-            let _ = crate::process::set_state_try(target, crate::process::ProcState::Running);
+            // The cooperative hand-off alone does NOT re-enter the force_wake-released
+            // engine thread on the AP, so the bootstrap stalls without an ISR resume.
+            // The resume corrupts ONLY when it re-enters a thread with no valid saved
+            // FP (build_image zeroes v0–v31 incl. callee-saved v8–v15 → EC=0x24). So:
+            // resume MULTI-CORE only, and ONLY when the target has a valid FP image
+            // (aarch64_fp_valid) — i.e. exactly the case where restoring FP is correct.
+            // No valid FP → wake-only (skip), never enter with garbage FP.
+            if crate::process::set_state_try(target, crate::process::ProcState::Running) {
+                let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+                if smp
+                    && crate::process::aarch64_fp_valid(target)
+                    && crate::process::try_claim_cpu_for_try(target, my_cpu)
+                {
+                    crate::process::enter_user_by_pid_noreturn_try(target);
+                }
+            }
         }
         return;
     }
@@ -184,12 +229,16 @@ fn production_irq_handler(f: &mut super::vectors::TrapFrame) {
     let slice_expired = crate::process::account_tick_try(cur).unwrap_or(false);
     let focus = crate::wm::focus_pid();
     let target = if focus != 0 { focus } else { 1 };
-    // Cooperative-only scheduling (matches x86, which never preempts user threads
-    // and renders reliably). The timer ISR still drives vsync/timerfd-wake/kick
-    // above; we only suppress the preemptive *thread switch*. Preempting an engine
-    // thread mid-execution was the cause of the residual Dart EventHandler crash;
-    // now that the syscall-arg3 re-exec corruption is fixed, the engine is driven
-    // entirely by cooperative syscall yields and no longer needs preemption.
+    // EL0 preemption stays OFF — empirically it does NOT fix the post-app-launch
+    // freeze and currently can't even fire: in a 45s render test the timer ISR
+    // landed in EL1 (kernel) on EVERY tick (arm-preempt-tick=0), because the threads
+    // spend ~all their time in EL1 syscalls / cooperative-handoff loops. And the
+    // freeze itself is a multi-threaded Dart GC stop-the-world safepoint that can't
+    // converge on ONE core — the deadlocked engine threads are blocked in EL1
+    // cond_wait/epoll, which EL0 preemption can't touch. The real fixes are SMP
+    // (parallel cores → the GC converges) or serial GC (engine allowlist patch); see
+    // [[post-app-launch-freeze]]. Preemption is still wanted for the general
+    // starvation class, but needs EL0 IRQ delivery wired first (separate work).
     let preempt_enabled = false;
     let should_preempt = preempt_enabled
         && (slice_expired

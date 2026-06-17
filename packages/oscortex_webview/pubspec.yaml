@@ -1,0 +1,21 @@
+name: oscortex_webview
+description: >
+  OSCortex native webview for userspace Flutter apps. Drives a userspace web-engine
+  service over the `oscortex/webview` platform channel; the engine renders into its
+  own OSCortex compositor surface stacked beneath the app's chrome, and this package
+  provides the controller + a placeholder widget that reserves the region and
+  forwards input. Engine-agnostic (Servo today; the contract is fixed).
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.11.0
+  flutter: '>=3.29.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

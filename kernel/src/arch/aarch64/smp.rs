@@ -21,6 +21,11 @@ pub struct PerCpuData {
     pub mpidr:       u64,
     pub online:      AtomicBool,
     pub current_pid: AtomicU32,
+    /// An AP is "engaged" once it has joined user scheduling. While NOT engaged
+    /// (online but idling pre-engage), its timer ISR does ZERO scheduler/lock work
+    /// (just EOI) so it can't contend PTABLE_LOCK with the BSP during the engine's
+    /// single-core bring-up. The BSP (cpu 0) is always considered engaged.
+    pub engaged:     AtomicBool,
 }
 
 const ZERO_CPU: PerCpuData = PerCpuData {
@@ -28,11 +33,26 @@ const ZERO_CPU: PerCpuData = PerCpuData {
     mpidr:       0,
     online:      AtomicBool::new(false),
     current_pid: AtomicU32::new(0),
+    engaged:     AtomicBool::new(false),
 };
 static mut PER_CPU_DATA: [PerCpuData; MAX_CPUS] = [ZERO_CPU; MAX_CPUS];
 
 /// Total logical CPUs online (including BSP).
 pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+
+/// Set true by the BSP once it has claimed the init process and is entering
+/// userspace — APs must not run the scheduler before this (else they'd race the
+/// BSP to claim the init thread). Set inside `enter_user_by_pid_noreturn` on CPU 0.
+pub static SMP_SCHED_READY: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+pub fn sched_ready() -> bool {
+    SMP_SCHED_READY.load(Ordering::Acquire)
+}
+#[inline]
+pub fn set_sched_ready() {
+    SMP_SCHED_READY.store(true, Ordering::Release);
+}
 
 /// Read this core's MPIDR_EL1 affinity bits.
 #[inline]
@@ -70,10 +90,345 @@ pub fn this_cpu() -> &'static PerCpuData {
     unsafe { &(*core::ptr::addr_of!(PER_CPU_DATA))[cpu_idx] }
 }
 
-/// Wake all APs. Currently single-core only.
+// ── SMP Milestone 1: AP bring-up via PSCI CPU_ON ─────────────────────────────
+//
+// Secondary cores park in boot.rs `_start` (wfe). We wake them with PSCI CPU_ON
+// (conduit read from the DTB) pointing at `_ap_trampoline` (a PHYSICAL address —
+// the `-kernel` image is identity-mapped, VA==PA). The trampoline runs MMU-off,
+// replicates the BSP's MMU/system state captured in `capture_boot_state`, turns
+// the MMU on, then calls `ap_main`. Milestone 1: the AP just inits its GIC CPU
+// interface, marks itself online, and idles — it touches NO shared user/scheduler
+// state yet (that's Milestone 2+). The BSP keeps doing all the work; an AP coming
+// online must not perturb the single-core path.
+
+const AP_STACK_SIZE: usize = 64 * 1024;
+const MAX_APS: usize = 3; // cores 1..=3 (core 0 = BSP)
+
+#[repr(C, align(16))]
+struct ApStacks([[u8; AP_STACK_SIZE]; MAX_APS]);
+static mut AP_STACKS: ApStacks = ApStacks([[0; AP_STACK_SIZE]; MAX_APS]);
+
+// BSP MMU/system state the AP must load before it can run kernel C/Rust.
+static mut AP_MAIR: u64 = 0;
+static mut AP_TCR: u64 = 0;
+static mut AP_TTBR0: u64 = 0;
+static mut AP_TTBR1: u64 = 0;
+static mut AP_SCTLR: u64 = 0;
+static mut AP_VBAR: u64 = 0;
+
+/// Snapshot the BSP's live MMU + vector registers so an AP can install identical
+/// translation before touching kernel memory. Call AFTER mmu::enable + vectors.
+#[cfg(feature = "smp")]
+pub fn capture_boot_state() {
+    unsafe {
+        let (mair, tcr, ttbr0, ttbr1, sctlr, vbar): (u64, u64, u64, u64, u64, u64);
+        core::arch::asm!(
+            "mrs {0}, mair_el1",
+            "mrs {1}, tcr_el1",
+            "mrs {2}, ttbr0_el1",
+            "mrs {3}, ttbr1_el1",
+            "mrs {4}, sctlr_el1",
+            "mrs {5}, vbar_el1",
+            out(reg) mair, out(reg) tcr, out(reg) ttbr0,
+            out(reg) ttbr1, out(reg) sctlr, out(reg) vbar,
+            options(nomem, nostack),
+        );
+        AP_MAIR = mair;
+        AP_TCR = tcr;
+        AP_TTBR0 = ttbr0;
+        AP_TTBR1 = ttbr1;
+        AP_SCTLR = sctlr;
+        AP_VBAR = vbar;
+    }
+}
+
+// AP entry trampoline. PSCI starts the core here MMU-off (x0 = context_id = the
+// AP's logical cpu index, which we passed as the PSCI context). It drops EL2→EL1
+// if needed, enables FP, installs the BSP's MMU regs, turns the MMU on, sets VBAR,
+// switches to this AP's stack, then branches to `ap_main(cpu_idx)`.
+core::arch::global_asm!(
+    r#"
+.section .text.ap_boot, "ax"
+.globl _ap_trampoline
+_ap_trampoline:
+    mov     x19, x0                     // x19 = cpu_idx (PSCI context_id)
+    // Drop EL2 -> EL1h if we came up at EL2.
+    mrs     x0, CurrentEL
+    lsr     x0, x0, #2
+    cmp     x0, #2
+    b.ne    1f
+    mov     x0, #(1 << 31)
+    msr     hcr_el2, x0
+    mov     x0, #0x3c5                  // DAIF masked + EL1h
+    msr     spsr_el2, x0
+    adr     x0, 1f
+    msr     elr_el2, x0
+    eret
+1:
+    msr     daifset, #0xf
+    // Enable FP/AdvSIMD (CPACR_EL1.FPEN = 0b11).
+    mrs     x0, cpacr_el1
+    orr     x0, x0, #(3 << 20)
+    msr     cpacr_el1, x0
+    isb
+    // Install the BSP's translation regs (MMU still OFF; symbols resolve to PA).
+    adrp    x0, {ap_mair}
+    ldr     x1, [x0, #:lo12:{ap_mair}]
+    msr     mair_el1, x1
+    adrp    x0, {ap_tcr}
+    ldr     x1, [x0, #:lo12:{ap_tcr}]
+    msr     tcr_el1, x1
+    adrp    x0, {ap_ttbr0}
+    ldr     x1, [x0, #:lo12:{ap_ttbr0}]
+    msr     ttbr0_el1, x1
+    adrp    x0, {ap_ttbr1}
+    ldr     x1, [x0, #:lo12:{ap_ttbr1}]
+    msr     ttbr1_el1, x1
+    isb
+    tlbi    vmalle1
+    dsb     nsh
+    isb
+    // Turn the MMU on (SCTLR with M/C/I as the BSP has it).
+    adrp    x0, {ap_sctlr}
+    ldr     x1, [x0, #:lo12:{ap_sctlr}]
+    msr     sctlr_el1, x1
+    isb
+    // Vector base.
+    adrp    x0, {ap_vbar}
+    ldr     x1, [x0, #:lo12:{ap_vbar}]
+    msr     vbar_el1, x1
+    // Stack: AP_STACKS has slots for cores 1..=MAX_APS (slot = cpu_idx-1). The top
+    // of this AP's slot = base + cpu_idx * AP_STACK_SIZE.
+    adrp    x0, {ap_stacks}
+    add     x0, x0, :lo12:{ap_stacks}
+    mov     x2, {stack_size}
+    mul     x2, x2, x19                 // x2 = cpu_idx * AP_STACK_SIZE
+    add     sp, x0, x2
+    mov     x0, x19                     // ap_main(cpu_idx)
+    bl      {ap_main}
+2:  wfe
+    b       2b
+"#,
+    ap_mair = sym AP_MAIR,
+    ap_tcr = sym AP_TCR,
+    ap_ttbr0 = sym AP_TTBR0,
+    ap_ttbr1 = sym AP_TTBR1,
+    ap_sctlr = sym AP_SCTLR,
+    ap_vbar = sym AP_VBAR,
+    ap_stacks = sym AP_STACKS,
+    ap_main = sym ap_main,
+    stack_size = const AP_STACK_SIZE,
+);
+
+#[cfg(feature = "smp")]
+extern "C" {
+    fn _ap_trampoline();
+}
+
+/// First Rust code on a secondary core. MMU + VBAR are live; running on this AP's
+/// own stack. Milestone 1: init the per-core GIC interface, register in the
+/// per-CPU table, mark online, then idle. (No scheduler entry yet.)
+#[no_mangle]
+pub extern "C" fn ap_main(cpu_idx: u64) -> ! {
+    let idx = cpu_idx as usize;
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
+        if idx < MAX_CPUS {
+            table[idx].cpu_id = cpu_idx as u32;
+            table[idx].mpidr = read_mpidr();
+            table[idx].online.store(true, Ordering::Release);
+        }
+    }
+    // Per-core GIC CPU interface (GICv2: banked per-core at the same MMIO base).
+    crate::arch::aarch64::gic::init_cpu_interface();
+    // CRITICAL per-core EL1 setup the AP was MISSING: enable FP/SIMD (CPACR_EL1) AND
+    // EL0 counter access (CNTKCTL_EL1.EL0VCTEN/EL0PCTEN). These are PER-CPU registers
+    // at reset on a secondary core. Without CNTKCTL, the app's inline CNTVCT_EL0 read
+    // (liboscortex_libc monotonic clock, called constantly by the Dart VM) traps to
+    // EL1 with EC=0x18 → report_unhandled → the engine bootstrap deterministically
+    // wedged on the AP (4/4). The x86 AP does this in ap_init; aarch64 ap_main never
+    // did. This is the fix for the aarch64 SMP app-launch freeze.
+    crate::arch::aarch64::cpu::enable_fpu_simd();
+    CPU_COUNT.fetch_add(1, Ordering::AcqRel);
+    log::error!("[SMP] AP cpu={} ONLINE (mpidr={:#x})", cpu_idx, read_mpidr());
+
+    // ENGAGE this AP in HOME-CORE user scheduling (mirrors x86 sched::ap_start).
+    //
+    // History: co-scheduling was attempted 6 ways on 2026-06-14 and froze, blamed on
+    // a "Dart GC safepoint that won't converge" — but those attempts PREDATE the
+    // 2026-06-16 arch-neutral SMP-safety fixes (per-CPU page-table lock depth that
+    // had let a 2nd core bypass the lock → real page-table corruption; the PTABLE↔WM
+    // ABBA lock-order fix). The "pid=2 Dart corruption" chased back then is very
+    // likely those exact bugs, now fixed. The x86 home-core model (pin each WHOLE
+    // engine to one core + foreground-exclusive, so an engine's threads never spread
+    // across cores and there is no cross-core GC safepoint) launches+renders apps on
+    // x86 this session. Apply the same here and let the live HVF test (real parallel
+    // cores) say whether it converges. If it regresses, this is reverted — not
+    // shipped as "done".
+    //
+    // Stay FULLY DORMANT (wfi, engaged=false → timer ISR does nothing per cpu_engaged)
+    // until an app is actually pinned to THIS core. Engaging earlier (e.g. at
+    // flutter_init_ready) makes this core's timer-ISR work contend with the BSP's
+    // timing-sensitive shell first-frame bring-up — observed to stall the shell at
+    // present=1 on HVF. Apps only launch well after the shell is up, so there is
+    // nothing for this core to do before then. spawn_with_bootstrap sets the
+    // CPU_HAS_HOME_WORK flag and broadcasts a reschedule IPI (GIC SGI), which wakes
+    // us from wfi the instant an app is assigned here.
+    while !sched_ready() {
+        core::hint::spin_loop();
+    }
+    // enable_and_halt (not raw wfi): IRQs enabled so the timer/SGI is actually taken
+    // each wake (its handler no-ops here via cpu_engaged), then we re-check the flag.
+    while !crate::process::cpu_has_home_work(cpu_idx as u32) {
+        crate::arch::enable_and_halt();
+    }
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
+        if idx < MAX_CPUS {
+            table[idx].engaged.store(true, Ordering::Release);
+        }
+    }
+    log::error!("[SMP] AP cpu={} ENGAGING home-pinned scheduler (app pinned here)", cpu_idx);
+    loop {
+        // home_cpu filter inside next_runnable_pid restricts the pick to engine(s)
+        // pinned to THIS core, on its own per-CPU state.
+        if let Some(pid) = crate::process::next_runnable_pid(0) {
+            crate::process::enter_user_by_pid_noreturn(pid);
+        }
+        crate::arch::enable_and_halt();
+    }
+}
+
+/// True if the given CPU has engaged user scheduling (BSP/cpu 0 always true).
+#[inline]
+pub fn cpu_engaged(cpu_id: u32) -> bool {
+    if cpu_id == 0 {
+        return true;
+    }
+    let i = cpu_id as usize;
+    if i >= MAX_CPUS {
+        return false;
+    }
+    unsafe { (*core::ptr::addr_of!(PER_CPU_DATA))[i].engaged.load(Ordering::Acquire) }
+}
+
+/// PSCI conduit, latched once from the DTB at wake time.
+#[cfg(feature = "smp")]
+static PSCI_USE_SMC: AtomicBool = AtomicBool::new(false);
+
+/// Raw PSCI/SMCCC call via the selected conduit. Returns x0.
+#[cfg(feature = "smp")]
+unsafe fn psci_raw(use_smc: bool, fn_id: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    let ret: u64;
+    if use_smc {
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") fn_id => ret,
+            in("x1") a1, in("x2") a2, in("x3") a3,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            options(nostack),
+        );
+    } else {
+        core::arch::asm!(
+            "hvc #0",
+            inout("x0") fn_id => ret,
+            in("x1") a1, in("x2") a2, in("x3") a3,
+            out("x4") _, out("x5") _, out("x6") _, out("x7") _,
+            options(nostack),
+        );
+    }
+    ret as i64
+}
+
+/// Probe PSCI_VERSION (0x84000000, side-effect-free) on a conduit. A real PSCI
+/// implementation returns a small positive version word (e.g. 0x10001 for v1.1);
+/// a conduit that isn't wired returns -1 (NOT_SUPPORTED) or garbage.
+#[cfg(feature = "smp")]
+unsafe fn psci_version(use_smc: bool) -> i64 {
+    psci_raw(use_smc, 0x8400_0000, 0, 0, 0)
+}
+
+/// Issue PSCI CPU_ON (SMC64 fn 0xC400_0003) on the selected conduit.
+#[cfg(feature = "smp")]
+unsafe fn psci_cpu_on(target_mpidr: u64, entry_pa: u64, context_id: u64) -> i64 {
+    psci_raw(
+        PSCI_USE_SMC.load(Ordering::Relaxed),
+        0xC400_0003,
+        target_mpidr,
+        entry_pa,
+        context_id,
+    )
+}
+
+/// Wake secondary cores into `ap_main` (Milestone 1: → idle). Must run after the
+/// BSP's MMU + vectors + GIC are up. Reads the PSCI conduit from the DTB; tries
+/// CPU_ON for cores 1..=MAX_APS and stops at the first absent core.
+#[cfg(feature = "smp")]
+pub fn wake_aps() {
+    let dtb = crate::arch::aarch64::fdt::dtb_ptr();
+    // Determine the PSCI conduit. Prefer the DTB; else probe both with the
+    // side-effect-free PSCI_VERSION and use whichever the platform answers.
+    let conduit = unsafe { crate::arch::aarch64::fdt::psci_method(dtb) };
+    let use_smc = match conduit {
+        Some(crate::arch::aarch64::fdt::PsciConduit::Smc) => true,
+        Some(crate::arch::aarch64::fdt::PsciConduit::Hvc) => false,
+        None => {
+            let smc_v = unsafe { psci_version(true) };
+            let hvc_v = unsafe { psci_version(false) };
+            log::error!("[SMP] PSCI_VERSION probe: smc={:#x} hvc={:#x}", smc_v, hvc_v);
+            // A valid PSCI version is a small positive word (>=0x10000 for v1.x,
+            // 0x2 for v0.2); -1 = NOT_SUPPORTED on that conduit.
+            if smc_v > 0 {
+                true
+            } else if hvc_v > 0 {
+                false
+            } else {
+                log::error!("[SMP] neither conduit answers PSCI — staying single-core");
+                return;
+            }
+        }
+    };
+    PSCI_USE_SMC.store(use_smc, Ordering::Relaxed);
+    log::error!("[SMP] PSCI conduit = {}", if use_smc { "SMC" } else { "HVC" });
+
+    capture_boot_state();
+    let entry = _ap_trampoline as usize as u64;
+    log::error!("[SMP] AP trampoline @ {:#x}; waking secondary cores...", entry);
+
+    for idx in 1..=MAX_APS as u64 {
+        // QEMU virt: core N has MPIDR Aff0 = N (< 16 cores).
+        let target_mpidr = idx;
+        let st = unsafe { psci_cpu_on(target_mpidr, entry, idx) };
+        if st == 0 || st == -4 {
+            // SUCCESS or ALREADY_ON — wait briefly for it to mark online.
+            let mut spun = 0u64;
+            loop {
+                if unsafe { (*core::ptr::addr_of!(PER_CPU_DATA))[idx as usize].online.load(Ordering::Acquire) } {
+                    break;
+                }
+                spun += 1;
+                if spun > 200_000_000 {
+                    log::error!("[SMP] core {} CPU_ON ok but never came online", idx);
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+        } else {
+            // -2 INVALID_PARAMS = core absent → stop probing further cores.
+            log::error!("[SMP] core {} CPU_ON returned {} — no more cores", idx, st);
+            break;
+        }
+    }
+    log::error!("[SMP] online CPU count = {}", CPU_COUNT.load(Ordering::Acquire));
+}
+
+/// Wake all APs. Sets up the BSP's per-CPU entry, then (under `--features smp`)
+/// brings secondary cores online (Milestone 1: into an idle loop).
 ///
-/// TODO(arm): bring APs online via PSCI `CPU_ON` (SMC/HVC) and have each call
-/// `crate::arch::ap_init()` then `crate::sched::ap_start()`.
+/// Single-core by default — matching x86. Waking cores only idles them today
+/// (`ap_main` parks in `wfi`; co-scheduling doesn't converge the Dart GC
+/// safepoint — see [[smp-bringup]]) and risks a boot hang on real hardware if an
+/// AP faults in the trampoline and the BSP spins waiting for it to come online.
 pub fn init(_smp_resp: Option<&'static MpResponse>) {
     unsafe {
         let table = &mut *core::ptr::addr_of_mut!(PER_CPU_DATA);
@@ -82,10 +437,21 @@ pub fn init(_smp_resp: Option<&'static MpResponse>) {
         table[0].online.store(true, Ordering::Release);
     }
     CPU_COUNT.store(1, Ordering::Release);
-    log::info!("[SMP] aarch64 single-core scaffold (AP wake via PSCI not implemented)");
+
+    #[cfg(feature = "smp")]
+    wake_aps();
+    #[cfg(not(feature = "smp"))]
+    log::info!("[SMP] single-core boot (AP bring-up gated behind the `smp` feature)");
 }
 
-/// Broadcast a reschedule IPI to all other online CPUs.
-///
-/// TODO(arm): send a GIC SGI to the target CPU interface(s). No-op (single core).
-pub fn broadcast_resched_ipi() {}
+/// Broadcast a reschedule IPI (GIC SGI) to all other online CPUs, so a thread
+/// made runnable on this core gets promptly picked up by the core it's affined
+/// to. Guarded on CPU_COUNT > 1: single-core never touches the GIC (this is on
+/// the hot `set_state(Running)` path), and the SGI is "all-but-self" so it
+/// reaches no one anyway on one core. The receiving core's IRQ handler EOIs it
+/// and (once APs schedule, M5) reruns its scheduler.
+pub fn broadcast_resched_ipi() {
+    if CPU_COUNT.load(Ordering::Acquire) > 1 {
+        crate::arch::aarch64::gic::send_sgi_all_but_self(crate::arch::aarch64::gic::SGI_RESCHED);
+    }
+}

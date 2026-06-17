@@ -402,7 +402,17 @@ pub fn force_wake_all_task_runners(reason: &str) -> (usize, usize) {
         let mut tbl = TIMERFD_TABLE.lock();
         for fd in &tfds {
             if let Some(t) = tbl.get_mut(fd) {
-                t.pending = t.pending.saturating_add(1);
+                // Mark ready WITHOUT accumulating. This is a spurious wake to break
+                // an epoll_wait parking deadlock, NOT a real expiration. The old
+                // `saturating_add(1)` inflated an actively-serviced timerfd's pending
+                // every time force-wake fired (frequent during app bring-up), so the
+                // next timerfd read returned a large BOGUS expiration count — a
+                // prime suspect for corrupting dart:io's timeout processing (the
+                // intermittent app-launch EventHandler #GP). Cap at 1: still reports
+                // EPOLLIN to unpark the waiter, but never piles up fake expirations.
+                if t.pending == 0 {
+                    t.pending = 1;
+                }
                 all_tfds.push(*fd);
             }
         }

@@ -81,12 +81,28 @@ if [ -n "${SKIP_CORE_APPS:-}" ]; then
     # JIT off kernel_blob.bin — arch-independent — so the staged bundles still render
     # their launcher tiles). Set SKIP_CORE_APPS=1 to take this path.
     echo "[0.35/5] SKIP_CORE_APPS set — reusing staged app assets (Docker/oscx-engine not required)"
-    for a in "Canvas.app/flutter_assets/kernel_blob.bin" "Files.app/flutter_assets/kernel_blob.bin" "Web Link.app/flutter_assets/kernel_blob.bin"; do
-        if [ ! -f "$ROOT/initramfs/Applications/$a" ]; then
-            echo "ERROR: SKIP_CORE_APPS set but staged app asset missing: initramfs/Applications/$a" >&2
-            exit 1
-        fi
-    done
+    if [ -n "${X86_AOT:-}" ]; then
+        # AOT path uses prebuilt libapp.so snapshots, not JIT kernel_blob — require those.
+        for a in "Files.app" "Canvas.app" "Web Link.app"; do
+            src=""
+            case "$a" in
+              "Files.app") src="oscortex_files" ;;
+              "Canvas.app") src="oscortex_canvas" ;;
+              "Web Link.app") src="oscortex_web_link" ;;
+            esac
+            if [ ! -f "$ROOT/apps/$src/build/oscortex/libapp.so" ]; then
+                echo "ERROR: X86_AOT set but app AOT snapshot missing: apps/$src/build/oscortex/libapp.so" >&2
+                exit 1
+            fi
+        done
+    else
+        for a in "Canvas.app/flutter_assets/kernel_blob.bin" "Files.app/flutter_assets/kernel_blob.bin" "Web Link.app/flutter_assets/kernel_blob.bin"; do
+            if [ ! -f "$ROOT/initramfs/Applications/$a" ]; then
+                echo "ERROR: SKIP_CORE_APPS set but staged app asset missing: initramfs/Applications/$a" >&2
+                exit 1
+            fi
+        done
+    fi
 else
     echo "[0.35/5] Building core system apps into /Applications..."
     "$ROOT/tools/build-flutter-osx.sh" \
@@ -110,17 +126,21 @@ if [ -d "$APP_ASSETS_DIR" ]; then
     echo "[0.4/5] Syncing shell Flutter assets into initramfs..."
     mkdir -p "$ROOT/initramfs/system/flutter/flutter_assets"
 
-    for f in kernel_blob.bin; do
-        if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
-            echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
-            exit 1
-        fi
-        cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
-    done
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
-    python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
+    # JIT path needs kernel_blob.bin (the Dart program for the JIT engine); the
+    # X86_AOT path carries the program in libapp.so and skips this entirely.
+    if [ -z "${X86_AOT:-}" ]; then
+        for f in kernel_blob.bin; do
+            if [ ! -f "$APP_ASSETS_DIR/$f" ]; then
+                echo "ERROR: required app asset missing: $APP_ASSETS_DIR/$f" >&2
+                exit 1
+            fi
+            cp "$APP_ASSETS_DIR/$f" "$ROOT/initramfs/system/flutter/flutter_assets/$f"
+        done
+        python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+        python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+        python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+        python3 "$ROOT/tools/flutter-engine/engine_patch.py" --kernel-blob "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
+    fi
 
     # Each launched app is its own Flutter host and hits the same bare-metal font
     # issue as the shell: no system font provider + no default/Roboto family ->
@@ -230,11 +250,17 @@ REQUIRED_FILES=(
     "$ROOT/initramfs/Applications/Canvas.app/Canvas.osx"
     "$ROOT/initramfs/Applications/Files.app/Files.osx"
     "$ROOT/initramfs/Applications/Web Link.app/Web Link.osx"
-    "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
-    "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
-    "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
-    "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
 )
+# JIT path requires kernel_blob; the X86_AOT path stages + validates its libapp.so
+# snapshots in the dedicated block below, so it skips the kernel_blob requirement.
+if [ -z "${X86_AOT:-}" ]; then
+    REQUIRED_FILES+=(
+        "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin"
+        "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin"
+        "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin"
+        "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
+    )
+fi
 for req in "${REQUIRED_FILES[@]}"; do
     if [ ! -f "$req" ]; then
         echo "ERROR: required Flutter artifact missing: $req" >&2
@@ -242,21 +268,55 @@ for req in "${REQUIRED_FILES[@]}"; do
     fi
 done
 
-# x86_64 runs the shell via the JIT engine off kernel_blob.bin (the staged engine
-# MUST be the JIT/debug engine that contains the Dart kernel compiler, NOT the AOT
-# 'product' engine — the AOT path needs a matching 'product' gen_snapshot that is
-# not available, so it leaves the shell unable to load Dart → blank screen). Remove
-# any AOT snapshot so the embedder uses the arch-independent JIT kernel_blob.
-rm -f "$ROOT/initramfs/system/flutter/libapp.so" \
-      "$ROOT/initramfs/system/flutter/app.aot"
+# x86_64 AOT path (X86_AOT=1): the patched release x64 engine is AOT-only (reports
+# FlutterEngineRunsAOTCompiledDartCode=true), so the shell/apps must load their AOT
+# libapp.so snapshots — NOT kernel_blob (the release engine has no Dart kernel
+# compiler). The matching x86-64 AOT snapshots are prebuilt under apps/*/build/
+# oscortex/libapp.so (version-matched to the engine). Stage them like the arm64
+# flow. Without X86_AOT, keep the legacy JIT path (strip AOT snapshots, use
+# kernel_blob) for a JIT/debug engine.
+if [ -n "${X86_AOT:-}" ]; then
+    echo "[1.5/5] X86_AOT: staging x86-64 AOT snapshots (shell + apps)..."
+    SHELL_AOT="$ROOT/apps/oscortex_app/build/oscortex/libapp.so"
+    [ -f "$SHELL_AOT" ] || { echo "ERROR: X86_AOT but shell snapshot missing: $SHELL_AOT" >&2; exit 1; }
+    cp "$SHELL_AOT" "$ROOT/initramfs/system/flutter/libapp.so"
+    # Map each bundled app to its prebuilt x86-64 AOT snapshot.
+    stage_app_aot() { # <app-src-dir> <App.app dir name>
+        local src="$ROOT/apps/$1/build/oscortex/libapp.so"
+        local dst="$ROOT/initramfs/Applications/$2/libapp.so"
+        if [ -f "$src" ]; then cp "$src" "$dst"; echo "  staged $2/libapp.so"; \
+        else echo "  WARN: missing app AOT snapshot $src" >&2; fi
+    }
+    stage_app_aot oscortex_files   "Files.app"
+    stage_app_aot oscortex_canvas  "Canvas.app"
+    stage_app_aot oscortex_web_link "Web Link.app"
+    # AOT carries the program in libapp.so — drop the JIT kernel_blob so the
+    # embedder takes the AOT path (mirrors the arm64 build).
+    rm -f "$ROOT/initramfs/system/flutter/flutter_assets/kernel_blob.bin" \
+          "$ROOT/initramfs/Applications/Files.app/flutter_assets/kernel_blob.bin" \
+          "$ROOT/initramfs/Applications/Canvas.app/flutter_assets/kernel_blob.bin" \
+          "$ROOT/initramfs/Applications/Web Link.app/flutter_assets/kernel_blob.bin"
+else
+    # Legacy JIT path: strip AOT snapshots so the embedder uses kernel_blob.
+    rm -f "$ROOT/initramfs/system/flutter/libapp.so" \
+          "$ROOT/initramfs/system/flutter/app.aot"
+fi
 
 echo "[1/5] Building kernel ELF..."
 touch "$ROOT/kernel/src/fs/initramfs.rs"
 cd "$ROOT"
+# Extra kernel cargo features (additive to the default arch-x86_64), e.g.
+# KERNEL_FEATURES=input-hud for the on-screen input debug HUD. See dev-tools/README.md.
+KERNEL_FEATURE_ARGS=()
+if [ -n "${KERNEL_FEATURES:-}" ]; then
+    echo "[1/5]   + kernel features: $KERNEL_FEATURES"
+    KERNEL_FEATURE_ARGS=(--features "$KERNEL_FEATURES")
+fi
 cargo +nightly build \
     --release \
     --package oscortex-kernel \
     --target x86_64-unknown-none \
+    ${KERNEL_FEATURE_ARGS[@]+"${KERNEL_FEATURE_ARGS[@]}"} \
     -Z build-std=core,compiler_builtins,alloc \
     -Z build-std-features=compiler-builtins-mem
 

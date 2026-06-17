@@ -326,20 +326,42 @@ pub fn kernel_main_arch_limine(map: mm::BootMemMap, hhdm_offset: u64) -> ! {
 /// manager, and the logger. This is the part of `kernel_main` that does not
 /// touch any boot protocol directly.
 fn shared_init_and_run() -> ! {
+    // On-screen boot milestones: set the phase + repaint the splash after each
+    // major step so a hang (e.g. on real hardware QEMU can't reproduce) leaves
+    // the LAST reached step on screen. No-op when the fb isn't ready.
+    macro_rules! bp {
+        ($n:expr) => {
+            if drivers::fb::is_ready() {
+                drivers::bootscreen::set_phase($n);
+                drivers::bootscreen::render();
+                // Present immediately: once the compositor enables double-
+                // buffering, render() draws to the back buffer and nothing
+                // swaps until the engine warm-up loop — which would freeze the
+                // splash at "compositor" and mask a hang in any LATER phase.
+                // Swapping here keeps every milestone actually on screen.
+                drivers::fb::swap_buffers();
+            }
+        };
+    }
+
     // ── 4. Platform drivers (input probe) ───────────────────────────────
+    bp!(1);
     let qemu_like = arch::cpu::is_qemu_like_hypervisor();
     drivers::platform::init_early(qemu_like);
 
     // ── 4b. Compositor scaffold (M13) ────────────────────────────────────
+    bp!(2);
     compositor::init();
 
     // ── 5. Scheduler ─────────────────────────────────────────────────────
+    bp!(3);
     sched::init();
 
     // ── 6. Security / capabilities ────────────────────────────────────────
     security::init();
 
     // ── 7. IPC subsystem ─────────────────────────────────────────────────
+    bp!(4);
     ipc::init();
 
     // ── 7a. Window-manager event bridge ──────────────────────────────────
@@ -351,24 +373,30 @@ fn shared_init_and_run() -> ! {
     crate::drivers::virtio_input::init();
 
     // ── 7b. Virtual filesystem (initramfs) ───────────────────────────────
+    bp!(5);
     fs::init();
 
     // ── 7c. Block, serial, and networking ─────────────────────────────────
+    bp!(6);
     drivers::platform::init_block_and_net();
 
     // ── 7d. On-demand package delivery ────────────────────────────────
+    bp!(7);
     pkg::init();
 
     // ── 8. AI Cortex ─────────────────────────────────────────────────────
     // The Cortex boots last so every kernel subsystem is available to it.
+    bp!(8);
     cortex::init();
 
     // ── 9. Signal APs + bring SMP online ────────────────────────────────
+    bp!(9);
     KERNEL_INIT_DONE.store(true, Ordering::Release);
     #[cfg(target_arch = "x86_64")]
     arch::smp_init(SMP_REQUEST.response());
     #[cfg(not(target_arch = "x86_64"))]
     arch::smp_init(None);
+    bp!(10);
 
     // ── 9b. Spawn init process from initramfs ────────────────────────────
     match fs::lookup("/init") {

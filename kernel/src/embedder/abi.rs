@@ -197,6 +197,19 @@ pub const SYS_CLIPBOARD_GET:    u64 = 0x4B4; // clipboard_get(buf_ptr, buf_len) 
 pub const SYS_APP_CLOSE_FOREGROUND: u64 = 0x4B5; // app_close_foreground() → 0  (refocus shell, terminate fg app)
 pub const SYS_BEEP:             u64 = 0x4B6; // beep(freq_hz, duration_ms) → 0  (PC speaker)
 
+// App networking API — exposes the kernel TCP stack to userspace apps.
+//
+// The TCP socket calls (connect/write/read/close at 0x388-0x38B) are async:
+// `tcp_connect` returns a fd immediately after sending SYN, so an app MUST poll
+// `tcp_status` until the handshake completes before writing. (`net::tcp` doc:
+// this is the correct connect-completion check — a zero-byte read probe does not
+// work because an ESTABLISHED socket reports can_recv()=false until the peer
+// sends.) All are CAP_NET-gated; apps are granted CAP_NET (see process::spawn).
+pub const SYS_TCP_STATUS: u64 = 0x4B7; // tcp_status(fd) → 1 established / 0 connecting / -ECONNREFUSED
+// Reserved for the next networking increment (DNS A-record resolution via a
+// smoltcp DNS socket, reusing the proven TCP stack's ARP/routing):
+pub const SYS_DNS_RESOLVE: u64 = 0x4B8; // dns_resolve(name_ptr, name_len) → ip_be u32 / negative errno
+
 /// Mouse-cursor shapes the compositor can draw. Mirrors the subset of Flutter
 /// `SystemMouseCursors` kinds OSCortex maps to a distinct on-screen pointer.
 pub const CURSOR_SHAPE_BASIC:     u32 = 0; // arrow (default)

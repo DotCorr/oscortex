@@ -255,6 +255,76 @@ pub unsafe fn parse(dtb_pa: u64) -> Option<FdtInfo> {
     }
 }
 
+/// PSCI call conduit advertised by the DTB `/psci` node's `method` property.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PsciConduit {
+    Hvc,
+    Smc,
+}
+
+/// Read the `/psci` node's `method` ("hvc"/"smc") from the DTB. This is the
+/// authoritative way to know how to issue PSCI calls (CPU_ON for SMP) — guessing
+/// the conduit and getting it wrong traps/hangs. Returns `None` if absent.
+///
+/// # Safety
+/// `dtb_pa` must point at a DTB blob accessible at this address.
+pub unsafe fn psci_method(dtb_pa: u64) -> Option<PsciConduit> {
+    let hdr = FdtHeader::parse(dtb_pa as *const u8)?;
+    let mut p = hdr.struct_start();
+    let end = hdr.struct_end();
+    let mut depth: i32 = -1;
+    let mut in_psci = false;
+    while p < end {
+        let token = read_be32(p);
+        p = p.add(4);
+        match token {
+            t if t == FDT_BEGIN_NODE => {
+                let name_ptr = p;
+                let mut nlen = 0usize;
+                while *name_ptr.add(nlen) != 0 {
+                    nlen += 1;
+                }
+                let name = core::str::from_utf8(core::slice::from_raw_parts(name_ptr, nlen))
+                    .unwrap_or("");
+                p = p.add((nlen + 4) & !3);
+                depth += 1;
+                if depth == 1 {
+                    in_psci = name == "psci" || name.starts_with("psci@");
+                }
+            }
+            t if t == FDT_END_NODE => {
+                if depth == 1 {
+                    in_psci = false;
+                }
+                depth -= 1;
+            }
+            t if t == FDT_PROP => {
+                let len = read_be32(p);
+                let nameoff = read_be32(p.add(4));
+                let val = p.add(8);
+                let pname = hdr.string_at(nameoff);
+                if in_psci && pname == "method" && len > 0 {
+                    let s = core::str::from_utf8(core::slice::from_raw_parts(
+                        val,
+                        (len as usize).saturating_sub(1),
+                    ))
+                    .unwrap_or("");
+                    return Some(if s.starts_with("smc") {
+                        PsciConduit::Smc
+                    } else {
+                        PsciConduit::Hvc
+                    });
+                }
+                p = p.add(((len as usize) + 3) & !3);
+            }
+            t if t == FDT_NOP => {}
+            t if t == FDT_END => break,
+            _ => break,
+        }
+    }
+    None
+}
+
 /// Scan a physical address range for the FDT magic on an 8-byte stride and
 /// return the first address whose blob parses to a valid `/memory` node.
 ///

@@ -18,6 +18,11 @@ const GICD_ICENABLER: u64 = 0x180; // Clear-enable
 const GICD_IPRIORITYR: u64 = 0x400; // Priority (1 byte/IRQ)
 const GICD_ITARGETSR: u64 = 0x800; // CPU targets (1 byte/IRQ, SPIs only)
 const GICD_ICFGR: u64 = 0xC00; // Config (2 bits/IRQ: edge/level)
+const GICD_SGIR: u64 = 0xF00; // Software-generated interrupt (send an SGI)
+
+/// SGI id used for the cross-core reschedule IPI (SMP). SGIs are 0..15; nothing
+/// else here uses one.
+pub const SGI_RESCHED: u32 = 0;
 
 // CPU interface registers (offsets from GICC_BASE).
 const GICC_CTLR: u64 = 0x00; // CPU interface control
@@ -100,6 +105,22 @@ pub fn route_to_cpu0(intid: u32) {
             core::ptr::write_volatile(addr as *mut u8, 0x01);
         }
     }
+}
+
+/// Send a Software-Generated Interrupt to **all other** CPU interfaces (the
+/// reschedule IPI). Uses TargetListFilter=0b01 ("all but self"), so on a
+/// single-core system it reaches no one — a safe no-op. `sgi_id` is 0..15.
+pub fn send_sgi_all_but_self(sgi_id: u32) {
+    // GICD_SGIR: [25:24]=TargetListFilter (0b01 = all-but-self),
+    //            [23:16]=CPUTargetList (ignored for filter 0b01), [3:0]=SGIINTID.
+    let val = (0b01u32 << 24) | (sgi_id & 0xF);
+    unsafe { gicd_write(GICD_SGIR, val) };
+}
+
+/// Send an SGI to a specific set of CPU interfaces (bitmask, bit N = interface N).
+pub fn send_sgi(target_mask: u8, sgi_id: u32) {
+    let val = ((target_mask as u32) << 16) | (sgi_id & 0xF);
+    unsafe { gicd_write(GICD_SGIR, val) };
 }
 
 /// Acknowledge the pending interrupt; returns its INTID (1023 = spurious).

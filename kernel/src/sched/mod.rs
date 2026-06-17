@@ -81,14 +81,44 @@ pub fn init() {
         MAX_TASKS, STACK_SIZE / 1024, SCHED_SLICE);
 }
 
-/// AP parking stub.
+/// AP scheduler entry — each application core runs HOME-PINNED user threads.
 ///
-/// The current scheduler is a single global queue/state machine and is not yet
-/// safe for concurrent scheduling decisions from multiple CPUs. Park APs with
-/// interrupts disabled so only the BSP drives preemption.
+/// SMP design: an engine (process group) is pinned to a `home_cpu` (see
+/// `process::pick_home_cpu_for_app`). `next_runnable_pid` only returns a thread
+/// whose `home_cpu == my_cpu`, so the BSP and each AP run disjoint engines on
+/// disjoint per-CPU GPR scratch — no shared cooperative context to corrupt.
+/// The AP loops: pick a home-pinned runnable thread, enter it; if none, halt
+/// until the next interrupt (timer tick / reschedule IPI) re-checks the queue.
 pub fn ap_start(cpu_idx: u32) -> ! {
-    log::info!("[Sched] AP cpu={} ready, parked (BSP-only scheduler)", cpu_idx);
-    crate::arch::halt_forever();
+    // Wait until the BSP has claimed the init thread and opened SMP scheduling,
+    // so we never race the BSP to claim pid 1 during early bring-up.
+    while !crate::arch::smp::sched_ready() {
+        core::hint::spin_loop();
+    }
+    // Stay fully PARKED (idle hlt, no run-queue polling) until the shell's engine
+    // is up. Apps only launch after that, so the AP has no home-pinned work before
+    // then — and polling next_runnable_pid (PTABLE_LOCK) every timer tick contends
+    // with the BSP during the timing-sensitive shell first-frame bring-up, which
+    // under TCG SMP can stall the shell at boot (present=0). An IPI/timer wakes the
+    // hlt; we just re-check the gate until the shell is ready, then join scheduling.
+    while !crate::wm::flutter_init_ready() {
+        crate::arch::enable_and_halt();
+    }
+    log::error!("[Sched] AP cpu={} entering home-pinned scheduler loop", cpu_idx);
+
+    loop {
+        // current=0: this core has no resident process between entries. The
+        // home_cpu filter inside next_runnable_pid (keyed off this_cpu().cpu_id)
+        // restricts the pick to engines pinned to THIS core.
+        if let Some(pid) = crate::process::next_runnable_pid(0) {
+            // enter_user_by_pid_noreturn never returns to the caller; on the next
+            // syscall/preemption the AP re-enters this loop via its idle path.
+            crate::process::enter_user_by_pid_noreturn(pid);
+        }
+        // Nothing home-pinned to this core right now — wait for an interrupt
+        // (timer tick or reschedule IPI) then re-scan.
+        crate::arch::enable_and_halt();
+    }
 }
 
 /// Register the **current** execution context (BSP idle loop) as the idle task.
