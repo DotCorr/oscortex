@@ -719,44 +719,96 @@ pub fn cursor_last_act_ns() -> u64 {
     CURSOR_LAST_ACT_NS.load(Ordering::Relaxed)
 }
 
-pub fn push_pointer(x: i32, y: i32, buttons: u32) {
-    // Record cursor state for the compositor's software cursor (arch-neutral).
-    CURSOR_X.store(x, Ordering::Relaxed);
-    CURSOR_Y.store(y, Ordering::Relaxed);
-    CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
-    CURSOR_SEEN.store(true, Ordering::Relaxed);
-    CURSOR_LAST_ACT_NS.store(crate::arch::rdtsc_ns(), Ordering::Relaxed);
-    PTR_COUNT.fetch_add(1, Ordering::Relaxed);
+// ── Adaptive pointer-move throttle ──────────────────────────────────────────
+// A physical mouse streams ~100+ move events/sec; on a slow single core the engine
+// cannot run hover hit-tests that fast and backs up internally until it faults
+// (measured: 40/s faults, 10/s survives at the SAME event count → rate-bound, not a
+// leak). Bound the rate two ways: (1) at most one move "in flight" until the engine
+// PRESENTS the frame it caused — adaptive to the engine's real throughput (fast HW
+// stays smooth, slow HW self-throttles); and (2) a hard floor of MOVE_HARD_CAP_NS for
+// the case a move causes NO repaint/present (e.g. jitter inside an already-hovered
+// card — the exact thing that crashed the ProBook), so moves are never held forever.
+// The software cursor is drawn by the compositor from CURSOR_X/Y (set on EVERY event
+// below) so the visible pointer stays smooth; only hover hit-testing is throttled.
+// Button transitions (clicks/releases) bypass the gate and are never dropped/delayed.
+static MOVE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static PENDING_MOVE: AtomicBool = AtomicBool::new(false);
+static LAST_MOVE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Hard floor between delivered moves when the engine isn't presenting (~10/s — below
+/// the measured single-core fault threshold). The visible cursor is unaffected.
+const MOVE_HARD_CAP_NS: u64 = 100_000_000;
 
+/// Route a pointer event: focused process → hit-test owner → engine host (pid 1).
+fn deliver_pointer(x: i32, y: i32, buttons: u32, b_val: u64) {
     let packed = ((x as u32 as u64) << 32) | (y as u32 as u64);
-
-    // Detect button transition (press or release) to flag it as high-priority.
-    let last = LAST_BUTTONS.swap(buttons, Ordering::AcqRel);
-    let is_transition = buttons != last;
-    let b_val = if is_transition { 1 } else { 0 };
-
-    // Route to focused process first so the active UI always gets click input.
-    // Falling back to hit-test owner is useful when no explicit focus is set.
     let focus = focus_pid();
-
     if focus != 0 {
         push_event_for(focus, EV_POINTER, buttons, packed, b_val);
         return;
     }
-
     // In bypass mode a userspace process owns the framebuffer directly.
-    // Skip compositor hit-testing and broadcast if there is no explicit focus.
     if !crate::compositor::is_fb_bypass() {
         if let Some((_surf_id, owner_pid)) = crate::compositor::surface_at_point(x, y) {
             push_event_for(owner_pid, EV_POINTER, buttons, packed, b_val);
             return;
         }
     }
+    // Avoid broadcast consumption races: route fallback events to the engine host.
+    push_event_for(1, EV_POINTER, buttons, packed, b_val);
+}
 
-    if focus == 0 {
-        // Avoid broadcast consumption races: route fallback pointer events
-        // to the engine host (pid 1) so Flutter reliably receives clicks.
-        push_event_for(1, EV_POINTER, buttons, packed, b_val);
+pub fn push_pointer(x: i32, y: i32, buttons: u32) {
+    let now = crate::arch::rdtsc_ns();
+    // Software-cursor state (drawn by the compositor) — update on EVERY event so the
+    // visible pointer is always smooth, independent of the engine-delivery throttle.
+    CURSOR_X.store(x, Ordering::Relaxed);
+    CURSOR_Y.store(y, Ordering::Relaxed);
+    CURSOR_BUTTONS.store(buttons, Ordering::Relaxed);
+    CURSOR_SEEN.store(true, Ordering::Relaxed);
+    CURSOR_LAST_ACT_NS.store(now, Ordering::Relaxed);
+    PTR_COUNT.fetch_add(1, Ordering::Relaxed);
+
+    let last = LAST_BUTTONS.swap(buttons, Ordering::AcqRel);
+    if buttons != last {
+        // Button transition: deliver immediately (clicks/releases are never throttled),
+        // carrying the current position; it supersedes any held move.
+        PENDING_MOVE.store(false, Ordering::Relaxed);
+        MOVE_IN_FLIGHT.store(true, Ordering::Relaxed);
+        LAST_MOVE_NS.store(now, Ordering::Relaxed);
+        deliver_pointer(x, y, buttons, 1);
+        return;
+    }
+
+    // Pure move/hover: deliver only if the engine has caught up (presented the last
+    // move's frame) OR the hard floor has elapsed; otherwise hold the latest position.
+    let caught_up = !MOVE_IN_FLIGHT.load(Ordering::Relaxed);
+    let past_floor = now.wrapping_sub(LAST_MOVE_NS.load(Ordering::Relaxed)) >= MOVE_HARD_CAP_NS;
+    if caught_up || past_floor {
+        MOVE_IN_FLIGHT.store(true, Ordering::Relaxed);
+        LAST_MOVE_NS.store(now, Ordering::Relaxed);
+        PENDING_MOVE.store(false, Ordering::Relaxed);
+        deliver_pointer(x, y, buttons, 0);
+    } else {
+        // Engine still digesting the last move and the floor hasn't elapsed — hold the
+        // latest position (the cursor still tracks via CURSOR_X/Y); flushed on the next
+        // present or the next move past the floor.
+        PENDING_MOVE.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Called by the engine's present path on each frame: the engine has caught up, so the
+/// next move may flow, and any move held during this frame is flushed (latest position).
+pub fn wm_note_present() {
+    MOVE_IN_FLIGHT.store(false, Ordering::Relaxed);
+    if PENDING_MOVE.swap(false, Ordering::Relaxed) {
+        MOVE_IN_FLIGHT.store(true, Ordering::Relaxed);
+        LAST_MOVE_NS.store(crate::arch::rdtsc_ns(), Ordering::Relaxed);
+        deliver_pointer(
+            CURSOR_X.load(Ordering::Relaxed),
+            CURSOR_Y.load(Ordering::Relaxed),
+            CURSOR_BUTTONS.load(Ordering::Relaxed),
+            0,
+        );
     }
 }
 

@@ -78,6 +78,8 @@ pub(crate) fn sys_surface_upload(id: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 }
 
 pub(crate) fn sys_surface_present(id: u64) -> i64 {
+    // Frame boundary → advance the pointer-move throttle clock + flush any held move.
+    crate::wm::wm_note_present();
     static SURFACE_PRESENT_LOG: core::sync::atomic::AtomicU32 =
         core::sync::atomic::AtomicU32::new(0);
     let n = SURFACE_PRESENT_LOG.fetch_add(1, Ordering::Relaxed);

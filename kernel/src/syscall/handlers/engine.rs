@@ -323,6 +323,9 @@ pub(crate) fn sys_engine_vsync_baton_post(baton: u64) -> i64 {
 ///
 /// `arg0` = surface_id, `arg1` = pixel_ptr, `arg2` = pixel_len (bytes)
 pub(crate) fn sys_gpu_submit(surface_id: u64, pixel_ptr: u64, pixel_len: u64) -> i64 {
+    // Frame boundary (software-renderer present_callback path) → advance the
+    // pointer-move throttle clock + flush any held move (see wm::wm_note_present).
+    crate::wm::wm_note_present();
     let bytes = match unsafe { read_user_bytes(pixel_ptr, pixel_len as usize) } {
         Some(b) => b,
         None => return -14, // EFAULT
