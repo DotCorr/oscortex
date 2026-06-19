@@ -198,6 +198,12 @@ impl Drop for InterruptGuard {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+/// Current framebuffer base virtual address (the write-combining VA on x86 once the
+/// WC remap engages, else the bootloader's mapping). Diagnostic.
+pub fn base() -> u64 {
+    FB_ADDR.load(Ordering::Acquire)
+}
+
 /// Initialise the framebuffer console from a Limine framebuffer response.
 ///
 /// Called from `logger::init()` once per boot.  Uses the first framebuffer
@@ -211,6 +217,39 @@ pub fn init(fb_resp: &limine::request::FramebufferResponse) {
     // a valid virtual address we can write to directly.
     let addr = fb.address() as u64;
     if addr == 0 { return; }
+
+    // The bootloader maps the framebuffer UNCACHED (no PAT/MTRR set up). On a large panel
+    // (a 2880x1800 Retina is ~20 MB) every full-frame write is tens of MB of uncached MMIO,
+    // so the engine livelocks painting at `spawn_shell` (seen on a 2016 Intel Mac; a small
+    // panel like the ProBook's is cheap, which is why it booted). Remap the fb as
+    // write-combining — fb writes go from ~tens-of-MB/s to GB/s, scaling away with panel
+    // size. The [fb-diag] log reports the original cache bits (PCD=1 ⇒ was uncached).
+    #[cfg(target_arch = "x86_64")]
+    let addr = {
+        let hhdm = crate::mm::frame_allocator::hhdm_offset();
+        let phys = addr.wrapping_sub(hhdm);
+        if let Some((e, psz)) = crate::mm::paging::leaf_entry_of(addr) {
+            log::error!(
+                "[fb-diag] va={:#x} phys={:#x} PWT={} PCD={} PAT={} page={}KiB",
+                addr, phys, (e >> 3) & 1, (e >> 4) & 1, (e >> 7) & 1, psz / 1024
+            );
+        }
+        crate::mm::paging::setup_pat_wc();
+        let fb_bytes = (fb.pitch * fb.height) as usize;
+        match unsafe { crate::mm::paging::map_write_combining(phys, fb_bytes) } {
+            Some(wc) => {
+                log::error!(
+                    "[fb-wc] write-combining remap phys={:#x} -> va={:#x} ({} KiB)",
+                    phys, wc, fb_bytes / 1024
+                );
+                wc
+            }
+            None => {
+                log::warn!("[fb-wc] WC remap failed; using uncached fb (slow on large panels)");
+                addr
+            }
+        }
+    };
 
     // Read the firmware's channel order. Log it unconditionally so a real
     // machine's GOP format is visible on the serial console for diagnosis.

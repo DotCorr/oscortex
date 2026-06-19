@@ -344,6 +344,12 @@ fn shared_init_and_run() -> ! {
         };
     }
 
+    // Confirm the framebuffer write-combining remap engaged (x86): FB_ADDR should be a
+    // fresh high-half WC VA (slot 384+, ~0xffff_c000_…), not the bootloader's uncached
+    // HHDM mapping. fb::init runs before the serial sink, so re-report here where it's live.
+    #[cfg(target_arch = "x86_64")]
+    log::error!("[fb-wc-check] FB_ADDR={:#x}", drivers::fb::base());
+
     // ── 4. Platform drivers (input probe) ───────────────────────────────
     bp!(1);
     let qemu_like = arch::cpu::is_qemu_like_hypervisor();

@@ -272,6 +272,79 @@ mod x86_64_impl {
         );
     }
 
+    /// Walk the active address space for `va`, returning the leaf entry bits and the page
+    /// size in bytes (1G/2M/4K), or None if unmapped. Read-only probe used to inspect the
+    /// framebuffer's cache attribute (PCD bit 4 / PWT bit 3).
+    pub fn leaf_entry_of(va: u64) -> Option<(u64, u64)> {
+        let i4 = ((va >> 39) & 0x1ff) as usize;
+        let i3 = ((va >> 30) & 0x1ff) as usize;
+        let i2 = ((va >> 21) & 0x1ff) as usize;
+        let i1 = ((va >> 12) & 0x1ff) as usize;
+        let cr3 = read_cr3() & PHYS_MASK;
+        unsafe {
+            let e4 = walk_table(cr3)?.add(i4).read_volatile();
+            if e4 & PageFlags::PRESENT.bits() == 0 { return None; }
+            let e3 = walk_table(e4 & PHYS_MASK)?.add(i3).read_volatile();
+            if e3 & PageFlags::PRESENT.bits() == 0 { return None; }
+            if e3 & PageFlags::HUGE.bits() != 0 { return Some((e3, 1 << 30)); }
+            let e2 = walk_table(e3 & PHYS_MASK)?.add(i2).read_volatile();
+            if e2 & PageFlags::PRESENT.bits() == 0 { return None; }
+            if e2 & PageFlags::HUGE.bits() != 0 { return Some((e2, 1 << 21)); }
+            let e1 = walk_table(e2 & PHYS_MASK)?.add(i1).read_volatile();
+            if e1 & PageFlags::PRESENT.bits() == 0 { return None; }
+            Some((e1, 1 << 12))
+        }
+    }
+
+    /// Reprogram IA32_PAT so entry PA1 (selected by PWT=1, PCD=0, PAT=0) is Write-Combining
+    /// instead of its default Write-Through. Nothing in this kernel uses WT, and `mmio()`
+    /// uses PA3 (UC), so this is safe. PAT is per-CPU — call on every core that writes the
+    /// WC framebuffer (the BSP suffices for the single-core shipping config).
+    pub fn setup_pat_wc() {
+        // Default PAT = 0x0007040600070406 (PA0=WB,PA1=WT,PA2=UC-,PA3=UC, mirrored 4..7).
+        // Change PA1 (byte 1) 0x04→0x01 (WC): 0x0007040600070106.
+        let pat: u64 = 0x0007_0406_0007_0106;
+        unsafe {
+            asm!(
+                "wrmsr",
+                in("ecx") 0x277u32,
+                in("eax") pat as u32,
+                in("edx") (pat >> 32) as u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// Map `size` bytes at physical `phys` into a fresh kernel-half VA as Write-Combining
+    /// (PWT=1 → PA1=WC after `setup_pat_wc`). Leaves the bootloader's original (uncached)
+    /// HHDM mapping untouched, so neighbouring MMIO sharing the fb's huge page stays UC.
+    /// Picks an empty PML4 slot in the gap between the HHDM and the kernel image. Returns
+    /// the new WC virtual address.
+    ///
+    /// # Safety
+    /// `phys`..`phys+size` must be the framebuffer's physical range.
+    pub unsafe fn map_write_combining(phys: u64, size: usize) -> Option<u64> {
+        let cr3 = read_cr3() & PHYS_MASK;
+        let pml4 = phys_to_virt(cr3) as *const u64;
+        // Slots 256 (HHDM) and 511 (kernel image) are taken; 384..480 is the empty gap.
+        let mut base = 0u64;
+        for slot in 384..480usize {
+            if unsafe { pml4.add(slot).read_volatile() } & PageFlags::PRESENT.bits() == 0 {
+                base = (slot as u64) << 39;
+                if base & (1 << 47) != 0 { base |= 0xffff_0000_0000_0000; } // canonicalize
+                break;
+            }
+        }
+        if base == 0 { return None; }
+        let flags = PageFlags::PRESENT | PageFlags::WRITABLE | PageFlags::WRITE_THROUGH
+            | PageFlags::NO_EXECUTE;
+        let pages = size.div_ceil(PAGE_SIZE);
+        for i in 0..pages as u64 {
+            unsafe { map_page(base + i * PAGE_SIZE as u64, phys + i * PAGE_SIZE as u64, flags) };
+        }
+        Some(base)
+    }
+
     pub fn init(_hhdm_offset: u64) {
         let cr3 = read_cr3() & PHYS_MASK;
         crate::logger::early_print("[MM::Paging] Virtual memory manager online (CR3=");
@@ -900,6 +973,45 @@ pub unsafe fn map_mmio(phys: u64, virt: u64, size: usize) {
     unsafe { aarch64_impl::map_mmio(phys, virt, size) }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe { stub_impl::map_mmio(phys, virt, size) }
+}
+
+/// x86: probe a VA's leaf page-table entry (cache-attribute diagnostic). None elsewhere.
+pub fn leaf_entry_of(va: u64) -> Option<(u64, u64)> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _lock = lock_page_table();
+        x86_64_impl::leaf_entry_of(va)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = va;
+        None
+    }
+}
+
+/// x86: program a Write-Combining PAT entry (PA1). No-op on other arches.
+pub fn setup_pat_wc() {
+    #[cfg(target_arch = "x86_64")]
+    x86_64_impl::setup_pat_wc();
+}
+
+/// x86: remap `[phys, phys + size)` to a fresh Write-Combining kernel VA, leaving the
+/// original uncached mapping intact. Returns the WC virtual address (None on other arches
+/// or if no free VA slot). Used to make the framebuffer fast on large/uncached panels.
+///
+/// # Safety
+/// `phys`..`phys+size` must be a valid device (framebuffer) physical range.
+pub unsafe fn map_write_combining(phys: u64, size: usize) -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _lock = lock_page_table();
+        unsafe { x86_64_impl::map_write_combining(phys, size) }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (phys, size);
+        None
+    }
 }
 
 /// Handle a demand-page fault. Returns `true` if the fault was resolved.
