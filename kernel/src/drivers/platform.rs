@@ -11,12 +11,22 @@ use crate::arch::pci;
 pub fn init_early(qemu_like: bool) {
     super::registry::init();
 
-    if cfg!(target_arch = "x86_64") && qemu_like {
+    if cfg!(target_arch = "x86_64") {
+        // ps2::init() is fully bounded/fail-safe: it bails immediately when the i8042
+        // status reads 0xFF (no controller present) and every flush/wait loop is
+        // iteration-capped, so it cannot hang even on exotic firmware. The old
+        // "bare-metal safe mode" skip predated that hardening (it dated from an
+        // UNBOUNDED i8042 flush that hung UTM) and left REAL hardware with no input at
+        // all — on a laptop the keyboard, and the trackpad as a generic PS/2 mouse, IS
+        // the i8042. Run it everywhere; it no-ops cleanly when the controller is absent
+        // (e.g. a USB-only board), and real USB-HID still binds via the xHCI probe below.
         super::ps2::init();
         unsafe { super::ps2::enable_pic_irqs() };
-        log::info!("[Input] PS/2 enabled (QEMU/KVM profile)");
-    } else if cfg!(target_arch = "x86_64") {
-        log::warn!("[Input] PS/2 skipped (bare-metal safe mode)");
+        if qemu_like {
+            log::info!("[Input] PS/2 init (hypervisor profile)");
+        } else {
+            log::info!("[Input] PS/2 init (bare-metal)");
+        }
     }
 
     // USB xHCI HID probe. Skipped on the aarch64 UEFI/Limine ISO build: probing
@@ -32,7 +42,7 @@ pub fn init_early(qemu_like: bool) {
         }
     }
 
-    register_input_natives(qemu_like);
+    register_input_natives();
 }
 
 /// Storage, serial, and networking (after VFS init).
@@ -60,8 +70,10 @@ pub fn init_block_and_net() {
     crate::net::init();
 }
 
-fn register_input_natives(qemu_like: bool) {
-    if qemu_like && super::ps2::PS2_READY.load(Ordering::Acquire) {
+fn register_input_natives() {
+    // Register whatever input actually bound, on any platform — PS/2 is no longer
+    // hypervisor-gated (see init_early), so a bare-metal i8042 registers too.
+    if super::ps2::PS2_READY.load(Ordering::Acquire) {
         let _ = super::registry::register_native(b"ps2");
     }
     if super::usb::is_ready() {

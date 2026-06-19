@@ -164,17 +164,27 @@ pub fn init(smp_resp: Option<&'static MpResponse>) {
             cpu_idx += 1;
         }
 
-        // Wait for each AP to come online — bounded in WALL-CLOCK time via the
-        // monotonic clock, NOT a spin count (PAUSE is ~140 cycles on Skylake, so a
-        // spin budget is ~minutes per AP on real hardware when an AP fails to start).
+        // Wait for each AP to come online — bounded by BOTH a wall-clock deadline AND a
+        // hard, clock-INDEPENDENT spin cap. The deadline (rdtsc_ns) is the normal path.
+        // The spin cap is the fail-safe for firmware where the monotonic clock does not
+        // advance as assumed: Apple Mac firmware doesn't wire the legacy PIT and
+        // rdtsc_ns() divides the raw TSC by a FIXED rate, so on a Mac the deadline can
+        // never be reached and the BSP would spin FOREVER here — exactly the observed
+        // hang at `cortex::smp 0.5s` on a real Intel MacBook. The spin cap makes infinite
+        // spin impossible: the wait always terminates and the BSP continues, advertising
+        // only the APs that actually came online (so the box boots single-core-safe).
         let expected = cpu_idx as usize;
-        const AP_TIMEOUT_NS: u64 = 500_000_000; // 0.5 s per AP, then continue
+        const AP_TIMEOUT_NS: u64 = 500_000_000; // 0.5 s per AP (normal path)
+        const AP_SPIN_CAP: u64 = 50_000_000;    // clock-independent backstop (~secs, only
+                                                //  ever hit when the clock is frozen/wrong)
         for i in 1..expected {
             let deadline = crate::arch::rdtsc_ns().wrapping_add(AP_TIMEOUT_NS);
+            let mut spins: u64 = 0;
             while !unsafe { PER_CPU_DATA[i].online.load(Ordering::Acquire) } {
-                if crate::arch::rdtsc_ns() >= deadline {
-                    log::warn!("[SMP] CPU {} (lapic={}) timed out — continuing",
-                        i, unsafe { PER_CPU_DATA[i].lapic_id });
+                spins = spins.wrapping_add(1);
+                if crate::arch::rdtsc_ns() >= deadline || spins >= AP_SPIN_CAP {
+                    log::warn!("[SMP] CPU {} (lapic={}) timed out (spins={}) — continuing",
+                        i, unsafe { PER_CPU_DATA[i].lapic_id }, spins);
                     break;
                 }
                 core::hint::spin_loop();
