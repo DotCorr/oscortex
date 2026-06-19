@@ -216,15 +216,14 @@ pub struct Process {
     /// next `ret` branches to address 0.
     #[cfg(target_arch = "aarch64")]
     pub user_lr: u64,
-    /// aarch64 only: the user PC (ELR) and SP (SP_EL0) captured at SVC ENTRY,
-    /// while the per-CPU snapshot is fresh (the eager entry capture). A blocking
-    /// syscall's `save_return_context` rewinds/uses THESE rather than the live
-    /// per-CPU scratch, which a timer-preempted sibling's SVC can clobber before
-    /// the yield decision — otherwise the thread resumes on the wrong SP and its
-    /// `ldp x29,x30,[sp,#..]; ret` reads a stale/zero frame record → `ret` to 0.
-    #[cfg(target_arch = "aarch64")]
+    /// The user PC and SP captured at syscall ENTRY, while the per-CPU snapshot is
+    /// fresh (the eager entry capture). A blocking/re-exec syscall's
+    /// `save_return_context` rewinds/uses THESE rather than the live per-CPU scratch,
+    /// which a timer preempt + another thread's syscall entry can clobber before the
+    /// yield decision. On aarch64 the wrong SP made `ldp x29,x30; ret` read a stale
+    /// frame → `ret` to 0; on x86 the wrong RIP made the epoll_wait re-exec resume PAST
+    /// the syscall → the nr (0x47B) leaked back as the return → the interact #GP.
     pub entry_user_rip: u64,
-    #[cfg(target_arch = "aarch64")]
     pub entry_user_rsp: u64,
     /// aarch64 only: callee-saved x24–x28 captured at SVC entry. The shared
     /// x86-named UserRegs has no slots for these (x86 only has r8–r15), so the
@@ -305,9 +304,7 @@ impl Process {
             arch_fp_valid: false,
             #[cfg(target_arch = "aarch64")]
             user_lr: 0,
-            #[cfg(target_arch = "aarch64")]
             entry_user_rip: 0,
-            #[cfg(target_arch = "aarch64")]
             entry_user_rsp: 0,
             #[cfg(target_arch = "aarch64")]
             user_x24: 0,
@@ -1142,6 +1139,16 @@ pub fn kill_group(leader: u32) -> u32 {
     let mut n = 0usize;
     {
         let _g = PTABLE_LOCK.lock();
+        // Every thread of the dead engine shares its address space (pml4_phys).
+        // get_group_leader (a parent-chain walk) BREAKS for a thread whose parent
+        // already died — ORPHANING it — so a pure leader match leaves stragglers
+        // (observed 2026-06-17: pids 10,11 survived a group-8 reap, then collided
+        // with the relaunched instance at the same .so VA → bootstrap stall). Also
+        // match the leader's address space so orphans are reaped too.
+        let leader_pml4 = {
+            let lp = unsafe { &PTABLE[idx_of(leader)] };
+            if lp.pid == leader { lp.pml4_phys } else { 0 }
+        };
         for slot in unsafe { PTABLE.iter() } {
             if slot.pid == 0 {
                 continue;
@@ -1149,7 +1156,9 @@ pub fn kill_group(leader: u32) -> u32 {
             if matches!(slot.state, ProcState::Zombie(_) | ProcState::Dead) {
                 continue;
             }
-            if get_group_leader_locked(slot.pid) == leader && n < victims.len() {
+            let in_group = get_group_leader_locked(slot.pid) == leader
+                || (leader_pml4 != 0 && slot.pml4_phys == leader_pml4);
+            if in_group && n < victims.len() {
                 victims[n] = slot.pid;
                 n += 1;
             }
@@ -1334,14 +1343,35 @@ pub fn save_regs(pid: u32, regs: UserRegs) {
     if p.pid == pid { p.regs = regs; }
 }
 
-/// Save current CPU xstate image into process slot.
+/// Save the current CPU's FP/SIMD (XSAVE) image into `pid`'s process slot.
 ///
-/// NOTE: intentionally does NOT check `p.state == Running`.  A blocking
-/// syscall sets the thread's state to `Blocked` *before* calling this
-/// function (to close a lost-wake race window), so the `Running` check
-/// would silently skip the save and leave the buffer stale.  At the
-/// call sites the CPU is always executing on behalf of `pid`, so saving
-/// the live XMM/YMM/MXCSR to that slot is always correct.
+/// This is captured EAGERLY at syscall entry by `capture_user_xstate_at_entry`
+/// (from `dispatch_fast`), BEFORE any handler code runs — symmetric with
+/// `capture_user_gprs_at_entry`. The per-CPU `XSTATE_CAPTURED` flag makes the
+/// first call per syscall (the eager entry capture) do the real save and every
+/// later yield-time call a no-op, so the stored image is always the USER's FP at
+/// the SYSCALL instant — never the kernel's live FP after the handler ran.
+///
+/// Why eager: the late yield-time save is only correct because the kernel `.text`
+/// emits ZERO xmm/ymm/x87 instructions today, so the live FP file == the user's
+/// FP at every yield site. If a future kernel FP instruction (a dependency bump,
+/// an auto-vectorized loop, an `__builtin_memcpy` lowered to SSE) ever ran on a
+/// syscall path that reaches a cooperative yield, a late save would store the
+/// kernel's polluted xmm into this buffer; on resume the userspace Dart AOT
+/// engine — which keeps tagged pointers / unboxed values in xmm and moves them to
+/// GPRs via `movq rax, xmm0` — would read garbage and nondeterministically deref
+/// a near-null / non-canonical pointer (the EventHandler #GP signature).
+/// Capturing at entry closes that hazard permanently for the cooperative-yield
+/// path. (The timer-preempt path, `timer_preempt_switch`, saves live FP directly
+/// and is intentionally NOT gated here: it interrupts a USER instruction, so the
+/// live FP file is genuinely the user's there.)
+///
+/// NOTE: intentionally does NOT check `p.state == Running`.  A blocking syscall
+/// sets the thread's state to `Blocked` *before* calling this (to close a
+/// lost-wake race window), so a `Running` check would silently skip the save and
+/// leave the buffer stale.  Every call site passes the *current* thread's pid
+/// (the CPU is executing on its behalf), so saving its XMM/YMM/MXCSR there is
+/// always correct.
 pub fn save_xstate(pid: u32) {
     // aarch64: FP/SIMD is captured in the vector stub at trap entry (TrapFrame.v)
     // and round-trips via arch_trapframe / the cooperative FP slot — NOT here.
@@ -1351,6 +1381,14 @@ pub fn save_xstate(pid: u32) {
     { let _ = pid; }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        // First call per syscall (the eager entry capture) records the live FP
+        // file — the USER's FP then, since the asm SYSCALL stub touches no FP and
+        // the kernel `.text` is xmm/x87-free. Later yield-time calls are no-ops so
+        // a since-polluted live FP can never leak into our saved context. Mirrors
+        // the `GPRS_CAPTURED` gate in `save_full_user_gprs`.
+        if XSTATE_CAPTURED[gpr_cap_cpu_idx()].swap(true, core::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let idx = idx_of(pid);
         let _g = PTABLE_LOCK.lock();
         let p = unsafe { &mut PTABLE[idx] };
@@ -1525,6 +1563,13 @@ pub fn debug_runnable_states() -> alloc::string::String {
 }
 
 pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
+    // Phase 3 (Redox blueprint): the clean per-CPU PICK replaces this whole
+    // special-case pile when `percpu-sched` is enabled. Shipping default keeps the
+    // body below byte-for-byte. See docs/spec-phase3-percpu-scheduler.md.
+    #[cfg(feature = "percpu-sched")]
+    {
+        return next_runnable_pid_percpu(current, my_cpu);
+    }
     // FOREGROUND-EXCLUSIVE SCHEDULING. When an app is foreground (focus is not the
     // shell pid 1), run ONLY that app's thread group and leave the backgrounded
     // shell suspended. Two concurrent heavy Flutter VMs overwhelm the cooperative
@@ -1637,6 +1682,91 @@ pub fn next_runnable_pid_locked(current: u32, my_cpu: u32) -> Option<u32> {
     }
 
     res
+}
+
+/// Clean per-CPU affinity-filtered round-robin PICK (Redox blueprint, Phase 3).
+/// Keeps foreground-exclusive (variant a — Dart isolate-confinement, see
+/// docs/spec-phase3-percpu-scheduler.md §4) and per-CPU `home_cpu` affinity, but
+/// drops the input/vsync-baton special-case shortcuts: under round-robin the focused
+/// thread is reached within a rotation. Next steps (WIP): explicit per-CPU run queues,
+/// the two-layer `switch_to`, and the `is_preemptable` bail. Gated by `percpu-sched`.
+#[cfg(feature = "percpu-sched")]
+fn next_runnable_pid_percpu(current: u32, my_cpu: u32) -> Option<u32> {
+    let smp = crate::arch::smp::CPU_COUNT.load(Ordering::Acquire) > 1;
+    // Foreground-exclusive: while an app is foreground run only its group; lapse if the
+    // group leader died so the shell + crash recovery can run.
+    let fg = crate::wm::focus_pid();
+    let fg_group = if fg > 1 { get_group_leader_locked(fg) } else { 1 };
+    // Foreground-exclusive (variant a): while an app is foreground run only its group;
+    // lapse if the group leader died so the shell + crash recovery can run.
+    //
+    // E1 finding (2026-06-18): dropping this under SMP to run shell+app CONCURRENTLY
+    // (variant b) does NOT trip Dart's isolate-confinement abort under per-CPU `home_cpu`
+    // affinity — both engines rendered, no EC=0x24/sys_abort. BUT present then flatlines:
+    // the vsync-baton/present path is shell-only and not concurrent-engine-aware, so it
+    // stalls once two engines run. Variant b is reachable once the baton/present path
+    // schedules per-engine. Staying on variant a until then. See docs/spec-phase3 §4.
+    let exclusive = fg_group > 1 && {
+        let leader = unsafe { &PTABLE[idx_of(fg_group)] };
+        leader.pid == fg_group
+            && !matches!(leader.state, ProcState::Zombie(_) | ProcState::Dead)
+    };
+
+    // Vsync-baton (RETAINED — the compositor↔engine vsync contract, spec §3; NOT a
+    // scheduler hack): prioritise the shell embedder when its baton is due so frames
+    // present on the vsync cadence. Suppressed while an app is foreground (the app gets
+    // its baton via the exclusive round-robin below). Without this the embedder loops in
+    // schedule_frame and never presents under SMP (no present_callback).
+    if !exclusive && current != 1 && crate::wm::embedder_baton_due(1) {
+        let e = unsafe { &mut PTABLE[idx_of(1)] };
+        if e.pid == 1
+            && e.state == ProcState::Running
+            && (!smp || e.home_cpu == my_cpu)
+            && (e.current_cpu.is_none() || e.current_cpu == Some(my_cpu))
+        {
+            e.current_cpu = Some(my_cpu);
+            return Some(1);
+        }
+    }
+
+    // Round-robin scan from current+1, affinity-filtered per CPU.
+    let start = if current == 0 { 0 } else { idx_of(current.wrapping_add(1)) };
+    for off in 0..MAX_PROCS {
+        let idx = (start + off) % MAX_PROCS;
+        let p = unsafe { &mut PTABLE[idx] };
+        if p.pid == 0 || p.state != ProcState::Running {
+            continue;
+        }
+        if smp && p.home_cpu != my_cpu {
+            continue; // pinned to another core
+        }
+        if exclusive && get_group_leader_locked(p.pid) != fg_group {
+            continue; // not the foreground app's group
+        }
+        if !(p.current_cpu.is_none() || p.current_cpu == Some(my_cpu)) {
+            continue; // claimed by another core
+        }
+        if current != 0 && p.pid == current {
+            continue; // prefer to rotate AWAY from current
+        }
+        p.current_cpu = Some(my_cpu);
+        return Some(p.pid);
+    }
+
+    // Fallback: stay on current if it is still runnable and ours.
+    if current != 0 {
+        let c = unsafe { &mut PTABLE[idx_of(current)] };
+        if c.pid == current
+            && c.state == ProcState::Running
+            && (!smp || c.home_cpu == my_cpu)
+            && (!exclusive || get_group_leader_locked(current) == fg_group)
+            && (c.current_cpu.is_none() || c.current_cpu == Some(my_cpu))
+        {
+            c.current_cpu = Some(my_cpu);
+            return Some(current);
+        }
+    }
+    None
 }
 
 pub fn next_runnable_pid(current: u32) -> Option<u32> {
@@ -2636,9 +2766,21 @@ fn save_return_context_inner(pid: u32, rip: u64, rsp: u64, aarch64_rewind: u64) 
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = aarch64_rewind;
-            p.regs.rip = rip;
-            p.regs.rsp = rsp;
+            // ARCH PARITY: prefer this thread's entry-captured RIP/RSP (snapshotted at the
+            // IRQ-masked syscall-entry point by capture_user_gprs_at_entry) over the live
+            // per-CPU scratch passed in `rip`/`rsp` — the scratch can be stale by the time a
+            // re-exec park reads it, which let the epoll_wait re-exec resume at a wrong RIP
+            // (the syscall nr 0x47B then leaked back as the return → the x86 interact #GP).
+            // entry_user_rip is the post-syscall return addr, so rewind by the syscall-insn
+            // length for re-exec mode (the same `aarch64_rewind` amount the aarch64 arm uses;
+            // it is SYSCALL_INSN_LEN here, 0 for a plain return).
+            if p.entry_user_rip != 0 {
+                p.regs.rip = p.entry_user_rip.wrapping_sub(aarch64_rewind);
+                p.regs.rsp = p.entry_user_rsp;
+            } else {
+                p.regs.rip = rip;
+                p.regs.rsp = rsp;
+            }
         }
         p.regs.rflags = 0x202; // IF=1, standard user RFLAGS
         // Saved at a SYSCALL boundary — SYSRETQ is correct for this thread.
@@ -2688,6 +2830,49 @@ fn gpr_cap_cpu_idx() -> usize {
 pub fn capture_user_gprs_at_entry(pid: u32) {
     GPRS_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
     save_full_user_gprs(pid);
+    // ARCH PARITY (x86): snapshot the entry RIP/RSP HERE — at the eager, IRQ-masked
+    // syscall-entry capture point, while the per-CPU scratch is guaranteed fresh — so a
+    // later re-exec park (sys_epoll_wait_real's de-starve / block yields) can rewind from
+    // a RELIABLE value instead of the live `user_rip()` scratch. The live scratch can be
+    // stale by the time the park reads it; trusting it let the epoll_wait re-exec resume
+    // at a wrong RIP, so the syscall number (0x47B) leaked back as the return value
+    // (size=1147) → the engine overread its 16-slot array → the x86 interact #GP. aarch64
+    // already does this (in its IRQ-masked SVC window); this gives x86 the same guarantee.
+    // Captured ONLY here (not in save_full_user_gprs, which the parks also call) so a
+    // park can never overwrite the reliable entry value with a clobbered one.
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let urip = crate::arch::syscall::user_rip();
+        let ursp = crate::arch::syscall::user_rsp();
+        let _g = PTABLE_LOCK.lock();
+        let p = unsafe { &mut PTABLE[idx_of(pid)] };
+        if p.pid == pid {
+            p.entry_user_rip = urip;
+            p.entry_user_rsp = ursp;
+        }
+    }
+}
+
+/// Per-CPU "user xstate already captured this syscall" flags — the FP/SIMD
+/// analogue of `GPRS_CAPTURED`. Reset once at syscall entry by
+/// `capture_user_xstate_at_entry`; the first `save_xstate` (the eager entry
+/// capture) sets it so every later yield-time `save_xstate` in the same syscall
+/// is a no-op. See `save_xstate` for the full rationale.
+static XSTATE_CAPTURED: [core::sync::atomic::AtomicBool; GPR_CAP_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(false) }; GPR_CAP_MAX_CPUS];
+
+/// Capture the user's FP/SIMD (XSAVE) image into `pid`'s PTABLE slot at syscall
+/// ENTRY, while the live FP file still holds the USER's state (the asm SYSCALL
+/// entry stub touches no FP, and the kernel `.text` is xmm/x87-free). Marks it
+/// captured so later `save_xstate` calls this syscall don't re-read the (possibly
+/// since-polluted) live FP file. Symmetric with `capture_user_gprs_at_entry`;
+/// MUST run before any kernel code that could touch FP/SIMD on the syscall path.
+///
+/// x86 only — aarch64 captures FP in the vector stub at trap entry (TrapFrame.v),
+/// and `save_xstate` is already a no-op there, so this is harmless if ever reached.
+pub fn capture_user_xstate_at_entry(pid: u32) {
+    XSTATE_CAPTURED[gpr_cap_cpu_idx()].store(false, core::sync::atomic::Ordering::Relaxed);
+    save_xstate(pid);
 }
 
 /// Snapshot the full user GPR set (as captured at SYSCALL entry) into the

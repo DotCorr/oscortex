@@ -44,6 +44,17 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
         let cur = crate::process::current_pid();
         if cur != 0 {
             crate::process::capture_user_gprs_at_entry(cur);
+            // Symmetric EAGER FP/SIMD (XSAVE) capture, taken at the SAME instant
+            // as the GPRs — before any handler code that could touch xmm/ymm/x87
+            // runs. The live FP file here is still the user's (the asm SYSCALL
+            // entry stub is FP-free). This makes the ~30 late `save_xstate` yield
+            // sites no-ops, so a future kernel FP instruction on a yielding syscall
+            // path can never leak polluted xmm into the resumed thread's saved
+            // context (which the Dart AOT engine would deref as a bad pointer).
+            // See capture_user_xstate_at_entry / save_xstate. (Today's kernel emits
+            // zero FP ops, so this is provably byte-identical to the late capture —
+            // hardening, not a behavior change.)
+            crate::process::capture_user_xstate_at_entry(cur);
         }
     }
 
@@ -232,8 +243,9 @@ pub extern "C" fn dispatch_fast(number: u64, arg0: u64, arg1: u64, arg2: u64, ar
             // to choose any address. Our sys_mmap treats any non-zero hint
             // as MAP_FIXED, which clobbers libflutter pages when Dart's heap
             // allocator passes hints that overlap. Force hint=0 unless the
-            // caller explicitly asked for MAP_FIXED.
-            let hint = arg0;
+            // caller explicitly asked for MAP_FIXED. (The comment described this
+            // for ages but the code still forwarded the raw hint — now honored.)
+            let hint = if is_fixed { arg0 } else { 0 };
             let va = sys_mmap(hint, arg1, effective_prot);
             if va < 0 { return va; }
             if file_backed {

@@ -31,7 +31,14 @@ pub fn acqmutex_waiter_for(mutex: u64, exclude: u32) -> Option<u32> {
 fn perform_cooperative_yield(cur: u32, sys_nr: u64, next: u32) -> ! {
     let urip = crate::arch::syscall::user_rip();
     let ursp = crate::arch::syscall::user_rsp();
-    crate::process::save_return_context(cur, urip, ursp);
+    // RE-EXEC mode (rip rewound to the `syscall` instruction), NOT a plain return. We set
+    // rax=sys_nr so the thread RE-EXECUTES this syscall on resume. The old
+    // `save_return_context` (RETURN mode, rip PAST the syscall) made the thread RETURN with
+    // rax=sys_nr instead — i.e. the syscall handed its own number back as the result. For
+    // epoll_wait (sys_nr=0x47B) the engine read that 1147 as an event count, overran its
+    // 16-slot array, and #GP'd on a garbage DescriptorInfo* (the x86 interact-freeze). The
+    // sibling de-starve helper already uses `_reexec`; this one was the odd one out.
+    crate::process::save_return_context_reexec(cur, urip, ursp);
     crate::process::save_full_user_gprs(cur);
     crate::process::set_rax(cur, sys_nr);
     crate::process::save_xstate(cur);
@@ -372,6 +379,45 @@ pub(crate) fn epoll_wake_try(fd: u32) {
     };
     for pid in pids_to_wake {
         crate::process::wake_process(pid);
+    }
+}
+
+/// Linux-correct cleanup on `close(fd)`: a closed epoll/timerfd/eventfd must be removed
+/// from its backing table AND from every epoll watch-list, and any thread blocked in
+/// epoll_wait on an affected epfd woken to re-evaluate. Without this the entry lingers
+/// and `epoll_collect_ready` keeps reporting the dead fd with its now-FREED `data` cookie
+/// — which dart:io's EventHandler dereferences (the #GP). See docs/foundation-redesign.md.
+pub(crate) fn on_fd_closed(fd: u32) {
+    // Drop `fd` as an epoll instance, and remove it from every other epfd's watch-list.
+    let mut affected: Vec<u32> = Vec::new();
+    {
+        let mut tbl = EPOLL_TABLE.lock();
+        tbl.remove(&fd);
+        for (epfd, list) in tbl.iter_mut() {
+            let before = list.len();
+            list.retain(|e| e.fd != fd);
+            if list.len() != before {
+                affected.push(*epfd);
+            }
+        }
+    }
+    // Drop timerfd / eventfd backing state.
+    TIMERFD_TABLE.lock().remove(&fd);
+    EVENTFD_TABLE.lock().remove(&fd);
+    // Wake any thread blocked in epoll_wait on an epfd whose watch-set changed, so it
+    // re-evaluates instead of parking on a fd that no longer exists.
+    if !affected.is_empty() {
+        let to_wake: Vec<u32> = {
+            let blocked = EPOLL_BLOCKED.lock();
+            blocked
+                .iter()
+                .filter(|(_, &epfd)| affected.contains(&epfd))
+                .map(|(&pid, _)| pid)
+                .collect()
+        };
+        for pid in to_wake {
+            crate::process::wake_process(pid);
+        }
     }
 }
 
@@ -870,6 +916,17 @@ pub(crate) fn sys_epoll_ctl_real(epfd: u64, op: u64, fd: u64, event_ptr: u64) ->
             if event_ptr == 0 { return -22; }
             let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
             let data = unsafe { core::ptr::read_unaligned((event_ptr + EPOLL_DATA_OFF) as *const u64) };
+            // BISECTION PROBE: a valid epoll `data` cookie (a user DescriptorInfo* or small
+            // int) is < 0x0000_8000_0000_0000. If the engine REGISTERS a non-canonical
+            // cookie, its memory was already corrupt upstream (before the kernel).
+            if data >= 0x0000_8000_0000_0000 {
+                static EPCTL_GARBAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                let k = EPCTL_GARBAGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if k < 32 {
+                    log::error!("[epoll-ctl-GARBAGE] #{} non-canonical cookie data={:#x} fd={} pid={}",
+                        k, data, fd, crate::process::current_pid());
+                }
+            }
             if let Some(e) = list.iter_mut().find(|e| e.fd == fd32) {
                 e.events = events;
                 e.data = data;
@@ -910,6 +967,18 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
     let mut tfd_tbl = TIMERFD_TABLE.lock();
     for entry in entries.iter() {
         if count >= maxevents { break; }
+        // BISECTION PROBE: if the cookie was canonical at registration (no ctl-GARBAGE
+        // above) but is non-canonical HERE, the kernel's EPOLL_TABLE storage was corrupted
+        // between epoll_ctl and epoll_wait. If neither probe fires yet the engine still
+        // #GPs on r12, the corruption is engine-side after the kernel returns.
+        if entry.data >= 0x0000_8000_0000_0000 {
+            static EPRET_GARBAGE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let k = EPRET_GARBAGE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if k < 32 {
+                log::error!("[epoll-ret-GARBAGE] #{} non-canonical cookie data={:#x} fd={} epfd={}",
+                    k, entry.data, entry.fd, epfd);
+            }
+        }
         if epfd == 70 && entry.fd == 71 {
             static EPOLL_70_SCAN_LOG: core::sync::atomic::AtomicU32 =
                 core::sync::atomic::AtomicU32::new(0);
@@ -1001,6 +1070,30 @@ fn epoll_collect_ready(epfd: u32, events_out: u64, maxevents: i32) -> i32 {
                     core::ptr::write_unaligned((slot + EPOLL_DATA_OFF) as *mut u64, entry.data);
                 }
                 count += 1;
+            }
+        }
+    }
+    // OSCORTEX freeze-hunt: re-read every cookie we just wrote and verify it is canonical
+    // AT THE MOMENT WE RETURN. This is the decisive localizer for the x86 interact-freeze
+    // (#GP at eventhandler_linux.cc:361 dereferencing a non-canonical di). If a cookie is
+    // garbage HERE, the corruption is in-kernel (write/buffer). If every cookie is canonical
+    // here yet the engine still #GPs, the corruption happens POST-RETURN (engine-side or a
+    // thread-stack VA collision overwriting the events_out buffer between return and read).
+    if events_out != 0 && count > 0 {
+        for i in 0..(count as u64) {
+            let slot = events_out + i * EPOLL_EVENT_SIZE;
+            let cookie =
+                unsafe { core::ptr::read_unaligned((slot + EPOLL_DATA_OFF) as *const u64) };
+            if cookie != 0 && cookie >= 0x0000_8000_0000_0000 {
+                static EC_BADCOOKIE_LOG: core::sync::atomic::AtomicU32 =
+                    core::sync::atomic::AtomicU32::new(0);
+                let bn = EC_BADCOOKIE_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                if bn < 32 {
+                    log::error!(
+                        "[ec-BADCOOKIE] epfd={} i={}/{} cookie={:#x} events_out={:#x}",
+                        epfd, i, count, cookie, events_out
+                    );
+                }
             }
         }
     }

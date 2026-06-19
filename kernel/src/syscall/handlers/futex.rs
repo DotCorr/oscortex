@@ -102,7 +102,7 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
             // only one waiter per futex address to avoid wake storms.
             let bridge_wake_count = if wake_count > 1 { 1 } else { wake_count };
             // Snapshot waiter table addresses.
-            let addrs: alloc::vec::Vec<u64> = {
+            let addrs: alloc::vec::Vec<(u64, bool)> = {
                 let t = FUTEX_WAITERS.lock();
                 let cond_states = COND_WAIT_STATE.lock();
                 t.iter()
@@ -133,15 +133,25 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                                 None => true,
                             }
                         });
+                        // Confirmed glibc cond_t iff a sibling is actually `Waiting` on THIS
+                        // addr. Raw-futex waiters (the `None` cond-state branch above) still
+                        // get woken, but must NOT receive the glibc __wakeup_seq(+16)/
+                        // __broadcast_seq(+40) pokes — that addr is not a pthread_cond_t and
+                        // the writes stomp its heap (suspected interact-freeze corruption).
+                        let is_glibc_cond = waiters.iter().any(|&wpid| {
+                            siblings.contains(&wpid)
+                                && matches!(cond_states.get(&wpid),
+                                    Some(&CondWaitState::Waiting { cond: wcond, .. }) if wcond == *addr)
+                        });
                         if has_sibling {
-                            Some(*addr)
+                            Some((*addr, is_glibc_cond))
                         } else {
                             None
                         }
                     })
                     .collect()
             };
-            for addr in addrs {
+            for (addr, is_glibc_cond) in addrs {
                 let bridged = futex_wake_waiters(addr, bridge_wake_count);
                 if bridged > 0 {
                     total = total.saturating_add(bridged as u32);
@@ -153,7 +163,7 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
                     // Also update glibc pthread_cond_t __wakeup_seq (at addr+16)
                     // so threads using glibc's pthread_cond_wait see a proper
                     // signal and exit their re-check loop.
-                    if addr >= 0x1000 && addr < 0x0000_8000_0000_0000 {
+                    if is_glibc_cond && addr >= 0x1000 && addr < 0x0000_8000_0000_0000 {
                         let cur_cr3 = crate::arch::memory::read_cr3() & 0x000f_ffff_ffff_f000;
                         if crate::mm::paging::translate_user_page(cur_cr3, addr & !0xfff).is_some() {
                             // Custom condvar seq bump (our protocol)

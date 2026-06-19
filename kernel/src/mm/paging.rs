@@ -1056,6 +1056,11 @@ fn pml4_root_walkable(pml4_phys: u64) -> bool {
 }
 
 pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
+    // Reject non-canonical / non-user VAs before walking. A corrupted user pointer (e.g. a
+    // garbage syscall arg from the prebuilt engine — observed: 0x60a2_4192_b8ca8) would
+    // otherwise index a present entry and make the walk deref a bogus physical address →
+    // unrecoverable kernel page fault. User VAs live in [0, 0x0000_8000_0000_0000).
+    if virt >= 0x0000_8000_0000_0000 { return None; }
     if !pml4_root_walkable(pml4_phys) { return None; }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]
@@ -1069,6 +1074,7 @@ pub fn translate_user_page(pml4_phys: u64, virt: u64) -> Option<u64> {
 /// Walk a user PML4 and return the physical frame mapped at `virt` along with
 /// its writable and executable flags.
 pub fn translate_user_page_flags(pml4_phys: u64, virt: u64) -> Option<(u64, bool, bool)> {
+    if virt >= 0x0000_8000_0000_0000 { return None; } // non-canonical/non-user VA — see translate_user_page
     if !pml4_root_walkable(pml4_phys) { return None; }
     let _lock = lock_page_table();
     #[cfg(target_arch = "x86_64")]

@@ -113,7 +113,12 @@ pub fn init() {
         wrmsr(LSTAR_MSR, syscall_entry as *const () as u64);
 
         // FMASK: mask IF on entry (keep interrupts disabled during syscall entry).
-        wrmsr(FMASK_MSR, 0x200);
+        // IF | DF: clear interrupts AND the direction flag on syscall entry. The DF clear
+        // is ABI-mandated (Linux does it) — without it a user RFLAGS.DF=1 leaks into the
+        // kernel and reverses every `rep movs/stos` (copy_to_user, the epoll events buffer
+        // write, memcpy) → backwards copy → heap/buffer corruption → garbage epoll cookie
+        // → the engine dereferences a non-canonical DescriptorInfo* → the interact #GP.
+        wrmsr(FMASK_MSR, 0x600);
     }
     log::info!("[Syscall] SYSCALL/SYSRET initialised (STAR base={:#x})", USER_SYSRET_BASE);
 }
@@ -133,7 +138,12 @@ pub fn init_ap(cpu_idx: u32) {
         wrmsr(STAR_MSR, star);
 
         wrmsr(LSTAR_MSR, syscall_entry as *const () as u64);
-        wrmsr(FMASK_MSR, 0x200);
+        // IF | DF: clear interrupts AND the direction flag on syscall entry. The DF clear
+        // is ABI-mandated (Linux does it) — without it a user RFLAGS.DF=1 leaks into the
+        // kernel and reverses every `rep movs/stos` (copy_to_user, the epoll events buffer
+        // write, memcpy) → backwards copy → heap/buffer corruption → garbage epoll cookie
+        // → the engine dereferences a non-canonical DescriptorInfo* → the interact #GP.
+        wrmsr(FMASK_MSR, 0x600);
     }
     log::info!("[Syscall] AP cpu={} SYSCALL/SYSRET initialised", cpu_idx);
 }

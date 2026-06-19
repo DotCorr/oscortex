@@ -56,6 +56,11 @@ self-healing = []
 # yet and AP bring-up hung real hardware (a 2016 Skylake Mac) at cortex::smp. The
 # proven-stable config is single-core (serial-GC engine). Enable for SMP dev.
 smp = []
+# Per-CPU preemptive scheduler (Redox blueprint). OFF by default → the shipping path is
+# the current cooperative+SMP scheduler, byte-identical. ON replaces the special-case-laden
+# global PICK with a clean per-CPU affinity-filtered round-robin. Implies `smp`. WIP — see
+# docs/spec-phase3-percpu-scheduler.md.
+percpu-sched = ["smp"]
 # Draw an on-screen input debug HUD (bound device + live pointer/key/scroll event
 # counts) over every frame. For diagnosing input on a VM/board with no serial.
 # Off in release ISOs (zero cost). See compositor::input_hud + dev-tools/README.md.

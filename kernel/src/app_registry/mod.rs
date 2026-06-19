@@ -579,6 +579,19 @@ fn note_running(root_pid: u32, app_id: u32) {
 /// auto-relaunch for that particular death (the scheduler liveness fallback
 /// still returns control to the shell).
 pub fn note_thread_exit(leader: u32, pid: u32, code: i32) {
+    // CRASH-RECOVERY UNWEDGE (2026-06-17): if ANY thread of the FOREGROUND app group
+    // dies abnormally, defocus the group NOW. A *worker* death leaves the leader
+    // alive, so foreground-exclusivity (which only lapses on LEADER death,
+    // process/mod.rs ~1548) keeps scheduling the now render-dead husk exclusively and
+    // starves the shell — but the shell (pid 1) is what runs drain_relaunches(). That
+    // was a PERMANENT freeze: the x86 dart:io EventHandler GPF (ip=0x140d84cdb) kills a
+    // worker, the leader loops schedule_frame forever, present_callback flatlines.
+    // Defocusing lapses exclusivity → shell runs → kill_group + relaunch. Done BEFORE
+    // the try-locks so a contended RUNNING lock can't skip the unwedge. Safe from the
+    // fault path: a user-mode fault holds no kernel lock.
+    if code != 0 && leader > 1 && crate::wm::focus_pid() == leader {
+        crate::wm::set_focus_pid(1);
+    }
     // Only thread-group LEADER deaths matter for bookkeeping of graceful exits;
     // for crashes, any member's abnormal death condemns the group.
     let Some(mut running) = RUNNING.try_lock() else { return };

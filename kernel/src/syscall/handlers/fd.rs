@@ -188,6 +188,32 @@ pub(crate) fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> i64 {
             let p = &mut pipes[pid];
             if p.r_refs == 0 { return -32; } // EPIPE
             let free = PIPE_BUF_SIZE - p.len;
+            // POSIX atomicity: a write of <= PIPE_BUF bytes is ALL-OR-NOTHING — never write
+            // a fragment. dart:io's EventHandler writes 24-byte InterruptMessages and relies
+            // on this guarantee: a partial write desyncs its fixed-size-record read loop
+            // (4096 % 24 = 16 free bytes when the pipe is full → a 16-byte fragment → every
+            // subsequent record misaligned → garbage timer/event data → the engine
+            // dereferences a non-canonical pointer → the interact-freeze #GP at 0x140d84cdb).
+            // If the whole message can't fit now, BLOCK (cooperative yield + re-exec write)
+            // until the reader drains — never fragment a <= PIPE_BUF message.
+            if (len as usize) <= PIPE_BUF_SIZE && src.len() > free {
+                drop(pipes);
+                let me = crate::process::current_pid();
+                if me != 0 {
+                    if let Some(next) = crate::process::next_runnable_pid(me) {
+                        if next != me {
+                            let urip = crate::arch::syscall::user_rip();
+                            let ursp = crate::arch::syscall::user_rsp();
+                            crate::process::save_return_context_reexec(me, urip, ursp);
+                            crate::process::save_full_user_gprs(me);
+                            crate::process::set_rax(me, 1); // re-exec write(2) when space frees
+                            crate::process::save_xstate(me);
+                            crate::process::enter_user_by_pid_noreturn(next);
+                        }
+                    }
+                }
+                return -11; // EAGAIN: no runnable thread to yield to / kernel ctx
+            }
             let n = src.len().min(free);
             for i in 0..n {
                 p.buf[p.tail] = src[i];
@@ -490,6 +516,10 @@ pub(crate) fn sys_open(path_ptr: u64, path_len: u64, _flags: u64) -> i64 {
 }
 
 pub(crate) fn sys_close(fd: u64) -> i64 {
+    // Linux-correct cleanup: a closed epoll/timerfd/eventfd (synthetic fd, not in
+    // OPEN_FILES) must be purged from its table + every epoll watch-list, else it lingers
+    // and is reported ready with its now-freed `data` cookie → EventHandler #GP. Phase 1.
+    crate::syscall::poll::on_fd_closed(fd as u32);
     let idx = fd as usize;
     if idx < 3 || idx >= MAX_OPEN_FILES { return 0; }
     let mut tbl = OPEN_FILES.lock();
