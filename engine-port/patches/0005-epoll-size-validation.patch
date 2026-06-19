@@ -1,0 +1,46 @@
+diff --git a/runtime/bin/eventhandler_linux.cc b/runtime/bin/eventhandler_linux.cc
+index dd3aaa24..3842abbb 100644
+--- a/runtime/bin/eventhandler_linux.cc
++++ b/runtime/bin/eventhandler_linux.cc
+@@ -342,6 +342,19 @@ intptr_t EventHandlerImplementation::GetPollEvents(intptr_t events,
+ 
+ void EventHandlerImplementation::HandleEvents(struct epoll_event* events,
+                                               int size) {
++  // OSCORTEX freeze root-cause guard: epoll_wait() is called with maxevents=kMaxEvents
++  // (16), so a correct kernel returns size in [0,16]. OSCortex's cooperative-yield
++  // re-exec path can intermittently leak the epoll_wait syscall number (0x47B=1147) as
++  // the return value; when it does, epoll_wait never actually ran, so `events` is
++  // uninitialized stack garbage and `size` is absurd. Iterating it overreads the 16-slot
++  // array and dereferences a non-canonical DescriptorInfo* (#GP at di->Mask below). Drop
++  // the bogus batch entirely — no real events are lost (epoll is level-triggered, so any
++  // genuinely-ready fd re-fires on the next wait).
++  if (size < 0 || size > 16) {
++    Syslog::PrintErr("[OSX-GUARD] bogus epoll_wait size=%d (>kMaxEvents) — dropping batch\n",
++                     size);
++    return;
++  }
+   bool interrupt_seen = false;
+   for (int i = 0; i < size; i++) {
+     if (events[i].data.ptr == nullptr) {
+@@ -358,6 +371,21 @@ void EventHandlerImplementation::HandleEvents(struct epoll_event* events,
+     } else {
+       DescriptorInfo* di =
+           reinterpret_cast<DescriptorInfo*>(events[i].data.ptr);
++      // OSCORTEX freeze-hunt guard: a live DescriptorInfo* is a canonical user pointer.
++      // The x86 interact-freeze dereferences a non-canonical cookie right here (#GP at
++      // di->Mask()). Log the full context and SKIP the event instead of crashing — turns
++      // the fatal #GP into a survivable skip, and the log reveals whether data.fd aliases a
++      // real fd (epoll disambiguation false-negative) or the high bits are garbage
++      // (events_out / cookie corruption).
++      {
++        const uintptr_t pdi = reinterpret_cast<uintptr_t>(events[i].data.ptr);
++        if (pdi != 0 && (pdi >> 47) != 0 && (pdi >> 47) != 0x1FFFF) {
++          Syslog::PrintErr(
++              "[OSX-GUARD] non-canonical di=%p fd_lo=%d ev=%x i=%d size=%d\n",
++              events[i].data.ptr, events[i].data.fd, events[i].events, i, size);
++          continue;
++        }
++      }
+       const intptr_t old_mask = di->Mask();
+       const intptr_t event_mask = GetPollEvents(events[i].events, di);
+       if ((event_mask & (1 << kErrorEvent)) != 0) {

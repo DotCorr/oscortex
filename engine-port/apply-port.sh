@@ -50,6 +50,11 @@ docker exec "$CONTAINER" bash -c '
   else echo "[apply-port] WARN: 0003 does not apply cleanly" >&2; fi
 '
 
+#    0005 (epoll_wait size-validation + non-canonical-cookie skip in dart:io's
+#    EventHandler — the x86 interact-freeze crash-free defense; rejects bogus epoll_wait
+#    counts > kMaxEvents=16). Rooted at the dart dep.
+apply_patch "$PATCHES/0005-epoll-size-validation.patch" "flutter/third_party/dart"
+
 # 2. OSCortex platform backend sources (Phase 2 — copied 1:1 into the checkout).
 if [ -d "$SRC" ]; then
   docker exec "$CONTAINER" bash -c 'mkdir -p /work/engine/engine/src/flutter/fml/platform/oscortex'
