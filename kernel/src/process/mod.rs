@@ -2151,6 +2151,46 @@ pub fn mark_init_launched() {
     PENDING_INIT_PID.store(0, Ordering::Release);
 }
 
+/// Robustness invariant (x86): a thread resuming with rax = the epoll_wait nr (0x47B) must
+/// be RE-EXECUTING — rip at the `syscall` instruction. If rip is PAST the syscall (the
+/// engine's post-syscall code, which reads rax as the epoll event count), the nr 1147 is
+/// read as 1147 events → the dart:io EventHandler overruns its 16-slot events[] array and
+/// #GPs on a garbage DescriptorInfo* (the x86 interact-freeze). This is the *delivery point*
+/// for the cooperative-yield re-exec leak (root-fixed partially in `perform_cooperative_yield`,
+/// but a rare race remains across save paths). Read the 2 bytes at rip — the caller has
+/// switched to the user CR3 — and if it is not `syscall` (0F 05), neutralize by delivering 0:
+/// epoll_wait returns 0 (no events), which is safe because epoll is level-triggered, so a
+/// genuinely-ready fd re-fires on the next wait. The engine makes EVERY syscall through the
+/// 2-page syscall-stub trampoline at [TRAMPOLINE_PAGES_VA, +0x2000) (the crash trace shows
+/// nr=0x47B always issued from rip≈0x7fffeefa there), so the guard is scoped to those pages:
+/// they are always mapped (the resuming thread was executing there) → the read can never
+/// fault, and a coincidental rax==0x47B anywhere else (a real register value) is left alone.
+/// Count of leaks the guard caught (lock-free; dumped at ERROR level from the safe
+/// epoll_wait syscall path, never logged from this hot resume path which is boot-fragile).
+#[cfg(not(target_arch = "aarch64"))]
+pub static EPOLL_NR_GUARD_FIRED: AtomicU32 = AtomicU32::new(0);
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub(crate) fn epoll_nr_leak_guard(rax: u64, rip: u64) -> u64 {
+    const TRAMP_LO: u64 = posix_trampolines::TRAMPOLINE_PAGES_VA; // 0x7FFF_E000
+    const TRAMP_HI: u64 = posix_trampolines::TRAMPOLINE_PAGES_VA + 0x2000; // 2 stub pages
+    if rax == 0x47B && rip >= TRAMP_LO && rip < TRAMP_HI {
+        let insn = unsafe { core::ptr::read_volatile(rip as *const u16) };
+        if insn == 0x050F {
+            rax // genuine re-exec: rip sits on the `syscall` insn (0F 05) — re-run it
+        } else {
+            // rip is PAST the syscall → engine post-syscall code that reads rax as the
+            // epoll event count. Delivering 1147 overruns its 16-slot events[]. Neutralize
+            // to 0 (epoll is level-triggered, the ready fd re-fires next wait).
+            EPOLL_NR_GUARD_FIRED.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+    } else {
+        rax
+    }
+}
+
 pub fn enter_user_by_pid_noreturn(req_pid: u32) -> ! {
     let my_cpu = crate::arch::smp::this_cpu().cpu_id;
     let old_pid = current_pid();
@@ -2254,6 +2294,12 @@ pub fn enter_user_by_pid_noreturn(req_pid: u32) -> ! {
             );
         }
     }
+
+    // x86 epoll_wait re-exec leak guard (see epoll_nr_leak_guard): neutralize the nr if it
+    // would be delivered as an event count. Done after the CR3 switch so the rip read sees
+    // the resuming thread's own mapping. Rebinds rax for the EnterUserRegs assembled below.
+    #[cfg(not(target_arch = "aarch64"))]
+    let rax = epoll_nr_leak_guard(rax, rip);
 
     // aarch64: if this thread was timer-preempted at an arbitrary instruction,
     // its FULL register file lives in `arch_trapframe`. Resume from that frame
@@ -2427,6 +2473,13 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
             );
         }
     }
+
+    // x86 epoll_wait re-exec leak guard (see epoll_nr_leak_guard) — same as the main
+    // resume path; this `_try` wake-assist variant is one of the engine thread's resume
+    // routes, so it must neutralize a leaked nr too. After the CR3 switch so [rip] reads
+    // this thread's mapping. Rebinds rax for the EnterUserRegs below.
+    #[cfg(not(target_arch = "aarch64"))]
+    let rax = epoll_nr_leak_guard(rax, rip);
 
     // aarch64: prefer the full saved trap-frame (timer-preempt snapshot) over the
     // lossy `p.regs` reconstruction — see the matching block in

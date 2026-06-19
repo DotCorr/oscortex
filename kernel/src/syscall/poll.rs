@@ -1116,6 +1116,25 @@ pub(crate) fn sys_epoll_wait_real(epfd: u64, events_out: u64, maxevents: u64, ti
         if n < 8 {
             log::warn!("[epoll_wait] #{} pid={} epfd={} max={} to={}", n, cur, epfd, maxevents, timeout_signed);
         }
+        // ERROR-level dump (greppable) emitted each time the kernel resume guard catches
+        // another epoll_wait-nr leak. Dumped from here (the syscall path), never from the
+        // boot-fragile resume path. fired>0 == the guard is actively neutralizing the rare
+        // re-exec race that would otherwise #GP the engine. Change-triggered (swap) so the
+        // count is visible even on short runs that do far fewer than 65536 epoll_waits.
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            static LAST_FIRED_DUMP: core::sync::atomic::AtomicU32 =
+                core::sync::atomic::AtomicU32::new(0);
+            let fired = crate::process::EPOLL_NR_GUARD_FIRED
+                .load(core::sync::atomic::Ordering::Relaxed);
+            let prev = LAST_FIRED_DUMP.swap(fired, core::sync::atomic::Ordering::Relaxed);
+            // Rate-limited (first 8, then every 64th) so a release isn't spammed while still
+            // proving the guard is live: each line is a prevented #GP. Regression signal —
+            // fired==0 together with a 0x140d84cdb #GP would mean the guard stopped matching.
+            if fired != prev && (fired <= 8 || fired % 64 == 0) {
+                log::error!("[epoll-guard] fired={}", fired);
+            }
+        }
     }
 
     // ── Input de-starve (single-core fairness) ───────────────────────────────
