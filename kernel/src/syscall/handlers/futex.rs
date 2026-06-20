@@ -1,12 +1,12 @@
 use super::fd::{read_user_bytes, sys_exit};
 use crate::syscall::poll::{force_wake_all_task_runners, monotonic_ns};
 use crate::syscall::state::{
-    CondWaitState, COND_WAIT_STATE, FUTEX_PENDING_WAKES, FUTEX_WAITERS, SYSCALL_TRACE_DEPTH,
-    WM_WAITER_DEADLINE, WM_WAITER_PID,
+    CondWaitState, FutexKey, COND_WAIT_STATE, FUTEX_PENDING_WAKES, FUTEX_WAITERS,
+    SYSCALL_TRACE_DEPTH, WM_WAITER_DEADLINE, WM_WAITER_PID,
 };
 use crate::syscall::trace::dump_recent_syscalls;
 use crate::syscall::trace::POSTEXIT_TRACE_COUNT;
-use crate::syscall::wait::{futex_waiter_present, futex_waiter_remove};
+use crate::syscall::wait::{futex_key_for_current, futex_waiter_present, futex_waiter_remove};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -38,8 +38,11 @@ fn futex_addr_is_target(addr: u64) -> bool {
 
 #[inline]
 fn futex_target_waiter_count(addr: u64) -> usize {
+    // Count waiters parked on this well-known address in the CURRENT process's
+    // address space (the table is keyed by (root, va); a magic VA is still a VA).
+    let key = futex_key_for_current(addr);
     let table = FUTEX_WAITERS.lock();
-    table.get(&addr).map_or(0, |w| w.len())
+    table.get(&key).map_or(0, |w| w.len())
 }
 
 #[inline]
@@ -101,12 +104,16 @@ pub(crate) fn cond_miss_bridge(cond: u64, wake_count: u32) -> u32 {
             // Keep sibling fallback available for broadcast paths, but wake
             // only one waiter per futex address to avoid wake storms.
             let bridge_wake_count = if wake_count > 1 { 1 } else { wake_count };
-            // Snapshot waiter table addresses.
+            // Snapshot waiter table addresses. The table is keyed by
+            // (root, va); cond_miss_bridge runs in the broadcaster's address
+            // space and only ever bridges to its own siblings (same root), so
+            // the key's VA is the address the cond-state machine compares against.
             let addrs: alloc::vec::Vec<(u64, bool)> = {
                 let t = FUTEX_WAITERS.lock();
                 let cond_states = COND_WAIT_STATE.lock();
                 t.iter()
-                    .filter_map(|(addr, waiters)| {
+                    .filter_map(|(key, waiters)| {
+                        let addr = &key.va();
                         if *addr == cond || *addr == FUTEX_ADDR_HANDOFF {
                             return None;
                         }
@@ -298,9 +305,13 @@ fn futex_pid1_postrun_bypass(uaddr: u64, val: u32) -> bool {
 /// its predicate when pid 1 is about to park on its own cond. Returns the
 /// total number of wakes performed.
 fn futex_wake_all_known_waiters() -> u32 {
+    // Collect the virtual addresses of every recorded waiter bucket; the table is
+    // keyed by (root, va) and this runs in the current (pid 1) address space, so
+    // its sibling waiters share that root — wake by VA via futex_wake_waiters,
+    // which re-derives the same key.
     let addrs: Vec<u64> = {
         let table = FUTEX_WAITERS.lock();
-        table.keys().copied().collect()
+        table.keys().map(|k| k.va()).collect()
     };
     let mut total = 0u32;
     for addr in addrs {
@@ -312,95 +323,87 @@ fn futex_wake_all_known_waiters() -> u32 {
     total
 }
 
-/// Record `count` pending wakes for `addr`. Capped at 64 so a stuck producer
+/// Record `count` pending wakes for `key`. Capped at 64 so a stuck producer
 /// can't unbounded-grow the table.
-fn futex_pending_post(addr: u64, count: u32) {
+fn futex_pending_post(key: FutexKey, count: u32) {
     if count == 0 { return; }
     let mut t = FUTEX_PENDING_WAKES.lock();
-    let e = t.entry(addr).or_insert(0);
+    let e = t.entry(key).or_insert(0);
     *e = e.saturating_add(count).min(64);
 }
 
-/// Consume one pending wake on `addr`. Returns true if a wake was pending.
-fn futex_pending_take(addr: u64) -> bool {
+/// Consume one pending wake on `key`. Returns true if a wake was pending.
+fn futex_pending_take(key: FutexKey) -> bool {
     let mut t = FUTEX_PENDING_WAKES.lock();
-    if let Some(e) = t.get_mut(&addr) {
+    if let Some(e) = t.get_mut(&key) {
         if *e > 0 {
             *e -= 1;
-            if *e == 0 { t.remove(&addr); }
+            if *e == 0 { t.remove(&key); }
             return true;
         }
     }
     false
 }
 
-/// SMP M2: the PHYSICAL address backing a process's futex word at virtual `addr`.
-/// Two contexts share a futex iff this matches — the correct, address-space-
-/// independent identity (Redox blueprint #4). Returns None if the page isn't
-/// mapped in that process (caller then falls back to group-leader scoping).
-fn futex_phys_of(pid: u32, addr: u64) -> Option<u64> {
-    let p4 = crate::process::pml4_phys_of(pid)?;
-    let frame = crate::mm::paging::translate_user_page(p4, addr & !0xFFF)?;
-    Some(frame | (addr & 0xFFF))
-}
-
 pub(crate) fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
-    // CRITICAL: FUTEX_WAITERS is keyed by the userspace futex/mutex ADDRESS only,
-    // but that address is process-local. The shell (pid 1) and any launched app
-    // (e.g. pid 10) are distinct address spaces that load the same libc / Flutter
-    // engine .so at IDENTICAL virtual addresses, so their internal pthread
-    // mutex/cond addresses COLLIDE in this table. Waking the first `count` waiters
-    // blindly can wake — and remove — the WRONG process's waiter, leaving the
-    // intended one parked forever (the post-app-launch render freeze: a render
-    // thread stuck in pthread_mutex_lock while the unlock woke a sibling-process
-    // waiter instead). Only wake waiters that share the caller's address space.
-    // (Kernel/ISR context, pid 0, has no group and wakes everyone — preserves the
-    // force-wake bring-up path.)
+    // FUTEX_WAITERS is keyed by FutexKey::Private{root_phys, va} (foundation
+    // blueprint Step 4). The old raw-VA key collided across processes — the shell
+    // (pid 1) and a launched app load the same libc / Flutter engine .so at
+    // IDENTICAL virtual addresses, so their pthread mutex/cond words landed in one
+    // bucket and a wake could pop the WRONG process's waiter (the post-app-launch
+    // render freeze). The key now embeds the page-table root, so each address space
+    // has its OWN bucket and a wake is structurally confined to the caller's space —
+    // NO per-op virtual→physical page-table walk (the per-op translate is what
+    // double-faulted Attempt-1; `futex_phys_of` is deleted). The key is derived ONCE
+    // here, from the CURRENT process's root, BEFORE taking FUTEX_WAITERS (so we never
+    // hold FUTEX_WAITERS across PTABLE_LOCK — the Step-3 lock order).
+    //
+    // Kernel/ISR context (caller==0) has no address space of its own. It is only the
+    // force-wake bring-up path, which must reach EVERY waiter; with private buckets
+    // we can no longer point at one, so it drains all buckets for this VA.
     let caller = crate::process::current_pid();
-    let caller_grp = if caller == 0 { 0 } else { crate::process::get_group_leader(caller) };
-    // SMP M2: prefer PHYSICAL-address identity over group-leader scoping. The
-    // caller's physical futex address is the authoritative key — two contexts
-    // share the futex iff they map `addr` to the same physical page (correct even
-    // across cores, and across the shell/app shared-VA collision). Kernel/ISR
-    // context (caller==0) still wakes everyone (the bring-up force-wake path).
-    let caller_phys = if caller == 0 { None } else { futex_phys_of(caller, addr) };
+    let key = futex_key_for_current(addr);
     let wake_list = {
         let mut table = FUTEX_WAITERS.lock();
-        let Some(waiters) = table.get_mut(&addr) else {
-            // No waiter parked. If this is a target address, remember the
-            // wake so the next waiter can consume it (fixes wake-before-wait
-            // race in cond-bridge path).
-            if futex_addr_is_target(addr) {
-                drop(table);
-                futex_pending_post(addr, count);
+        if caller == 0 {
+            // Force-wake path: collect every waiter on this VA across all roots.
+            let mut woke = Vec::new();
+            let mut empty_keys = Vec::new();
+            for (k, waiters) in table.iter_mut() {
+                if k.va() != addr { continue; }
+                while !waiters.is_empty() && woke.len() < count as usize {
+                    woke.push(waiters.remove(0));
+                }
+                if waiters.is_empty() {
+                    empty_keys.push(*k);
+                }
             }
-            return 0;
-        };
-        let mut woke = Vec::with_capacity((count as usize).min(waiters.len()));
-        let mut i = 0;
-        while i < waiters.len() && woke.len() < count as usize {
-            let w = waiters[i];
-            // Physical-address identity is authoritative when both resolve; fall
-            // back to group-leader scoping only if a translation fails (so we
-            // never DROP a wake the old path would have allowed).
-            let same_space = if caller_grp == 0 {
-                true
-            } else if let (Some(cp), Some(wp)) = (caller_phys, futex_phys_of(w, addr)) {
-                cp == wp
-            } else {
-                crate::process::get_group_leader(w) == caller_grp
+            for k in empty_keys {
+                table.remove(&k);
+            }
+            woke
+        } else {
+            let Some(waiters) = table.get_mut(&key) else {
+                // No waiter parked. If this is a target address, remember the
+                // wake so the next waiter can consume it (fixes wake-before-wait
+                // race in cond-bridge path).
+                if futex_addr_is_target(addr) {
+                    drop(table);
+                    futex_pending_post(key, count);
+                }
+                return 0;
             };
-            if same_space {
-                woke.push(w);
-                waiters.remove(i);
-            } else {
-                i += 1;
+            // Same-space is now GUARANTEED by the key (every waiter in this bucket
+            // shares the caller's root), so wake the first `count` outright.
+            let mut woke = Vec::with_capacity((count as usize).min(waiters.len()));
+            while !waiters.is_empty() && woke.len() < count as usize {
+                woke.push(waiters.remove(0));
             }
+            if waiters.is_empty() {
+                table.remove(&key);
+            }
+            woke
         }
-        if waiters.is_empty() {
-            table.remove(&addr);
-        }
-        woke
     };
 
     let n = wake_list.len();
@@ -453,11 +456,18 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                 return 0;
             }
 
+            // Compute the address-space-identity key ONCE, here, from the current
+            // process's page-table root (foundation blueprint Step 4). This reads
+            // the root via current_user_root (which takes + releases PTABLE_LOCK)
+            // BEFORE any FUTEX_WAITERS acquisition below, preserving the Step-3 lock
+            // order (FUTEX_WAITERS → PTABLE_LOCK). pid != 0 here, so the root is valid.
+            let key = futex_key_for_current(uaddr);
+
             // Consume any pending wake that arrived before we parked. This is
             // the proper fix for the cond-bridge wake-before-wait race. If a
             // wake is pending, return success immediately so the user code
             // can re-test its predicate.
-            if futex_addr_is_target(uaddr) && futex_pending_take(uaddr) {
+            if futex_addr_is_target(uaddr) && futex_pending_take(key) {
                 static FUTEX_PENDING_CONSUME_LOG: core::sync::atomic::AtomicU32 =
                     core::sync::atomic::AtomicU32::new(0);
                 let k = FUTEX_PENDING_CONSUME_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -524,9 +534,9 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                     drop(table);
                     return -11; // EAGAIN
                 }
-                // Enqueue our waiter record (inline; we already hold the lock that
-                // futex_waiter_add would otherwise take).
-                let waiters = table.entry(uaddr).or_insert_with(Vec::new);
+                // Enqueue our waiter record under the pre-computed key (inline; we
+                // already hold the lock that futex_waiter_add would otherwise take).
+                let waiters = table.entry(key).or_insert_with(Vec::new);
                 if !waiters.contains(&pid) {
                     waiters.push(pid);
                 }
@@ -664,6 +674,10 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             }
             log::warn!("[futex-bitset] WAIT pid={} uaddr={:#x} val={}", pid, uaddr, val);
 
+            // Address-space-identity key, computed once before FUTEX_WAITERS (see
+            // the FUTEX_WAIT arm). pid != 0 here, so the root is valid.
+            let key = futex_key_for_current(uaddr);
+
             // ── ATOMIC WAIT (foundation blueprint Step 3) ──────────────────────
             // Same register-under-lock-then-block ordering as FUTEX_WAIT above:
             // value-check + enqueue + Running→Blocked under ONE FUTEX_WAITERS
@@ -679,7 +693,7 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                     log::warn!("[futex-bitset] EAGAIN pid={} uaddr={:#x} cur={} expected={}", pid, uaddr, cur, val);
                     return -11; // EAGAIN
                 }
-                let waiters = table.entry(uaddr).or_insert_with(Vec::new);
+                let waiters = table.entry(key).or_insert_with(Vec::new);
                 if !waiters.contains(&pid) {
                     waiters.push(pid);
                 }

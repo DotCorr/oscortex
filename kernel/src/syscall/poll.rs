@@ -1,4 +1,4 @@
-use super::state::{CondWaitState, COND_WAIT_STATE, FUTEX_WAITERS, WM_WAITER_DEADLINE, WM_WAITER_PID};
+use super::state::{CondWaitState, FutexKey, COND_WAIT_STATE, FUTEX_WAITERS, WM_WAITER_DEADLINE, WM_WAITER_PID};
 use super::tables::pipe_readable_for_fd;
 use super::trace::{POSTEXIT_TRACE_ACTIVE, POSTEXIT_TRACE_COUNT, POSTEXIT_TRACE_LIMIT};
 use super::wait::futex_waiter_remove;
@@ -631,29 +631,37 @@ pub fn check_timerfds_and_wake_try() {
     // drive the expiry to un-block the thread.
     {
         // Single lock acquisition: collect + transition atomically.
-        let expired: alloc::vec::Vec<(u32, u64, u64)> = {
+        // (pid, mutex VA, pre-computed cond key) — the cond key was captured when
+        // the waiter parked, so this ISR never re-derives it (Step 4).
+        let expired: alloc::vec::Vec<(u32, u64, FutexKey)> = {
             let mut cws = match COND_WAIT_STATE.try_lock() {
                 Some(c) => c,
                 None => return, // contention — retry next tick
             };
             let mut exps = alloc::vec::Vec::new();
             for (&pid, st) in cws.iter_mut() {
-                if let CondWaitState::Waiting { timeout_ns, mutex, cond, .. } = *st {
+                if let CondWaitState::Waiting { timeout_ns, mutex, cond_key, .. } = *st {
                     if timeout_ns != 0 && now >= timeout_ns {
                         // Atomically transition to AcquiringMutex inside the lock.
                         *st = CondWaitState::AcquiringMutex { mutex, timed_out: true };
-                        exps.push((pid, mutex, cond));
+                        exps.push((pid, mutex, cond_key));
                     }
                 }
             }
             exps
         };
-        for (pid, mutex, cond) in expired {
+        for (pid, mutex, cond_key) in expired {
             // ISR-safe: never block on FUTEX_WAITERS here. An interrupted syscall
             // (e.g. spawn_thread, a futex op) may hold it; a non-try lock would
             // self-deadlock this single core with IRQs masked. On contention the
             // removal is simply retried on the next timer tick.
-            super::futex_waiter_remove_try(cond, pid);
+            //
+            // Use the PRE-COMPUTED cond_key captured when this waiter parked
+            // (foundation blueprint Step 4): the parked thread (`pid`) is NOT the
+            // process current on this CPU, so the key cannot be re-derived here, and
+            // deriving it would touch PTABLE_LOCK / the page tables under the IRQ
+            // mask — the per-op translate that double-faulted in Attempt-1.
+            super::futex_waiter_remove_try(cond_key, pid);
             static COND_EXPIRE_LOG: AtomicU32 = AtomicU32::new(0);
             let n = COND_EXPIRE_LOG.fetch_add(1, Ordering::Relaxed);
             if n < 32 {

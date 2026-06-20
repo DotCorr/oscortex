@@ -1278,8 +1278,15 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
             super::futex_waiter_add(cond, pid);
         }
         sys_pthread_mutex_unlock(mutex);
+        // Pre-compute the address-space-identity key for `cond` while we are the
+        // current process (foundation blueprint Step 4). The generic-timer ISR
+        // cond-timeout path removes this waiter using `cond_key` directly, so it
+        // never re-derives the key under the IRQ mask. `cond` is private, so this
+        // process's root is the right one.
+        let cond_key = super::futex_key_for_current(cond);
         let next_state = super::CondWaitState::Waiting {
             cond,
+            cond_key,
             mutex,
             seq,
             timeout_ns,
@@ -1294,6 +1301,7 @@ pub fn sys_pthread_cond_wait_timeout(cond: u64, mutex: u64, timeout_ns: u64, sys
         match state.unwrap() {
             super::CondWaitState::Waiting {
                 cond,
+                cond_key: _,
                 mutex,
                 seq,
                 timeout_ns,

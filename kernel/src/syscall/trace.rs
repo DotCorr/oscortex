@@ -33,7 +33,7 @@ pub fn debug_dump_sync_states() {
             log::info!("=== Cond Wait States ===");
             for (&pid, state) in cws.iter() {
                 match state {
-                    CondWaitState::Waiting { cond, mutex, seq, timeout_ns } => {
+                    CondWaitState::Waiting { cond, cond_key: _, mutex, seq, timeout_ns } => {
                         let c_val = safe_read_u32(pid, *cond).map_or(-1, |v| v as i32);
                         let m_val = safe_read_u32(pid, *mutex).map_or(-1, |v| v as i32);
                         log::info!("  pid={}: Waiting {{ cond: {:#x} (val={}), mutex: {:#x} (val={}), seq: {}, timeout_ns: {} }}",
@@ -51,14 +51,16 @@ pub fn debug_dump_sync_states() {
     if let Some(fw) = FUTEX_WAITERS.try_lock() {
         if !fw.is_empty() {
             log::info!("=== Futex Waiters ===");
-            for (&addr, pids) in fw.iter() {
+            for (key, pids) in fw.iter() {
+                // Keyed by (root, va) now; read the futex word in an owner's space.
+                let addr = key.va();
                 let owner = pids.first().copied().unwrap_or(0);
                 let val = if owner != 0 {
                     safe_read_u32(owner, addr).map_or(-1, |v| v as i32)
                 } else {
                     -1
                 };
-                log::info!("  addr={:#x} (val={}): {:?}", addr, val, pids);
+                log::info!("  key={:?} (val={}): {:?}", key, val, pids);
             }
         }
     }

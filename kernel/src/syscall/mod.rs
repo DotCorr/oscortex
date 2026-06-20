@@ -105,8 +105,11 @@ pub(crate) use handlers::{
 };
 pub(crate) use tables::{MAX_OPEN_FILES, OPEN_FILES, PIPES};
 pub(crate) use state::{
-    CondWaitState, COND_WAIT_STATE, ENGINE_HOST_PID, ENGINE_LIBRARY_PATH, ENGINE_PROC_TABLE_PTR,
-    FS_BOOTSTRAP_LOGGED, WM_WAITER_DEADLINE, WM_WAITER_PID,
+    CondWaitState, FutexKey, COND_WAIT_STATE, ENGINE_HOST_PID, ENGINE_LIBRARY_PATH,
+    ENGINE_PROC_TABLE_PTR, FS_BOOTSTRAP_LOGGED, WM_WAITER_DEADLINE, WM_WAITER_PID,
 };
 pub(crate) use trace::{POSTEXIT_TRACE_ACTIVE, POSTEXIT_TRACE_COUNT, POSTEXIT_TRACE_LIMIT};
-pub(crate) use wait::{futex_waiter_add, futex_waiter_for, futex_waiter_present, futex_waiter_remove, futex_waiter_remove_try};
+pub(crate) use wait::{
+    futex_key_for_current, futex_waiter_add, futex_waiter_for, futex_waiter_present,
+    futex_waiter_remove, futex_waiter_remove_try,
+};
