@@ -2671,7 +2671,16 @@ pub fn timer_preempt_switch_try(cur_pid: u32, cur_regs: &UserRegs) -> Option<(u3
     // SMP M1 (non-preemptable bail): if the interrupted thread holds PTABLE_LOCK,
     // a recursive try_lock below would SUCCEED and let us switch threads mid-
     // critical-section, pinning the lock to this CPU forever. Bail instead.
-    if preempt_disabled() {
+    //
+    // Phase 3 (is_preemptable bail, spec §2.3 / A0): ALSO bail if the interrupted thread
+    // is inside a Dart-isolate USERSPACE critical section (is_preemptable=false) —
+    // preempting + migrating it there is the EC=0x24/#GP isolate-confinement class.
+    // is_preemptable (try_lock-based, fail-open true) is set false/true by the engine via
+    // SYS_SET_PREEMPTABLE (Phase 3 A1, not yet wired); until then it is always-true (init)
+    // so this is a BEHAVIOR-IDENTICAL no-op. A1 MUST add the slice-expiry safety valve
+    // (force-off when the quantum is fully spent) so a non-preemptable thread can only
+    // delay a discretionary switch, NEVER freeze a core.
+    if preempt_disabled() || !is_preemptable(cur_pid) {
         return None;
     }
     let my_cpu = crate::arch::smp::current_cpu_id();

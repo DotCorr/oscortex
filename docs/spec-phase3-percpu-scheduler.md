@@ -324,3 +324,35 @@ phys-futex → then this scheduler rework can shed its worst hacks.**
   This is the FIRST step (a clean, flag-gated, working per-CPU PICK), NOT Phase 3 complete.
 - **`oscortex.iso` is currently the flag-ON build.** For shipping, rebuild WITHOUT
   `KERNEL_FEATURES=percpu-sched` (the default).
+
+---
+
+## EXECUTION LOG + RE-VERIFIED EDIT PLAN (2026-06-19) — committed to driving Phase 3 (user: "no patches, we are an OS")
+
+**Why now:** bare-metal exposed the freeze class as ONE architectural gap — app-launch freezes the OS, install-demo freezes it (even the mouse), the Mac likely too. All = the cooperative scheduler can't reclaim the core from a busy/stuck/GC-safepointed thread. Phase 3 (preemptive per-CPU scheduler) is the generic fix. Driving it from the safe end, feature-flagged, verified each step.
+
+**Line-number drift vs the 2026-06-18 spec (re-verified against the live tree):** `set_preemptable` 1190 (was 1197), `is_preemptable()` accessor 1254 (was 1261, STILL zero callers before A0), `CONTEXT_SWITCH_LOCK` 751 (was 754, still dead), default PICK `next_runnable_pid_locked` 1565 (was 1543), `timer_preempt_switch_try` def **2670** (was 2515), its bail **2674**. `is_preemptable` field 183, init 297, `PREEMPT_DEPTH`/`preempt_disabled()` 688/716, percpu PICK `next_runnable_pid_percpu` 1694, `should_preempt` (x86) idt.rs:692-698 — all unchanged. `MAX_PROCS`=256, `MAX_CPUS`=64. `percpu-sched=["smp"]` confirmed in Cargo.toml.
+
+**KEY ARCHITECTURAL FINDINGS (override the dated spec where noted):**
+1. **The bail belongs at ONE site — `timer_preempt_switch_try` (process/mod.rs:2674)**, the single funnel that switches away a *running* thread (both arches, BSP+AP). NOT scattered in idt.rs/apic.rs (the spec's "edit should_preempt" is at best a cheap early-out).
+2. **aarch64 EL0 preemption is hard-OFF** (`apic.rs:277 let preempt_enabled=false`) — do NOT edit the aarch64 preempt path; it's a dead branch.
+3. **The x86 wake-assist S9 (idt.rs:775-788) is NOT a preempt-of-critical-section risk** — it only enters a target when `cur==0 || is_blocked_try(cur)`; never switches away a running thread. STEP A doesn't touch it.
+4. **A pure kernel heuristic for is_preemptable is INSUFFICIENT.** Cooperative cond/futex waits already mark the thread `Blocked` (un-pickable) → a wait-scoped `set_preemptable(false)` is redundant. The window that actually causes EC=0x24 — a thread running Dart *user* code inside an isolate it owns, timer-preempted at an arbitrary instruction — is NOT kernel-observable. **It REQUIRES an engine signal.** Hence A splits into A0 (no-op wiring) + A1 (the ABI).
+5. **`wake_process` (766) only sets a PENDING_WAKES bit** — the →Running flip is in `handle_pending_wakes_try` (798). Enqueue hook goes at 798.
+6. **All `=ProcState::Running` writes are inside process/mod.rs** (cross-file grep clean) → enqueue hooks centralize through `set_state` (3075) / `set_state_try` (3090) + the spawn direct-writes.
+
+**STEP A0 — DONE + committed (2026-06-19):** bail at process/mod.rs:2674 now `if preempt_disabled() || !is_preemptable(cur_pid)`. Behavior-identical no-op (field always true until A1). Lands in the shipping path (the only step that can). Verified: default build compiles + SMP no-regression; flag-on compiles.
+
+**STEP A1 — NEXT (the teeth + the safety valve):**
+- Add `SYS_SET_PREEMPTABLE` (embedder/abi.rs, next to SYS_THREAD_JOIN); handler `set_preemptable(current_pid(), arg0!=0)`; dispatch in syscall match. ISR-safe (set_preemptable already try_lock-based).
+- **Safety valve (REQUIRED):** thread `slice_expired: bool` (forced) into `timer_preempt_switch_try` (+ the non-try `timer_preempt_switch` if it gates EL0) from idt.rs:721; change the bail to `if preempt_disabled() { return None } if !forced && !is_preemptable(cur_pid) { return None }`. So a fully-spent quantum ALWAYS preempts → a non-preemptable thread can delay a discretionary (input/baton) switch but NEVER freeze a core.
+- Engine brackets (embedder, outside kernel): `set_preemptable(false)` on Dart_EnterIsolate / isolate-owning-thread entry, `true` on Dart_ExitIsolate. **If the embedder can't change yet, A1 stays kernel-side-ready (ABI + valve) and the field stays true = no-op until the engine calls it.**
+- Add a lock-free `PREEMPT_BAILED_PREEMPTABLE` counter (next to EPOLL_NR_GUARD_FIRED ~2171), dumped from a safe syscall path — OVER-BAIL detector (climbs while present plateaus). Gate: SMP=2 multiapp no-regression vs ~70-85%; the counter increments ONLY in marked isolate sections.
+
+**STEP B — per-CPU run-queue infra (behind `percpu-sched`, byte-identical default, observational mirror):**
+- `RunQueue { slots:[u32;MAX_PROCS], head, len }` + `push_if_absent` (idempotent) + `static RUN_QUEUES: [spin::Mutex<RunQueue>; MAX_CPUS]` + `pub fn enqueue(pid){ RUN_QUEUES[home_cpu_of(pid)].lock().push_if_absent(pid) }` — declare near 751, all `#[cfg(feature="percpu-sched")]`. Keep it OUT of PerCpuData (smaller blast radius; folds in at step 3 with need_resched/idle_ctx).
+- **Lock order: PTABLE_LOCK → RUN_QUEUE** (hooks run inside PTABLE_LOCK). Document it; never reverse (the ABBA/M6-bug-1 seed).
+- Enqueue hooks (8): set_state→Running **3075**, set_state_try→Running **3090**, handle_pending_wakes_try **798**, spawn_with_bootstrap (after home_cpu set ~978) **947/978**, spawn_thread **~2046**, clone_thread **~2120**, fork child **3313**, cooperative-yield Blocked→Running poll.rs **87**. (futex.rs 248/431 set_state(Running) are COVERED transitively by 3075 — do NOT double-hook.) Stale entries self-heal (PICK lazily skips non-Running) → `remove` can be a no-op in B.
+- Gate: default ISO BYTE-identical (feature off, binary-diff) + flag-on SMP=2 no-regression + a `debug_runnable_states` probe that RUN_QUEUES membership == PTABLE {Running && home_cpu==cpu}.
+
+**Then:** step 3 (replace PICK with the queue-reading pick_next, delete S2/S3/S10), step 4 (two-layer switch_to/switch_to_inner + CONTEXT_SWITCH_LOCK — HIGHEST risk, §2.4: aarch64 102-word frame stays the user-context source, switch_to_inner touches ONLY the 6/12 kernel regs, never FP), step 5 (delete S8), step 6 (delete S5/S9/S6 — needs Phase 2a). Variant (b) true concurrency is reachable once the present/baton path is per-engine (not is_preemptable-blocked) — the key unblocker for reliable multi-app.
