@@ -6,7 +6,7 @@ use crate::syscall::state::{
 };
 use crate::syscall::trace::dump_recent_syscalls;
 use crate::syscall::trace::POSTEXIT_TRACE_COUNT;
-use crate::syscall::wait::{futex_waiter_add, futex_waiter_present, futex_waiter_remove};
+use crate::syscall::wait::{futex_waiter_present, futex_waiter_remove};
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -426,9 +426,13 @@ pub(crate) fn futex_wake_waiters(addr: u64, count: u32) -> i64 {
     }
 
     for pid in &wake_list {
-        // Best-effort: ensure waker target is marked Running so a scheduler
-        // that has parked it can pick it up again.
-        crate::process::set_state(*pid, crate::process::ProcState::Running);
+        // Guarded unblock (foundation blueprint Step 3): flip the waiter
+        // Blocked→Running ONLY, idempotent. This is the wake side of the atomic
+        // WAIT — it must NOT force Running over an unrelated state. Critically,
+        // when a wake races a thread that is between its (already-committed)
+        // waiter push and its try_block, this leaves the thread Running so its
+        // try_block returns false and it skips sleeping (the lost-wakeup fix).
+        crate::process::try_unblock(*pid);
     }
 
     n as i64
@@ -439,10 +443,6 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
     match op_base {
         FUTEX_WAIT => {
             if uaddr < 0x1000 || uaddr & 3 != 0 { return -22; } // EINVAL: invalid/unaligned
-            let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
-            if cur != val {
-                return -11; // EAGAIN: value changed before we could sleep
-            }
 
             let pid = crate::process::current_pid();
             if pid == 0 {
@@ -499,7 +499,44 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                 log::warn!("[futex-wait] pid={} uaddr={:#x} val={:#x} rip={:#x}", pid, uaddr, val, urip);
             }
 
-            futex_waiter_add(uaddr, pid);
+            // ── ATOMIC WAIT (foundation blueprint Step 3) ──────────────────────
+            // Value-check, enqueue, and the Running→Blocked transition all happen
+            // under ONE FUTEX_WAITERS critical section. Previously the value-check
+            // and the enqueue were SEPARATE lock acquisitions, so a FUTEX_WAKE
+            // landing in the gap found no waiter and was LOST — the thread then
+            // parked forever (a face of the post-app-launch render freeze). Now a
+            // wake can only be processed either entirely before we hold the lock
+            // (→ value changed under the lock → EAGAIN, no park) or entirely after
+            // we release it (→ our waiter record is already present, so the wake
+            // sees us and flips us Running). `try_block` is the linchpin: if a wake
+            // already flipped us out of Running between the push and here, it
+            // returns false and we skip sleeping. The lock is DROPPED before any
+            // cooperative hand-off / halt below — never held across the yield (that
+            // would strand it cross-core; the M6 PTABLE_LOCK-desync class).
+            let blocked = {
+                let mut table = FUTEX_WAITERS.lock();
+                // Re-read the futex word UNDER the lock so the compare and the
+                // enqueue are not separated by a wake.
+                let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                if cur != val {
+                    // Value changed before we could sleep — no waiter was queued,
+                    // so nothing to remove. Drop the lock and report EAGAIN.
+                    drop(table);
+                    return -11; // EAGAIN
+                }
+                // Enqueue our waiter record (inline; we already hold the lock that
+                // futex_waiter_add would otherwise take).
+                let waiters = table.entry(uaddr).or_insert_with(Vec::new);
+                if !waiters.contains(&pid) {
+                    waiters.push(pid);
+                }
+                // Running→Blocked-ONLY. False ⇒ a wake already flipped our state
+                // (it ran after our push became visible) ⇒ we must NOT sleep.
+                let did_block = crate::process::try_block(pid);
+                drop(table);
+                did_block
+            };
+
             if futex_addr_is_target(uaddr) {
                 futex_trace_targets("wait-queued", pid, uaddr, val);
                 if uaddr == FUTEX_ADDR_PID1_WAIT {
@@ -514,14 +551,28 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                 }
             }
 
+            // A wake landed between our push and the block (try_block saw us
+            // already non-Running). The wake won: do not sleep. Remove our (now
+            // stale) waiter record and return success so user code re-tests its
+            // predicate. This is the LOAD-BEARING half — without it we would park
+            // on a state a wake already cleared and lose the wakeup.
+            if !blocked {
+                futex_waiter_remove(uaddr, pid);
+                if futex_addr_is_target(uaddr) {
+                    futex_trace_targets("wait-woke-early", pid, uaddr, val);
+                }
+                return 0;
+            }
+
             // Try to cooperatively hand the CPU to a sibling user thread that
             // is runnable. This is the only path by which other threads of
             // PID 1 (e.g. the Flutter engine worker) can actually execute,
             // since the APIC timer ISR does not preempt user mode during
             // bring-up. We save our user return context (with RAX=0 so the
-            // resumed syscall reports success), mark ourselves Blocked, and
-            // SYSRET into the sibling. A subsequent FUTEX_WAKE will mark us
-            // Running again and the next yielding thread will pick us up.
+            // resumed syscall reports success) and SYSRET into the sibling. We
+            // are ALREADY Blocked (try_block above), so no further set_state is
+            // needed here. A subsequent FUTEX_WAKE will mark us Running again and
+            // the next yielding thread will pick us up.
             if let Some(next) = crate::process::next_runnable_pid(pid) {
                 if next != pid {
                     let urip = crate::arch::syscall::user_rip();
@@ -530,7 +581,6 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                     crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, 0);
                     crate::process::save_xstate(pid);
-                    crate::process::set_state(pid, crate::process::ProcState::Blocked);
                     crate::process::enter_user_by_pid_noreturn(next);
                 }
             }
@@ -607,19 +657,43 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
             // safe under cooperative scheduling because the sibling will call
             // set_value / FUTEX_WAKE before the parent ever needs to time out.
             if uaddr < 0x1000 || uaddr & 3 != 0 { return -22; }
-            let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
-            if cur != val {
-                let pid = crate::process::current_pid();
-                log::warn!("[futex-bitset] EAGAIN pid={} uaddr={:#x} cur={} expected={}", pid, uaddr, cur, val);
-                return -11; // EAGAIN
-            }
             let pid = crate::process::current_pid();
             if pid == 0 { return 0; }
             if futex_pid1_postrun_bypass(uaddr, val) {
                 return 0;
             }
             log::warn!("[futex-bitset] WAIT pid={} uaddr={:#x} val={}", pid, uaddr, val);
-            futex_waiter_add(uaddr, pid);
+
+            // ── ATOMIC WAIT (foundation blueprint Step 3) ──────────────────────
+            // Same register-under-lock-then-block ordering as FUTEX_WAIT above:
+            // value-check + enqueue + Running→Blocked under ONE FUTEX_WAITERS
+            // critical section, lock dropped before any hand-off. Bitset and
+            // absolute-timeout semantics are intentionally LEFT unchanged here
+            // (still ignored, block like plain FUTEX_WAIT) — those land in
+            // Step 5; this step only closes the lost-wakeup window.
+            let blocked = {
+                let mut table = FUTEX_WAITERS.lock();
+                let cur = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                if cur != val {
+                    drop(table);
+                    log::warn!("[futex-bitset] EAGAIN pid={} uaddr={:#x} cur={} expected={}", pid, uaddr, cur, val);
+                    return -11; // EAGAIN
+                }
+                let waiters = table.entry(uaddr).or_insert_with(Vec::new);
+                if !waiters.contains(&pid) {
+                    waiters.push(pid);
+                }
+                let did_block = crate::process::try_block(pid);
+                drop(table);
+                did_block
+            };
+
+            // A wake won the race between our push and try_block — skip sleeping.
+            if !blocked {
+                futex_waiter_remove(uaddr, pid);
+                return 0;
+            }
+
             if let Some(next) = crate::process::next_runnable_pid(pid) {
                 if next != pid {
                     let urip = crate::arch::syscall::user_rip();
@@ -632,7 +706,7 @@ pub(crate) fn sys_futex(uaddr: u64, op: u32, val: u32, sys_nr: u64) -> i64 {
                     crate::process::save_full_user_gprs(pid);
                     crate::process::set_rax(pid, 0);
                     crate::process::save_xstate(pid);
-                    crate::process::set_state(pid, crate::process::ProcState::Blocked);
+                    // Already Blocked (try_block); no redundant set_state.
                     crate::process::enter_user_by_pid_noreturn(next);
                 }
             }

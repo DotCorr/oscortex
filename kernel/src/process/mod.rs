@@ -3121,6 +3121,48 @@ pub fn set_state_try(pid: u32, state: ProcState) -> bool {
     }
 }
 
+/// Guarded block: transition `pid` Running→Blocked ONLY. Returns `false` if the
+/// thread was not Running (already Blocked, a wake flipped it, Zombie/Dead, or
+/// absent). LOAD-BEARING for the atomic futex WAIT (foundation blueprint Step 3):
+/// the caller holds FUTEX_WAITERS, has already pushed its waiter record, and
+/// calls this last under that lock; if a wake landed in the gap it already
+/// flipped the state away from Running, so `try_block` returns false and the
+/// caller MUST skip sleeping and re-loop / return success. Never forces Blocked
+/// over a non-Running state, so a concurrent wake can never be lost. CPU
+/// occupancy is left untouched (matches `set_state`: a blocked thread keeps its
+/// home CPU so no other core schedules its sleeping kernel context).
+pub fn try_block(pid: u32) -> bool {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state == ProcState::Running {
+        p.state = ProcState::Blocked;
+        true
+    } else {
+        false
+    }
+}
+
+/// Guarded unblock: transition `pid` Blocked→Running ONLY, idempotent. Returns
+/// `true` iff a Blocked thread was flipped to Running (broadcasting a resched
+/// IPI so a parked core re-picks it). Returns `false` if the thread was not
+/// Blocked (already Running — a no-op, the idempotent wake case — or
+/// Zombie/Dead/absent). The wake side of the atomic futex WAIT uses this instead
+/// of an unconditional `set_state(Running)` so it never clobbers an unrelated
+/// state and is safe to call redundantly. Try-lock-free counterpart of
+/// `try_unblock_soft`.
+pub fn try_unblock(pid: u32) -> bool {
+    let _g = PTABLE_LOCK.lock();
+    let p = unsafe { &mut PTABLE[idx_of(pid)] };
+    if p.pid == pid && p.state == ProcState::Blocked {
+        p.state = ProcState::Running;
+        drop(_g);
+        crate::arch::smp::broadcast_resched_ipi();
+        true
+    } else {
+        false
+    }
+}
+
 /// Dump a compact scheduler snapshot for the main Flutter bring-up threads.
 /// Used by syscall diagnostics to explain deadlock conditions.
 pub fn debug_dump_core_threads() {
