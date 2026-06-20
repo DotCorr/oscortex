@@ -688,6 +688,18 @@ pub(crate) static PTABLE_LOCK: PTableLock = PTableLock::new();
 pub static PREEMPT_DEPTH: [AtomicU32; crate::arch::smp::MAX_CPUS] =
     [const { AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
 
+// Phase-3 Step 1 (foundation blueprint): a LOCK-FREE per-CPU quantum so the MANDATORY
+// time-slice preempt cannot be starved by PTABLE_LOCK contention — THE root freeze bug
+// (account_tick_try's try_lock returned None on contention → the slice was never
+// decremented → a CPU-bound thread was never forced off → the OS froze). One slot per
+// CPU; only the owning CPU's timer ISR writes it, so the swap+update is race-free without
+// a lock. QUANTUM_TICKS matches the old slice_left quantum (10).
+pub static PER_CPU_QUANTUM: [AtomicU32; crate::arch::smp::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
+pub static PER_CPU_QUANTUM_PID: [AtomicU32; crate::arch::smp::MAX_CPUS] =
+    [const { AtomicU32::new(0) }; crate::arch::smp::MAX_CPUS];
+const QUANTUM_TICKS: u32 = 10;
+
 #[inline(always)]
 fn preempt_disable_cpu(cpu: u32) {
     if (cpu as usize) < crate::arch::smp::MAX_CPUS {
@@ -3208,20 +3220,46 @@ pub fn account_tick(pid: u32) -> bool {
     preempt
 }
 
-/// Try-lock variant of `account_tick` to avoid ISR deadlocks.
+/// Try-lock variant of `account_tick` for ISR context. Blueprint Step 1: the slice verdict
+/// now comes from a LOCK-FREE per-CPU quantum, so a fully-spent quantum ALWAYS preempts even
+/// when PTABLE_LOCK is contended (the old try_lock→None path silently dropped the mandatory
+/// preempt → the freeze). Always returns `Some` now. PCB accounting (cpu_ticks/slice_left)
+/// stays best-effort under the lock and does NOT gate the verdict.
 pub fn account_tick_try(pid: u32) -> Option<bool> {
+    // Lock-free mandatory quantum. Per-CPU, single-writer (only this CPU's timer ISR), so
+    // the swap + store/fetch_add sequence is race-free without a lock.
+    let cpu = crate::arch::smp::current_cpu_id() as usize;
+    let slice_expired = if cpu < crate::arch::smp::MAX_CPUS {
+        let last = PER_CPU_QUANTUM_PID[cpu].swap(pid, Ordering::Relaxed);
+        let ticks = if last != pid {
+            // a different thread is now running on this CPU → fresh quantum
+            PER_CPU_QUANTUM[cpu].store(1, Ordering::Relaxed);
+            1
+        } else {
+            PER_CPU_QUANTUM[cpu].fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+        };
+        if ticks >= QUANTUM_TICKS {
+            PER_CPU_QUANTUM[cpu].store(0, Ordering::Relaxed); // reset for the next thread
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // Best-effort PCB accounting when uncontended — keeps cpu_ticks/slice_left roughly
+    // current for diagnostics; the forced verdict above is independent of it.
     if let Some(_g) = PTABLE_LOCK.try_lock() {
         let idx = idx_of(pid);
         let p = unsafe { &mut PTABLE[idx] };
-        if p.pid != pid || p.state != ProcState::Running { return Some(false); }
-        p.cpu_ticks += 1;
-        if p.slice_left > 0 { p.slice_left -= 1; }
-        let preempt = p.slice_left == 0;
-        if preempt { p.slice_left = 10; } // reset quantum
-        Some(preempt)
-    } else {
-        None
+        if p.pid == pid && p.state == ProcState::Running {
+            p.cpu_ticks += 1;
+            if p.slice_left > 0 { p.slice_left -= 1; }
+            if p.slice_left == 0 { p.slice_left = 10; }
+        }
     }
+    Some(slice_expired)
 }
 
 /// Return cumulative CPU ticks for a process.
