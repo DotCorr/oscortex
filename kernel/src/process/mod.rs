@@ -1134,8 +1134,16 @@ pub fn exit(pid: u32, code: i32) {
     // belongs to. Resolved while the lock is held; the (try-lock, ISR-safe)
     // notification itself runs after we release it.
     let leader = get_group_leader_locked(pid);
+    let dead_pml4 = p.pml4_phys;
+    let dead_is_thread = p.is_thread;
     drop(_g);
     crate::app_registry::note_thread_exit(leader, pid, code);
+    // Reclaim every per-pid kernel table entry this thread/process owned (COND_WAIT_STATE,
+    // FUTEX_WAITERS, EPOLL_BLOCKED, and standalone-only malloc bookkeeping). Runs OUTSIDE
+    // PTABLE_LOCK (the futex/cond locks order before it). Closes the slow per-thread table leak
+    // that bloats the timer-ISR + cooperative-yield scans over long use until the engine starves
+    // (the "frozen UI, cursor still moves" degradation seen on the ProBook after heavy use).
+    crate::syscall::cleanup_dead_pid(pid, dead_pml4, dead_is_thread);
 }
 
 /// Forcefully terminate every still-live member of `leader`'s thread group

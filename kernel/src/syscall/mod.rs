@@ -99,6 +99,33 @@ pub use dispatch::{dispatch_fast, dispatch_legacy};
 pub use poll::{check_timerfds_and_wake, check_timerfds_and_wake_try, coop_target_ready, cooperative_sched_target, cooperative_yield_for_cond_resched, cooperative_yield_to, force_wake_all_task_runners, monotonic_ns, prefer_embedder_if_baton_due, KICK_REQUESTED, acqmutex_waiter_for};
 pub use trace::{debug_dump_sync_states, dump_event_state, dump_recent_syscalls, dump_user_backtrace, init};
 
+/// Reclaim every per-pid kernel table entry a dying thread/process owned. Called from
+/// `process::exit()` — the single chokepoint for sys_exit / kill / kill_group / crash recovery —
+/// AFTER PTABLE_LOCK is dropped, so the futex/cond locks (which order before PTABLE_LOCK) are taken
+/// fresh. Closes the slow per-thread table leak (COND_WAIT_STATE / FUTEX_WAITERS / EPOLL_BLOCKED /
+/// malloc) that the Dart VM's constant short-lived-thread churn bloats over long use until the
+/// timer-ISR + cooperative-yield scans starve the engine (the "frozen UI, cursor still moves"
+/// degradation). The malloc bookkeeping is keyed by address space, so only a STANDALONE process
+/// exit (not a thread, which shares the parent's pml4) purges it.
+pub fn cleanup_dead_pid(pid: u32, pml4: u64, is_thread: bool) {
+    // COND_WAIT_STATE is keyed by pid.
+    state::COND_WAIT_STATE.lock().remove(&pid);
+    // FUTEX_WAITERS: drain this pid from every bucket; drop now-empty buckets.
+    {
+        let mut t = state::FUTEX_WAITERS.lock();
+        t.retain(|_k, waiters| {
+            waiters.retain(|&w| w != pid);
+            !waiters.is_empty()
+        });
+    }
+    // epoll block-state for this pid.
+    poll::cleanup_dead_pid(pid);
+    // Standalone process only: its malloc bookkeeping (keyed by pml4) dies with the address space.
+    if !is_thread {
+        posix::cleanup_dead_pml4(pml4);
+    }
+}
+
 // Flat re-exports for `posix` and legacy `super::` call sites.
 pub(crate) use handlers::{
     cond_miss_bridge, engine_broadcast_storm_wake, futex_wake_waiters, read_user_bytes, sys_exit, write_user_bytes, wm_consumer_pid,

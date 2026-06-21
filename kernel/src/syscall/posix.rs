@@ -71,6 +71,16 @@ struct MallocBlock {
 static MALLOC_ALLOCS: Mutex<BTreeMap<(u64, u64), MallocBlock>> = Mutex::new(BTreeMap::new());
 static MALLOC_FREE: Mutex<Vec<MallocBlock>> = Mutex::new(Vec::new());
 
+/// Purge a dead STANDALONE process's malloc bookkeeping (keyed by its pml4) from the kernel heap.
+/// Called from the exit-cleanup chokepoint (`crate::syscall::cleanup_dead_pid`). Threads SHARE the
+/// parent's pml4 → must never be called for a thread exit. Without this, every launched-and-closed
+/// app left all its never-freed malloc blocks + free-list entries resident in the 64 MiB kernel
+/// heap forever (and grew the O(n log n) coalesce on every system-wide free).
+pub(crate) fn cleanup_dead_pml4(pml4: u64) {
+    MALLOC_ALLOCS.lock().retain(|&(p, _), _| p != pml4);
+    MALLOC_FREE.lock().retain(|b| b.pml4 != pml4);
+}
+
 // ── Random state ─────────────────────────────────────────────────────────
 
 static RAND_STATE: AtomicU64 = AtomicU64::new(1234567890);

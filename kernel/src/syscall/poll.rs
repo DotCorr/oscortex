@@ -323,6 +323,13 @@ pub(crate) static EPOLL_TABLE: spin::Mutex<BTreeMap<u32, Vec<EpollEntry>>> = spi
 /// Threads blocked in epoll_wait(timeout=-1): pid → epfd they're waiting on.
 static EPOLL_BLOCKED: spin::Mutex<BTreeMap<u32, u32>> = spin::Mutex::new(BTreeMap::new());
 
+/// Drop a dying pid's epoll block-state (the exit-cleanup chokepoint). EPOLL_BLOCKED is keyed by
+/// pid; a thread force-woken by a crutch that then exits without re-entering epoll_wait would
+/// otherwise orphan its entry here.
+pub(crate) fn cleanup_dead_pid(pid: u32) {
+    EPOLL_BLOCKED.lock().remove(&pid);
+}
+
 /// Wake every thread that is blocked in epoll_wait and whose epoll watches `tfd`.
 /// Called after a timerfd is armed. The blocked thread already has rax=1 and a
 /// fake EPOLLIN event written to its events_out buffer; it will resume and call
