@@ -580,8 +580,10 @@ extern "C" fn apic_resched_handler(frame_ptr: *mut TimerTrapFrame) {
                 // switch above made the next thread's mapping active, so [rip] is readable.
                 // If next resumes with rax=the epoll_wait nr (0x47B) at a post-syscall rip,
                 // the engine would read 1147 as the event count and #GP — neutralize to 0.
-                frame.rax = crate::process::epoll_nr_leak_guard(next_regs.rax, next_regs.rip);
-                frame.rip = next_regs.rip;
+                let (guard_rax, guard_rip) =
+                    crate::process::epoll_nr_leak_guard(next_regs.rax, next_regs.rip);
+                frame.rax = guard_rax;
+                frame.rip = guard_rip;
                 frame.rflags = next_regs.rflags | 0x200;
                 frame.user_rsp = next_regs.rsp;
             }
@@ -741,8 +743,10 @@ extern "C" fn apic_timer_handler(frame_ptr: *mut TimerTrapFrame) {
                 // switch above made the next thread's mapping active, so [rip] is readable.
                 // If next resumes with rax=the epoll_wait nr (0x47B) at a post-syscall rip,
                 // the engine would read 1147 as the event count and #GP — neutralize to 0.
-                frame.rax = crate::process::epoll_nr_leak_guard(next_regs.rax, next_regs.rip);
-                frame.rip = next_regs.rip;
+                let (guard_rax, guard_rip) =
+                    crate::process::epoll_nr_leak_guard(next_regs.rax, next_regs.rip);
+                frame.rax = guard_rax;
+                frame.rip = guard_rip;
                 frame.rflags = next_regs.rflags | 0x200;
                 frame.user_rsp = next_regs.rsp;
             }

@@ -2184,22 +2184,33 @@ pub static EPOLL_NR_GUARD_FIRED: AtomicU32 = AtomicU32::new(0);
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
-pub(crate) fn epoll_nr_leak_guard(rax: u64, rip: u64) -> u64 {
+pub(crate) fn epoll_nr_leak_guard(rax: u64, rip: u64) -> (u64, u64) {
     const TRAMP_LO: u64 = posix_trampolines::TRAMPOLINE_PAGES_VA; // 0x7FFF_E000
     const TRAMP_HI: u64 = posix_trampolines::TRAMPOLINE_PAGES_VA + 0x2000; // 2 stub pages
     if rax == 0x47B && rip >= TRAMP_LO && rip < TRAMP_HI {
         let insn = unsafe { core::ptr::read_volatile(rip as *const u16) };
         if insn == 0x050F {
-            rax // genuine re-exec: rip sits on the `syscall` insn (0F 05) — re-run it
+            (rax, rip) // genuine re-exec: rip already on the `syscall` insn (0F 05) — re-run it
         } else {
-            // rip is PAST the syscall → engine post-syscall code that reads rax as the
-            // epoll event count. Delivering 1147 overruns its 16-slot events[]. Neutralize
-            // to 0 (epoll is level-triggered, the ready fd re-fires next wait).
+            // rip is PAST the syscall (post-syscall engine code that would read rax=1147 as the
+            // epoll event count and overrun its 16-slot events[]). The de-starve's INTENT was to
+            // RE-EXECUTE epoll_wait, so do exactly that: rewind rip to the `syscall` instruction
+            // (rip-2, the 0F 05) and keep rax=0x47B so the syscall re-issues CLEANLY and the
+            // thread re-blocks in-kernel. This replaces the old neutralize-to-0, which returned a
+            // spurious epoll_wait=0 that the engine logged as "Poll failed" → its I/O event loop
+            // degraded → present flatlined (the intermittent post-app-launch soft freeze).
             EPOLL_NR_GUARD_FIRED.fetch_add(1, Ordering::Relaxed);
-            0
+            let prev = rip.wrapping_sub(2); // SYSCALL (0F 05) is 2 bytes
+            if prev >= TRAMP_LO {
+                let prev_insn = unsafe { core::ptr::read_volatile(prev as *const u16) };
+                if prev_insn == 0x050F {
+                    return (0x47B, prev); // re-execute the syscall at the rewound rip
+                }
+            }
+            (0, rip) // syscall insn not found at rip-2 → neutralize (no #GP), last resort
         }
     } else {
-        rax
+        (rax, rip)
     }
 }
 
@@ -2311,7 +2322,7 @@ pub fn enter_user_by_pid_noreturn(req_pid: u32) -> ! {
     // would be delivered as an event count. Done after the CR3 switch so the rip read sees
     // the resuming thread's own mapping. Rebinds rax for the EnterUserRegs assembled below.
     #[cfg(not(target_arch = "aarch64"))]
-    let rax = epoll_nr_leak_guard(rax, rip);
+    let (rax, rip) = epoll_nr_leak_guard(rax, rip);
 
     // aarch64: if this thread was timer-preempted at an arbitrary instruction,
     // its FULL register file lives in `arch_trapframe`. Resume from that frame
@@ -2491,7 +2502,7 @@ pub fn enter_user_by_pid_noreturn_try(pid: u32) -> bool {
     // routes, so it must neutralize a leaked nr too. After the CR3 switch so [rip] reads
     // this thread's mapping. Rebinds rax for the EnterUserRegs below.
     #[cfg(not(target_arch = "aarch64"))]
-    let rax = epoll_nr_leak_guard(rax, rip);
+    let (rax, rip) = epoll_nr_leak_guard(rax, rip);
 
     // aarch64: prefer the full saved trap-frame (timer-preempt snapshot) over the
     // lossy `p.regs` reconstruction — see the matching block in
